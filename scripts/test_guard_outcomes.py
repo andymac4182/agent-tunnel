@@ -122,6 +122,12 @@ def main() -> int:
     # M4-26: a lost git index must stop the run, not go unreported.
     a_checkout_without_a_git_index_is_refused()
 
+    # M4-30 / M4-32: the tree or history changing under a case is refused.
+    an_untouched_case_in_a_git_repo_restores_without_refusal()
+    a_foreign_edit_during_a_case_is_not_overwritten()
+    a_commit_during_a_case_is_refused()
+    a_staged_mutation_is_refused()
+
     # The harness code between the shared module and the source-text
     # checks, which nothing here used to execute.
     every_harness_main_runs_to_its_summary()
@@ -1284,6 +1290,165 @@ def a_checkout_without_a_git_index_is_refused() -> None:
         "git read-tree HEAD" in refused,
         f"the refusal must say how to recover, got {refused!r}",
     )
+
+
+# --------------------------------------------------------------------------
+# M4-30 / M4-32: a case whose tree or history changed underneath it
+# --------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def scratch_git_repo():
+    """A throwaway git repository holding one committed product file."""
+    with tempfile.TemporaryDirectory() as directory:
+        repo = Path(directory)
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+            ).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        (repo / "guard.rs").write_text(ORIGINAL)
+        (repo / "other.rs").write_text(ORIGINAL)
+        git("add", "-A")
+        git("commit", "-qm", "initial")
+        yield repo, git
+
+
+def _exit_refusal(body) -> str:
+    """Run `body(applied)` inside an `AppliedCase`; return its exit refusal."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            body()
+    except SystemExit as stop:
+        return str(stop)
+    return ""
+
+
+def an_untouched_case_in_a_git_repo_restores_without_refusal() -> None:
+    """The positive control for the three refusals below.
+
+    Without it an `AppliedCase` that refused on every exit in a git work tree
+    would satisfy all three, and prove nothing about what they name.  It also
+    asserts HEAD was read, so the HEAD check below is known to have run rather
+    than to have been skipped as "not a git repository".
+    """
+    with scratch_git_repo() as (repo, git):
+        seen = {}
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "suite", "case") as applied:
+                check(applied.apply(repo / "guard.rs", "real_check()", "true") is None,
+                      "the edit should apply")
+                seen["head"] = applied.head
+        refusal = _exit_refusal(body)
+        check(refusal == "", f"an untouched case must restore quietly, got {refusal!r}")
+        check(
+            seen["head"] == git("rev-parse", "HEAD"),
+            f"the case must record the HEAD it began on, got {seen['head']!r}; "
+            "without it the HEAD check is skipped, not passed",
+        )
+        check((repo / "guard.rs").read_text() == ORIGINAL, "the case must be restored")
+        check(not mutation_journal(repo).exists(), "the journal must be gone")
+
+
+def a_foreign_edit_during_a_case_is_not_overwritten() -> None:
+    """M4-32: an edit made mid-case is refused over, never erased.
+
+    The restore used to write the recorded original back unconditionally, so
+    an editor save or a `cargo fmt` landing on a mutated file during the
+    case's test run was silently erased and the run exited 0.  Now the restore
+    sees the file no longer holds the bytes the case wrote, leaves it alone,
+    keeps it in the journal, restores the case's other file, and refuses.
+
+    **Defeating it.**  Restore unconditionally again and the foreign line is
+    gone and no refusal is raised: both assertions below fail.
+    """
+    with scratch_git_repo() as (repo, _git):
+        guard, other = repo / "guard.rs", repo / "other.rs"
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "m4c32", "a raced case") as applied:
+                applied.apply_all([(guard, "real_check()", "true"),
+                                   (other, "real_check()", "true")])
+                # Somebody else edits one mutated file mid-case.
+                guard.write_text(MUTATED + "// a foreign edit\n")
+        refusal = _exit_refusal(body)
+        check(
+            "guard.rs was edited by something else" in refusal
+            and "M4-32" in refusal
+            and "HEAD moved" not in refusal,
+            f"a foreign edit to a mutated file must be refused by name, got {refusal!r}",
+        )
+        check(
+            guard.read_text() == MUTATED + "// a foreign edit\n",
+            "the foreign edit was erased by the restore (M4-32)",
+        )
+        check(other.read_text() == ORIGINAL, "the case's other file must still be restored")
+        journal = mutation_journal(repo)
+        check(journal.exists() and "guard.rs" in journal.read_text()
+              and "other.rs" not in journal.read_text(),
+              "the journal must keep exactly the file that was not restored")
+
+
+def a_commit_during_a_case_is_refused() -> None:
+    """M4-30: a commit taken mid-case promotes the defeated guard.
+
+    Afterwards `git status` is clean -- truthfully -- because HEAD itself
+    holds the mutation.  The restore must refuse, and say that HEAD's blob of
+    the file IS the defeated text.
+
+    **Defeating it.**  Drop the HEAD comparison from `restore` and the run
+    ends quietly with the defeated guard in history: the refusal is empty.
+    """
+    with scratch_git_repo() as (repo, git):
+        guard = repo / "guard.rs"
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "m4c30", "a committed case") as applied:
+                applied.apply(guard, "real_check()", "true")
+                git("add", "guard.rs")
+                git("commit", "-qm", "docs: an unrelated commit taken mid-run")
+        refusal = _exit_refusal(body)
+        check(
+            "HEAD moved" in refusal
+            and "guard.rs IS the defeated text" in refusal
+            and "M4-30" in refusal
+            and "never --amend" in refusal
+            and "edited by something else" not in refusal,
+            f"a commit taken mid-case must be refused, naming the promoted file, got {refusal!r}",
+        )
+        check(
+            git("show", "HEAD:guard.rs") + "\n" == MUTATED,
+            "the fixture must really have promoted the mutation into HEAD",
+        )
+
+
+def a_staged_mutation_is_refused() -> None:
+    """M4-30's precursor: a `git add` mid-case stages the defeated text.
+
+    The working tree is restored, so `git diff` shows the restore as an
+    unstaged change and the next `git commit` would promote the mutation.
+
+    **Defeating it.**  Drop the index comparison and this returns quietly.
+    """
+    with scratch_git_repo() as (repo, git):
+        guard = repo / "guard.rs"
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "m4c30", "a staged case") as applied:
+                applied.apply(guard, "real_check()", "true")
+                git("add", "guard.rs")
+        refusal = _exit_refusal(body)
+        check(
+            "index stages the defeated text of guard.rs" in refusal
+            and "HEAD moved" not in refusal,
+            f"a staged mutation must be refused by name, got {refusal!r}",
+        )
+        check(guard.read_text() == ORIGINAL, "the working tree must still be restored")
 
 
 def every_harness_main_runs_to_its_summary() -> None:
