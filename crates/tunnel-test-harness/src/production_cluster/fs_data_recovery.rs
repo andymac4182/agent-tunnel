@@ -634,7 +634,14 @@ pub async fn verify() -> Result<FsDataRecoveryEvidence> {
     };
     let scenario = match timeout(SCENARIO_TIMEOUT, run(&mut cluster, &harness)).await {
         Ok(result) => result.and_then(|evidence| {
-            validate_fs_data_recovery_evidence(&evidence)?;
+            if let Err(error) = validate_fs_data_recovery_evidence(&evidence) {
+                // Payload-free: identifiers, labels and counters only.  A
+                // violated rule is otherwise named without the evidence that
+                // violated it, and the conjunctive same-owner rule cannot say
+                // which of its qualifiers failed (M4-29).
+                eprintln!("fs data recovery rejected evidence: {evidence:?}");
+                return Err(error);
+            }
             Ok(evidence)
         }),
         Err(_) => Err(HarnessError::Timeout(
@@ -1071,7 +1078,9 @@ async fn exercise(
             if evidence.owner_recovery_reason.is_none()
                 && let Ok(snapshot) = owner_snapshot(cluster).await
                 && let Ok(owner) = session_of(&snapshot, session_id)
-                && let Some(reason) = owner.rotation_recovery_reason
+                && let Some(reason) = owner
+                    .rotation_recovery_reason
+                    .or(owner.last_activated_recovery_reason)
             {
                 evidence.owner_recovery_reason = Some(reason.to_owned());
             }

@@ -45,6 +45,7 @@ use tunnel_fs_ninep::{
     flags::{O_DIRECTORY, O_RDONLY, O_WRONLY},
     parse_entries,
 };
+use tunnel_relay::RelaySnapshot;
 use uuid::Uuid;
 
 use super::fs_wire as wire;
@@ -52,8 +53,8 @@ use wire::{Event, NinepClient, Target, UpgradeFailure, errno_of, unexpected};
 
 use super::http_forward_real_path::{connect_consumer, empty_stream, once_stream, request};
 use super::{
-    CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT,
-    finish_scenario_with_cleanup, push_cleanup_error,
+    CLEANUP_TIMEOUT, ProductionCluster, ProductionRelay, RunningHarness, SCENARIO_TIMEOUT,
+    STARTUP_TIMEOUT, finish_scenario_with_cleanup, push_cleanup_error,
 };
 use crate::acceptance::helpers::write_device_profile;
 use crate::oidc::OidcTokenOptions;
@@ -267,6 +268,18 @@ pub struct FsRealPathEvidence {
     pub revoked_session_close_code: Option<u16>,
     /// 9P replies that arrived after the revocation.  Must be zero.
     pub revoked_session_replies_after: usize,
+    // (s) task row M4-22: a live session held idle across its grant deadline.
+    /// The owner's admission deadline for the session's stream when the hold
+    /// began, on the owner's monotonic clock.
+    pub grant_deadline_initial_ms: Option<u64>,
+    /// Whether the owner's own clock passed that deadline during the hold,
+    /// so the session really was held **across** it.
+    pub grant_deadline_crossed: bool,
+    /// Distinct later admission deadlines the owner confirmed during the
+    /// hold: each is one completed refresh of the stream's authorization.
+    pub grant_deadline_renewals: usize,
+    /// Whether a request sent after the hold was answered on the same fid.
+    pub grant_deadline_served_after: bool,
 }
 
 /// Every rule gate 4 must satisfy.  Returns the first violated one, so a
@@ -276,7 +289,7 @@ pub struct FsRealPathEvidence {
 /// A `HarnessError::Process` naming the violated rule.
 #[allow(clippy::too_many_lines)]
 pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<()> {
-    let checks: [(&str, bool); 54] = [
+    let checks: [(&str, bool); 57] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the upgrade ran against the owning relay and the refusal against another",
@@ -504,6 +517,18 @@ pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<(
         (
             "nothing was answered after the revocation",
             evidence.revoked_session_replies_after == 0,
+        ),
+        (
+            "the idle session was held across its grant deadline on the owner's clock",
+            evidence.grant_deadline_initial_ms.is_some() && evidence.grant_deadline_crossed,
+        ),
+        (
+            "the filesystem stream's authorization was renewed during the hold",
+            evidence.grant_deadline_renewals >= 1,
+        ),
+        (
+            "the session kept serving after its original grant deadline",
+            evidence.grant_deadline_served_after,
         ),
     ];
     for (rule, passed) in checks {
@@ -1083,6 +1108,9 @@ async fn exercise(
     let after = std::fs::read(&target_path).map_err(HarnessError::Io)?;
     evidence.mutation_host_unchanged =
         before.len() == after.len() && fnv1a(&before) == fnv1a(&after);
+
+    // (s) The same live session, held idle across its grant deadline.
+    grant_deadline_case(owner_relay, &mut client, root_fid, evidence).await?;
     client.close().await;
 
     // (k) `list` without `read`.
@@ -1149,6 +1177,68 @@ async fn exercise(
         evidence,
     )
     .await?;
+    Ok(())
+}
+
+/// How long case (s) holds its session idle.
+///
+/// The connector's grant window is at most five seconds (docs/cluster.md;
+/// `limits.grant_timeout_ms` is refused above 5,000), so this is more than two
+/// whole windows: a stream that could not refresh would have expired inside
+/// it at least once, and the owner's clock is required to pass the first
+/// deadline rather than trusted to.
+const GRANT_DEADLINE_HOLD: Duration = Duration::from_secs(12);
+
+/// The owner's admission deadline for the one live, admitted stream of this
+/// run's session, if exactly one exists.
+fn live_stream_admission_deadline(snapshot: &RelaySnapshot) -> Option<u64> {
+    let mut live = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| session.streams.iter())
+        .filter(|stream| !stream.terminal && stream.authorization_admission_deadline_ms.is_some());
+    let stream = live.next()?;
+    if live.next().is_some() {
+        return None;
+    }
+    stream.authorization_admission_deadline_ms
+}
+
+/// Case (s), task row M4-22: a filesystem stream expired at its grant
+/// deadline and never refreshed, because the connector's refresh guards
+/// omitted `fs_9p`. The fix (`8f83e43`) was proven by unit tests and, only
+/// indirectly, by the rotation gate outliving five seconds; this drives the
+/// event itself. The session is held **idle** -- no request in flight to
+/// mask anything -- for more than two grant windows, the owner is required
+/// to have confirmed at least one later admission deadline on its own clock,
+/// and the fid opened before the hold must still be served after it.
+async fn grant_deadline_case(
+    owner_relay: &ProductionRelay,
+    client: &mut NinepClient,
+    root_fid: u32,
+    evidence: &mut FsRealPathEvidence,
+) -> Result<()> {
+    let initial = live_stream_admission_deadline(&owner_relay.snapshot().await?);
+    evidence.grant_deadline_initial_ms = initial;
+    let mut seen = BTreeSet::new();
+    let started = Instant::now();
+    let mut owner_now_ms = 0_u64;
+    while started.elapsed() < GRANT_DEADLINE_HOLD {
+        sleep(AUTHORIZATION_POLL).await;
+        let snapshot = owner_relay.snapshot().await?;
+        owner_now_ms = snapshot.monotonic_now_ms;
+        if let Some(deadline) = live_stream_admission_deadline(&snapshot)
+            && initial.is_some_and(|first| deadline > first)
+        {
+            seen.insert(deadline);
+        }
+    }
+    evidence.grant_deadline_crossed = initial.is_some_and(|first| owner_now_ms > first);
+    evidence.grant_deadline_renewals = seen.len();
+    evidence.grant_deadline_served_after = matches!(
+        client.getattr(root_fid, GETATTR_BASIC).await?,
+        Message::Rgetattr(_)
+    );
     Ok(())
 }
 
@@ -1873,6 +1963,10 @@ mod tests {
             revoked_session_closed: true,
             revoked_session_close_code: Some(AUTHORIZATION_CLOSE),
             revoked_session_replies_after: 0,
+            grant_deadline_initial_ms: Some(5_000),
+            grant_deadline_crossed: true,
+            grant_deadline_renewals: 2,
+            grant_deadline_served_after: true,
         }
     }
 
@@ -2022,6 +2116,21 @@ mod tests {
             ("a reply arrived after the revocation", |e| {
                 e.revoked_session_replies_after = 1;
             }),
+            ("no admission deadline was observed before the hold", |e| {
+                e.grant_deadline_initial_ms = None;
+            }),
+            ("the hold ended before the grant deadline", |e| {
+                e.grant_deadline_crossed = false;
+            }),
+            ("the stream's authorization was never renewed", |e| {
+                e.grant_deadline_renewals = 0;
+            }),
+            (
+                "the session stopped serving after its grant deadline",
+                |e| {
+                    e.grant_deadline_served_after = false;
+                },
+            ),
         ];
         for (name, mutate) in mutations {
             let mut evidence = passing();
