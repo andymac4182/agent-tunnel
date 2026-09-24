@@ -258,6 +258,7 @@ impl FreezeFixture {
                 response_bytes: Vec::new(),
                 response_records: VecDeque::new(),
                 orphaned_response_records: 0,
+                credit_reissue_pending: false,
                 late_response_records: 0,
                 send_bytes: 0,
                 receive_bytes: 0,

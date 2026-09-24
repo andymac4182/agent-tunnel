@@ -1123,9 +1123,18 @@ fn data_occupancy(sender: &mpsc::Sender<DataOutbound>) -> ChannelOccupancy {
 ///
 /// A rotation enqueues two control messages back to back (`RECOVERY_BEGIN`
 /// plus `RECOVERY_CLOSED`); a cancellation and a revocation close each need
-/// one.  Four slots of the 32 KiB control bound therefore cover rotation,
+/// one.  Four slots of the 32 KiB control bound cover rotation,
 /// cancellation and revocation simultaneously while data is saturated, with
 /// the fourth left for a control reply.
+///
+/// **Not quite four whole slots any more (M4-37).** Relay flow-control frames
+/// on the data carrier -- `ACK`, `WINDOW_UPDATE` and the answering `RESET` --
+/// are charged against the full budget, as control is, so they may occupy
+/// part of this reservation: at most one data channel's worth of header-only
+/// frames (`max_queue_messages` slots of 64 bytes, 8 KiB at the default 128),
+/// released as the socket task takes each one. The guarantee is therefore
+/// the reservation less that bound, still more than three full control
+/// messages.
 pub(crate) const RESERVED_CONTROL_SLOTS: usize = 4;
 
 /// Bytes of the shared session budget reserved for control messages:
@@ -1543,6 +1552,12 @@ struct M2Stream {
     /// being treated as unsolicited (`INVALID_SEQUENCE`).  Any further record
     /// is still a protocol failure.
     orphaned_response_records: usize,
+    /// This stream's whole connector-to-relay receive credit must be
+    /// advertised again on the active carrier: set when a retained recovery
+    /// activates (the WINDOW_UPDATE that last carried it may have died with
+    /// the old socket, M4-52), cleared only once the reissue is queued, and
+    /// retried from the actor tick until then.
+    credit_reissue_pending: bool,
     /// Late response records discarded through the orphan allowance.
     late_response_records: u64,
     send_bytes: usize,
@@ -5054,6 +5069,7 @@ impl RelayActor {
                 response_bytes: Vec::new(),
                 response_records: VecDeque::new(),
                 orphaned_response_records: 0,
+                credit_reissue_pending: false,
                 late_response_records: 0,
                 send_bytes: 0,
                 receive_bytes: 0,
@@ -11844,8 +11860,11 @@ impl RelayActor {
                 };
                 if let Err(refusal) = queue_flow_control(&data_tx, &queue_budget, ack) {
                     if let ResponseFrameUpdate::Complete(_, response) = update {
+                        // The consumer is told the same thing the device is:
+                        // a dead carrier, or the relay's own backpressure
+                        // (M4-37 review follow-up).
                         let _ = response.send(EchoOutcome::Failure {
-                            code: "REVERSE_CHANNEL_UNAVAILABLE",
+                            code: refusal.flow_control_close_reason(),
                             execution: "unknown",
                         });
                     }
@@ -14556,8 +14575,9 @@ fn queue_data(
 /// is full turned backpressure into a fence (task row M4-37).
 ///
 /// The cost to the control reservation is bounded and small: at most one
-/// data channel's worth of slots, each holding one fixed-size header-only
-/// frame, released as the socket task takes it.
+/// data channel's worth of slots, each holding one fixed-size 64-byte
+/// header-only frame (8 KiB at the default 128 slots), released as the socket
+/// task takes it. See `RESERVED_CONTROL_SLOTS`.
 fn queue_flow_control(
     sender: &mpsc::Sender<DataOutbound>,
     budget: &QueueBudget,
@@ -15264,6 +15284,7 @@ mod stream_identity_tests {
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
                     orphaned_response_records: 0,
+                    credit_reissue_pending: false,
                     late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
@@ -15421,6 +15442,7 @@ mod stream_identity_tests {
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
                     orphaned_response_records: 0,
+                    credit_reissue_pending: false,
                     late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
@@ -19234,6 +19256,82 @@ mod stream_identity_tests {
             Some(granted),
             "the successor carries the whole advertised credit again"
         );
+        drop(registration);
+    }
+
+    /// Review of M4-52: the reissue at activation competes for the
+    /// successor's bounded channel with the re-driven held frames, and a
+    /// refusal must not lose it. With the channel full, nothing is queued and
+    /// the stream stays marked; once room returns the actor tick delivers
+    /// the whole credit. On an echo stream, which has no read path of its own
+    /// to pay a debt later.
+    #[tokio::test]
+    async fn a_refused_recovery_credit_reissue_is_retried_from_the_tick() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_531, "m4-52-refused-reissue").await;
+        let stream_id = registration.stream_id;
+        let granted = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let stream = session.streams.get_mut(&stream_id).expect("stream");
+            let current = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit();
+            let lost =
+                Frame::window_update(key.epoch, carrier.generation, stream_id, current + 4_096);
+            stream
+                .sequence
+                .send_frame(Direction::RelayToConnector, &lost)
+                .expect("recorded as advertised");
+            current + 4_096
+        };
+        let drain = |rx: &mut mpsc::Receiver<DataOutbound>| {
+            let mut window = None;
+            while let Ok(outbound) = rx.try_recv() {
+                if let DataOutbound::Binary(mut bytes) = outbound {
+                    // The 1-byte filler items below are not frames.
+                    let frame = Frame::decode(bytes.as_slice()).ok();
+                    bytes.release();
+                    if let Some(frame) = frame
+                        && frame.kind == FrameKind::WindowUpdate
+                        && frame.stream_id == stream_id
+                    {
+                        window = Some(frame.window);
+                    }
+                }
+            }
+            window
+        };
+        drain(&mut data_rx);
+        // The successor's channel is full at activation.
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        while data_tx.capacity() > 0 {
+            assert!(budget.reserve_data(1));
+            data_tx
+                .try_send(DataOutbound::Binary(super::QueuedBytes::new(
+                    vec![0_u8; 1],
+                    budget.clone(),
+                )))
+                .expect("a free slot");
+        }
+        actor.reissue_receive_credit_after_recovery(&key);
+        assert!(
+            actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending,
+            "a refused reissue stays pending"
+        );
+        assert_eq!(drain(&mut data_rx), None, "nothing fitted");
+        // Room returns; the tick pays the reissue.
+        actor.tick().await;
+        assert_eq!(
+            drain(&mut data_rx),
+            Some(granted),
+            "the whole credit reaches the connector once the queue has room"
+        );
+        assert!(!actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending);
         drop(registration);
     }
 
