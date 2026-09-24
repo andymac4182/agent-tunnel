@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "4b83232e3dff122bd51a092421f3f1b92f1bde09",
-  "lastPublishedOriginMain": "4b83232e3dff122bd51a092421f3f1b92f1bde09",
-  "lastReviewAt": "2026-09-24T22:03:50+10:00",
-  "lastReviewOutcome": "Reviewed packaging, HTTP framing test corrections, Redis lane and ownership fixes, peer-drain evidence and Fly upgrade documentation through 4b83232. Published historical hosted upgrade/reconnect evidence, Redis restart and rollback boundaries, and the Fly entrypoint catalog-command limitation. No Fly or runtime operations executed; CI and release gates unchanged.",
+  "reviewedOriginMain": "77bfd28cbb8c275f9826046a3197c8f63f446823",
+  "lastPublishedOriginMain": "77bfd28cbb8c275f9826046a3197c8f63f446823",
+  "lastReviewAt": "2026-09-24T23:04:23+10:00",
+  "lastReviewOutcome": "Reviewed Fly entrypoint catalog commands, configuration override refusal, local proof and operator workflow through 77bfd28. Replaced the old entrypoint restriction with image-version requirements, one-off machine operation and cleanup, dry-run limits and explicit local-versus-hosted evidence. No Fly or runtime operations executed; CI and release gates unchanged.",
   "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
   "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T22:03:50+10:00",
-  "deploymentId": "dpl_BRYHPzqUgQYMvKagkUvZVG6tV53y"
+  "verifiedAt": "2026-09-24T23:04:23+10:00",
+  "deploymentId": "dpl_Em48TnWuvDviQKD22K88Zr7xvg8x"
 }
