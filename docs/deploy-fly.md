@@ -1115,7 +1115,7 @@ one-off container, with `serve` running:
 
 | Check | Result |
 | --- | --- |
-| An unknown command; `add-user ... --config X` | both refused by the entrypoint, exit `1`. The `--config=X` form was added to the proof in review, after this run, and has not run yet |
+| An unknown command; `add-user ... --config X`; `add-user ... --config=X` | all refused by the entrypoint, exit `1` (the `--config=X` form from the `c2169ec` run below) |
 | All seven catalog commands with `--dry-run` | exit `0`, each `This dry run contacted no Redis authority and wrote nothing.` |
 | `add-user`, with a records path holding a space, `$(...)`, a backquote and a quote | exit `0`, so `tunnel-relay` read exactly that path, unexpanded; the same again exit `1`, `catalog conflict: user already exists` |
 | `add-device` (certificate from the proof's device CA), `add-service`, `set-grant` | exit `0` each; the grant `revision=1` |
@@ -1125,6 +1125,15 @@ one-off container, with `serve` running:
 | `revoke-credential` of a third device's credential, then again | exit `0`; exit `1`, `no active credential` |
 | The first tester's echo afterwards | HTTP 200 |
 | Key lines or the Redis password in any day-2 output; a leftover one-off container | none; none |
+
+**Re-run after review** from the committed tip: log nonce
+`m6c60-proof-20260924T125518Z-1043`, head `c2169ec`, 0 uncommitted paths, the
+same relay image `ddb0496c8ea8` (the entrypoint did not change), exit `0`.
+Every row above repeated, and the two checks added in review passed:
+`add-user ... --config=/tmp/provision/device-2.toml` was refused by the
+entrypoint with exit `1`, and after the relay stopped the device log held 5
+`backoff`/`reconnecting` events, so the proof reported it as reconnecting
+(not a hang) before stopping it, exit `130`.
 
 **The day-2 phase can go red.** With the relay image's entrypoint replaced by
 the one before M6-C91 (`PROOF_SKIP_BUILD=1 RELAY_IMAGE=...`, log nonce
