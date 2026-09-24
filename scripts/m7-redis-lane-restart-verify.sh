@@ -56,8 +56,13 @@ if [[ "${CONTAINER_NAME}" != agent-tunnel-m7-lane-restart-[0-9A-Fa-f]* ]]; then
 fi
 
 # The live catalog keeps one URL across the restart, so the published host
-# port must be fixed rather than reassigned by Docker on restart.
-readonly REDIS_PORT="$(python3 - <<'PY'
+# port must be fixed rather than reassigned by Docker on restart.  A port
+# found free by a probe can be taken by anything else on the host before
+# Docker publishes it (task row M7-C119), so a publish refused with "address
+# already in use" -- and only that -- is retried on a fresh port, a bounded
+# number of times.  Nothing about the restart under test is retried.
+pick_port() {
+    python3 - <<'PY'
 import socket
 
 probe = socket.socket()
@@ -65,35 +70,63 @@ probe.bind(("127.0.0.1", 0))
 print(probe.getsockname()[1])
 probe.close()
 PY
-)"
+}
+
+remove_owned_container() {
+    local owner_label
+    owner_label="$(docker inspect --format '{{index .Config.Labels "agent-tunnel.lane-restart-owner"}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+    if [[ "${owner_label}" == "${RUN_ID}" ]]; then
+        docker rm --force --volumes "${CONTAINER_NAME}" >/dev/null
+    fi
+}
+
+REDIS_PORT=""
+for publish_attempt in 1 2 3 4 5; do
+    candidate_port="$(pick_port)"
+    if [[ -z "${candidate_port}" ]]; then
+        printf '%s\n' 'could not reserve a loopback port for the fixture Redis' >&2
+        exit 1
+    fi
+    # From here the container may exist, so the exit trap must remove it.
+    container_started=1
+    # This disposable fixture disables Redis protected mode inside the
+    # container; the published listener remains bound to 127.0.0.1 and
+    # contains only synthetic data.
+    if run_error="$(docker run --detach \
+        --name "${CONTAINER_NAME}" \
+        --label "${CONTAINER_LABEL}" \
+        --publish "127.0.0.1:${candidate_port}:6379/tcp" \
+        --memory 256m \
+        --cpus 1.0 \
+        --pids-limit 64 \
+        --ulimit nofile=1024:1024 \
+        "${REDIS_IMAGE}" \
+        redis-server \
+        --appendonly yes \
+        --appendfsync always \
+        --aof-load-truncated no \
+        --save "" \
+        --maxmemory 64mb \
+        --maxmemory-policy noeviction \
+        --protected-mode no \
+        --bind 0.0.0.0 \
+        2>&1 >/dev/null)"; then
+        REDIS_PORT="${candidate_port}"
+        break
+    fi
+    if [[ "${run_error}" != *"address already in use"* ]]; then
+        printf '%s\n' "${run_error}" >&2
+        exit 1
+    fi
+    printf 'lane-restart: loopback port %s was taken before Docker published it (attempt %s); retrying on a fresh port\n' \
+        "${candidate_port}" "${publish_attempt}" >&2
+    remove_owned_container
+done
 if [[ -z "${REDIS_PORT}" ]]; then
-    printf '%s\n' 'could not reserve a loopback port for the fixture Redis' >&2
+    printf '%s\n' 'every probed loopback port was taken before Docker could publish it' >&2
     exit 1
 fi
-
-# This disposable fixture disables Redis protected mode inside the container;
-# the published listener remains bound to 127.0.0.1 and contains only
-# synthetic data.
-docker run --detach \
-    --name "${CONTAINER_NAME}" \
-    --label "${CONTAINER_LABEL}" \
-    --publish "127.0.0.1:${REDIS_PORT}:6379/tcp" \
-    --memory 256m \
-    --cpus 1.0 \
-    --pids-limit 64 \
-    --ulimit nofile=1024:1024 \
-    "${REDIS_IMAGE}" \
-    redis-server \
-    --appendonly yes \
-    --appendfsync always \
-    --aof-load-truncated no \
-    --save "" \
-    --maxmemory 64mb \
-    --maxmemory-policy noeviction \
-    --protected-mode no \
-    --bind 0.0.0.0 \
-    >/dev/null
-container_started=1
+readonly REDIS_PORT
 
 wait_for_redis() {
     local attempt
