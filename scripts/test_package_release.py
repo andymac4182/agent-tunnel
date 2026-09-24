@@ -1,4 +1,5 @@
 import json
+import os
 import tarfile
 import tempfile
 import unittest
@@ -89,6 +90,24 @@ class PackagingTests(unittest.TestCase):
                         self.assertEqual(member.mode, 0o755)
                     else:
                         self.assertEqual(member.mode, 0o644)
+
+    def test_zip_accepts_files_dated_before_1980(self):
+        # crates.io sources can carry epoch (1970) mtimes, and packaging copies
+        # dependency licence files with shutil.copy2, which keeps them. ZIP
+        # cannot encode dates before 1980, so the Windows archive failed in
+        # release run 35984188758 while the tar archives did not care.
+        dependency = self.root / "vendor-dep"
+        dependency.mkdir()
+        (dependency / "Cargo.toml").write_text("[package]\n")
+        licence = dependency / "LICENSE"
+        licence.write_text("synthetic dependency licence")
+        os.utime(licence, (0, 0))
+        metadata = {"packages": [{"name": "dep", "version": "1.0.0", "license": "MIT", "source": None, "manifest_path": str(dependency / "Cargo.toml")}]}
+        target = next(t for t in TARGETS if t.endswith("windows-msvc"))
+        archive = package(self.root, target, self.sha, "123", self.output, metadata)
+        with zipfile.ZipFile(archive) as handle:
+            self.assertIn("notices/dep-1.0.0/LICENSE", handle.namelist())
+            self.assertEqual(handle.getinfo("notices/dep-1.0.0/LICENSE").date_time[0], 1980)
 
     def test_missing_helper_fails(self):
         (self.root / "target" / TARGETS[0] / "release" / "tunnel-deadman").unlink()
