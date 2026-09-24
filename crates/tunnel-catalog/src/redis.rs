@@ -3522,6 +3522,13 @@ local function h(key, field)
 end
 if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'incarnation'} end
 if redis.call('GET', KEYS[3]) ~= ARGV[2] then return {'authority'} end
+-- An owner past its lease is absent to every other script, but the key's
+-- millisecond PEXPIREAT outlives the microsecond lease by up to a millisecond.
+-- Refuse a release there too, so an expired owner can never act (M7-C114).
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+local expiry = tonumber(h(KEYS[1], 'lease_expires_at_us'))
+if not expiry or expiry <= now then return {'stale'} end
 if h(KEYS[1], 'owner_epoch') ~= ARGV[3]
    or h(KEYS[1], 'deployment_incarnation') ~= ARGV[1]
    or h(KEYS[1], 'node_id') ~= ARGV[4]

@@ -717,10 +717,12 @@ impl Catalog for MemoryCatalog {
     async fn release_owner(&self, token: &OwnerToken) -> Result<bool, CatalogError> {
         self.with_state(|state| {
             let key = (token.tenant_id, token.device_id);
+            // As in Redis, an owner past its lease cannot release (M7-C114).
+            let now = Utc::now();
             if state
                 .owners
                 .get(&key)
-                .is_some_and(|claim| claim.token == *token)
+                .is_some_and(|claim| claim.token == *token && claim.lease_expires_at > now)
             {
                 state.owners.remove(&key);
                 return Ok(true);
