@@ -80,6 +80,20 @@ pub enum Outcome {
     Complete,
     /// Reset, failed validation, or was cancelled before completion.
     Aborted,
+    /// Response direction only: the consumer released the response body
+    /// after its head was committed and before this endpoint saw the
+    /// response's FIN (M3-32).  The transport was cancelled — a RESET with
+    /// `HTTP_CANCELLED` was sent, so a handler still running is told — but
+    /// this endpoint cannot say whether the *call* completed: the release may
+    /// have come after the application's final message (an MCP client drops
+    /// a POST's SSE stream once its final JSON-RPC response has arrived) or in
+    /// the middle of it, and only the body tells them apart.  The relay does
+    /// not interpret bodies, so it records the release as its own outcome
+    /// rather than as an ordinary abort, and the device's record — which
+    /// saw whether its response completed before the RESET arrived — is
+    /// authoritative for the call, exactly as its dispatch record is for
+    /// [`Execution`].
+    Released,
 }
 
 /// The terminal status of one exchange as seen by one endpoint.

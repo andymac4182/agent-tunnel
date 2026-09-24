@@ -1170,6 +1170,14 @@ impl OpenJournal {
         self.entries.len()
     }
 
+    /// The distinct stream IDs of the retained entries, lowest first, at
+    /// most `limit` of them.
+    fn stream_ids(&self, limit: usize) -> Vec<u64> {
+        let ids: std::collections::BTreeSet<u64> =
+            self.entries.values().map(|entry| entry.stream_id).collect();
+        ids.into_iter().take(limit).collect()
+    }
+
     fn stream_message_is_reserved_by_other(&self, stream_id: u64, message_id: &str) -> bool {
         self.entries
             .iter()
@@ -2454,6 +2462,9 @@ impl M2Actor {
                 .map(|attempt| attempt.rotation_id.clone()),
             streams: self.streams.len(),
             open_journal_entries: self.open_journal.entry_count(),
+            open_journal_stream_ids: self
+                .open_journal
+                .stream_ids(crate::OPEN_JOURNAL_STREAM_IDS_REPORTED),
             open_streams_retired: self.retired_streams.retired_count(),
             open_retired_ranges_coalesced: self.retired_streams.coalesced_gaps,
             emitted_sequences: emitted,

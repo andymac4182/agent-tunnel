@@ -41,7 +41,9 @@ pub use carrier::{
 };
 pub use device::{HandlerCancellation, serve, serve_paused};
 pub use normalize::NormalizeError;
-pub use owner::{ExchangeHandle, forward, forward_paused, rejection_response};
+pub use owner::{
+    ExchangeHandle, PendingHead, begin_paused, forward, forward_paused, rejection_response,
+};
 pub use progress::{
     MAX_PROGRESS_BUDGET, PauseController, PauseSignal, ProgressBudgets, ProgressKind,
 };

@@ -3278,12 +3278,18 @@ impl RelayActor {
                 cause,
                 response,
             } => {
-                let _ = response.send(self.close_echo_stream_with_cause(
-                    &key,
-                    stream_id,
-                    &operation_id,
-                    cause,
-                ));
+                let closed =
+                    self.close_echo_stream_with_cause(&key, stream_id, &operation_id, cause);
+                // M3-31: the close is often the event that makes the stream's
+                // STREAM_FORGET provable (its FIN and ACK proofs arrived while
+                // the exchange task was still finishing).  Publish it now
+                // rather than at the session's next inbound frame or the
+                // maintenance tick, so the connector's OPEN journal does not
+                // hold the entry for a later request's round trip.  The
+                // flush keeps every rule it already has, including the
+                // rotation-freeze serialization.
+                let _ = self.flush_owner_stream_forgets(&key);
+                let _ = response.send(closed);
             }
             Command::OpenHttpStream {
                 consumer,

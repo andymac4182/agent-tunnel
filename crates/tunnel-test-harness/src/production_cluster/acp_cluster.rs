@@ -1971,8 +1971,8 @@ impl Gate<'_> {
         Ok(())
     }
 
-    /// Every ingress exchange the relay has already recorded as aborted,
-    /// keyed by request id.
+    /// Every ingress exchange the relay has already recorded as aborted or
+    /// released, keyed by request id.
     ///
     /// Taken before and after the revocation so the withdrawal can be
     /// **correlated** rather than guessed at.  An earlier version read "the
@@ -1988,7 +1988,10 @@ impl Gate<'_> {
             .exchanges
             .iter()
             .filter(|record| record.role == "ingress_remote")
-            .filter(|record| record.response_outcome == "aborted")
+            // `released` too (M3-32): a consumer that lets go of a body the
+            // relay is withdrawing is recorded as a release rather than an
+            // abort, and that must not hide the withdrawn exchange here.
+            .filter(|record| matches!(record.response_outcome, "aborted" | "released"))
             .filter_map(|record| {
                 record
                     .request_id

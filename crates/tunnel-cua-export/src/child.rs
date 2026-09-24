@@ -54,15 +54,19 @@
 //!   also the group id — has been released and may in principle have been
 //!   recycled.
 //!
-//! So a post-reap `killpg` at a recyclable group id is real. It is kept
-//! because the alternative is worse: dropping it would leave a naturally
-//! exited wrapper's helpers unsignalled, which is the whole case the group
-//! kill exists for. The window is the scheduling gap between the reap and the
-//! next line, and it needs a full wrap of the host's pid space to bite.
-//! Closing it properly wants a handle that stays valid across the reap —
-//! `pidfd` on Linux — and **macOS has no equivalent**, which is the same
-//! reason `docs/tasks.md` M3-18 exists for the sentinel's version of this
-//! race. It is recorded there rather than claimed away here.
+//! **With a sentinel armed, that post-reap `killpg` is no longer at a
+//! recyclable id (M3-18).** The sentinel joins a *pin* to the watched group
+//! and does not reap it until it is stood down, and the stand-down comes
+//! after this `kill_group`. So when the post-reap signal is sent the group
+//! still has a member -- the pin, alive or an unreaped zombie -- and POSIX
+//! keeps its id allocated: the signal can reach only this group. Two cases
+//! keep the old window, and only those: **no sentinel** (the executable is
+//! missing or could not be started, which `doctor` reports), and a child that
+//! exits and is reaped before the sentinel's pin has joined (the arming
+//! window, M8-C29). There the signal is still sent, because dropping it would
+//! leave a naturally exited wrapper's helpers unsignalled -- the case the group
+//! kill exists for -- and the race needs a full wrap of the host's pid space
+//! inside a scheduling gap.
 //!
 //! # The stand-down ordering, and the trade it makes
 //!
@@ -244,7 +248,8 @@ pub fn spawn(
                 // **This one** is pre-reap: the leader is still unreaped, so
                 // POSIX keeps the group id from being reissued and the signal
                 // reaches only members of this group. The one after the
-                // `select!` has no such guarantee -- see the module docs.
+                // `select!` relies on the sentinel's pin for the same
+                // guarantee -- see the module docs.
                 let _ = kill_group(pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -254,12 +259,12 @@ pub fn spawn(
         // Whatever ended the leader, no member of its group may outlive it.
         //
         // **This signal lands after the leader has been reaped**, and on the
-        // natural-exit path it is the only one sent. The group id is therefore
-        // a released pid and is in principle recyclable. Kept anyway, because
-        // dropping it would leave a naturally exited wrapper's helpers
-        // unsignalled -- the case the group kill exists for -- and the race
-        // needs a full pid-space wrap inside a scheduling gap. Recorded in the
-        // module docs and in M3-18, not claimed away.
+        // natural-exit path it is the only one sent. With a sentinel armed its
+        // pin still holds the group allocated (it is stood down only below),
+        // so the id cannot have been reissued (M3-18). Without one -- or inside
+        // the arming window (M8-C29) -- the id is in principle recyclable; the
+        // signal is kept anyway, because dropping it would leave a naturally
+        // exited wrapper's helpers unsignalled. See the module docs.
         if kill_group(pid) {
             supervisor_counters
                 .group_kills

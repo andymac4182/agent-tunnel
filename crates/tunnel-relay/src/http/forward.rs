@@ -49,9 +49,9 @@ use tokio_util::sync::CancellationToken;
 use tunnel_http_bridge::{
     BridgeConfig, CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, ExchangeReport,
     Execution, HANDOFF_CAPACITY, OutboundEnd, Outcome, PauseController, PauseSignal, Profile,
-    QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset, channel,
-    detail_from_reason, detail_from_status, forward_paused, pump_inbound, pump_outbound,
-    rejection_response, reset_reason_for, reset_signal_pair,
+    QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset, begin_paused, channel,
+    detail_from_reason, detail_from_status, pump_inbound, pump_outbound, rejection_response,
+    reset_reason_for, reset_signal_pair,
 };
 use tunnel_http_forward::HttpErrorCode;
 use tunnel_protocol::{ResultDetail, reset_reason};
@@ -1207,6 +1207,7 @@ fn outcome_label(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Complete => "complete",
         Outcome::Aborted => "aborted",
+        Outcome::Released => "released",
         Outcome::Pending => "pending",
     }
 }
@@ -1588,19 +1589,25 @@ pub(crate) async fn http_forward_route(
             let owner_freeze = hop.peer_pause_signal();
             let outbound = tokio::spawn(pump_outbound(to_device_rx, hop_writer));
             let inbound = tokio::spawn(pump_inbound(hop_reader, from_device_tx));
-            let (response, exchange) = forward_paused(
+            let (exchange, head) = begin_paused(
                 request,
                 export.profile,
                 config,
                 to_device_tx,
                 from_device_rx,
                 owner_freeze,
-            )
-            .await;
-            let body_stats = response.body().stats();
+            );
+            // The record is written by a task that exists before the head
+            // is awaited, so a consumer that leaves while the request is
+            // dispatched and unanswered is still recorded (M3-14): dropping
+            // this handler drops only `head`, which cancels the exchange.
+            let (body_stats_tx, body_stats_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let _permits = (permit, scope_permit);
                 let (report, _, _) = tokio::join!(exchange.report(), outbound, inbound);
+                // Absent when no head reached the consumer.
+                let body_stats: std::sync::Arc<QueueStats> =
+                    body_stats_rx.await.unwrap_or_default();
                 hop_finish_and_record(
                     hop,
                     diagnostics,
@@ -1614,6 +1621,8 @@ pub(crate) async fn http_forward_route(
                 )
                 .await;
             });
+            let response = head.await;
+            let _ = body_stats_tx.send(response.body().stats());
             response.map(axum::body::Body::new)
         }
         _ => {
@@ -1650,20 +1659,23 @@ pub(crate) async fn http_forward_route(
             let (writer, reader, signal_task, freeze) = actor_carriers(&state.handle, registration);
             let outbound = tokio::spawn(pump_outbound(to_device_rx, writer));
             let inbound = tokio::spawn(pump_inbound(reader, from_device_tx));
-            let (response, exchange) = forward_paused(
+            let (exchange, head) = begin_paused(
                 request,
                 export.profile,
                 config,
                 to_device_tx,
                 from_device_rx,
                 freeze,
-            )
-            .await;
-            let body_stats = response.body().stats();
+            );
+            // As for the remote route: recorded even if the consumer leaves
+            // before any response head (M3-14).
+            let (body_stats_tx, body_stats_rx) = tokio::sync::oneshot::channel();
             let handle = state.handle.clone();
             tokio::spawn(async move {
                 let _permits = (permit, scope_permit);
                 let (report, _, _) = tokio::join!(exchange.report(), outbound, inbound);
+                let body_stats: std::sync::Arc<QueueStats> =
+                    body_stats_rx.await.unwrap_or_default();
                 signal_task.abort();
                 if matches!(
                     timeout(
@@ -1687,6 +1699,8 @@ pub(crate) async fn http_forward_route(
                     report,
                 );
             });
+            let response = head.await;
+            let _ = body_stats_tx.send(response.body().stats());
             response.map(axum::body::Body::new)
         }
     }
