@@ -1024,6 +1024,33 @@ FORGET_AT_CLOSE_CASES: list[Case] = [
     ),
 ]
 
+#: The M3-32 review's race: a head the consumer had already dropped is not a
+#: release.  Witnessed by the owner module's own unit tests.
+RELEASE_RACE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-http-bridge",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "owner::tests::",
+]
+RELEASE_RACE_CASES: list[Case] = [
+    Case(
+        "a head the consumer never took does not make leaving a release",
+        [
+            (
+                BRIDGE_OWNER,
+                "            self.committed.store(false, Ordering::SeqCst);\n",
+                "",
+            )
+        ],
+        frozenset({"owner::tests::a_head_the_consumer_never_took_is_not_a_release"}),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -1038,6 +1065,7 @@ SUITES: list[Suite] = [
         RETIRING_ADMISSION_CASES,
     ),
     Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
+    Suite("m3c32-release-race", [BRIDGE], RELEASE_RACE_TEST, RELEASE_RACE_CASES),
     Suite("m3c33-owner-not-ready-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
     Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
 ]

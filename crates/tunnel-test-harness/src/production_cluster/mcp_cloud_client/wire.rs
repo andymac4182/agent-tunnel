@@ -212,9 +212,11 @@ pub(in crate::production_cluster) const OWNER_NOT_READY_MESSAGE: &str =
 /// execution and `retryable` alone also match the empty-pin-set refusal
 /// (`peer_trust_unavailable_response`, M7-C83), which carries its own message
 /// and a 5000 ms hint.  So the message must be the owner-not-ready one and the
-/// hint must be present and within `OWNER_NOT_READY_RETRY_AFTER_MS` (250 ms),
-/// the ceiling that response clamps to.  A missing hint is no longer
-/// defaulted.
+/// hint must be present and within `1..=MIN_RETRY_HINT_MS` -- this harness's
+/// copy of the relay's `OWNER_NOT_READY_RETRY_AFTER_MS` (250 ms,
+/// `tunnel-relay/src/peer_runtime.rs`), the ceiling
+/// `retryable_peer_failure_response` clamps its hint to.  A missing hint is
+/// no longer defaulted.
 fn not_dispatched_retry_after(
     error: &StreamableHttpError<rmcp::transport::common::unix_socket::UnixSocketError>,
 ) -> Option<Duration> {

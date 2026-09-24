@@ -99,7 +99,17 @@ impl Owner {
     /// released the response body, which is recorded as
     /// [`Outcome::Released`] (M3-32).  Both send the same RESET.
     fn consumer_left(&self) {
-        if self.committed.load(Ordering::SeqCst) {
+        // Read under the head lock, which `commit` holds from setting
+        // `committed` until it knows whether the consumer took the head, so
+        // an in-between value is never observed.
+        let committed = {
+            let _head = self
+                .head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.committed.load(Ordering::SeqCst)
+        };
+        if committed {
             // No gateway response can follow a committed head, so there is
             // no head sender to answer.
             let _ = self.exchange.release(HttpErrorCode::Cancelled);
@@ -123,16 +133,29 @@ impl Owner {
     }
 
     fn commit(&self, response: Response<ChannelBody>) -> bool {
-        match self.take_head() {
-            Some(head) => {
-                // Marked before the send: the consumer can only release a
-                // body it has been handed.
-                self.committed.store(true, Ordering::SeqCst);
-                let _ = head.send(HeadOutcome::Committed(response));
-                true
-            }
-            None => false,
+        let mut slot = self
+            .head
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(head) = slot.take() else {
+            return false;
+        };
+        // Marked before the send, because a consumer that takes the head can
+        // release its body at once; cleared again if the consumer had already
+        // dropped the pending head, because then it was never handed a body
+        // and leaving is an ordinary pre-head cancellation, not a release
+        // (M3-32 review).  The lock is held throughout, so `consumer_left`
+        // never sees the transient value.
+        self.committed.store(true, Ordering::SeqCst);
+        let unsent = head.send(HeadOutcome::Committed(response)).err();
+        if unsent.is_some() {
+            self.committed.store(false, Ordering::SeqCst);
         }
+        drop(slot);
+        // Dropped outside the lock: an unsent body's drop cancels the
+        // exchange, and that path takes the lock again.
+        drop(unsent);
+        true
     }
 }
 
@@ -535,5 +558,56 @@ async fn response_pump(
         // finishes cannot hold the exchange open, but a deadline abort still
         // gives the peer time to see the RESET instead of a lost receiver.
         let _ = tokio::time::timeout_at(discard_until, from_device.discard_until_terminal()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner_with_head(head: oneshot::Sender<HeadOutcome>) -> Owner {
+        let (to_device, _device_rx, _) = crate::stream::channel(64 * 1024);
+        Owner {
+            exchange: Exchange::new(
+                to_device,
+                Execution::Dispatched,
+                PauseSignal::never(),
+                BridgeConfig::default().progress(),
+            ),
+            head: Mutex::new(Some(head)),
+            committed: AtomicBool::new(false),
+            consumer: CancellationToken::new(),
+        }
+    }
+
+    fn response() -> Response<ChannelBody> {
+        let (_sender, body) = ChannelBody::channel(1, None, None);
+        Response::new(body)
+    }
+
+    /// M3-32 review: a head the consumer never received is not a release.
+    /// The consumer dropped the pending head just as the response head was
+    /// committed, so the send fails; leaving then is a pre-head cancellation.
+    #[tokio::test]
+    async fn a_head_the_consumer_never_took_is_not_a_release() {
+        let (head_tx, head_rx) = oneshot::channel();
+        drop(head_rx);
+        let owner = owner_with_head(head_tx);
+        assert!(owner.commit(response()));
+        owner.consumer_left();
+        let report = owner.exchange.report();
+        assert_eq!(report.response, Outcome::Aborted);
+        assert_eq!(report.error, Some(HttpErrorCode::Cancelled));
+    }
+
+    /// The other side of the same rule: a head the consumer did take makes a
+    /// later departure a release.
+    #[tokio::test]
+    async fn a_head_the_consumer_took_makes_leaving_a_release() {
+        let (head_tx, _head_rx) = oneshot::channel();
+        let owner = owner_with_head(head_tx);
+        assert!(owner.commit(response()));
+        owner.consumer_left();
+        assert_eq!(owner.exchange.report().response, Outcome::Released);
     }
 }

@@ -95,16 +95,22 @@ const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
 /// could only restate the cap the loop already enforces.
 const SEQUENTIAL_RETRY_CAP: usize = 12;
 const SEQUENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// The most OPEN journal entries the sequential phase may retain at once: a
-/// quarter of the journal cap (M3-31).  It is a bound tied to the cap, not a
-/// latency measured on one host: it cannot tell the close-time
-/// `STREAM_FORGET` (witnessed by the relay actor test
-/// `an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete`)
-/// from its absence, because the owner also flushes forgets after every
-/// inbound frame, which bounds the lag at about one request either way.  It
-/// does catch a relay that forgets only on its maintenance tick, where every
-/// request that fits in a tick stays retained.
-pub const SEQUENTIAL_JOURNAL_PEAK_BOUND: usize = OPEN_JOURNAL_TRACKED_ENTRIES / 4;
+/// The most OPEN journal entries the sequential phase may retain at once:
+/// one sixteenth of the journal cap, 8 (M3-31).
+///
+/// **Chosen, not derived, and chosen to catch one regression.**  No request
+/// count bounds the peak by construction (see the reclamation rule below), so
+/// this is a ceiling with margin: 4x the largest peak measured with forgets
+/// published at close (1 locally; 2 on hosted Linux, from a settled baseline
+/// of 0).  It is set to go red on a relay that publishes `STREAM_FORGET` only
+/// on its 500 ms maintenance tick: with the close-time and
+/// after-every-inbound-frame flushes both removed, two local runs peaked at
+/// **23** and **25**, which a quarter of the cap (32) let through.  It cannot tell the
+/// close-time flush alone from its absence, because the after-every-frame
+/// flush bounds the lag at about one request either way; that rule is
+/// witnessed by the relay actor test
+/// `an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete`.
+pub const SEQUENTIAL_JOURNAL_PEAK_BOUND: usize = OPEN_JOURNAL_TRACKED_ENTRIES / 16;
 /// How long the earlier phases' OPEN journal entries may take to be
 /// reclaimed before the sequential phase reads its baseline.
 const JOURNAL_SETTLE_WAIT: Duration = Duration::from_secs(15);
@@ -426,7 +432,7 @@ pub fn validate_http_forward_real_path_evidence(
             evidence.open_journal_entries_before_sequential == 0,
         ),
         (
-            "the OPEN journal stayed within a quarter of its cap while serving them",
+            "the OPEN journal stayed within a sixteenth of its cap while serving them",
             evidence.open_journal_entries_peak <= SEQUENTIAL_JOURNAL_PEAK_BOUND
                 && SEQUENTIAL_JOURNAL_PEAK_BOUND < OPEN_JOURNAL_TRACKED_ENTRIES,
         ),
@@ -1875,7 +1881,7 @@ mod tests {
                 e.open_journal_entries_before_sequential = 1;
                 e.open_journal_entries_after_sequential = 1;
             }),
-            ("journal peak over a quarter of the cap", |e| {
+            ("journal peak over a sixteenth of the cap", |e| {
                 e.open_journal_entries_peak = SEQUENTIAL_JOURNAL_PEAK_BOUND + 1;
             }),
             ("journal reclamation short", |e| e.open_streams_retired -= 1),

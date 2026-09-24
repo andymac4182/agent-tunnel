@@ -290,10 +290,11 @@ jobs:
         run: sh scripts/m7-harness-verify.sh
 
   # M3: the MCP and http-forward/1 gates over the three-relay cluster fixture,
-  # plus the stdio export's process-tree residue measurements.  Added once
-  # M3-31 was decided (docs/tasks.md): the real-path gate's OPEN-journal rule
-  # is now derived from the reclamation path rather than from a peak observed
-  # on one host.
+  # plus the stdio export's process-tree residue measurements.  The real-path
+  # gate's OPEN-journal rules are M3-31's (docs/tasks.md): the earlier
+  # phases' entries must be reclaimed before the sequential baseline, the
+  # journal must return to that baseline, and its peak stays within a sixteenth
+  # of the journal cap.
   #
   # **No artifacts and no process-log directories, on purpose (M7-C112).**
   # The harness's preserved child captures carry the fixture's Redis TLS client
@@ -315,6 +316,7 @@ jobs:
           --health-retries 20
           --memory 256m
     env:
+      RUST_LOG: info
       TEST_REDIS_URL: redis://127.0.0.1:6379/
       TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
     steps:
