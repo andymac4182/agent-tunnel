@@ -1245,10 +1245,9 @@ impl Gate<'_> {
             )
             .await?;
         if answer.status != 200 {
-            return Err(HarnessError::Process(format!(
-                "{}: initialize answered {}",
-                consumer.label, answer.status
-            )));
+            return Err(self
+                .session_open_refused(consumer, "initialize", &answer)
+                .await);
         }
         let session = answer.session.clone().ok_or_else(|| {
             HarnessError::Process(format!(
@@ -1268,12 +1267,29 @@ impl Gate<'_> {
             )
             .await?;
         if answer.status != 202 {
-            return Err(HarnessError::Process(format!(
-                "{}: notifications/initialized answered {}",
-                consumer.label, answer.status
-            )));
+            return Err(self
+                .session_open_refused(consumer, "notifications/initialized", &answer)
+                .await);
         }
         Ok(session)
+    }
+
+    /// A session-opening step answered with anything but success, described
+    /// payload-free with the relays' peer fault tuples and pin state: a
+    /// `503 PEER_UNAVAILABLE` here is otherwise indistinguishable between a
+    /// rotation freeze and a dial refused on an empty pin set (M3-30).
+    async fn session_open_refused(
+        &self,
+        consumer: &Consumer,
+        step: &str,
+        answer: &Answer,
+    ) -> HarnessError {
+        let forensics = self.cluster.peer_path_forensics().await;
+        HarnessError::Process(format!(
+            "{}: {step} answered {}; peer path: {forensics}",
+            consumer.label,
+            answer.describe()
+        ))
     }
 
     /// End one legacy session as its owning principal would, and report
