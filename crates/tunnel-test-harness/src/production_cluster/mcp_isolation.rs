@@ -60,8 +60,8 @@ use tunnel_mcp_export::ExportDiagnostics;
 
 use super::http_forward_real_path::{ConsumerStream, connect_consumer, request};
 use super::mcp_cloud_client::wire::{
-    FreezeWatch, HttpBackend, MAX_RETRY_AFTER, MIN_RETRY_HINT_MS, RETRY_MARGIN, count_lines,
-    fixture_binary_path, wait_file,
+    FreezeWatch, HttpBackend, MAX_RETRY_AFTER, MIN_RETRY_HINT_MS, OWNER_NOT_READY_MESSAGE,
+    RETRY_MARGIN, count_lines, fixture_binary_path, wait_file,
 };
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, STARTUP_TIMEOUT,
@@ -932,11 +932,6 @@ struct Consumer {
     /// Freeze refusals seen and resent, shared by every consumer.
     refusals: Arc<FreezeRefusals>,
 }
-
-/// The message of the relay's owner-not-ready refusal
-/// (`retryable_peer_failure_response`), which is what separates it from the
-/// empty-pin-set refusal that shares its code and execution (M3-30).
-const OWNER_NOT_READY_MESSAGE: &str = "selected owner is not ready; retry after the bounded hint";
 
 /// How many times one request is sent again after a retryable
 /// `not_dispatched` refusal that coincided with an observed rotation freeze.

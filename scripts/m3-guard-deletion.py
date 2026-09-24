@@ -953,6 +953,42 @@ RELEASE_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-33: the cloud-client gate resends only the owner-not-ready refusal.**
+#: The gate's classifier used to accept any retryable `not_dispatched` 503,
+#: which M7-C83's empty-pin-set refusal also is, so a freeze could have
+#: masked that signature.  Narrowed as M3-30 narrowed the isolation gate's.
+WIRE = HARNESS / "src" / "production_cluster" / "mcp_cloud_client" / "wire.rs"
+WIRE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-test-harness",
+    "--locked",
+    "--lib",
+    "--no-fail-fast",
+    "--",
+    "production_cluster::mcp_cloud_client::wire::tests::",
+]
+WIRE_CASES: list[Case] = [
+    Case(
+        "the cloud-client gate resends only a refusal carrying the owner-not-ready message and hint",
+        [
+            (
+                WIRE,
+                '        && value["message"] == OWNER_NOT_READY_MESSAGE\n'
+                "        && (1..=MIN_RETRY_HINT_MS).contains(&hint))",
+                "        && hint > 0)",
+            )
+        ],
+        frozenset(
+            {
+                "production_cluster::mcp_cloud_client::wire::tests::"
+                "only_the_owner_not_ready_503_carries_a_retry_hint"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -967,6 +1003,7 @@ SUITES: list[Suite] = [
         RETIRING_ADMISSION_CASES,
     ),
     Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
+    Suite("m3c33-owner-not-ready-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
