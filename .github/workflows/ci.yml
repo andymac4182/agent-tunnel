@@ -190,6 +190,47 @@ jobs:
       - name: Verify a single relay keeps its namespace across Redis restarts
         run: sh scripts/m6-redis-restart-verify.sh
 
+  # M1-04: the M1 real-socket acceptance on the second advertised CI operating
+  # system.  macOS runners have no service containers and no Docker, so Redis
+  # comes from Homebrew and is started here, and the two restart gates above --
+  # which own their own Docker containers -- are Linux-only by construction.
+  # Windows has no M1 acceptance lane at all: the relay refuses to start off
+  # Unix (M6-C83) and credential creation/import is unsupported there, which
+  # docs/tasks.md M1-04 records as an owner decision rather than a skip.
+  m1-acceptance-macos:
+    name: M1 real-socket acceptance (macOS, Redis)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      RUST_LOG: info
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
+      TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Start Redis
+        run: |
+          set -euo pipefail
+          brew install redis
+          redis-server --version
+          redis-server --port 6379 --bind 127.0.0.1 --save '' --appendonly no --daemonize yes
+          for _ in $(seq 1 50); do
+            if redis-cli -p 6379 ping | grep -q PONG; then exit 0; fi
+            sleep 0.2
+          done
+          echo "Redis did not answer PING" >&2
+          exit 1
+      - name: Build runnable workspace binaries
+        run: cargo +1.95.0 build --workspace --bins --locked
+      - name: Test authoritative Redis catalog
+        run: cargo +1.95.0 test -p tunnel-catalog --test redis_catalog --locked -- --ignored
+      - name: Verify production relay, client, authorization and transport failures
+        run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
+
   m2-acceptance:
     name: M2 rotation and recovery (Redis)
     runs-on: ubuntu-latest
