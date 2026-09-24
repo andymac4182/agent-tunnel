@@ -2482,6 +2482,19 @@ impl PeerClient {
                             // withdrawal closed it while the acknowledgement
                             // was being written (M7-C105).
                             Ok(Err(_)) if driver_cancel.is_cancelled() => return Ok(()),
+                            // The peer finished its own planned close first:
+                            // it closed the connection cleanly (application
+                            // code 0 or H3_NO_ERROR) while this side was
+                            // writing its acknowledgement.  That is the end
+                            // the drain waits for, not a failure, and the
+                            // idle wait below classifies it the same way
+                            // (M7-C116).
+                            Ok(Err(error))
+                                if error.is_h3_no_error()
+                                    || error.is_remote_no_error_application_close() =>
+                            {
+                                return Ok(());
+                            }
                             Ok(Err(error)) => {
                                 driver_connection.close(
                                     quinn::VarInt::from_u32(0),
