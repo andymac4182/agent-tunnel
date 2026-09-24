@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "fbf94b196651b4d0fd9067a59055a39f290df2c4",
-  "lastPublishedOriginMain": "fbf94b196651b4d0fd9067a59055a39f290df2c4",
-  "lastReviewAt": "2026-09-25T00:03:24+10:00",
-  "lastReviewOutcome": "Reviewed the recorded hosted Fly catalog dry run through fbf94b1. Updated setup to distinguish successful hosted entrypoint execution and cleanup from unverified catalog writes and Redis access. No Fly or runtime operations executed; CI and release gates unchanged.",
+  "reviewedOriginMain": "68346276387ea0242600cc9deb684bf702609a86",
+  "lastPublishedOriginMain": "68346276387ea0242600cc9deb684bf702609a86",
+  "lastReviewAt": "2026-09-25T01:03:45+10:00",
+  "lastReviewOutcome": "Reviewed M0-M2 closeout, strengthened credential and rotation tests, recorded hosted results and remaining platform gaps through 6834627. Documented unsupported Windows credential creation/import and dated hosted acceptance without implying complete cluster acceptance or repeatably green Linux M1. No runtime tests rerun; CI and release gates unchanged by this update.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T00:03:24+10:00",
-  "deploymentId": "dpl_65ZvyGzmEhVhQugYq3QYx9nVhfiw"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup, downloads and support exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-25T01:03:45+10:00",
+  "deploymentId": "dpl_E7kN5qRghamgvmZ8wq5RroUzvzL9"
 }

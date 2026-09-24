@@ -38,6 +38,9 @@ const I08_FANOUT_FORCED_JOIN_GRACE: Duration = Duration::from_secs(2);
 const I08_FID: u64 = 0x0049_3038;
 const I08_SYNTHETIC_OPERATION: &str = "synthetic.echo.v1";
 const I08_MAGIC: &[u8] = b"I08ECHO1";
+/// Public ingress of the partial-response gate.  The device's owner is
+/// observed from the catalog and must differ (M2-06).
+const I08_PARTIAL_INGRESS_RELAY: &str = "relay-c";
 
 /// Payload-free evidence for one real CLI session and three scheduled
 /// replacement generations.  All IDs are tunnel/runtime correlation values;
@@ -116,6 +119,11 @@ pub fn validate_i08_evidence(evidence: &I08Evidence) -> Result<()> {
             evidence.relay_count
         )));
     }
+    require_non_owner_ingress(
+        "M7-I08",
+        &evidence.public_ingress_relay,
+        &evidence.owner_relay,
+    )?;
     let checks = [
         ("actual_cli_process", evidence.actual_cli_process),
         ("public_ingress", evidence.public_ingress),
@@ -222,6 +230,50 @@ pub fn validate_i08_evidence(evidence: &I08Evidence) -> Result<()> {
         }
         previous_generation = rotation.active_generation;
         previous_connection = Some(rotation.active_connection_id.clone());
+    }
+    require_sequences_advance_across_rotations("M7-I08", &evidence.rotations)?;
+    Ok(())
+}
+
+/// M2-06: the M2 transport contract is claimed **through M7 owner
+/// forwarding**, so the consumer's relay must not be the device's owner.
+/// Without this the gate would pass unchanged if the fixture's topology
+/// drifted so that the ingress and the owner coincided, and every rotation it
+/// proves would then be a single-relay rotation with no peer hop at all.
+fn require_non_owner_ingress(scope: &str, ingress: &str, owner: &str) -> Result<()> {
+    if ingress.is_empty() || owner.is_empty() || ingress == owner {
+        return Err(HarnessError::Process(format!(
+            "{scope} did not prove a non-owner ingress: ingress={ingress:?} owner={owner:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// M2-06: a scheduled rotation replaces the data carrier and must not reset
+/// the logical stream's per-direction sequence spaces.  Each gate exchanges at
+/// least one record between consecutive rotations, so both directions' fences
+/// (and, since a fence equals its ACK, both ACK cursors) must strictly advance
+/// from one rotation to the next.  A counter reset onto the replacement
+/// carrier would present the same or a lower fence and is rejected here.
+fn require_sequences_advance_across_rotations(
+    scope: &str,
+    rotations: &[I08RotationEvidence],
+) -> Result<()> {
+    for pair in rotations.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        if after.relay_fence_sequence <= before.relay_fence_sequence
+            || after.connector_fence_sequence <= before.connector_fence_sequence
+        {
+            return Err(HarnessError::Process(format!(
+                "{scope} rotation {} did not advance the logical stream sequences past rotation {}: relay {}->{} connector {}->{}",
+                after.rotation,
+                before.rotation,
+                before.relay_fence_sequence,
+                after.relay_fence_sequence,
+                before.connector_fence_sequence,
+                after.connector_fence_sequence,
+            )));
+        }
     }
     Ok(())
 }
@@ -1560,6 +1612,11 @@ const I08_OVERLAP_PHASES: [&str; 5] = [
 pub struct I08PartialResponseEvidence {
     pub scope: &'static str,
     pub relay_count: usize,
+    /// Relay whose public listener the consumer used.
+    pub public_ingress_relay: String,
+    /// Catalog owner of the device's session, observed before the first
+    /// rotation.  M2-06 requires it to differ from the ingress.
+    pub owner_relay: String,
     pub session_id: String,
     pub epoch: u64,
     pub stream_id: u64,
@@ -1627,6 +1684,11 @@ pub fn validate_i08_partial_response_evidence(evidence: &I08PartialResponseEvide
             evidence.relay_count
         )));
     }
+    require_non_owner_ingress(
+        "M7-I08 partial",
+        &evidence.public_ingress_relay,
+        &evidence.owner_relay,
+    )?;
     if evidence.session_id.is_empty()
         || evidence.epoch == 0
         || evidence.stream_id == 0
@@ -1746,6 +1808,7 @@ pub fn validate_i08_partial_response_evidence(evidence: &I08PartialResponseEvide
         }
         previous_generation = rotation.active_generation;
     }
+    require_sequences_advance_across_rotations("M7-I08 partial", &evidence.rotations)?;
     if !evidence.adapter_shutdown_in_overlap
         || !I08_OVERLAP_PHASES.contains(&evidence.adapter_shutdown_phase.as_str())
     {
@@ -2183,7 +2246,7 @@ async fn drive_partial_scenario(
             ..crate::OidcTokenOptions::default()
         },
     )?;
-    let ingress_addr = cluster.relay("relay-c")?.consumer_addr()?;
+    let ingress_addr = cluster.relay(I08_PARTIAL_INGRESS_RELAY)?.consumer_addr()?;
     let started = Instant::now();
     let (mut process, mut stream) = start_cli(
         harness,
@@ -2339,6 +2402,8 @@ async fn drive_partial_scenario(
         Ok::<I08PartialResponseEvidence, HarnessError>(I08PartialResponseEvidence {
             scope: "synthetic_echo_mapping_only",
             relay_count: cluster.relays.len(),
+            public_ingress_relay: I08_PARTIAL_INGRESS_RELAY.to_owned(),
+            owner_relay: owner_before.token.node_id.clone(),
             session_id: cli_status.session_id.clone(),
             epoch: cli_status.epoch,
             stream_id,
@@ -2791,6 +2856,8 @@ mod envelope_and_evidence_tests {
         I08PartialResponseEvidence {
             scope: "synthetic_echo_mapping_only",
             relay_count: 3,
+            public_ingress_relay: "relay-c".to_owned(),
+            owner_relay: "relay-a".to_owned(),
             session_id: "session".to_owned(),
             epoch: 1,
             stream_id: 1,
@@ -2819,6 +2886,67 @@ mod envelope_and_evidence_tests {
             cleanup_joined: true,
             elapsed_ms: 12_000,
         }
+    }
+
+    /// M2-06: both rotation gates are the M2 transport contract measured
+    /// through M7 owner forwarding, so each must refuse evidence in which the
+    /// consumer's ingress was the owner (no peer hop) or in which a rotation
+    /// reset a direction's logical sequence space onto the replacement
+    /// carrier.  Every mutation below was accepted before the rules existed.
+    #[test]
+    fn m2_06_rotation_gates_require_a_non_owner_ingress_and_advancing_sequences() {
+        type Mutation = (&'static str, fn(&mut Vec<I08RotationEvidence>, &mut String));
+        let mutations: [Mutation; 6] = [
+            ("ingress is the owner", |_, owner| {
+                *owner = "relay-c".to_owned()
+            }),
+            ("owner not observed", |_, owner| owner.clear()),
+            (
+                "relay sequence reset on replacement carrier",
+                |rotations, _| {
+                    rotations[2].relay_fence_sequence = 1;
+                    rotations[2].relay_ack_sequence = 1;
+                },
+            ),
+            (
+                "connector sequence reset on replacement carrier",
+                |rotations, _| {
+                    rotations[1].connector_fence_sequence = 1;
+                    rotations[1].connector_ack_sequence = 1;
+                },
+            ),
+            (
+                "relay sequence stalled across a rotation",
+                |rotations, _| {
+                    rotations[2].relay_fence_sequence = rotations[1].relay_fence_sequence;
+                    rotations[2].relay_ack_sequence = rotations[1].relay_ack_sequence;
+                },
+            ),
+            (
+                "connector sequence rewound below the first fence",
+                |rotations, _| {
+                    rotations[1].connector_fence_sequence = 0;
+                    rotations[1].connector_ack_sequence = 0;
+                },
+            ),
+        ];
+        // Collected rather than asserted one at a time, so a red run names
+        // every mutation a validator accepts instead of only the first.
+        let mut accepted = Vec::new();
+        for (name, mutate) in mutations {
+            let mut synthetic = valid_evidence();
+            mutate(&mut synthetic.rotations, &mut synthetic.owner_relay);
+            if validate_i08_evidence(&synthetic).is_ok() {
+                accepted.push(format!("synthetic-rotation: {name}"));
+            }
+
+            let mut partial = valid_partial_evidence();
+            mutate(&mut partial.rotations, &mut partial.owner_relay);
+            if validate_i08_partial_response_evidence(&partial).is_ok() {
+                accepted.push(format!("partial-response: {name}"));
+            }
+        }
+        assert!(accepted.is_empty(), "validators accepted: {accepted:#?}");
     }
 
     #[test]

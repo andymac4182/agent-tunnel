@@ -27,16 +27,16 @@ GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunne
 | CLI operations and diagnostics | [#9](https://github.com/andymac4182/agent-tunnel/issues/9) |
 
 Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
-Hosted CI status: since 2026-09-11 GitHub Actions jobs on this repository fail before starting because of an account payment/spending-limit block, so M2 and M7 evidence is local-only until that is restored.
+Hosted CI status: GitHub Actions was blocked by an account spending limit from 2026-09-11 and runs again since 2026-09-24. Run 36006258279 at `50b12df` passed the locked Rust checks on Linux, macOS and Windows (Windows without `tunnel-relay`, M6-C83), the M1 acceptance on Linux and macOS, both M2 plans including three actual 300-second rotations, and the M7 gate suite on Linux. Evidence dated before 2026-09-24 remains local-only.
 ## M0 — Repository and executable configuration
 
 Delivered or under active implementation: private MIT-licensed repo, Rust workspace, strict legacy configuration validation, the M1 `RuntimeConfig` client CLI, local CSR/import commands for externally issued device credentials, Axum consumer/device listeners, configured Redis authority and JWT/JWKS authorization, pinned TLS/WSS/H3 transport helpers, and a reusable real-resource harness. Local evidence covers the locked checks, 62 workspace tests, five explicitly executed real Redis integration tests, AOF same-dataset restart, and full real M1 acceptance; CI results are linked in this document. Redis is the authority catalog for every tenant, user, membership, device, service, grant, and credential record formerly assigned to PostgreSQL. Relay sockets, queues, in-flight operations, and other process-local session state remain ephemeral. In the narrow M1 Redis profile, the durable device hash also stores lease fields and expiry without a Redis TTL; logical lease validation and complete `deployment_incarnation` plus `run_id` guards make stale owner fields non-authoritative. Separate TTL namespaces remain an M7 design. `redis_url`, `redis_namespace`, and `deployment_incarnation` remain deployment inputs whose persistence, restore, and fail-closed behavior require explicit evidence. Legacy configuration retains the documented 300-second/10-second/30-second rotation defaults for the future M2 profile; M1 itself does not rotate or replay.
 
 Gate: the local macOS arm64 run satisfies the formatting, strict Clippy,
 workspace test, Redis integration, AOF restart, and full M1 acceptance checks.
-Hosted Linux/macOS/Windows CI must repeat the locked checks and keep the
-acceptance result visible; that evidence remains pending until the pull request
-runs there. New fields/commands in [runtime.md](runtime.md) remain proposals
+Hosted Linux/macOS/Windows CI repeats the locked checks (task row M0-01,
+verified at `50b12df`); the hosted M1 acceptance runs on Linux and macOS only,
+and M1-04 stays open on the Windows decision and the M6-C85 flake. New fields/commands in [runtime.md](runtime.md) remain proposals
 unless the source and acceptance evidence say otherwise.
 
 ## M1 — Axum and authenticated multi-user tunnel
@@ -58,7 +58,8 @@ Locally verified on 2026-09-10: 151 workspace tests, strict locked checks,
 five Redis tests, AOF restart and full M1 regression pass. The real-socket
 M2 suite passes three accelerated rotations, targeted recovery/abort/control
 loss/cancellation/revocation faults, and three actual 300-second rotations in
-903.05 seconds. See [M2 evidence](m2-verification.md). Hosted M2 CI is pending.
+903.05 seconds. See [M2 evidence](m2-verification.md). Hosted M2 CI passed both plans at
+`50b12df` (run 36006258279; task row M2-05).
 
 Implement [protocol.md](protocol.md) as a pure state machine before real socket I/O. Each logical stream has independent sequence spaces per direction, tied to a unique session/stream identity and preserved through scheduled rotation. Physical connection IDs, generations and owner epochs fence carriers without resetting logical counters. Bound credits, queued bytes, replay, tombstones, roster snapshots and recovery time.
 
