@@ -69,6 +69,26 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(has_relay, not manifest["target"].endswith("windows-msvc"), file.name)
             self.assertEqual(manifest["sourceSha"], self.sha)
 
+    def test_tar_modes_do_not_depend_on_the_build_host(self):
+        # A Windows runner's file system has no execute bits, so the release
+        # job's packaging test saw mode 0 for bin/tunnel-client. Simulate that
+        # host here by clearing the execute bits before packaging: the archive
+        # must still mark the binaries executable and nothing else.
+        target = next(t for t in TARGETS if not t.endswith("windows-msvc"))
+        release = self.root / "target" / target / "release"
+        for name in binaries_for(target):
+            (release / name).chmod(0o644)
+        (self.root / "LICENSE").chmod(0o600)
+        archive = package(self.root, target, self.sha, "123", self.output, {"packages": []})
+        with tarfile.open(archive) as handle:
+            for member in handle.getmembers():
+                with self.subTest(member=member.name):
+                    self.assertEqual((member.uid, member.gid, member.uname, member.gname), (0, 0, "", ""))
+                    if member.isdir() or member.name.startswith("bin/"):
+                        self.assertEqual(member.mode, 0o755)
+                    else:
+                        self.assertEqual(member.mode, 0o644)
+
     def test_missing_helper_fails(self):
         (self.root / "target" / TARGETS[0] / "release" / "tunnel-deadman").unlink()
         with self.assertRaises(ValueError):
