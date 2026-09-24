@@ -156,7 +156,7 @@ def package(root, target, sha, run, output, metadata):
         (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
         if windows:
             # strict_timestamps=False stores a pre-1980 mtime (crates.io sources
-            # can carry the 1970 epoch) as 1980-01-01, which ZIP can encode,
+            # carry some, e.g. mtime 1 and 123456789) as 1980-01-01, which ZIP can encode,
             # instead of failing the Windows package (M6-C90).
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as handle:
                 for file in sorted(staging.rglob("*")):
