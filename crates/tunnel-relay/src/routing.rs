@@ -429,8 +429,25 @@ where
         now: DateTime<Utc>,
         destination: Option<&VerifiedPeerBinding>,
     ) -> Result<OwnerRoute, OwnerRoutingError> {
+        self.resolve_observed(scope, now, destination)
+            .await
+            .map(|(route, _)| route)
+    }
+
+    /// [`Self::resolve`], also returning the wall time the route is known
+    /// at: the caller's `now` for a cached route, and for a catalog read the
+    /// caller's time plus the lookup's monotonic duration.  A caller that
+    /// binds a remote read afterwards ([`Self::bind_remote`]) must cache it
+    /// from that time, not from before the lookup, or a slow read would
+    /// receive a cache lifetime its lease no longer covers.
+    pub(crate) async fn resolve_observed(
+        &self,
+        scope: OwnerScope,
+        now: DateTime<Utc>,
+        destination: Option<&VerifiedPeerBinding>,
+    ) -> Result<(OwnerRoute, DateTime<Utc>), OwnerRoutingError> {
         if let Some(route) = self.try_cached(scope, now, destination).await {
-            return Ok(route);
+            return Ok((route, now));
         }
 
         let lookup_started = Instant::now();
@@ -461,7 +478,7 @@ where
             self.cache_owner(scope, route.owner().clone(), lookup_now, None)
                 .await;
         }
-        Ok(route)
+        Ok((route, lookup_now))
     }
 
     /// Attach a verified peer binding to a remote owner the caller has just
@@ -477,26 +494,35 @@ where
     /// every request naming it.  This caches the read through the generation
     /// fence and returns the cache's view, which is that generation or a newer
     /// one already observed, never an older one.
-    pub async fn bind_remote(
+    ///
+    /// It takes the route [`Self::resolve_observed`] returned and the time
+    /// that read was observed at, rather than a bare owner and the caller's
+    /// earlier clock, so only a route this router produced can be bound and
+    /// its cache lifetime starts from the read.  A local route is returned
+    /// unchanged.
+    pub(crate) async fn bind_remote(
         &self,
         scope: OwnerScope,
-        owner: OwnerClaim,
-        now: DateTime<Utc>,
+        route: OwnerRoute,
+        observed_at: DateTime<Utc>,
         binding: &VerifiedPeerBinding,
     ) -> Result<OwnerRoute, OwnerRoutingError> {
-        let route = self.classify(scope, owner, now, Some(binding))?;
+        let OwnerRoute::Remote { owner, .. } = route else {
+            return Ok(route);
+        };
+        let route = self.classify(scope, owner, observed_at, Some(binding))?;
         if route.is_local() {
             return Ok(route);
         }
         self.cache_owner(
             scope,
             route.owner().clone(),
-            now,
+            observed_at,
             Some(binding.valid_until()),
         )
         .await;
         Ok(self
-            .try_cached(scope, now, Some(binding))
+            .try_cached(scope, observed_at, Some(binding))
             .await
             .filter(|cached| cached.owner_token().epoch >= route.owner_token().epoch)
             .unwrap_or(route))
@@ -700,7 +726,7 @@ fn bounded_cache_lifetime(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -888,7 +914,11 @@ mod tests {
 
     /// A signed membership binding for one remote node, from a synthetic key
     /// digest: routing only compares the binding's node, boot and validity.
-    fn remote_binding(node_id: &str, boot_id: &str, now: DateTime<Utc>) -> VerifiedPeerBinding {
+    pub(crate) fn remote_binding(
+        node_id: &str,
+        boot_id: &str,
+        now: DateTime<Utc>,
+    ) -> VerifiedPeerBinding {
         use std::collections::BTreeMap;
         use tunnel_cluster::membership::{
             MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipIssuer, MembershipPolicy,
@@ -975,16 +1005,22 @@ mod tests {
         let binding = remote_binding("node-b", "boot-b", now);
 
         // The previous session's route: read, then bound and cached.
-        let first = router.resolve(scope, now, None).await.expect("first read");
+        let (first, observed) = router
+            .resolve_observed(scope, now, None)
+            .await
+            .expect("first read");
         let first = router
-            .bind_remote(scope, first.owner().clone(), now, &binding)
+            .bind_remote(scope, first, observed, &binding)
             .await
             .expect("first binding");
         assert_eq!(first.owner_token().epoch, 1);
 
         // The device reconnects to the same node: a new owner epoch.
         directory.set_owner(Some(owner_with_epoch("node-b", "boot-b", 2, lease)));
-        let read = router.resolve(scope, now, None).await.expect("second read");
+        let (read, observed) = router
+            .resolve_observed(scope, now, None)
+            .await
+            .expect("second read");
         assert_eq!(
             read.owner_token().epoch,
             2,
@@ -1004,7 +1040,7 @@ mod tests {
         );
 
         let bound = router
-            .bind_remote(scope, read.owner().clone(), now, &binding)
+            .bind_remote(scope, read, observed, &binding)
             .await
             .expect("binding the fresh read");
         assert_eq!(bound.owner_token().epoch, 2);
@@ -1023,7 +1059,10 @@ mod tests {
         let older = router
             .bind_remote(
                 scope,
-                owner_with_epoch("node-b", "boot-b", 1, lease),
+                OwnerRoute::Remote {
+                    owner: owner_with_epoch("node-b", "boot-b", 1, lease),
+                    peer: None,
+                },
                 now,
                 &binding,
             )
