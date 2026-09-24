@@ -1204,9 +1204,22 @@ async fn open_session(
 ) -> Result<(NinepClient, u32, String)> {
     let mut session = match NinepClient::connect(target, ca, token, Some(SUBPROTOCOL)).await {
         Ok(session) => session,
-        Err(UpgradeFailure::Status { status, .. }) => {
+        Err(UpgradeFailure::Status { status, body }) => {
+            // The contract's error `code` is a closed, payload-free label;
+            // naming it tells a 503 for an unowned device from one for an
+            // offline one (M4-51).
+            let code = body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|value| {
+                    value
+                        .pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
             return Err(HarnessError::Http(format!(
-                "the filesystem upgrade was refused with HTTP status {status}"
+                "the filesystem upgrade was refused with HTTP status {status} ({code})"
             )));
         }
         Err(UpgradeFailure::Harness(error)) => return Err(error),
@@ -1301,7 +1314,7 @@ async fn wait_data_attached(cluster: &ProductionCluster, session_id: &str) -> Re
     loop {
         if let Ok(snapshot) = owner_snapshot(cluster).await
             && let Ok(session) = session_of(&snapshot, session_id)
-            && session.sockets >= 2
+            && session.data_queue_capacity.is_some()
         {
             return Ok(());
         }
