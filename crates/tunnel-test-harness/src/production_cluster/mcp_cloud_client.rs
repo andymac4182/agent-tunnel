@@ -543,6 +543,13 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 },
             ),
             (
+                // The cancelled call's stream carried no final response, so
+                // the post-response drain (M3-23) never held it open.  For
+                // 2026 that closing *is* the cancellation.
+                format!("{name} cancellation: the cancelled call's stream was not drained"),
+                c.wire.drained("tools/call:sleep") == 0,
+            ),
+            (
                 format!("{name} cancellation: profile signal"),
                 match (current, stdio) {
                     // Closing the response stream is the cancellation: the
@@ -1097,8 +1104,11 @@ impl Gate<'_> {
         Ok((running, handler, ledger))
     }
 
-    async fn close(client: Client) {
+    /// End a case's client, then join its post-response drains (M3-23)
+    /// so none outlives the case.
+    async fn close(client: Client, ledger: &WireLedger) {
         let _ = timeout(WAIT, client.cancel()).await;
+        ledger.finish_drains(WAIT).await;
     }
 
     /// Case boundary: re-sign membership at most every
@@ -1460,7 +1470,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.lifecycle_dispatches = combo.discoveries(lifecycle) - lifecycle_before;
         evidence.foreign_lifecycle_dispatches = combo.discoveries(foreign) - foreign_before;
@@ -1545,7 +1555,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.wire = ledger.counts();
         Ok(evidence)
@@ -1617,7 +1627,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(descendant)
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         let descendant = outcome?;
         if !combo.current()
             && let Some(pid) = descendant
@@ -1731,7 +1741,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         let export_after = self.export(combo);
         evidence.export_interrupted = export_after.interrupted - export_before.interrupted;
@@ -1825,7 +1835,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         for stale in [
             tunnel_mcp_fixture::waiting_marker(&release),
             tunnel_mcp_fixture::release_marker(&release),
@@ -1942,7 +1952,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.children_spawned = self.export(combo).children_spawned - spawned_before;
         evidence.invocations = combo.invocations("stream") - stream_before;
@@ -2707,6 +2717,13 @@ mod tests {
             }),
             ("2025 no session header", |e| {
                 e.combos[1].discovery.wire.session_headers = 0;
+            }),
+            ("cancelled stream drained", |e| {
+                e.combos[0]
+                    .cancellation
+                    .wire
+                    .drained_by_call
+                    .insert("tools/call:sleep".to_owned(), 1);
             }),
             ("progress multiset", |e| {
                 e.combos[0].notifications.progress_values.pop();

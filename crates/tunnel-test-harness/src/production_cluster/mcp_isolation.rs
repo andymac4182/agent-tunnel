@@ -857,24 +857,28 @@ impl Answer {
         (field("code"), field("execution"))
     }
 
-    /// The bounded retry hint of the relay's retryable owner-not-ready
-    /// refusal, or `None` for any other answer.
+    /// The retry hint of the relay's retryable **owner-not-ready** refusal
+    /// (`retryable_peer_failure_response` in `tunnel-relay/src/http.rs`), or
+    /// `None` for any other answer.
+    ///
+    /// Code, execution and `retryable` alone do not identify it: the
+    /// empty-pin-set refusal (`peer_trust_unavailable_response`, M7-C83)
+    /// carries the same three with its own message and a 5000 ms hint.  So
+    /// the message must be the owner-not-ready one and the hint must be
+    /// present and within `OWNER_NOT_READY_RETRY_AFTER_MS` (250 ms), the
+    /// ceiling that response clamps to (M3-30).
     fn owner_not_ready_hint(&self) -> Option<Duration> {
         if self.status != 503 {
             return None;
         }
         let parsed: Value = serde_json::from_slice(&self.body).ok()?;
+        let hint = parsed["retry_after_ms"].as_u64()?;
         (parsed["code"] == "PEER_UNAVAILABLE"
             && parsed["execution"] == "not_dispatched"
-            && parsed["retryable"] == true)
-            .then(|| {
-                Duration::from_millis(
-                    parsed["retry_after_ms"]
-                        .as_u64()
-                        .unwrap_or(MIN_RETRY_HINT_MS),
-                )
-                .min(MAX_RETRY_AFTER)
-            })
+            && parsed["retryable"] == true
+            && parsed["message"] == OWNER_NOT_READY_MESSAGE
+            && (1..=MIN_RETRY_HINT_MS).contains(&hint))
+        .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))
     }
 
     /// A payload-free description of this answer for a failure message: the
@@ -929,6 +933,11 @@ struct Consumer {
     refusals: Arc<FreezeRefusals>,
 }
 
+/// The message of the relay's owner-not-ready refusal
+/// (`retryable_peer_failure_response`), which is what separates it from the
+/// empty-pin-set refusal that shares its code and execution (M3-30).
+const OWNER_NOT_READY_MESSAGE: &str = "selected owner is not ready; retry after the bounded hint";
+
 /// How many times one request is sent again after a retryable
 /// `not_dispatched` refusal that coincided with an observed rotation freeze.
 /// Derived as the cloud-client gate derives its cap: a freeze ends when the
@@ -969,9 +978,12 @@ impl Consumer {
     /// "Quiesce admission"; M3-15).  Nothing was dispatched, so such a
     /// refusal is sent again after its hint -- but only while the device
     /// session is observed frozen, and at most [`FREEZE_RESENDS`] times.  The
-    /// same body answers every other owner-not-ready condition, including a
-    /// dial refused on an empty pin set (M7-C83), and outside a freeze it is
-    /// returned to the case exactly as before (M3-30).
+    /// same owner-not-ready body also answers the relay's other owner-not-ready
+    /// conditions (no active carrier, an unfenced owner), and outside a freeze
+    /// it is returned to the case exactly as before.  The empty-pin-set
+    /// refusal (M7-C83) is a *different* body -- its own message and a
+    /// 5000 ms hint -- and is never resent, frozen or not (M3-30; the
+    /// consumer-facing question is M3-15).
     async fn send(
         &self,
         method: &str,
@@ -1307,14 +1319,18 @@ impl Gate<'_> {
         use std::sync::atomic::Ordering;
         let peak = std::sync::Arc::clone(&self.journal_peak);
         let freeze = Arc::clone(&self.freeze);
+        // Stop the previous session's watcher first, then start this device
+        // session's freeze watch from nothing, so a reconnect (after owner
+        // loss) never inherits the previous session's last freeze.
+        if let Some(task) = self.journal_task.take() {
+            task.abort();
+        }
+        freeze.reset();
         let mut status = client.status();
         {
             let snapshot = status.borrow_and_update();
             peak.fetch_max(snapshot.open_journal_entries, Ordering::Relaxed);
             freeze.record(&snapshot.phase, snapshot.rotations_completed);
-        }
-        if let Some(task) = self.journal_task.take() {
-            task.abort();
         }
         // The same watch also feeds the rotation phase every consumer reads
         // before it resends a freeze refusal (M3-30).
@@ -3185,20 +3201,36 @@ mod tests {
     /// status do not, so they reach their case unchanged.
     #[test]
     fn only_the_retryable_owner_not_ready_refusal_is_a_resend_candidate() {
-        let refusal = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":true,"retry_after_ms":250}"#;
+        // Byte-for-byte the two relay bodies (`tunnel-relay/src/http.rs`):
+        // `retryable_peer_failure_response(250)` and
+        // `peer_trust_unavailable_response()`.
+        let refusal = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#;
+        let empty_pin_set = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"no approved peer trust evidence is published; retry after the bounded hint","retryable":true,"retry_after_ms":5000}"#;
         assert_eq!(
             answer(503, refusal).owner_not_ready_hint(),
             Some(Duration::from_millis(250))
         );
-        let long = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":true,"retry_after_ms":60000}"#;
+        let shorter = refusal.replace(r#""retry_after_ms":250"#, r#""retry_after_ms":40"#);
         assert_eq!(
-            answer(503, long).owner_not_ready_hint(),
-            Some(MAX_RETRY_AFTER)
+            answer(503, &shorter).owner_not_ready_hint(),
+            Some(Duration::from_millis(40))
         );
+        // M7-C83's empty-pin-set refusal shares code, execution and
+        // `retryable`, and must never be resent.
+        assert_eq!(answer(503, empty_pin_set).owner_not_ready_hint(), None);
+        // Each discriminator on its own: the owner-not-ready message with the
+        // pin-set hint, the pin-set message with the owner hint, no hint.
+        let long = refusal.replace(r#""retry_after_ms":250"#, r#""retry_after_ms":5000"#);
+        let pin_message_short_hint =
+            empty_pin_set.replace(r#""retry_after_ms":5000"#, r#""retry_after_ms":250"#);
+        let no_hint = refusal.replace(r#","retry_after_ms":250"#, "");
         for body in [
-            r#"{"code":"PEER_UNAVAILABLE","execution":"unknown","retryable":true,"retry_after_ms":250}"#,
+            long.as_str(),
+            pin_message_short_hint.as_str(),
+            no_hint.as_str(),
+            r#"{"code":"PEER_UNAVAILABLE","execution":"unknown","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#,
             r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched"}"#,
-            r#"{"code":"ADMISSION_LIMIT","execution":"not_dispatched","retryable":true,"retry_after_ms":250}"#,
+            r#"{"code":"ADMISSION_LIMIT","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#,
             "not json",
         ] {
             assert_eq!(answer(503, body).owner_not_ready_hint(), None, "{body}");

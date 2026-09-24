@@ -96,6 +96,24 @@ pub(in crate::production_cluster) struct FreezeWatch {
 }
 
 impl FreezeWatch {
+    /// Forget every earlier sample, so a watch shared across device sessions
+    /// never attributes a refusal on a new session to an old session's
+    /// freeze.
+    pub(in crate::production_cluster) fn reset(&self) {
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.frozen.store(false, Ordering::SeqCst);
+        self.seen_frozen.store(false, Ordering::SeqCst);
+        self.last_frozen_ms.store(0, Ordering::SeqCst);
+        self.rotations_completed.store(0, Ordering::SeqCst);
+        self.phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Record one connector status sample: its rotation phase and completed
     /// rotation count.
     pub fn record(&self, phase: &str, rotations_completed: u64) {
@@ -366,6 +384,11 @@ pub struct WireCounts {
     /// before the body ended, which the gate then read to its end (M3-23;
     /// see [`DrainAfterResponse`]).  Diagnostics only.
     pub post_streams_drained_after_response: u64,
+    /// The same drains by the call whose response each stream carried.
+    pub drained_by_call: BTreeMap<String, u64>,
+    /// Those drains still running when the case tore its client down, and
+    /// aborted there.  Diagnostics only.
+    pub post_stream_drains_aborted: u64,
 }
 
 impl WireCounts {
@@ -379,6 +402,10 @@ impl WireCounts {
 
     pub fn error(&self, key: &str) -> u64 {
         self.errors.get(key).copied().unwrap_or(0)
+    }
+
+    pub fn drained(&self, key: &str) -> u64 {
+        self.drained_by_call.get(key).copied().unwrap_or(0)
     }
 }
 
@@ -394,6 +421,8 @@ struct LedgerInner {
 #[derive(Default)]
 pub struct WireLedger {
     inner: Mutex<LedgerInner>,
+    /// Post-response drains still reading (M3-23), joined at teardown.
+    drains: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for WireLedger {
@@ -425,6 +454,29 @@ impl WireLedger {
         update(&mut inner)
     }
 
+    /// Join every post-response drain this client started, and abort any
+    /// still running at `bound` -- counted, so a drain that never reached its
+    /// stream's end is visible in the evidence rather than left running.
+    pub async fn finish_drains(&self, bound: Duration) {
+        let drains = std::mem::take(
+            &mut *self
+                .drains
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut aborted = 0;
+        for mut drain in drains {
+            if tokio::time::timeout_at(deadline, &mut drain).await.is_err() {
+                drain.abort();
+                aborted += 1;
+            }
+        }
+        if aborted > 0 {
+            self.with(|inner| inner.counts.post_stream_drains_aborted += aborted);
+        }
+    }
+
     pub fn counts(&self) -> WireCounts {
         use sha2::Digest;
         self.with(|inner| {
@@ -449,9 +501,11 @@ impl WireLedger {
         });
     }
 
-    fn observe(&self, data: &str, standalone: bool) {
+    /// Count one message; for a JSON-RPC result or error, return the call it
+    /// answers.
+    fn observe(&self, data: &str, standalone: bool) -> Option<String> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            return;
+            return None;
         };
         self.with(|inner| {
             if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
@@ -478,19 +532,23 @@ impl WireLedger {
                         inner.counts.logs_on_request_streams += 1;
                     }
                 }
-                return;
+                return None;
             }
-            let Some(id) = value.get("id") else { return };
+            let id = value.get("id")?;
             let key = inner
                 .outstanding
                 .remove(&id.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
             if value.get("error").is_some() {
-                *inner.counts.errors.entry(key).or_default() += 1;
+                *inner.counts.errors.entry(key.clone()).or_default() += 1;
+                Some(key)
             } else if value.get("result").is_some() {
-                *inner.counts.results.entry(key).or_default() += 1;
+                *inner.counts.results.entry(key.clone()).or_default() += 1;
+                Some(key)
+            } else {
+                None
             }
-        });
+        })
     }
 
     fn wrap(
@@ -500,17 +558,18 @@ impl WireLedger {
     ) -> BoxStream<'static, std::result::Result<Sse, SseError>> {
         let ledger = Arc::clone(self);
         let observed = Arc::clone(self);
-        let responded = Arc::new(AtomicBool::new(false));
+        let responded = Arc::new(Mutex::new(None));
         let saw_response = Arc::clone(&responded);
         let inspected = stream
             .inspect(move |item| {
                 if let Ok(event) = item
                     && let Some(data) = &event.data
+                    && let Some(key) = observed.observe(data, standalone)
+                    && !standalone
                 {
-                    if !standalone && is_response(data) {
-                        saw_response.store(true, Ordering::Relaxed);
-                    }
-                    observed.observe(data, standalone);
+                    *saw_response
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
                 }
             })
             .boxed();
@@ -525,16 +584,6 @@ impl WireLedger {
         }
         .boxed()
     }
-}
-
-/// Whether one SSE `data` field is a JSON-RPC response or error (an `id`
-/// and no `method`).
-fn is_response(data: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(data).is_ok_and(|value| {
-        value.get("id").is_some()
-            && value.get("method").is_none()
-            && (value.get("result").is_some() || value.get("error").is_some())
-    })
 }
 
 /// The longest a released POST response stream is read on towards its end.
@@ -564,7 +613,8 @@ pub(super) const POST_RESPONSE_DRAIN: Duration = Duration::from_secs(30);
 struct DrainAfterResponse {
     inner: Option<BoxStream<'static, std::result::Result<Sse, SseError>>>,
     ended: bool,
-    responded: Arc<AtomicBool>,
+    /// The call whose final response this stream carried, once it has.
+    responded: Arc<Mutex<Option<String>>>,
     ledger: Arc<WireLedger>,
 }
 
@@ -588,22 +638,36 @@ impl futures_util::Stream for DrainAfterResponse {
 
 impl Drop for DrainAfterResponse {
     fn drop(&mut self) {
-        if self.ended || !self.responded.load(Ordering::Relaxed) {
+        let responded = self
+            .responded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(key) = responded.filter(|_| !self.ended) else {
             return;
-        }
+        };
         let (Some(mut inner), Ok(runtime)) =
             (self.inner.take(), tokio::runtime::Handle::try_current())
         else {
             return;
         };
-        self.ledger
-            .with(|inner| inner.counts.post_streams_drained_after_response += 1);
-        runtime.spawn(async move {
+        self.ledger.with(|inner| {
+            inner.counts.post_streams_drained_after_response += 1;
+            *inner.counts.drained_by_call.entry(key).or_default() += 1;
+        });
+        let drain = runtime.spawn(async move {
             let _ = timeout(POST_RESPONSE_DRAIN, async {
                 while inner.next().await.is_some() {}
             })
             .await;
         });
+        // Held by the ledger so the case's teardown joins it, or aborts it at
+        // a bound, instead of leaving it running into the next case.
+        self.ledger
+            .drains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(drain);
     }
 }
 
