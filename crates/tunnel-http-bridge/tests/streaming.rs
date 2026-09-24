@@ -483,7 +483,9 @@ async fn consumer_drop_mid_body_resets_both_directions_and_the_handler_observes_
     drop(response);
     let owner = within(handle.report()).await;
     let device = within(device).await.unwrap();
-    assert_eq!(owner.response, Outcome::Aborted);
+    // A release after the head is its own recorded outcome (M3-32); the
+    // device's record, not the ingress's, says the call was cut short.
+    assert_eq!(owner.response, Outcome::Released);
     assert_eq!(owner.error, Some(HttpErrorCode::Cancelled));
     assert_eq!(
         device.request,
@@ -1085,4 +1087,189 @@ async fn owner_deadline_reaches_a_busy_device_as_an_ordered_reset() {
         "the device saw the ordered RESET, not an interrupted carrier"
     );
     drop(response);
+}
+
+/// M3-32.  An MCP client (rmcp 3.4.0's `close_on_response`) drops a POST's
+/// SSE stream once the final JSON-RPC response has arrived.  The device sends
+/// END and FIN straight after that event, but they can reach the ingress
+/// later than the release.  The ingress cannot tell a release after the
+/// application's final message from one in the middle of it without
+/// interpreting the body, which the relay does not do, so it records the
+/// release as [`Outcome::Released`] — never as a completed exchange and not
+/// as an ordinary abort — and the device's record, which finished before the
+/// RESET arrived, is the one that says the call completed.
+///
+/// The frames after the final event (END and FIN) are held between the
+/// device and the ingress until the consumer has released the body and the
+/// ingress has sent its RESET: the window the gate's drain used to hide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_after_the_final_event_and_before_end_is_recorded_as_released() {
+    const INTERIM: &[u8] = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+    const FINAL: &[u8] = b"data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n";
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        mut owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let (device_rx, request_log) = tap(device_rx, STREAM_CREDIT, Vec::new());
+    let (held_tx, held_rx, _) = tunnel_http_bridge::channel(STREAM_CREDIT);
+    let released = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::clone(&released);
+    // Forward everything up to the end of the final event at once; hold the
+    // rest (END) and FIN until the consumer has gone.
+    let relay = tokio::spawn(async move {
+        let mut seen: Vec<u8> = Vec::new();
+        let mut sent = 0usize;
+        let mut cut: Option<usize> = None;
+        let mut fin = false;
+        while let Some(frame) = owner_rx.recv().await {
+            match frame {
+                Frame::Data(bytes) => {
+                    seen.extend_from_slice(&bytes);
+                    if cut.is_none() {
+                        cut = seen
+                            .windows(FINAL.len())
+                            .position(|window| window == FINAL)
+                            .map(|at| at + FINAL.len());
+                    }
+                    let upto = cut.unwrap_or(seen.len()).min(seen.len());
+                    if upto > sent {
+                        held_tx
+                            .send_data(Bytes::copy_from_slice(&seen[sent..upto]))
+                            .await
+                            .unwrap();
+                        sent = upto;
+                    }
+                }
+                Frame::Fin => {
+                    fin = true;
+                    break;
+                }
+                Frame::Reset(_) => break,
+            }
+        }
+        let held = seen.len() - sent;
+        release.notified().await;
+        if held > 0 {
+            let _ = held_tx
+                .send_data(Bytes::copy_from_slice(&seen[sent..]))
+                .await;
+        }
+        if fin {
+            let _ = held_tx.finish();
+        }
+        (fin, held)
+    });
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        |_request: Request<ChannelBody>| async move {
+            Ok::<_, TestError>(
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(frames_body(vec![data(INTERIM), data(FINAL)], None))
+                    .unwrap(),
+            )
+        },
+    ));
+    let (mut response, handle) = within(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        held_rx,
+    ))
+    .await;
+    let mut received = Vec::new();
+    while !received.ends_with(FINAL) {
+        let chunk = within(next_chunk(response.body_mut()))
+            .await
+            .expect("a chunk")
+            .expect("no body error before the final event");
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        received,
+        [INTERIM, FINAL].concat(),
+        "the consumer has the whole call"
+    );
+    // The device finished its response before the consumer let go.
+    let device = within(device).await.unwrap();
+    assert_eq!(device.response, Outcome::Complete);
+    assert_eq!(device.error, None, "the device completed the call");
+    assert_eq!(device.execution, Execution::Dispatched);
+    // The consumer releases the body; END and FIN are still in transit.
+    drop(response);
+    within(async {
+        while request_log.lock().unwrap().reset.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        request_log.lock().unwrap().reset.map(|detail| detail.code),
+        Some(HttpErrorCode::Cancelled),
+        "the transport is still cancelled, so a handler still running is told"
+    );
+    released.notify_one();
+    let (fin, held) = within(relay).await.unwrap();
+    assert!(fin && held > 0, "END and FIN really were held back");
+    let ingress = within(handle.report()).await;
+    assert_eq!(ingress.request, Outcome::Complete);
+    assert_eq!(
+        ingress.response,
+        Outcome::Released,
+        "a release after the head is recorded as released, not aborted and not complete"
+    );
+    assert_eq!(ingress.error, Some(HttpErrorCode::Cancelled));
+    assert_eq!(ingress.execution, Execution::Dispatched);
+}
+
+/// M3-14.  [`begin_paused`] hands back the exchange's handle before the
+/// response head exists, so a consumer that leaves while its request is
+/// dispatched and unanswered — the head future dropped — still yields a
+/// terminal report for the caller to record.  Before the head it is an
+/// ordinary consumer cancellation, not a release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumer_that_leaves_before_any_head_still_yields_a_report() {
+    let (started_tx, started_rx) = oneshot::channel();
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        move |_request: Request<ChannelBody>| async move {
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok::<_, TestError>(Response::new(empty_body()))
+        },
+    ));
+    let (handle, head) = tunnel_http_bridge::begin_paused(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+        tunnel_http_bridge::PauseSignal::never(),
+    );
+    within(started_rx).await.unwrap();
+    drop(head);
+    let ingress = within(handle.report()).await;
+    assert_eq!(ingress.error, Some(HttpErrorCode::Cancelled));
+    assert_eq!(ingress.response, Outcome::Aborted, "no head, so no release");
+    let device = within(device).await.unwrap();
+    assert_eq!(device.error, Some(HttpErrorCode::Cancelled));
+    assert_eq!(device.execution, Execution::Dispatched);
 }

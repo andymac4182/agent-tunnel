@@ -1,5 +1,8 @@
 //! The owner-side ingress adapter.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -58,6 +61,10 @@ enum HeadOutcome {
 struct Owner {
     exchange: Exchange,
     head: Mutex<Option<oneshot::Sender<HeadOutcome>>>,
+    /// Set once a response head has been handed to the consumer.  A consumer
+    /// that leaves after this released a response body; before it, it
+    /// abandoned the request (M3-32).
+    committed: AtomicBool,
     consumer: CancellationToken,
 }
 
@@ -87,6 +94,20 @@ impl Owner {
         self.fail(Origin::Upstream, detail.code);
     }
 
+    /// The consumer went away: before the response head it abandoned the
+    /// request, which is an ordinary consumer cancellation; after it, it
+    /// released the response body, which is recorded as
+    /// [`Outcome::Released`] (M3-32).  Both send the same RESET.
+    fn consumer_left(&self) {
+        if self.committed.load(Ordering::SeqCst) {
+            // No gateway response can follow a committed head, so there is
+            // no head sender to answer.
+            let _ = self.exchange.release(HttpErrorCode::Cancelled);
+        } else {
+            self.fail(Origin::Consumer, HttpErrorCode::Cancelled);
+        }
+    }
+
     fn progress_expired(&self, kind: ProgressKind) {
         self.exchange.note_progress_expired(kind);
         self.fail(Origin::Upstream, HttpErrorCode::DeadlineExceeded);
@@ -104,6 +125,9 @@ impl Owner {
     fn commit(&self, response: Response<ChannelBody>) -> bool {
         match self.take_head() {
             Some(head) => {
+                // Marked before the send: the consumer can only release a
+                // body it has been handed.
+                self.committed.store(true, Ordering::SeqCst);
                 let _ = head.send(HeadOutcome::Committed(response));
                 true
             }
@@ -183,10 +207,43 @@ pub async fn forward_paused<B>(
 where
     B: Body<Data = Bytes> + Send + 'static,
 {
+    let (handle, head) = begin_paused(request, profile, config, to_device, from_device, pause);
+    (head.await, handle)
+}
+
+/// The consumer-facing half of an exchange started by [`begin_paused`]: it
+/// resolves to the response (or the gateway failure) once the head is
+/// decided.  Dropping it before then — even unpolled — is the consumer going
+/// away, and cancels the exchange exactly as dropping [`forward`] does.
+pub type PendingHead = Pin<Box<dyn Future<Output = Response<ChannelBody>> + Send>>;
+
+/// [`forward_paused`] split in two, so a caller can observe the exchange's
+/// terminal report **whether or not the consumer waits for the head**.
+///
+/// With [`forward_paused`] the [`ExchangeHandle`] only exists once the head
+/// has been decided, so a consumer that leaves before any response head drops
+/// the handle with the future and nobody records the exchange (M3-14).  Here
+/// the handle is returned immediately: the exchange is already running, and
+/// its report is available however the [`PendingHead`] ends.
+pub fn begin_paused<B>(
+    request: Request<B>,
+    profile: Arc<Profile>,
+    config: BridgeConfig,
+    to_device: FrameSender,
+    from_device: FrameReceiver,
+    pause: PauseSignal,
+) -> (ExchangeHandle, PendingHead)
+where
+    B: Body<Data = Bytes> + Send + 'static,
+{
     let (parts, body) = request.into_parts();
     let ingress = match normalize::request_head(&parts, &profile.request) {
         Ok(ingress) => ingress,
-        Err(error) => return rejected(error.status(), error.code(), Execution::NotDispatched),
+        Err(error) => {
+            let (response, handle) =
+                rejected(error.status(), error.code(), Execution::NotDispatched);
+            return (handle, Box::pin(std::future::ready(response)));
+        }
     };
     let method = ingress.head.method;
     let declared = ingress.head.body_length;
@@ -200,6 +257,7 @@ where
             config.progress(),
         ),
         head: Mutex::new(Some(head_tx)),
+        committed: AtomicBool::new(false),
         consumer: consumer.clone(),
     });
     let task = tokio::spawn(run(
@@ -216,30 +274,34 @@ where
         task,
         consumer: consumer.clone(),
     };
+    // Created here, not inside the future, so that dropping a head future
+    // that was never polled still cancels the exchange.
     let guard = consumer.drop_guard();
-    let outcome = head_rx.await;
-    drop(guard.disarm());
-    let response = match outcome {
-        Ok(HeadOutcome::Committed(response)) => response,
-        Ok(HeadOutcome::Failed(origin, detail)) => gateway_response(
-            gateway_status(origin, detail.code, detail.execution),
-            detail.code,
-            detail.execution,
-        ),
-        Err(_) => {
-            let execution = owner.exchange.execution();
-            gateway_response(
-                gateway_status(
-                    Origin::Upstream,
+    let head = async move {
+        let outcome = head_rx.await;
+        drop(guard.disarm());
+        match outcome {
+            Ok(HeadOutcome::Committed(response)) => response,
+            Ok(HeadOutcome::Failed(origin, detail)) => gateway_response(
+                gateway_status(origin, detail.code, detail.execution),
+                detail.code,
+                detail.execution,
+            ),
+            Err(_) => {
+                let execution = owner.exchange.execution();
+                gateway_response(
+                    gateway_status(
+                        Origin::Upstream,
+                        HttpErrorCode::StreamInterrupted,
+                        execution,
+                    ),
                     HttpErrorCode::StreamInterrupted,
                     execution,
-                ),
-                HttpErrorCode::StreamInterrupted,
-                execution,
-            )
+                )
+            }
         }
     };
-    (response, handle)
+    (handle, Box::pin(head))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,7 +361,7 @@ where
         tokio::select! {
             biased;
             () = finished => {}
-            () = owner.consumer.cancelled() => owner.fail(Origin::Consumer, HttpErrorCode::Cancelled),
+            () = owner.consumer.cancelled() => owner.consumer_left(),
             () = deadline => owner.fail(Origin::Upstream, HttpErrorCode::DeadlineExceeded),
         }
     };
@@ -445,7 +507,7 @@ async fn response_pump(
                                 biased;
                                 () = exchange.stop.cancelled() => break 'frames,
                                 sent = sender.send(chunk) => if sent.is_err() {
-                                    owner.fail(Origin::Consumer, HttpErrorCode::Cancelled);
+                                    owner.consumer_left();
                                     break 'frames;
                                 },
                                 // Only a RESET before the device's FIN: bytes

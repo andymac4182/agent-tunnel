@@ -126,7 +126,9 @@ pub struct HttpForwardRealPathEvidence {
     pub cancel_owner_release: String,
     pub cancel_owner_reset_reason: Option<u16>,
     pub cancel_ingress_error: Option<String>,
-    pub cancel_ingress_response_aborted: bool,
+    /// The ingress recorded the consumer's release of the `/events` body after
+    /// its head as `released` (M3-32), not as an ordinary abort.
+    pub cancel_ingress_response_released: bool,
     pub cancel_device_response_aborted: bool,
     pub cancel_device_response_completed: bool,
     // (e) consumer disconnect cancels the handler.
@@ -240,8 +242,10 @@ pub fn validate_http_forward_real_path_evidence(
             evidence.cancel_ingress_error.as_deref() == Some(HttpErrorCode::Cancelled.as_str()),
         ),
         (
-            "cancelled ingress response aborted",
-            evidence.cancel_ingress_response_aborted,
+            // A release after the head is its own outcome (M3-32); the next
+            // rule, the device's record, is what says the call was cut short.
+            "cancelled ingress response released",
+            evidence.cancel_ingress_response_released,
         ),
         (
             "cancelled device response aborted, not completed",
@@ -1330,7 +1334,7 @@ async fn exercise(
     evidence.echo_device_receive_buffer = echo_device.receive_buffer_high_water;
     if let Some(cancel_ingress) = cancel_ingress {
         evidence.cancel_ingress_error = cancel_ingress.error_code.map(str::to_owned);
-        evidence.cancel_ingress_response_aborted = cancel_ingress.response_outcome == "aborted";
+        evidence.cancel_ingress_response_released = cancel_ingress.response_outcome == "released";
         if let Some(cancel_owner) = owner_for(&cancel_ingress.request_id) {
             if let Some(stream) = stream_for(cancel_owner.stream_id) {
                 evidence.cancel_owner_release = stream.release.to_owned();
@@ -1598,7 +1602,7 @@ mod tests {
             cancel_owner_release: "reset".into(),
             cancel_owner_reset_reason: Some(CANCEL_REASON),
             cancel_ingress_error: Some("HTTP_CANCELLED".into()),
-            cancel_ingress_response_aborted: true,
+            cancel_ingress_response_released: true,
             cancel_device_response_aborted: true,
             cancel_device_response_completed: false,
             handler_cancellation_observed: true,
@@ -1680,8 +1684,8 @@ mod tests {
                 e.cancel_owner_reset_reason = Some(tunnel_protocol::reset_reason::ADAPTER_FAILURE);
             }),
             ("cancel ingress code", |e| e.cancel_ingress_error = None),
-            ("cancel ingress aborted", |e| {
-                e.cancel_ingress_response_aborted = false;
+            ("cancel ingress released", |e| {
+                e.cancel_ingress_response_released = false;
             }),
             ("cancel device completed", |e| {
                 e.cancel_device_response_completed = true;

@@ -133,6 +133,18 @@ impl Exchange {
     /// pump and emit RESET once.  Completed directions stay complete.
     /// Returns the reset detail if this call recorded the first failure.
     pub fn abort(&self, code: HttpErrorCode) -> Option<ResetDetail> {
+        self.abort_as(code, Outcome::Aborted)
+    }
+
+    /// [`abort`](Self::abort) for a consumer that released the response body
+    /// after its head: an unfinished response is recorded as
+    /// [`Outcome::Released`] rather than [`Outcome::Aborted`] (M3-32).  The
+    /// RESET and everything else are identical.
+    pub fn release(&self, code: HttpErrorCode) -> Option<ResetDetail> {
+        self.abort_as(code, Outcome::Released)
+    }
+
+    fn abort_as(&self, code: HttpErrorCode, response_outcome: Outcome) -> Option<ResetDetail> {
         let (detail, first) = {
             let mut state = self.lock();
             if state.request == Outcome::Complete && state.response == Outcome::Complete {
@@ -146,10 +158,15 @@ impl Exchange {
             } = &mut *state;
             let first = error.is_none();
             let code = *error.get_or_insert(code);
-            for slot in [request, response] {
-                if *slot == Outcome::Pending {
-                    *slot = Outcome::Aborted;
-                }
+            if *request == Outcome::Pending {
+                *request = Outcome::Aborted;
+            }
+            if *response == Outcome::Pending {
+                *response = if first {
+                    response_outcome
+                } else {
+                    Outcome::Aborted
+                };
             }
             // Read under the lock that `begin_dispatch` takes.
             let detail = ResetDetail {

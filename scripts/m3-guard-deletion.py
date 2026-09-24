@@ -303,6 +303,38 @@ DEADMAN_CASES: list[Case] = [
         ],
         frozenset({"tests::an_explicit_path_to_a_non_file_resolves_to_no_sentinel"}),
     ),
+    # ------------------------------------------------------------- M3-18
+    Case(
+        # The whole of M3-18.  Without the pin the sentinel watches a group it
+        # holds no member of, so once the watched child is reaped the id is
+        # free and a late firing could land on a stranger.  The witness asks
+        # the kernel whether the group still exists after its leader is
+        # reaped, which only a member the sentinel has not reaped can make
+        # true.
+        "the sentinel pins the watched group with a member it does not reap",
+        [
+            (
+                DEADMAN_LIB,
+                "    let pin = GroupPin::join(leader);",
+                "    let pin: Option<GroupPin> = None;",
+            )
+        ],
+        frozenset({"the_watched_group_id_stays_allocated_after_its_last_member_is_reaped"}),
+    ),
+    Case(
+        # A group that had already emptied when the sentinel started can
+        # never be pinned, and its id belongs to nobody the sentinel watches:
+        # without this refusal the bare end of file signals it anyway.
+        "a sentinel that could pin nothing never signals the id it was given",
+        [
+            (
+                DEADMAN_LIB,
+                "    if !watched {\n        return EXIT_NOTHING_WATCHED;\n    }\n",
+                "",
+            )
+        ],
+        frozenset({"a_sentinel_given_a_group_that_no_longer_exists_never_signals_that_id"}),
+    ),
     # ------------------------------------------------------------- M6-C08
     Case(
         # **The defect the row measured.**  Without the execute test, a
@@ -883,6 +915,44 @@ RETIRING_ADMISSION_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-32: a consumer release after the response head is its own recorded
+#: outcome.**  The ingress cannot tell a release after the application's final
+#: message from one in the middle of it without interpreting the body, so it
+#: records `released` and leaves the call's outcome to the device's record.
+#: The witnesses are the bridge's in-process exchanges: one holds the device's
+#: END and FIN back until after the consumer lets go of a completed SSE call,
+#: the other releases mid-stream.
+BRIDGE = REPO / "crates" / "tunnel-http-bridge"
+BRIDGE_OWNER = BRIDGE / "src" / "owner.rs"
+RELEASE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-http-bridge",
+    "--locked",
+    "--no-fail-fast",
+    "--test",
+    "streaming",
+]
+RELEASE_CASES: list[Case] = [
+    Case(
+        "a consumer that releases the response body after its head is recorded as released",
+        [
+            (
+                BRIDGE_OWNER,
+                "            let _ = self.exchange.release(HttpErrorCode::Cancelled);",
+                "            self.fail(Origin::Consumer, HttpErrorCode::Cancelled);",
+            )
+        ],
+        frozenset(
+            {
+                "a_release_after_the_final_event_and_before_end_is_recorded_as_released",
+                "consumer_drop_mid_body_resets_both_directions_and_the_handler_observes_it",
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -896,6 +966,7 @@ SUITES: list[Suite] = [
         RETIRING_ADMISSION_TEST,
         RETIRING_ADMISSION_CASES,
     ),
+    Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

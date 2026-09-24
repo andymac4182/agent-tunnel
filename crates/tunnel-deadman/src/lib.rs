@@ -70,19 +70,30 @@
 //! ([`EXIT_FIRED`]).  In the late ordering that firing happens after the
 //! group has been reaped, so the id may already be free; an early stand-down
 //! would have fired while the group was still alive and therefore still
-//! unreusable.  The crash window is the larger and more likely exposure, so
-//! the late ordering stays, but it is a trade and not a free win.
+//! unreusable.  That trade no longer costs anything: the sentinel's pin
+//! (below) keeps the group allocated until the sentinel has decided, so a
+//! late firing still lands on the watched group's own id.  The late ordering
+//! stays for the crash window.
 //!
-//! # The residual reuse race
+//! # The reuse race, and the pin that closes it (M3-18)
 //!
-//! Named rather than implied, and it lives on the `SIGKILL` path rather than
-//! in the ordering above: if the supervisor is killed, the orphaned child may
-//! exit on its own (it sees its stdin at end of file), be reaped by `init`,
-//! and have its group id reissued before the sentinel is scheduled.  The
-//! sentinel would then signal a group it does not own.  The window is the
-//! sentinel's wakeup latency *and* a full wrap of the host's pid space, so it
-//! is vanishingly unlikely, but it is real and is recorded as a task row
-//! rather than left to be rediscovered.
+//! A group id can be reissued once the group has no member left, so a
+//! sentinel that signals an id *after* the group emptied could signal a
+//! stranger.  Two paths reach that state: on the `SIGKILL` path the orphaned
+//! child may exit on its own (it sees its stdin at end of file) and be reaped
+//! by `init` before the sentinel is scheduled; on the token-failure path above
+//! the supervisor has already killed and reaped the group when the bare end of
+//! file arrives.  **Both are closed by construction, not by timing**: the
+//! sentinel joins a **pin** — a copy of this executable run with
+//! [`PIN_ARGUMENT`] — to the watched group as soon as it starts, and does not
+//! reap it until after it has decided.  An unreaped member, even a zombie,
+//! keeps the group's lifetime open, so the id the sentinel signals is always
+//! the watched group's own.  The sentinel itself stays in a group of its own,
+//! so a signal the child aims at *its* group takes only the pin, which as a
+//! zombie pins the id just as well.  A sentinel that starts after the group
+//! has already emptied cannot pin it, knows it, and never signals that id
+//! ([`EXIT_NOTHING_WATCHED`]).  What remains is only the arming window before
+//! the pin joins, which is M8-C29's row, not this one.
 //!
 //! # Platforms
 //!
@@ -112,6 +123,14 @@ pub const SENTINEL_PATH_ENV: &str = "TUNNEL_DEADMAN_BIN";
 pub const EXIT_FIRED: i32 = 10;
 /// The sentinel's exit status when it was stood down.
 pub const EXIT_STOOD_DOWN: i32 = 0;
+/// The sentinel's exit status on a bare end of file when the group it was
+/// given had no member left when it started: that id belongs to nobody it
+/// watches, so it is never signalled (M3-18).
+pub const EXIT_NOTHING_WATCHED: i32 = 11;
+
+/// The argument that runs the executable as a group **pin** rather than as a
+/// sentinel; see [`watch`].
+pub const PIN_ARGUMENT: &str = "--pin";
 
 /// An armed sentinel watching one process group.
 ///
@@ -547,13 +566,42 @@ fn resolve_sentinel(explicit: Option<&std::ffi::OsStr>, executable: &Path) -> Re
     rejected.map_or(Resolution::Absent, Resolution::Unusable)
 }
 
-/// The sentinel's body: read `stdin` to end of file, then decide.
+/// The sentinel's body: pin the watched group, read `stdin` to end of file,
+/// then decide.
 ///
 /// Returns the process exit status: [`EXIT_STOOD_DOWN`] when the supervisor
-/// asked it to stand down, [`EXIT_FIRED`] when it signalled the group.
+/// asked it to stand down, [`EXIT_FIRED`] when it signalled the group, and
+/// [`EXIT_NOTHING_WATCHED`] when the group had no member left to pin or
+/// signal by the time the sentinel started.
+///
+/// # The pin (M3-18)
+///
+/// A process group id is only guaranteed not to be reissued while the group
+/// has a member (POSIX: a group's lifetime ends when its last member's
+/// lifetime ends, and a member's lifetime lasts until it is *reaped*, so an
+/// unreaped zombie still counts).  The sentinel therefore spawns a **pin**
+/// into the watched group before it does anything else — a copy of this
+/// executable in [`PIN_ARGUMENT`] mode, joined to the group with `setpgid` at
+/// spawn — and never reaps it until after it has decided.  While the sentinel
+/// lives the group always has a member, alive or zombie, so the id it signals
+/// is always this group's own: there is no window, however long the
+/// sentinel's wakeup takes and however fast the host's pid space wraps.  The
+/// sentinel stays in a group of its own, so a signal the watched child sends
+/// to *its* group (or the supervisor's own group kill) reaches only the pin,
+/// which as a zombie pins the id just as well.
+///
+/// If the pin cannot join, the group either no longer exists — then nothing
+/// can ever be in it again and the sentinel never signals that id — or it
+/// exists and the spawn failed for another reason, in which case the sentinel
+/// keeps the unpinned behaviour it had before, because leaking the group is
+/// worse than the residual race.
 #[must_use]
 pub fn watch(leader: u32) -> i32 {
     use std::io::Read as _;
+    // Killed and reaped when this function returns, i.e. only after any
+    // group signal has been sent.
+    let pin = GroupPin::join(leader);
+    let watched = pin.is_some() || group_exists(leader);
     let mut received = Vec::new();
     // A short read is not an end of file, so read to exhaustion.  An error is
     // treated as a death: failing closed kills the group, failing open leaks
@@ -562,8 +610,77 @@ pub fn watch(leader: u32) -> i32 {
     if received == STAND_DOWN {
         return EXIT_STOOD_DOWN;
     }
+    if !watched {
+        return EXIT_NOTHING_WATCHED;
+    }
     kill_group(leader);
     EXIT_FIRED
+}
+
+/// The pin's body ([`PIN_ARGUMENT`]): hold the group id by being a member of
+/// it, until the sentinel that spawned it closes the pipe or kills it.  A pin
+/// whose sentinel died reads end of file and exits, so it never outlives the
+/// sentinel.
+#[must_use]
+pub fn pin() -> i32 {
+    use std::io::Read as _;
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    0
+}
+
+/// A member of the watched group that the sentinel does not reap until it
+/// has decided (see [`watch`]).
+#[derive(Debug)]
+struct GroupPin {
+    child: Child,
+}
+
+impl GroupPin {
+    #[cfg(unix)]
+    fn join(leader: u32) -> Option<Self> {
+        use std::os::unix::process::CommandExt as _;
+        let group = i32::try_from(leader).ok().filter(|group| *group > 0)?;
+        let executable = std::env::current_exe().ok()?;
+        let child = Command::new(executable)
+            .arg(PIN_ARGUMENT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // `setpgid(0, group)` at spawn: it fails, and so does the spawn,
+            // unless the group still exists in this session.
+            .process_group(group)
+            .spawn()
+            .ok()?;
+        Some(Self { child })
+    }
+
+    #[cfg(not(unix))]
+    fn join(_leader: u32) -> Option<Self> {
+        None
+    }
+}
+
+impl Drop for GroupPin {
+    fn drop(&mut self) {
+        // The pin is this process's own unreaped child, so its pid cannot
+        // have been reissued and signalling it by pid is exact.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn group_exists(leader: u32) -> bool {
+    i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process_group(pid).is_ok())
+}
+
+#[cfg(not(unix))]
+fn group_exists(_leader: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]
