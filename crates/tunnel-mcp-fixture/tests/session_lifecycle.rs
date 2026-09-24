@@ -103,6 +103,42 @@ async fn an_idle_legacy_session_expires_even_with_an_open_get_stream() {
     let _replacement = open_session(&export).await;
 }
 
+/// M3-27: the count that announces an expiry is published only after the
+/// session has left the map.  The reader here waits on `sessions_expired`
+/// and then reads the map at once, with nothing between them that could
+/// close a gap for it: had the counter been released before the removal, as
+/// it once was, a reader landing in between would see an expired session
+/// still open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_session_has_left_the_map_before_its_expiry_is_counted() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export_with(
+        LEGACY,
+        workspace.path(),
+        1,
+        &fixture_binary(),
+        "session_idle_seconds = 1\n",
+    );
+    let _session = open_session(&export).await;
+    assert_eq!(export.open_stdio_sessions(), Some(1), "the session is open");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // A tight poll, so the read lands as close to the release as it can.
+    while export.diagnostics().sessions_expired == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle session never expired: {:?}",
+            export.diagnostics()
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        export.open_stdio_sessions(),
+        Some(0),
+        "an expiry was counted while the session was still in the map"
+    );
+    assert_eq!(export.diagnostics().sessions_expired, 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activity_keeps_a_legacy_session_alive() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -159,7 +195,24 @@ async fn a_stalled_consumer_interrupts_only_its_own_stream() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Wait for the stall itself, with a bound, rather than for a fixed time.
+    // The detector counts at the instant a notification finds this stream's
+    // queue full, which needs the child to have emitted about
+    // `SESSION_STREAM_QUEUE` + `STREAM_QUEUE` notifications at 5 ms apart or
+    // slower.  A fixed 800 ms sleep usually covered that, but on a loaded
+    // host the child had not emitted enough by the time the echo below
+    // completed, so a bare read of the count after the echo raced the child
+    // (M3-20).  Waiting here also makes the echo run with the stall already
+    // detected, which is the ordering this test is about.
+    let stall_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while export.diagnostics().stalled_streams == 0 {
+        assert!(
+            tokio::time::Instant::now() < stall_deadline,
+            "the stalled stream was never detected: {:?}",
+            export.diagnostics()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Another request on the same session still completes promptly.
     let echo = tokio::time::timeout(
         Duration::from_secs(5),
@@ -178,7 +231,8 @@ async fn a_stalled_consumer_interrupts_only_its_own_stream() {
         .expect("echo body ok")
         .to_bytes();
     assert!(String::from_utf8_lossy(&bytes).contains(r#""id":2"#));
-    assert!(export.diagnostics().stalled_streams >= 1);
+    // Exactly the one stalled stream: the echo, which was read, is not one.
+    assert_eq!(export.diagnostics().stalled_streams, 1);
     // The stalled stream itself is interrupted, not completed.
     let collected = tokio::time::timeout(Duration::from_secs(5), stalled.into_body().collect())
         .await
