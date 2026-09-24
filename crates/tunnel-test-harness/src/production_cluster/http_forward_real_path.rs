@@ -628,6 +628,22 @@ pub(super) async fn connect_consumer(
     Ok((sender, task))
 }
 
+/// An error and every source beneath it, joined with `: `.  Hyper's top-level
+/// message alone ("operation was canceled") does not say whether a request
+/// was refused before it was written or lost on a closed connection; the
+/// source does.  Hyper's sources are fixed strings and I/O kinds, never a
+/// payload.
+pub(super) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        message.push_str(": ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+    message
+}
+
 pub(super) fn empty_stream() -> StreamBody<ConsumerStream> {
     StreamBody::new(Box::pin(futures_util::stream::empty()))
 }
@@ -756,7 +772,14 @@ pub async fn verify() -> Result<HttpForwardRealPathEvidence> {
     .await
     {
         Ok(result) => result.and_then(|evidence| {
-            validate_http_forward_real_path_evidence(&evidence)?;
+            if let Err(error) = validate_http_forward_real_path_evidence(&evidence) {
+                // The rule name alone does not say by how much it failed
+                // (M3-31: a hosted run broke the journal-peak bound with no
+                // figure printed).  The evidence is counts, flags, node names
+                // and digest matches only.
+                eprintln!("http-forward real-path evidence (failed validation): {evidence:?}");
+                return Err(error);
+            }
             Ok(evidence)
         }),
         Err(_) => Err(HarnessError::Timeout(
@@ -1445,6 +1468,29 @@ async fn sequential_streams(
         let (sender, _task) = connection
             .as_mut()
             .ok_or_else(|| HarnessError::Process("sequential consumer connection".into()))?;
+        // M3-21/M3-24: wait for the reused connection to ask for its next
+        // request.  Hyper's HTTP/1 `SendRequest` buffers exactly one request
+        // before the connection task first polls it; every later request is
+        // refused -- as `Canceled`, "operation was canceled", source
+        // "connection was not ready" -- unless the connection task has
+        // already finished the previous exchange and re-armed its want.  The
+        // loop sends the next request the moment the previous body is
+        // collected, so on a loaded host it raced that task and failed at a
+        // varying index that was never the first request on a connection.
+        // Nothing was sent, so the relay saw nothing.  A connection that has
+        // closed still fails here, with its own cause, rather than being
+        // retried.
+        timeout(SEQUENTIAL_REQUEST_TIMEOUT, sender.ready())
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout(format!("sequential request {index} connection not ready"))
+            })?
+            .map_err(|error| {
+                HarnessError::Http(format!(
+                    "sequential request {index}: connection closed before it was ready: {}",
+                    error_chain(&error)
+                ))
+            })?;
         let response = timeout(
             SEQUENTIAL_REQUEST_TIMEOUT,
             sender.send_request(request(
@@ -1457,7 +1503,12 @@ async fn sequential_streams(
         )
         .await
         .map_err(|_| HarnessError::Timeout(format!("sequential request {index} head timed out")))?
-        .map_err(|error| HarnessError::Http(format!("sequential request {index}: {error}")))?;
+        .map_err(|error| {
+            HarnessError::Http(format!(
+                "sequential request {index}: {}",
+                error_chain(&error)
+            ))
+        })?;
         let status = response.status().as_u16();
         let body = timeout(SEQUENTIAL_REQUEST_TIMEOUT, response.into_body().collect())
             .await
@@ -1757,5 +1808,97 @@ mod tests {
         assert!(header_leaks(&secret, &secrets, &addresses).1);
         let address = vec![("accept".to_owned(), "http://127.0.0.1:4433/".to_owned())];
         assert!(header_leaks(&address, &secrets, &addresses).1);
+    }
+
+    /// M3-21/M3-24: the gate's `sequential request N: operation was canceled`
+    /// is hyper refusing a request on a connection that has not asked for
+    /// one.  `SendRequest` buffers one request before its connection task
+    /// runs; a second, sent before that task re-arms its want, is refused
+    /// synchronously and never written.  Here the connection task is never
+    /// polled at all, which is the loaded-host case taken to its limit.
+    #[tokio::test]
+    async fn a_reused_connection_refuses_a_request_it_has_not_asked_for() {
+        let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+        let (mut sender, _connection) = hyper::client::conn::http1::handshake::<
+            _,
+            StreamBody<ConsumerStream>,
+        >(TokioIo::new(client_io))
+        .await
+        .expect("handshake");
+        let _first = sender.send_request(
+            request("POST", "/first", None, &[], empty_stream()).expect("first request"),
+        );
+        let error = sender
+            .send_request(request("POST", "/second", None, &[], empty_stream()).expect("second"))
+            .await
+            .expect_err("a request the connection did not ask for is refused");
+        assert!(error.is_canceled());
+        assert_eq!(error.to_string(), "operation was canceled");
+        assert_eq!(
+            error_chain(&error),
+            "operation was canceled: connection was not ready"
+        );
+    }
+
+    /// The fix: `ready()` waits for the connection to ask, so a reused
+    /// connection serves request after request with no refusal.  The peer is
+    /// a minimal HTTP/1.1 responder on an in-memory pipe.
+    #[tokio::test]
+    async fn a_reused_connection_serves_every_request_once_it_is_ready() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const REQUESTS: usize = 64;
+        const BODY_END: &[u8] = b"0\r\n\r\n";
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            for _ in 0..REQUESTS {
+                // Each request is a head plus an empty chunked body.
+                let end = loop {
+                    if let Some(position) = buffer
+                        .windows(BODY_END.len())
+                        .position(|window| window == BODY_END)
+                    {
+                        break position + BODY_END.len();
+                    }
+                    let read = server_io.read(&mut chunk).await.expect("read");
+                    assert!(read > 0, "client closed early");
+                    buffer.extend_from_slice(&chunk[..read]);
+                };
+                buffer.drain(..end);
+                server_io
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await
+                    .expect("write");
+            }
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake::<
+            _,
+            StreamBody<ConsumerStream>,
+        >(TokioIo::new(client_io))
+        .await
+        .expect("handshake");
+        let connection = tokio::spawn(connection);
+        for index in 0..REQUESTS {
+            sender
+                .ready()
+                .await
+                .expect("the connection asks for a request");
+            let response = sender
+                .send_request(request("POST", "/next", None, &[], empty_stream()).expect("request"))
+                .await
+                .unwrap_or_else(|error| panic!("request {index}: {}", error_chain(&error)));
+            assert_eq!(response.status(), 200);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            assert_eq!(body.as_ref(), b"ok");
+        }
+        server.await.expect("server");
+        drop(sender);
+        let _ = connection.await;
     }
 }

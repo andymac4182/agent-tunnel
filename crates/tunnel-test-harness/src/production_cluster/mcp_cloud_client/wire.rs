@@ -6,13 +6,16 @@
 //!   pin.  The sidecar only adds TLS: it copies each accepted connection's
 //!   bytes, unchanged and in both directions, to one fresh TLS connection to
 //!   the ingress relay, and closes both sides when either ends.  It never
-//!   parses HTTP, so every header, body byte and disconnect the relay sees is
-//!   rmcp's own.
+//!   parses HTTP, so every header and body byte the relay sees is rmcp's
+//!   own, and so is every disconnect but one (next item).
 //! * [`CountingHttpClient`]: rmcp's [`UnixSocketHttpClient`] decorated with
 //!   a payload-free [`WireLedger`].  Every call is delegated unchanged; the
 //!   ledger only counts POSTs by JSON-RPC method, responses by call, legacy
 //!   session headers, standalone streams and where log notifications
-//!   arrived.
+//!   arrived.  The one departure from rmcp's own behaviour: a POST response
+//!   stream that has already carried its final response is read to its end
+//!   after rmcp releases it, rather than closed 50 ms after that response
+//!   (M3-23, [`DrainAfterResponse`]).
 //! * [`HttpBackend`]: the synthetic rmcp Streamable HTTP server as its own
 //!   process on a fixed loopback port, so a `crash` tool ends that process
 //!   and nothing else.
@@ -48,10 +51,10 @@ use crate::{HarnessError, Result};
 /// The smallest retry hint the relay sends with a retryable refusal
 /// (`OWNER_NOT_READY_RETRY_AFTER_MS`), and so the shortest wait between two
 /// resends of one request.
-pub(super) const MIN_RETRY_HINT_MS: u64 = 250;
+pub(in crate::production_cluster) const MIN_RETRY_HINT_MS: u64 = 250;
 /// Margin over the derived cap: a drain can be slower than its budget on a
 /// loaded machine, and a refusal may land just before the freeze starts.
-pub(super) const RETRY_MARGIN: u64 = 4;
+pub(in crate::production_cluster) const RETRY_MARGIN: u64 = 4;
 /// How many times one POST or standalone GET is sent again after a
 /// retryable `not_dispatched` refusal that coincided with a rotation
 /// freeze.
@@ -65,7 +68,7 @@ pub(super) const NOT_DISPATCHED_RETRIES: u64 =
     (super::MCP_GATE_ROTATION.handshake_timeout_seconds * 1_000).div_ceil(MIN_RETRY_HINT_MS)
         + RETRY_MARGIN;
 /// The longest retry hint honoured.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub(in crate::production_cluster) const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// How long after the last observed frozen owner sample a refusal still
 /// counts as coinciding with that freeze.
 const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
@@ -79,7 +82,7 @@ const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 /// fault state.  The gate samples the owner's session phase instead and
 /// resends only while that says a rotation is frozen.
 #[derive(Debug, Default)]
-pub(super) struct FreezeWatch {
+pub(in crate::production_cluster) struct FreezeWatch {
     frozen: AtomicBool,
     /// Whether any frozen sample was ever recorded.
     seen_frozen: AtomicBool,
@@ -93,6 +96,24 @@ pub(super) struct FreezeWatch {
 }
 
 impl FreezeWatch {
+    /// Forget every earlier sample, so a watch shared across device sessions
+    /// never attributes a refusal on a new session to an old session's
+    /// freeze.
+    pub(in crate::production_cluster) fn reset(&self) {
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.frozen.store(false, Ordering::SeqCst);
+        self.seen_frozen.store(false, Ordering::SeqCst);
+        self.last_frozen_ms.store(0, Ordering::SeqCst);
+        self.rotations_completed.store(0, Ordering::SeqCst);
+        self.phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Record one connector status sample: its rotation phase and completed
     /// rotation count.
     pub fn record(&self, phase: &str, rotations_completed: u64) {
@@ -123,7 +144,7 @@ impl FreezeWatch {
     /// Why a refusal was not attributed to a freeze: the connector state at
     /// the moment it was observed.  The owner freezes before the connector
     /// sees `ROTATE_QUIESCE`, so a refusal can land in that head gap.
-    fn unexplained(&self) -> String {
+    pub(in crate::production_cluster) fn unexplained(&self) -> String {
         let phase = self
             .phase
             .lock()
@@ -152,7 +173,7 @@ impl FreezeWatch {
     }
 
     /// Whether a refusal observed now coincides with a rotation freeze.
-    fn coincides(&self) -> bool {
+    pub(in crate::production_cluster) fn coincides(&self) -> bool {
         if self.frozen.load(Ordering::SeqCst) {
             return true;
         }
@@ -359,6 +380,15 @@ pub struct WireCounts {
     /// The first transport failure's status line and sanitized gateway
     /// code, truncated (diagnostics only).
     pub first_failure: Option<String>,
+    /// POST response streams rmcp released after their final response but
+    /// before the body ended, which the gate then read to its end (M3-23;
+    /// see [`DrainAfterResponse`]).  Diagnostics only.
+    pub post_streams_drained_after_response: u64,
+    /// The same drains by the call whose response each stream carried.
+    pub drained_by_call: BTreeMap<String, u64>,
+    /// Those drains still running when the case tore its client down, and
+    /// aborted there.  Diagnostics only.
+    pub post_stream_drains_aborted: u64,
 }
 
 impl WireCounts {
@@ -372,6 +402,10 @@ impl WireCounts {
 
     pub fn error(&self, key: &str) -> u64 {
         self.errors.get(key).copied().unwrap_or(0)
+    }
+
+    pub fn drained(&self, key: &str) -> u64 {
+        self.drained_by_call.get(key).copied().unwrap_or(0)
     }
 }
 
@@ -387,6 +421,8 @@ struct LedgerInner {
 #[derive(Default)]
 pub struct WireLedger {
     inner: Mutex<LedgerInner>,
+    /// Post-response drains still reading (M3-23), joined at teardown.
+    drains: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for WireLedger {
@@ -418,6 +454,29 @@ impl WireLedger {
         update(&mut inner)
     }
 
+    /// Join every post-response drain this client started, and abort any
+    /// still running at `bound` -- counted, so a drain that never reached its
+    /// stream's end is visible in the evidence rather than left running.
+    pub async fn finish_drains(&self, bound: Duration) {
+        let drains = std::mem::take(
+            &mut *self
+                .drains
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut aborted = 0;
+        for mut drain in drains {
+            if tokio::time::timeout_at(deadline, &mut drain).await.is_err() {
+                drain.abort();
+                aborted += 1;
+            }
+        }
+        if aborted > 0 {
+            self.with(|inner| inner.counts.post_stream_drains_aborted += aborted);
+        }
+    }
+
     pub fn counts(&self) -> WireCounts {
         use sha2::Digest;
         self.with(|inner| {
@@ -442,9 +501,11 @@ impl WireLedger {
         });
     }
 
-    fn observe(&self, data: &str, standalone: bool) {
+    /// Count one message; for a JSON-RPC result or error, return the call it
+    /// answers.
+    fn observe(&self, data: &str, standalone: bool) -> Option<String> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            return;
+            return None;
         };
         self.with(|inner| {
             if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
@@ -471,19 +532,23 @@ impl WireLedger {
                         inner.counts.logs_on_request_streams += 1;
                     }
                 }
-                return;
+                return None;
             }
-            let Some(id) = value.get("id") else { return };
+            let id = value.get("id")?;
             let key = inner
                 .outstanding
                 .remove(&id.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
             if value.get("error").is_some() {
-                *inner.counts.errors.entry(key).or_default() += 1;
+                *inner.counts.errors.entry(key.clone()).or_default() += 1;
+                Some(key)
             } else if value.get("result").is_some() {
-                *inner.counts.results.entry(key).or_default() += 1;
+                *inner.counts.results.entry(key.clone()).or_default() += 1;
+                Some(key)
+            } else {
+                None
             }
-        });
+        })
     }
 
     fn wrap(
@@ -492,15 +557,117 @@ impl WireLedger {
         standalone: bool,
     ) -> BoxStream<'static, std::result::Result<Sse, SseError>> {
         let ledger = Arc::clone(self);
-        stream
+        let observed = Arc::clone(self);
+        let responded = Arc::new(Mutex::new(None));
+        let saw_response = Arc::clone(&responded);
+        let inspected = stream
             .inspect(move |item| {
                 if let Ok(event) = item
                     && let Some(data) = &event.data
+                    && let Some(key) = observed.observe(data, standalone)
+                    && !standalone
                 {
-                    ledger.observe(data, standalone);
+                    *saw_response
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
                 }
             })
-            .boxed()
+            .boxed();
+        if standalone {
+            return inspected;
+        }
+        DrainAfterResponse {
+            inner: Some(inspected),
+            ended: false,
+            responded,
+            ledger,
+        }
+        .boxed()
+    }
+}
+
+/// The longest a released POST response stream is read on towards its end.
+pub(super) const POST_RESPONSE_DRAIN: Duration = Duration::from_secs(30);
+
+/// A POST response stream that is read to its end even after rmcp lets go.
+///
+/// rmcp 3.4.0's client, once a POST's SSE stream has carried the final
+/// response, drains the rest for at most 50 ms and then drops it
+/// (`execute_sse_stream`, `close_on_response`).  The response body ends
+/// with the device's END and FIN, which cross the owner, the peer hop and
+/// the ingress after the final event's bytes; when they arrive later than
+/// 50 ms -- a loaded host, or a rotation freeze landing between the last
+/// event and END -- the drop reaches the ingress while the body is still
+/// open, and the ingress rightly records the consumer's departure as
+/// `HTTP_CANCELLED`.  That is M3-23: a cancellation the consumer did issue,
+/// by closing early, in a case that asserts nothing was cancelled.
+///
+/// So only a stream that has *already carried its final response* is read
+/// on after rmcp releases it, bounded by [`POST_RESPONSE_DRAIN`].  A stream
+/// released before its response -- the 2026 profile's cancellation, where
+/// closing the stream is the cancel -- is dropped at once, exactly as rmcp
+/// dropped it.  A stream that never ends is still dropped at the bound, so
+/// a hang still reaches the ingress as a departure and still fails the
+/// case; and a RESET that arrives while draining still ends the body with
+/// its own error, which the ingress records as that error.
+struct DrainAfterResponse {
+    inner: Option<BoxStream<'static, std::result::Result<Sse, SseError>>>,
+    ended: bool,
+    /// The call whose final response this stream carried, once it has.
+    responded: Arc<Mutex<Option<String>>>,
+    ledger: Arc<WireLedger>,
+}
+
+impl futures_util::Stream for DrainAfterResponse {
+    type Item = std::result::Result<Sse, SseError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        let polled = inner.poll_next_unpin(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            self.ended = true;
+        }
+        polled
+    }
+}
+
+impl Drop for DrainAfterResponse {
+    fn drop(&mut self) {
+        let responded = self
+            .responded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(key) = responded.filter(|_| !self.ended) else {
+            return;
+        };
+        let (Some(mut inner), Ok(runtime)) =
+            (self.inner.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        self.ledger.with(|inner| {
+            inner.counts.post_streams_drained_after_response += 1;
+            *inner.counts.drained_by_call.entry(key).or_default() += 1;
+        });
+        let drain = runtime.spawn(async move {
+            let _ = timeout(POST_RESPONSE_DRAIN, async {
+                while inner.next().await.is_some() {}
+            })
+            .await;
+        });
+        // Held by the ledger so the case's teardown joins it, or aborts it at
+        // a bound, instead of leaving it running into the next case.
+        self.ledger
+            .drains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(drain);
     }
 }
 
@@ -1030,6 +1197,107 @@ impl HttpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(data: &str) -> std::result::Result<Sse, SseError> {
+        Ok(Sse {
+            data: Some(data.to_owned()),
+            ..Sse::default()
+        })
+    }
+
+    /// A POST stream of `head` events whose remainder, after them, is one
+    /// event that is delivered only once `release` is notified and then the
+    /// end, which sets `reached_end`.  Dropping the returned stream drops the
+    /// remainder.
+    fn post_stream(
+        head: Vec<std::result::Result<Sse, SseError>>,
+        release: Arc<Notify>,
+        reached_end: Arc<AtomicBool>,
+    ) -> BoxStream<'static, std::result::Result<Sse, SseError>> {
+        let tail = futures_util::stream::once(async move {
+            release.notified().await;
+            event(r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#)
+        })
+        .chain(
+            futures_util::stream::once(async move {
+                reached_end.store(true, Ordering::SeqCst);
+                None
+            })
+            .filter_map(|item| async move { item }),
+        );
+        futures_util::stream::iter(head).chain(tail).boxed()
+    }
+
+    /// M3-23: a POST stream rmcp releases after its final response is read
+    /// on to its end, so the ingress sees END rather than a departure.
+    #[tokio::test]
+    async fn a_stream_released_after_its_response_is_read_to_its_end() {
+        let ledger = Arc::new(WireLedger::default());
+        let release = Arc::new(Notify::new());
+        let reached_end = Arc::new(AtomicBool::new(false));
+        let mut stream = ledger.wrap(
+            post_stream(
+                vec![event(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)],
+                Arc::clone(&release),
+                Arc::clone(&reached_end),
+            ),
+            false,
+        );
+        assert!(stream.next().await.is_some(), "the final response");
+        // rmcp lets go here, before the body has ended.
+        drop(stream);
+        assert_eq!(ledger.counts().post_streams_drained_after_response, 1);
+        release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            while !reached_end.load(Ordering::SeqCst) {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the released stream is read to its end");
+    }
+
+    /// A stream released before any response -- the 2026 profile's
+    /// cancellation, where closing the stream is the cancel -- is dropped at
+    /// once, exactly as rmcp dropped it.
+    #[tokio::test]
+    async fn a_stream_released_before_its_response_is_dropped_at_once() {
+        let ledger = Arc::new(WireLedger::default());
+        let release = Arc::new(Notify::new());
+        let reached_end = Arc::new(AtomicBool::new(false));
+        let mut stream = ledger.wrap(
+            post_stream(
+                vec![event(
+                    r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}"#,
+                )],
+                Arc::clone(&release),
+                Arc::clone(&reached_end),
+            ),
+            false,
+        );
+        assert!(
+            stream.next().await.is_some(),
+            "a notification, not a response"
+        );
+        drop(stream);
+        assert_eq!(ledger.counts().post_streams_drained_after_response, 0);
+        // Nothing holds the remainder: releasing it reaches no reader.
+        release.notify_one();
+        sleep(Duration::from_millis(100)).await;
+        assert!(!reached_end.load(Ordering::SeqCst));
+        // A standalone stream is never drained either.
+        let mut standalone = ledger.wrap(
+            post_stream(
+                vec![event(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#)],
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            true,
+        );
+        assert!(standalone.next().await.is_some());
+        drop(standalone);
+        assert_eq!(ledger.counts().post_streams_drained_after_response, 0);
+    }
 
     #[test]
     fn a_refusal_coincides_only_with_a_recent_or_current_freeze() {

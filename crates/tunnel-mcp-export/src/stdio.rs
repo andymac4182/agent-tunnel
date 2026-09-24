@@ -954,6 +954,9 @@ async fn run_session(
     counters: Arc<ExportCounters>,
     shutdown: CancellationToken,
 ) {
+    // Why the loop ended, announced only once the session has left the map
+    // (M3-27; the same ordering M8-C31 fixed in the ACP export).
+    let mut expired = false;
     loop {
         let event = tokio::select! {
             () = shutdown.cancelled() => break,
@@ -971,7 +974,7 @@ async fn run_session(
                     if router.pending.is_empty() {
                         router.ended = true;
                         drop(router);
-                        counters.sessions_expired.fetch_add(1, Ordering::Relaxed);
+                        expired = true;
                         break;
                     }
                 }
@@ -1094,5 +1097,14 @@ async fn run_session(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&session.id);
     session.child.kill();
-    counters.sessions_ended.fetch_add(1, Ordering::Relaxed);
+    // **Out of the map before either counter is released.** A reader waits
+    // on `sessions_expired` or `sessions_ended` with an `Acquire` load (see
+    // `ExportCounters::snapshot`) and then reads `open_sessions()` under the
+    // map's mutex, so the removal above, sequenced before this `Release`, is
+    // visible to it. Counted first, as this loop once did, the announcement
+    // named a session the map still listed open (M3-27).
+    if expired {
+        counters.sessions_expired.fetch_add(1, Ordering::Release);
+    }
+    counters.sessions_ended.fetch_add(1, Ordering::Release);
 }

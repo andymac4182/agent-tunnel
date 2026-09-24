@@ -107,7 +107,10 @@ pub struct ExportDiagnostics {
 
 impl ExportCounters {
     fn snapshot(&self) -> ExportDiagnostics {
-        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        // `Acquire` pairs with the `Release` of a counter that announces an
+        // outcome (`sessions_expired`, `sessions_ended`), so state published
+        // before that announcement is visible to a reader that saw it (M3-27).
+        let load = |counter: &AtomicU64| counter.load(Ordering::Acquire);
         ExportDiagnostics {
             children_spawned: load(&self.children.spawned),
             children_spawn_failed: load(&self.children.spawn_failed),
@@ -203,6 +206,20 @@ impl McpExport {
     #[must_use]
     pub fn diagnostics(&self) -> ExportDiagnostics {
         self.counters.snapshot()
+    }
+
+    /// Protocol sessions a stdio export currently holds open, or `None` for a
+    /// Streamable HTTP export, whose sessions belong to its backend.
+    ///
+    /// A reader that has seen `sessions_expired` or `sessions_ended` in
+    /// [`Self::diagnostics`] sees the session that count announces already
+    /// gone from this figure (M3-27).
+    #[must_use]
+    pub fn open_stdio_sessions(&self) -> Option<usize> {
+        match &*self.kind {
+            Kind::Stdio(export) => Some(export.open_sessions()),
+            Kind::Http(_) => None,
+        }
     }
 
     /// End every open protocol session this export holds and kill each

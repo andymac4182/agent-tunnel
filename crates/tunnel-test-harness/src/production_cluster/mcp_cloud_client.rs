@@ -161,7 +161,12 @@ pub struct DiscoveryEvidence {
 /// `notifications`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NotificationEvidence {
+    /// The progress value of every notification the client handler received,
+    /// sorted: rmcp may run notification handlers concurrently, so only the
+    /// wire order in `wire.progress_values` is ordering evidence (M3-29).
     pub progress_values: Vec<u64>,
+    /// Whether the handler also saw the progress in order (reported only).
+    pub progress_handler_order_exact: bool,
     pub progress_result_exact: bool,
     /// The `seq` of every log the client handler received, sorted: rmcp may
     /// run notification handlers concurrently, so only the wire order in
@@ -493,6 +498,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
             (
                 format!("{name} notifications: ordered progress"),
                 n.progress_values == (1..=PROGRESS_STEPS).collect::<Vec<_>>()
+                    && n.wire.progress_values == (1..=PROGRESS_STEPS).collect::<Vec<_>>()
                     && n.progress_result_exact,
             ),
             (
@@ -535,6 +541,13 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 } else {
                     c.descendant_killed.is_none()
                 },
+            ),
+            (
+                // The cancelled call's stream carried no final response, so
+                // the post-response drain (M3-23) never held it open.  For
+                // 2026 that closing *is* the cancellation.
+                format!("{name} cancellation: the cancelled call's stream was not drained"),
+                c.wire.drained("tools/call:sleep") == 0,
             ),
             (
                 format!("{name} cancellation: profile signal"),
@@ -1091,8 +1104,11 @@ impl Gate<'_> {
         Ok((running, handler, ledger))
     }
 
-    async fn close(client: Client) {
+    /// End a case's client, then join its post-response drains (M3-23)
+    /// so none outlives the case.
+    async fn close(client: Client, ledger: &WireLedger) {
         let _ = timeout(WAIT, client.cancel()).await;
+        ledger.finish_drains(WAIT).await;
     }
 
     /// Case boundary: re-sign membership at most every
@@ -1257,8 +1273,13 @@ impl Gate<'_> {
         position: fn(&HttpRotationObservation) -> bool,
     ) -> Result<HttpRotationObservation> {
         let deadline = Instant::now() + OBSERVATION_BOUND;
+        let mut recorded_at_start = None;
+        let mut polls = 0_u64;
         loop {
             let snapshot = self.owner_snapshot().await?;
+            polls += 1;
+            let recorded_now = snapshot.http_forward.rotations_recorded;
+            let recorded_at_start = *recorded_at_start.get_or_insert(recorded_now);
             let observations = snapshot
                 .http_forward
                 .rotations
@@ -1277,10 +1298,44 @@ impl Gate<'_> {
             }
             if observations.len() as u64 >= MAX_ROTATIONS_PER_WAIT || Instant::now() >= deadline {
                 let session = self.session(&snapshot).ok();
+                // M3-22 forensics, payload-free: how much the owner's bounded
+                // observation ring saw during this wait, what it still holds,
+                // and which of the session's streams are open right now.
+                let ring = &snapshot.http_forward.rotations;
+                let after_any = ring
+                    .iter()
+                    .filter(|observation| observation.rotation > after)
+                    .count();
+                let ring_streams = ring
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|observation| (observation.stream_id, observation.rotation))
+                    .collect::<Vec<_>>();
+                let live = session
+                    .map(|session| {
+                        session
+                            .streams
+                            .iter()
+                            .map(|stream| {
+                                (
+                                    stream.stream_id,
+                                    stream.operation_id == operation_id,
+                                    stream
+                                        .http
+                                        .as_ref()
+                                        .map(|http| (http.request.ends, http.response.ends)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 return Err(HarnessError::Process(format!(
-                    "{label}: no rotation observed stream {stream_id} at its position after rotation {after}: observations={observations:?} phase={:?} rotations={:?}",
+                    "{label}: no rotation observed stream {stream_id} at its position after rotation {after}: observations={observations:?} phase={:?} rotations={:?} ring_len={} recorded_during_wait={} ring_after_rotation_any_stream={after_any} ring_newest={ring_streams:?} polls={polls} live_streams(id,same_operation,(request_ends,response_ends))={live:?}",
                     session.map(|session| session.phase.clone()),
                     session.map(|session| session.rotations_completed),
+                    ring.len(),
+                    recorded_now.saturating_sub(recorded_at_start),
                 )));
             }
             sleep(POLL).await;
@@ -1415,7 +1470,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.lifecycle_dispatches = combo.discoveries(lifecycle) - lifecycle_before;
         evidence.foreign_lifecycle_dispatches = combo.discoveries(foreign) - foreign_before;
@@ -1451,13 +1506,21 @@ impl Gate<'_> {
                 })
                 .await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                evidence.progress_values = handler
-                    .progress()
-                    .iter()
-                    .map(|(value, _)| *value as u64)
-                    .collect();
-            }
+            let received = handler
+                .progress()
+                .iter()
+                .map(|(value, _)| *value as u64)
+                .collect::<Vec<_>>();
+            // The handler proves the multiset; the wire ledger proves the
+            // order (M3-29: rmcp ran two handlers out of order on a hosted
+            // runner while the wire order was exact).
+            evidence.progress_handler_order_exact =
+                received == (1..=PROGRESS_STEPS).collect::<Vec<_>>();
+            evidence.progress_values = {
+                let mut sorted = received;
+                sorted.sort_unstable();
+                sorted
+            };
             let logged = timeout(
                 WAIT,
                 client.call_tool(CallToolRequestParams::new("log").with_arguments(arguments(
@@ -1492,7 +1555,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.wire = ledger.counts();
         Ok(evidence)
@@ -1564,7 +1627,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(descendant)
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         let descendant = outcome?;
         if !combo.current()
             && let Some(pid) = descendant
@@ -1678,7 +1741,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         let export_after = self.export(combo);
         evidence.export_interrupted = export_after.interrupted - export_before.interrupted;
@@ -1772,7 +1835,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         for stale in [
             tunnel_mcp_fixture::waiting_marker(&release),
             tunnel_mcp_fixture::release_marker(&release),
@@ -1889,7 +1952,7 @@ impl Gate<'_> {
             Ok::<_, HarnessError>(())
         }
         .await;
-        Self::close(client).await;
+        Self::close(client, &ledger).await;
         outcome?;
         evidence.children_spawned = self.export(combo).children_spawned - spawned_before;
         evidence.invocations = combo.invocations("stream") - stream_before;
@@ -2379,12 +2442,14 @@ mod tests {
             },
             notifications: NotificationEvidence {
                 progress_values: (1..=PROGRESS_STEPS).collect(),
+                progress_handler_order_exact: true,
                 progress_result_exact: true,
                 log_seqs: (0..LOG_COUNT).collect(),
                 log_data_exact: true,
                 log_handler_order_exact: true,
                 log_result_exact: true,
                 wire: WireCounts {
+                    progress_values: (1..=PROGRESS_STEPS).collect(),
                     log_seqs: (0..LOG_COUNT).collect(),
                     logs_on_request_streams: if current { LOG_COUNT } else { 0 },
                     logs_on_standalone_streams: if current { 0 } else { LOG_COUNT },
@@ -2653,8 +2718,18 @@ mod tests {
             ("2025 no session header", |e| {
                 e.combos[1].discovery.wire.session_headers = 0;
             }),
-            ("progress order", |e| {
-                e.combos[0].notifications.progress_values.swap(0, 1);
+            ("cancelled stream drained", |e| {
+                e.combos[0]
+                    .cancellation
+                    .wire
+                    .drained_by_call
+                    .insert("tools/call:sleep".to_owned(), 1);
+            }),
+            ("progress multiset", |e| {
+                e.combos[0].notifications.progress_values.pop();
+            }),
+            ("progress wire order", |e| {
+                e.combos[0].notifications.wire.progress_values.swap(0, 1);
             }),
             ("progress result", |e| {
                 e.combos[0].notifications.progress_result_exact = false;
