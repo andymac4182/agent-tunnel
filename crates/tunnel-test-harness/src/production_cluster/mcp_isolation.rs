@@ -832,8 +832,13 @@ impl Answer {
         let rpc_error = self
             .final_message()
             .and_then(|message| message["error"]["code"].as_i64());
+        // The relay's retryable owner-not-ready refusal carries a bounded
+        // hint; its presence is what separates it from other 503s.
+        let retry_after_ms = serde_json::from_slice::<Value>(&self.body)
+            .ok()
+            .and_then(|parsed| parsed["retry_after_ms"].as_u64());
         format!(
-            "status {} code={code:?} execution={execution:?} jsonrpc_error={rpc_error:?}",
+            "status {} code={code:?} execution={execution:?} retry_after_ms={retry_after_ms:?} jsonrpc_error={rpc_error:?}",
             self.status
         )
     }
@@ -1274,6 +1279,72 @@ impl Gate<'_> {
         Ok(session)
     }
 
+    /// Wait for a held call's fixture marker `waiting-<gate>`, racing it
+    /// against the call's own answer.
+    ///
+    /// A hold answered without its side effect starting would otherwise
+    /// leave the wait to expire with nothing said about what the consumer
+    /// saw (M3-26, M3-30).  The failure names the answer (status, typed code,
+    /// execution, JSON-RPC error number), the owner session's rotation phase
+    /// and the relays' peer fault tuples, all payload-free, so a rotation
+    /// freeze refusal and a dial refused on an empty pin set read apart.
+    async fn wait_hold_started(
+        &self,
+        gate: &str,
+        what: &str,
+        call: &mut tokio::task::JoinHandle<Result<Answer>>,
+    ) -> Result<()> {
+        let marker = self.markers(SERVICE_2025).join(format!("waiting-{gate}"));
+        let started = tokio::select! {
+            started = wait_file(&marker, WAIT) => started,
+            joined = &mut *call => {
+                let observed = match joined {
+                    Ok(Ok(answer)) => answer.describe(),
+                    Ok(Err(error)) => format!("request failed: {error}"),
+                    Err(error) => format!("task did not join: {error}"),
+                };
+                let phase = self.owner_phase().await;
+                let forensics = self.cluster.peer_path_forensics().await;
+                return Err(HarnessError::Process(format!(
+                    "{what} was answered before it started: {observed}; owner session {phase}; peer path: {forensics}"
+                )));
+            }
+        };
+        if !started {
+            call.abort();
+            let phase = self.owner_phase().await;
+            return Err(HarnessError::Timeout(format!(
+                "{what} never started and was still unanswered after {} s; owner session {phase}",
+                WAIT.as_secs()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The owner session's rotation phase and completed-rotation count, for
+    /// a failure message.
+    async fn owner_phase(&self) -> String {
+        let Ok(relay) = self.cluster.relay("relay-a") else {
+            return "unknown (no relay-a)".into();
+        };
+        let Ok(snapshot) = relay.snapshot().await else {
+            return "unknown (no snapshot)".into();
+        };
+        snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session_id == self.session_id)
+            .map_or_else(
+                || "missing".into(),
+                |session| {
+                    format!(
+                        "phase={:?} rotations_completed={}",
+                        session.phase, session.rotations_completed
+                    )
+                },
+            )
+    }
+
     /// A session-opening step answered with anything but success, described
     /// payload-free with the relays' peer fault tuples and pin state: a
     /// `503 PEER_UNAVAILABLE` here is otherwise indistinguishable between a
@@ -1284,9 +1355,10 @@ impl Gate<'_> {
         step: &str,
         answer: &Answer,
     ) -> HarnessError {
+        let phase = self.owner_phase().await;
         let forensics = self.cluster.peer_path_forensics().await;
         HarnessError::Process(format!(
-            "{}: {step} answered {}; peer path: {forensics}",
+            "{}: {step} answered {}; owner session {phase}; peer path: {forensics}",
             consumer.label,
             answer.describe()
         ))
@@ -2073,33 +2145,9 @@ impl Gate<'_> {
                     .await
             })
         };
-        // Race the marker against the hold's own answer.  A hold that is
-        // answered without its side effect starting would otherwise leave
-        // this wait to expire with nothing said about what the consumer saw
-        // (M3-26).  Payload-free: status, typed code, execution and the
-        // JSON-RPC error number only.
         let mut holder = holder;
-        let hold_marker = self.markers(SERVICE_2025).join("waiting-gatedup");
-        let started = tokio::select! {
-            started = wait_file(&hold_marker, WAIT) => started,
-            joined = &mut holder => {
-                let observed = match joined {
-                    Ok(Ok(answer)) => answer.describe(),
-                    Ok(Err(error)) => format!("request failed: {error}"),
-                    Err(error) => format!("task did not join: {error}"),
-                };
-                return Err(HarnessError::Process(format!(
-                    "the duplicate-probe hold was answered before it started: {observed}"
-                )));
-            }
-        };
-        if !started {
-            holder.abort();
-            return Err(HarnessError::Timeout(format!(
-                "the duplicate-probe hold never started and was still unanswered after {} s",
-                WAIT.as_secs()
-            )));
-        }
+        self.wait_hold_started("gatedup", "the duplicate-probe hold", &mut holder)
+            .await?;
         let duplicate_id = alice
             .send(
                 "POST",
@@ -2185,12 +2233,9 @@ impl Gate<'_> {
                     .await
             })
         };
-        if !wait_file(&self.markers(SERVICE_2025).join("waiting-gaterevoke"), WAIT).await {
-            in_flight.abort();
-            return Err(HarnessError::Timeout(
-                "the revocation hold never started".into(),
-            ));
-        }
+        let mut in_flight = in_flight;
+        self.wait_hold_started("gaterevoke", "the revocation hold", &mut in_flight)
+            .await?;
         let dispatched_before = self.export(SERVICE_2025).dispatched;
         let revoked_at = Instant::now();
         self.cluster
@@ -2325,12 +2370,9 @@ impl Gate<'_> {
                     .await
             })
         };
-        if !wait_file(&self.markers(SERVICE_2025).join("waiting-gatespan"), WAIT).await {
-            call.abort();
-            return Err(HarnessError::Timeout(
-                "the spanning call never started".into(),
-            ));
-        }
+        let mut call = call;
+        self.wait_hold_started("gatespan", "the spanning call", &mut call)
+            .await?;
         let deadline = Instant::now() + ROTATION_BOUND;
         let spanned = loop {
             let spanned = self

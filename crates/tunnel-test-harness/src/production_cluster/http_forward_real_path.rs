@@ -772,7 +772,14 @@ pub async fn verify() -> Result<HttpForwardRealPathEvidence> {
     .await
     {
         Ok(result) => result.and_then(|evidence| {
-            validate_http_forward_real_path_evidence(&evidence)?;
+            if let Err(error) = validate_http_forward_real_path_evidence(&evidence) {
+                // The rule name alone does not say by how much it failed
+                // (M3-31: a hosted run broke the journal-peak bound with no
+                // figure printed).  The evidence is counts, flags, node names
+                // and digest matches only.
+                eprintln!("http-forward real-path evidence (failed validation): {evidence:?}");
+                return Err(error);
+            }
             Ok(evidence)
         }),
         Err(_) => Err(HarnessError::Timeout(
