@@ -23,7 +23,7 @@ nothing caches the lookup across processes. Since M6-C73 each startup
 connection gets 10 s. **The relay now runs `main-af23c2f`**, built from
 `af23c2f` with these deploy files. It replaced `main-721ed2a` in place on
 2026-09-24 with no re-provisioning, and it has M6-C65 continuity on
-(section 6.3, "Upgrading the relay image"). A lane reconnect inside a running relay still has
+(section 6.3, "Upgrade to `main-af23c2f`"). A lane reconnect inside a running relay still has
 2 s (M6-C74), which matters after a Redis restart (section 6.4).
 
 Every `fly` command below is one the owner runs, in
@@ -368,11 +368,12 @@ fly deploy . --config deploy/fly/relay/fly.toml \
   --build-only --push --image-label fly-1
 ```
 
-Build from a checkout of `main` at or after `721ed2a`. The live relay's image
-was built that way from a worktree at `721ed2a` with `deploy/fly` from this
-branch, labelled `main-721ed2a`
-(`registry.fly.io/agentuplink-relay:main-721ed2a@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`,
-32 MB).
+Build from a checkout of `main` at or after `af23c2f`. The live relay's image
+was built that way from `af23c2f`, labelled `main-af23c2f`
+(`registry.fly.io/agentuplink-relay:main-af23c2f@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`,
+32 MB). The previous image, and the rollback target, is `main-721ed2a`
+(`@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`). It has no
+M6-C65 (section 6.4).
 
 ### 6.2 Activate and provision (before any relay serves)
 
@@ -618,14 +619,14 @@ curl --cacert ~/agentuplink-fly/relay-ca.pem \
 The reply is the export's `device_canary` followed by `hello`. `/readyz`
 answering `200` is not enough on its own: a non-cluster relay answers `200`
 even when Redis is unusable (M6-C67), so the echo is the check.
-On the live relay (`main-721ed2a`), 150 sequential echoes on one device
+On the then-live relay (`main-721ed2a`), 150 sequential echoes on one device
 session all returned `200` with the canary, past the old 128-request limit
 (M7-C92; measured by the coordinator on 2026-09-23).
 
 **Upgrade to `main-af23c2f` (2026-09-24, measured by the coordinator).**
 Before touching Fly, the upgrade was rehearsed locally. A namespace was
-provisioned by the `721ed2a` binaries on a Redis configured exactly like
-the live one. A relay built from `af23c2f` with continuity at 5 s then
+provisioned by the `721ed2a` binaries on a Redis configured like the Fly
+Redis entrypoint of that time (`88f71e2`). A relay built from `af23c2f` with continuity at 5 s then
 served it without re-provisioning. Old and new clients echoed, and the
 relay survived a `docker restart` and a `docker kill`. Rolling back to
 the `721ed2a` relay also worked. On Fly:
@@ -643,14 +644,19 @@ the `721ed2a` relay also worked. On Fly:
   returned `200`, the device reached `active`, and 150 of 150 echoes on
   one session returned `200`.
 - After `fly machine restart --signal SIGTERM`, the device went through
-  `backoff`, `reconnecting`, `reconnected` and `ready` on its own, and an
-  echo returned `200` 4 s after the restart.
+  `backoff`, `reconnecting`, `reconnected` and `ready` on its own. The
+  second echo attempt returned `200`, 4 s after the restart.
 - An in-place restart of the Fly Redis machine has not been exercised on
   Fly. The local rehearsal and the M6-C65 gate are the evidence for it.
-- Rollback:
-  `fly deploy --image registry.fly.io/agentuplink-relay:main-721ed2a --ha=false`.
-- The catalog commands (M6-C31) are not accepted by the relay entrypoint,
-  so on Fly they need `fly ssh console` into the relay.
+- Rollback: `fly deploy . --config deploy/fly/relay/fly.toml --image
+  registry.fly.io/agentuplink-relay:main-721ed2a --ha=false`. That image
+  has no M6-C65, so after a rollback any Redis restart ends the namespace
+  (section 6.4.1).
+- The relay entrypoint accepts only `serve`, `check-serve-config`,
+  `activate-first-incarnation`, `provision-catalog` and `rebind-redis-run`.
+  So the catalog commands (M6-C31) cannot run through `fly machine run`.
+  Running them over `fly ssh console` on the relay is the expected route,
+  but it has not been tried on Fly (M6-C91).
 
 **Restarting the relay.** Use `--signal SIGTERM`, which is the signal Fly
 sends on a deploy or a stop (`kill_signal` in `fly.toml`):
@@ -723,7 +729,9 @@ every token, so a runtime `CONFIG SET` downgrade is caught too. Do not change
 them at runtime. The Redis entrypoint sets the first two;
 `no-appendfsync-on-rewrite no` is Redis's default and is set explicitly only
 from this commit on, so the running Fly Redis gets the explicit line at its
-next rebuild (its `CONFIG GET` should already show `no`; not checked on Fly).
+next rebuild. A read-only `CONFIG GET` on the running Fly Redis on 2026-09-24
+returned `appendonly yes`, `appendfsync always` and
+`no-appendfsync-on-rewrite no` (section 6.3).
 Once Redis is back from its AOF, the relay re-binds the namespace by itself,
 and `fly logs -a agentuplink-relay --no-tail` shows `tunnel-relay: Redis
 authority restarted; namespace re-bound to the new Redis run`. Device
