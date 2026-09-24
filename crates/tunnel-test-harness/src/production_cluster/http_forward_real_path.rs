@@ -94,10 +94,6 @@ const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
 /// inside the loop; it is deliberately not also a validator rule, which
 /// could only restate the cap the loop already enforces.
 const SEQUENTIAL_RETRY_CAP: usize = 12;
-/// The sequential loop runs one request at a time, so the connector can hold
-/// the in-flight request's entry plus at most one whose reclamation has not
-/// completed.  Observed: 1.
-const SEQUENTIAL_JOURNAL_ENTRY_BOUND: usize = 2;
 const SEQUENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The bounded evidence one gate run produces.
@@ -178,7 +174,16 @@ pub struct HttpForwardRealPathEvidence {
     pub sequential_session_id_stable: bool,
     pub sequential_phase_after: String,
     pub sequential_ready_after: bool,
+    /// The most OPEN journal entries seen after any sequential response.  A
+    /// **measurement, not a rule** (M3-31): an entry is released by the
+    /// owner's `STREAM_FORGET` after its carrier barriers, which nothing
+    /// orders before the next request's admission, so no request-count bound
+    /// on it can be derived.  Locally 1 or 2; 3 on some hosted runners.
     pub open_journal_entries_peak: usize,
+    /// The connector's OPEN journal entries when the sequential phase began,
+    /// and once every sequential stream had been retired.
+    pub open_journal_entries_before_sequential: usize,
+    pub open_journal_entries_after_sequential: usize,
     pub open_streams_retired_before_sequential: u64,
     pub open_streams_retired: u64,
     pub open_retired_ranges_coalesced: u64,
@@ -390,13 +395,21 @@ pub fn validate_http_forward_real_path_evidence(
                 ),
         ),
         (
-            // One request at a time, so at most the in-flight request's own
-            // entry and one whose reclamation has not finished.  The cap
-            // itself would be vacuous: the journal refuses at the cap by
-            // construction.
-            "the OPEN journal held at most two entries while serving them",
-            evidence.open_journal_entries_peak <= SEQUENTIAL_JOURNAL_ENTRY_BOUND
-                && SEQUENTIAL_JOURNAL_ENTRY_BOUND < OPEN_JOURNAL_TRACKED_ENTRIES,
+            // M3-31.  The rule this replaces bounded the *peak* at two, which
+            // assumed request k's entry is reclaimed before request k+2 is
+            // admitted.  Nothing orders that: the owner's STREAM_FORGET
+            // follows the stream's close and the connector releases after the
+            // FORGET's carrier barriers, while the consumer already has its
+            // response and sends the next request (docs/protocol.md, "OPEN
+            // retry horizon and journal reclamation").  So a peak is a
+            // latency, and a bound on it could only be tuned to a host.  What
+            // the phase must prove is that the journal does not accumulate:
+            // read from the entry count itself, independently of the retired
+            // counter below, it returns to where it started.  A leak of even
+            // one entry fails this, which the peak rule never guaranteed.
+            "the OPEN journal returned to its starting size once every sequential stream retired",
+            evidence.open_journal_entries_after_sequential
+                <= evidence.open_journal_entries_before_sequential,
         ),
         (
             // Exactly, not at least: every stream this phase opened was
@@ -1456,7 +1469,9 @@ async fn sequential_streams(
 ) -> Result<()> {
     let dispatches_before = state.invocations.load(Ordering::SeqCst) as u64;
     evidence.sequential_requests = SEQUENTIAL_REQUESTS;
-    evidence.open_streams_retired_before_sequential = client.status_snapshot().open_streams_retired;
+    let before = client.status_snapshot();
+    evidence.open_streams_retired_before_sequential = before.open_streams_retired;
+    evidence.open_journal_entries_before_sequential = before.open_journal_entries;
     let mut connection: Option<(Sender, tokio::task::JoinHandle<()>)> = None;
     let mut on_connection = 0;
     let mut index = 0;
@@ -1566,6 +1581,7 @@ async fn sequential_streams(
     evidence.open_journal_entries_peak = evidence
         .open_journal_entries_peak
         .max(final_status.open_journal_entries);
+    evidence.open_journal_entries_after_sequential = final_status.open_journal_entries;
     evidence.open_streams_retired = final_status.open_streams_retired;
     evidence.open_retired_ranges_coalesced = final_status.open_retired_ranges_coalesced;
     evidence.sequential_session_id_stable = final_status.session_id.as_deref() == Some(session_id);
@@ -1647,7 +1663,9 @@ mod tests {
             sequential_session_id_stable: true,
             sequential_phase_after: "active".into(),
             sequential_ready_after: true,
-            open_journal_entries_peak: SEQUENTIAL_JOURNAL_ENTRY_BOUND,
+            open_journal_entries_peak: 3,
+            open_journal_entries_before_sequential: 0,
+            open_journal_entries_after_sequential: 0,
             open_streams_retired_before_sequential: 3,
             open_streams_retired: SEQUENTIAL_REQUESTS as u64 + 3,
             open_retired_ranges_coalesced: 0,
@@ -1773,8 +1791,9 @@ mod tests {
                 e.sequential_phase_after = "failed".into()
             }),
             ("sequential readiness", |e| e.sequential_ready_after = false),
-            ("journal bound", |e| {
-                e.open_journal_entries_peak = SEQUENTIAL_JOURNAL_ENTRY_BOUND + 1;
+            ("journal leak", |e| {
+                e.open_journal_entries_after_sequential =
+                    e.open_journal_entries_before_sequential + 1;
             }),
             ("journal reclamation short", |e| e.open_streams_retired -= 1),
             ("journal reclamation extra", |e| e.open_streams_retired += 1),

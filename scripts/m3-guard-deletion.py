@@ -989,6 +989,41 @@ WIRE_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-31: an HTTP stream's owner STREAM_FORGET is published by its own
+#: close.**  The close is usually the event that makes the FORGET provable,
+#: and before M3-31 it published nothing, so the connector's OPEN journal held
+#: the entry until the session's next inbound frame or the 500 ms tick.
+FORGET_AT_CLOSE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::rotation_freeze_tests::an_http_stream_is_forgotten_at_its_own_close",
+]
+FORGET_AT_CLOSE_CASES: list[Case] = [
+    Case(
+        "an owner close publishes the STREAM_FORGET it made provable",
+        [
+            (
+                ACTOR,
+                "                let _ = self.flush_owner_stream_forgets(&key);\n"
+                "                let _ = response.send(closed);",
+                "                let _ = response.send(closed);",
+            )
+        ],
+        frozenset(
+            {
+                "actor::rotation_freeze_tests::"
+                "an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -1004,6 +1039,7 @@ SUITES: list[Suite] = [
     ),
     Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
     Suite("m3c33-owner-not-ready-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
+    Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

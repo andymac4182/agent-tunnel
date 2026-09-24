@@ -288,3 +288,41 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal
       - name: Run M7 harness and Redis acceptance gates
         run: sh scripts/m7-harness-verify.sh
+
+  # M3: the MCP and http-forward/1 gates over the three-relay cluster fixture,
+  # plus the stdio export's process-tree residue measurements.  Added once
+  # M3-31 was decided (docs/tasks.md): the real-path gate's OPEN-journal rule
+  # is now derived from the reclamation path rather than from a peak observed
+  # on one host.
+  #
+  # **No artifacts and no process-log directories, on purpose (M7-C112).**
+  # The harness's preserved child captures carry the fixture's Redis TLS client
+  # key and OIDC tokens; synthetic or not, a public repository must not publish
+  # them.  The job log carries the gates' own payload-free evidence lines.
+  m3-acceptance:
+    name: M3 MCP and http-forward acceptance (Linux, Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      redis:
+        image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+          --memory 256m
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
+      TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Run M3 harness gates
+        run: sh scripts/m3-harness-verify.sh

@@ -3094,3 +3094,67 @@ async fn late_ack_below_the_watermark_still_forgets_an_out_of_order_unary_echo()
     );
     assert!(fixture.session().unary_tombstones.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// M3-31: an `http-forward/1` stream's owner STREAM_FORGET is published by the
+// stream's own close, not left for the next unrelated inbound frame or the
+// maintenance tick.
+// ---------------------------------------------------------------------------
+
+/// The last proof an HTTP stream's FORGET needs (the connector's FIN,
+/// acknowledging the owner's FIN) usually arrives *before* the owner's
+/// exchange task closes the stream, because the close waits for both pumps.
+/// The close is then the event that makes the FORGET provable, and before
+/// M3-31 it published nothing: the FORGET waited for the next inbound frame on
+/// the session — in a sequential workload, the next request's — or for the
+/// 500 ms maintenance tick, and the connector's OPEN journal held the entry
+/// that long.
+#[tokio::test]
+async fn an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete() {
+    let mut fixture = FreezeFixture::new("http-forget-at-close", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let generation = fixture.attempt.old_generation;
+
+    // The owner's request direction ends with FIN at sequence 1.
+    assert!(
+        fixture
+            .actor
+            .finish_http_stream(&key, STREAM_ID, OPERATION_ID)
+    );
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Fin, 1, generation)]
+    );
+    // The connector's FIN acknowledges it: every proof is now in, but the
+    // stream is not yet terminal at the owner, so nothing can be forgotten.
+    fixture
+        .connector_frame(Frame::fin(1, generation, STREAM_ID, 1, 1))
+        .await;
+    assert!(
+        FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty(),
+        "no FORGET before the owner has closed the stream"
+    );
+
+    // The owner's exchange task closes the stream.  Nothing else happens on
+    // the session: no inbound frame and no tick.
+    let (response, _closed) = oneshot::channel();
+    fixture
+        .actor
+        .handle(super::Command::CloseEchoStream {
+            key: key.clone(),
+            stream_id: STREAM_ID,
+            operation_id: OPERATION_ID.to_owned(),
+            cause: None,
+            response,
+        })
+        .await;
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets.len(),
+        1,
+        "the close itself publishes the FORGET it made provable"
+    );
+    assert_eq!(forgets[0].stream_id, STREAM_ID);
+    assert_eq!(forgets[0].operation_id, OPERATION_ID);
+}
