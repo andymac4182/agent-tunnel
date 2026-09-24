@@ -92,7 +92,7 @@ def main() -> int:
             "| M5-C13 | [ ] A task. | planned | a worker | prose `a | b` more | — |",
         ]
     )
-    findings, tables, rows, _exempt = guard.table_shape_findings("docs/tasks.md", body)
+    findings, tables, rows = guard.table_shape_findings("docs/tasks.md", body)
     check(len(findings) == 1, f"the planted stray pipe must be one finding, got {findings}")
     check(tables == 1 and rows == 1, f"one table and one row must be seen, got {tables}/{rows}")
     check(
@@ -110,7 +110,7 @@ def main() -> int:
 
     # The same row with the pipe escaped is the green half of red-then-green.
     fixed = body.replace("`a | b`", r"`a \| b`")
-    findings, _t, _r, _e = guard.table_shape_findings("docs/tasks.md", fixed)
+    findings, _t, _r = guard.table_shape_findings("docs/tasks.md", fixed)
     check(findings == [], f"one backslash must clear the finding, got {findings}")
 
     # --- a blank line inside a table must NOT hide the rows below it --------
@@ -129,7 +129,7 @@ def main() -> int:
             "| M4-14 | [x] A task with a stray | pipe. | verified local | a worker | p | — |",
         ]
     )
-    findings, tables, rows, _e = guard.table_shape_findings("docs/tasks.md", split_table)
+    findings, tables, rows = guard.table_shape_findings("docs/tasks.md", split_table)
     check(
         rows == 2,
         f"a row orphaned by a blank line must still be COUNTED as scanned; "
@@ -146,7 +146,7 @@ def main() -> int:
     # Rejoining the table brings the row back under the separator, and its
     # stray pipe then becomes visible as the cell-count defect it is.
     rejoined = split_table.replace("\n\n", "\n")
-    findings, _t, rows, _e = guard.table_shape_findings("docs/tasks.md", rejoined)
+    findings, _t, rows = guard.table_shape_findings("docs/tasks.md", rejoined)
     check(
         rows == 2 and len(findings) == 1 and "splits into 7 cells" in findings[0],
         f"once rejoined, the row's stray pipe must be reported as a cell-count "
@@ -154,7 +154,7 @@ def main() -> int:
     )
 
     # --- a header that disagrees with its own separator ---------------------
-    findings, _t, _r, _e = guard.table_shape_findings(
+    findings, _t, _r = guard.table_shape_findings(
         "docs/tasks.md", "| A | B | C |\n|---|---|\n| 1 | 2 |\n"
     )
     check(
@@ -177,7 +177,7 @@ def main() -> int:
             "| M5-01 | [ ] A task. | planned | a worker | prose | — |",
         ]
     )
-    findings, tables, rows, _e = guard.table_shape_findings("docs/tasks.md", mixed)
+    findings, tables, rows = guard.table_shape_findings("docs/tasks.md", mixed)
     check(
         findings == [] and tables == 2 and rows == 2,
         f"a 4-column table beside a 6-column one is not a defect, got "
@@ -187,54 +187,74 @@ def main() -> int:
     # --- the green fixture: the REAL docs, pinned ---------------------------
     total_rows = 0
     total_tables = 0
-    total_exempt = 0
     for rel in ("docs/m7-edge-cases.md", "docs/tasks.md"):
         text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-        findings, tables, rows, exempt = guard.table_shape_findings(rel, text)
+        findings, tables, rows = guard.table_shape_findings(rel, text)
         check(
             findings == [],
             f"{rel} has rows whose cell count contradicts their table: {findings}",
         )
         total_tables += tables
         total_rows += rows
-        total_exempt += exempt
     # A floor, not an equality: rows are added constantly and an equality here
     # would be a tripwire on ordinary work.  A floor still catches the failure
     # that matters, which is the scan quietly matching far less than it did.
+    # Raised from 690 by M4-41, which brought the completion history's 39
+    # bullet entries into the table: 940 rows in 27 tables when it landed.
     check(
-        total_rows >= 690 and total_tables >= 25,
+        total_rows >= 900 and total_tables >= 25,
         f"the shape scan now covers {total_rows} rows in {total_tables} tables, "
-        f"far below the 703/26 measured when this rule landed; the tables have "
+        f"far below the 940/27 measured when M4-41 landed; the tables have "
         f"moved or the walk stopped finding them",
     )
 
-    # --- the EXCLUDED set is measured, not just the included one ------------
-    # The exemption is one named section (M4-41).  A CEILING, because the
-    # failure that matters here is the opposite one: an exemption that grows.
-    # 260 rows were exempt when this landed; every one is a row no rule sees,
-    # so the number must be argued down and never quietly up.
+    # --- there is NO exempt section (M4-41) ---------------------------------
+    # The `Completion history` log was exempted by name while it was written in
+    # two formats at once; up to 300 of its rows were orphans no rule examined.
+    # M4-41 made it one table and deleted the exemption.  This fixture is the
+    # red half: an orphan run INSIDE that very section must fail exactly as it
+    # does anywhere else, and the finding must be the orphan finding -- not
+    # some other refusal that happens to fire on the same text.
+    history_orphans = "\n".join(
+        [
+            "## Completion history",
+            "",
+            "| At | Item | Event | Evidence or scope |",
+            "|---|---|---|---|",
+            "| 2026-09-10T08:00:00+10:00 | M7-C01 | first verified local | e |",
+            "",
+            "- 2026-09-10T12:28:09+10:00: a bullet entry ends the table above.",
+            "| 2026-09-10T12:30:00+10:00 | M7-C02 | reopened | e |",
+            "| 2026-09-10T12:31:00+10:00 | M7-C03 | reopened | e |",
+        ]
+    )
+    findings, _t, rows = guard.table_shape_findings("docs/tasks.md", history_orphans)
     check(
-        total_exempt <= 300,
-        f"{total_exempt} rows are exempt from the shape rule, up from the 260 "
-        f"measured when it landed. The '{guard.EXEMPT_SECTION}' log is growing "
-        f"new orphan rows; close M4-41 rather than raising this ceiling",
+        rows == 3,
+        f"all three history rows must be counted, got {rows}",
     )
     check(
-        total_exempt >= 200,
-        f"only {total_exempt} rows are exempt, far below 260. If M4-41 was "
-        f"fixed this is good news -- delete the exemption and this case rather "
-        f"than leaving a rule that no longer applies to anything",
-    )
-    # And the exemption must be a SECTION, not a blanket: a run of orphan rows
-    # anywhere else is still a hard failure.
-    findings, _t, _r, exempt = guard.table_shape_findings(
-        "docs/tasks.md",
-        "## Some other section\n\n| X-01 | a | b | c |\n| X-02 | a | b | c |\n",
+        len(findings) == 2
+        and all("is not governed by any header/separator" in f for f in findings)
+        and findings[0].startswith("docs/tasks.md:8:")
+        and findings[1].startswith("docs/tasks.md:9:"),
+        f"orphan rows in the '## Completion history' section must each fail "
+        f"with the orphan finding, not be exempted: {findings}",
     )
     check(
-        exempt == 0 and len(findings) >= 1,
-        f"orphan rows outside '{guard.EXEMPT_SECTION}' must fail, not be "
-        f"exempted: {exempt} exempt, {findings}",
+        not hasattr(guard, "EXEMPT_SECTION"),
+        "EXEMPT_SECTION is back; M4-41 deleted it rather than leave a rule "
+        "applying to nothing",
+    )
+    # And the tracker's real history is one well-formed table: every row sits
+    # under the single `At | Item | Event` header.
+    tasks = (REPO_ROOT / "docs/tasks.md").read_text(encoding="utf-8")
+    history = tasks[tasks.index("## Completion history"):]
+    check(
+        history.count("| At | Item | Event | Evidence or scope |") == 1
+        and "\n- 20" not in history,
+        "the completion history must be ONE table with no bullet entries; a "
+        "second header or a bullet splits it into fragments again (M4-41)",
     )
 
     # --- the status-column split must be split_cells, not a bare split -----
@@ -333,7 +353,7 @@ def main() -> int:
 
     print(
         f"test_table_shape: PASS ({total_rows} rows in {total_tables} tables "
-        f"checked in the real docs; {total_exempt} exempt under M4-41)"
+        f"checked in the real docs; 0 exempt)"
     )
     return 0
 

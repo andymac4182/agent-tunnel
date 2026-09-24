@@ -197,11 +197,13 @@ separator at all fails as well — a blank line inside a table ends it, and the
 rows below render as a paragraph of pipe-delimited text rather than as a table.
 Cell boundaries are `|` not preceded by a backslash, which is GFM's rule: a
 pipe inside an inline code span still splits the row, so `` `a | b` `` must be
-written `` `a \| b` ``. `--verbose` reports the rows and tables checked, the
-findings, and the number of rows **exempt** — the `Completion history` log,
-whose mixed bullet/row formatting is tracked as M4-41. An exempt row is one no
-rule examines, so the count is printed on every `--verbose` run and bounded in
-both directions by `scripts/test_table_shape.py`.
+written `` `a \| b` ``. `--verbose` reports the rows and tables checked and the
+findings. No section is exempt: the `Completion history` log was, while it
+mixed bullets with rows, until M4-41 made it one table and deleted the
+exemption. Which rows the gate and ancestry rules apply to is set only by each
+table's own verdict column, named in its header (`Status`, or `Current state`
+and `Event` for the milestone summary and the journal), never by wording in
+another cell (M4-40).
 
 The scan is fatal (exit 2) when it matches no tables, no rows, or no verified
 rows: a guard whose success and whose non-execution look identical is not

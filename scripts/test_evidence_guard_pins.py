@@ -239,8 +239,17 @@ def the_status_predicate_is_exercised_in_both_directions() -> None:
     other = "| Milestone | Current state | Gate statement | Completed at |"
     journal = "| At | Item | Event | Evidence or scope |"
     check(guard.status_column(header) == 2, "the task table's Status column is index 2")
-    check(guard.status_column(other) is None, "the milestone table has no Status column")
-    check(guard.status_column(journal) is None, "the journal table has no Status column")
+    # M4-40: the milestone and journal tables name their verdict column in
+    # their own headers too, and that is the only cell read for them.
+    check(guard.status_column(other) == 1, "the milestone table's verdict is `Current state`, index 1")
+    check(guard.status_column(journal) == 2, "the journal table's verdict is `Event`, index 2")
+    check(not guard.verdict_is_exact(header), "a `Status` column uses the substring rule")
+    check(guard.verdict_is_exact(other), "`Current state` keeps the exact rule it had before M4-40")
+    check(guard.verdict_is_exact(journal), "`Event` keeps the exact rule it had before M4-40")
+    check(
+        guard.status_column("| Key | Current source references | Narrow evidence |") is None,
+        "a table whose header names no verdict column has none",
+    )
 
     def status(cell: str) -> str:
         return f"| M0-00 | [x] a task | {cell} | owner | evidence | — |"
@@ -260,15 +269,49 @@ def the_status_predicate_is_exercised_in_both_directions() -> None:
             f"a status not claiming verification must stay out of scope: {cell!r}",
         )
 
-    # The exact-match half still holds a row whose table has no Status column,
-    # which is what keeps the widening from ever removing a row from scope.
+    # --- M4-40: ONLY the verdict column sets scope ---------------------------
+    # Before M4-40 any cell equal to "verified"/"verified local" put a row in
+    # scope, so a `planned` row whose Owner or Evidence cell happened to read
+    # exactly `verified` was judged as a verified row, and a row in a table
+    # with no verdict column at all was in scope by its wording.  Each case
+    # below is in scope under that fallback and must not be now.
+    for label, row, index in (
+        ("an Owner cell reading `verified`",
+         "| M0-00 | [ ] a task | planned | verified | evidence | — |", 2),
+        ("an Evidence cell reading `verified local`",
+         "| M0-00 | [ ] a task | open | owner | verified local | — |", 2),
+        ("a table with no verdict column",
+         "| K-01 | verified | prose |", None),
+        ("a milestone row whose Gate statement reads `verified`",
+         "| M9 / thing | in progress | verified | — |", 1),
+    ):
+        check(
+            not guard.row_is_verified(row, index, index == 1),
+            f"M4-40: {label} must not put a row in scope; only the table's own "
+            f"verdict column may (row {row!r})",
+        )
+    # The rows the fallback used to admit rightly are still admitted, through
+    # their own verdict column, with the exact rule they always had.
     check(
-        guard.row_is_verified("| M1 / tunnel | verified local | prose | — |", None),
-        "the exact-match rule must still hold a row with no Status column",
+        guard.row_is_verified("| M1 / tunnel | verified local | prose | — |", 1, True),
+        "a milestone row whose `Current state` is exactly `verified local` stays in scope",
     )
     check(
-        not guard.row_is_verified("| M1 / tunnel | in progress | prose | — |", None),
-        "a row with no Status column and no exact match stays out of scope",
+        guard.row_is_verified(
+            "| 2026-09-17T18:29:16+10:00 | M4-07 | verified local | evidence |", 2, True
+        ),
+        "a journal row whose `Event` is exactly `verified local` stays in scope",
+    )
+    check(
+        not guard.row_is_verified(
+            "| 2026-09-17T18:29:16+10:00 | M4-07 | first verified local | e |", 2, True
+        ),
+        "the journal keeps its exact rule: widening it is a separate, measured "
+        "decision (EXACT_VERDICT_HEADERS), not a side effect of M4-40",
+    )
+    check(
+        not guard.row_is_verified("| M1 / tunnel | in progress | prose | — |", 1, True),
+        "a milestone row not claiming verification stays out of scope",
     )
 
 
