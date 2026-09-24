@@ -45,6 +45,7 @@
 //! All payloads, credentials and processes are synthetic.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -58,7 +59,10 @@ use tunnel_core::RotationConfig;
 use tunnel_mcp_export::ExportDiagnostics;
 
 use super::http_forward_real_path::{ConsumerStream, connect_consumer, request};
-use super::mcp_cloud_client::wire::{HttpBackend, count_lines, fixture_binary_path, wait_file};
+use super::mcp_cloud_client::wire::{
+    FreezeWatch, HttpBackend, MAX_RETRY_AFTER, MIN_RETRY_HINT_MS, RETRY_MARGIN, count_lines,
+    fixture_binary_path, wait_file,
+};
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, STARTUP_TIMEOUT,
     finish_scenario_with_cleanup, push_cleanup_error,
@@ -441,6 +445,14 @@ pub struct McpIsolationEvidence {
     /// each session child's process group, whether or not anyone ended the
     /// session first.
     pub children_after_stop: u64,
+    /// Retryable owner-not-ready refusals the consumers received, how many
+    /// were resent because they coincided with an observed rotation freeze,
+    /// and the connector state at the first that did not (M3-30).
+    /// Reported, not asserted: a refusal outside a freeze is returned to its
+    /// case, which fails on it as before.
+    pub freeze_refusals: u64,
+    pub freeze_resends: u64,
+    pub unexplained_refusal: Option<String>,
     pub not_covered: Vec<String>,
 }
 
@@ -746,6 +758,27 @@ fn empty() -> StreamBody<ConsumerStream> {
     StreamBody::new(Box::pin(futures_util::stream::empty()))
 }
 
+/// The data frames of an in-memory request body, so it can be sent again
+/// frame for frame after a freeze refusal (M3-30).
+async fn collect_frames(body: StreamBody<ConsumerStream>) -> Result<Vec<Bytes>> {
+    let mut body = std::pin::pin!(body);
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| HarnessError::Http(format!("request body: {error}")))?;
+        if let Ok(data) = frame.into_data() {
+            frames.push(data);
+        }
+    }
+    Ok(frames)
+}
+
+fn replay_frames(frames: &[Bytes]) -> StreamBody<ConsumerStream> {
+    let frames = frames.to_vec();
+    StreamBody::new(Box::pin(futures_util::stream::iter(
+        frames.into_iter().map(|data| Ok(Frame::data(data))),
+    )))
+}
+
 /// One consumer answer, reduced to what the gate asserts on.
 #[derive(Clone, Debug, Default)]
 struct Answer {
@@ -824,6 +857,26 @@ impl Answer {
         (field("code"), field("execution"))
     }
 
+    /// The bounded retry hint of the relay's retryable owner-not-ready
+    /// refusal, or `None` for any other answer.
+    fn owner_not_ready_hint(&self) -> Option<Duration> {
+        if self.status != 503 {
+            return None;
+        }
+        let parsed: Value = serde_json::from_slice(&self.body).ok()?;
+        (parsed["code"] == "PEER_UNAVAILABLE"
+            && parsed["execution"] == "not_dispatched"
+            && parsed["retryable"] == true)
+            .then(|| {
+                Duration::from_millis(
+                    parsed["retry_after_ms"]
+                        .as_u64()
+                        .unwrap_or(MIN_RETRY_HINT_MS),
+                )
+                .min(MAX_RETRY_AFTER)
+            })
+    }
+
     /// A payload-free description of this answer for a failure message: the
     /// status, the typed relay code and execution, and the JSON-RPC error
     /// number of the final message, if any.
@@ -870,10 +923,91 @@ struct Consumer {
     token: String,
     ingress: std::net::SocketAddr,
     ca: Vec<u8>,
+    /// The device session's rotation phase, fed from the connector (M3-30).
+    freeze: Arc<FreezeWatch>,
+    /// Freeze refusals seen and resent, shared by every consumer.
+    refusals: Arc<FreezeRefusals>,
+}
+
+/// How many times one request is sent again after a retryable
+/// `not_dispatched` refusal that coincided with an observed rotation freeze.
+/// Derived as the cloud-client gate derives its cap: a freeze ends when the
+/// attempt commits or its handshake budget expires, so the cap covers that
+/// budget at the relay's smallest hint, plus a margin.
+const FREEZE_RESENDS: u64 = (ISOLATION_ROTATION.handshake_timeout_seconds * 1_000)
+    .div_ceil(MIN_RETRY_HINT_MS)
+    + RETRY_MARGIN;
+
+/// Payload-free counts of the relay's retryable owner-not-ready refusals.
+#[derive(Debug, Default)]
+struct FreezeRefusals {
+    refusals: std::sync::atomic::AtomicU64,
+    resends: std::sync::atomic::AtomicU64,
+    unexplained: std::sync::Mutex<Option<String>>,
+}
+
+impl FreezeRefusals {
+    fn snapshot(&self) -> (u64, u64, Option<String>) {
+        use std::sync::atomic::Ordering;
+        (
+            self.refusals.load(Ordering::SeqCst),
+            self.resends.load(Ordering::SeqCst),
+            self.unexplained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+    }
 }
 
 impl Consumer {
+    /// Send one request and read its whole answer.
+    ///
+    /// The relay pauses new stream admission from QUIESCE to COMMIT and
+    /// answers a request that lands there with a retryable `503
+    /// PEER_UNAVAILABLE` `not_dispatched` refusal (docs/protocol.md,
+    /// "Quiesce admission"; M3-15).  Nothing was dispatched, so such a
+    /// refusal is sent again after its hint -- but only while the device
+    /// session is observed frozen, and at most [`FREEZE_RESENDS`] times.  The
+    /// same body answers every other owner-not-ready condition, including a
+    /// dial refused on an empty pin set (M7-C83), and outside a freeze it is
+    /// returned to the case exactly as before (M3-30).
     async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: StreamBody<ConsumerStream>,
+    ) -> Result<Answer> {
+        use std::sync::atomic::Ordering;
+        let frames = collect_frames(body).await?;
+        let mut resends = 0;
+        loop {
+            let answer = self
+                .send_once(method, uri, headers, replay_frames(&frames))
+                .await?;
+            let Some(hint) = answer.owner_not_ready_hint() else {
+                return Ok(answer);
+            };
+            self.refusals.refusals.fetch_add(1, Ordering::SeqCst);
+            if !self.freeze.coincides() {
+                self.refusals
+                    .unexplained
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(|| self.freeze.unexplained());
+                return Ok(answer);
+            }
+            if resends >= FREEZE_RESENDS {
+                return Ok(answer);
+            }
+            resends += 1;
+            self.refusals.resends.fetch_add(1, Ordering::SeqCst);
+            sleep(hint).await;
+        }
+    }
+
+    async fn send_once(
         &self,
         method: &str,
         uri: &str,
@@ -1092,6 +1226,8 @@ struct Gate<'a> {
     /// Highest OPEN journal occupancy seen by the sampler below (M7-C82).
     journal_peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     journal_task: Option<tokio::task::JoinHandle<()>>,
+    /// The connector's rotation phase, shared with every consumer (M3-30).
+    freeze: Arc<FreezeWatch>,
 }
 
 impl Gate<'_> {
@@ -1170,18 +1306,30 @@ impl Gate<'_> {
     fn watch_journal(&mut self, client: &tunnel_client::ConnectionHandle) {
         use std::sync::atomic::Ordering;
         let peak = std::sync::Arc::clone(&self.journal_peak);
+        let freeze = Arc::clone(&self.freeze);
         let mut status = client.status();
         {
             let snapshot = status.borrow_and_update();
             peak.fetch_max(snapshot.open_journal_entries, Ordering::Relaxed);
+            freeze.record(&snapshot.phase, snapshot.rotations_completed);
         }
         if let Some(task) = self.journal_task.take() {
             task.abort();
         }
+        // The same watch also feeds the rotation phase every consumer reads
+        // before it resends a freeze refusal (M3-30).
         self.journal_task = Some(tokio::spawn(async move {
             while status.changed().await.is_ok() {
-                let entries = status.borrow_and_update().open_journal_entries;
+                let (entries, phase, rotations) = {
+                    let snapshot = status.borrow_and_update();
+                    (
+                        snapshot.open_journal_entries,
+                        snapshot.phase.clone(),
+                        snapshot.rotations_completed,
+                    )
+                };
                 peak.fetch_max(entries, Ordering::Relaxed);
+                freeze.record(&phase, rotations);
             }
         }));
     }
@@ -2770,6 +2918,8 @@ async fn run(
             .get(index)
             .ok_or_else(|| HarnessError::InvalidInput("a consumer principal is missing".into()))
     };
+    let freeze = Arc::new(FreezeWatch::default());
+    let refusals = Arc::new(FreezeRefusals::default());
     let alice = Consumer {
         label: "consumer-a-1",
         token: harness
@@ -2777,6 +2927,8 @@ async fn run(
             .issue_with(&principal(0)?.name, scope.clone())?,
         ingress,
         ca: ca.clone(),
+        freeze: Arc::clone(&freeze),
+        refusals: Arc::clone(&refusals),
     };
     let bob = Consumer {
         label: "consumer-a-2",
@@ -2785,6 +2937,8 @@ async fn run(
             .issue_with(&principal(1)?.name, scope.clone())?,
         ingress,
         ca: ca.clone(),
+        freeze: Arc::clone(&freeze),
+        refusals: Arc::clone(&refusals),
     };
     // The revocation victim is a third principal, so revoking it cannot
     // disturb the isolation and correlation evidence.
@@ -2795,6 +2949,8 @@ async fn run(
             .issue_with(&harness.topology.owner_a.name, scope.clone())?,
         ingress,
         ca: ca.clone(),
+        freeze: Arc::clone(&freeze),
+        refusals: Arc::clone(&refusals),
     };
     let victim_id = harness.topology.owner_a.id;
     // A fully authenticated consumer of the *other* tenant, holding the same
@@ -2810,6 +2966,8 @@ async fn run(
         token: harness.oidc.issue_with(&foreign_principal.name, scope)?,
         ingress,
         ca: ca.clone(),
+        freeze: Arc::clone(&freeze),
+        refusals: Arc::clone(&refusals),
     };
     let foreign_tenant_id = harness.topology.tenant_b.id;
 
@@ -2829,6 +2987,7 @@ async fn run(
             .unwrap_or_else(Instant::now),
         journal_peak: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         journal_task: None,
+        freeze: Arc::clone(&freeze),
     };
 
     let started = Instant::now();
@@ -2996,6 +3155,15 @@ async fn run(
     // The Streamable HTTP backend is the gate's own process, not the
     // connector's, so the gate ends it whatever the run did.
     http_backend.stop().await;
+    (
+        evidence.freeze_refusals,
+        evidence.freeze_resends,
+        evidence.unexplained_refusal,
+    ) = refusals.snapshot();
+    eprintln!(
+        "MCP isolation gate: owner-not-ready refusals={} resent_in_freeze={} first_unexplained={:?}",
+        evidence.freeze_refusals, evidence.freeze_resends, evidence.unexplained_refusal
+    );
     run_result?;
     Ok(evidence)
 }
@@ -3003,6 +3171,41 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answer(status: u16, body: &str) -> Answer {
+        Answer {
+            status,
+            body: body.as_bytes().to_vec(),
+            ..Answer::default()
+        }
+    }
+
+    /// M3-30: only the relay's retryable owner-not-ready refusal carries a
+    /// resend hint; an `unknown` 503, a non-retryable one and any other
+    /// status do not, so they reach their case unchanged.
+    #[test]
+    fn only_the_retryable_owner_not_ready_refusal_is_a_resend_candidate() {
+        let refusal = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":true,"retry_after_ms":250}"#;
+        assert_eq!(
+            answer(503, refusal).owner_not_ready_hint(),
+            Some(Duration::from_millis(250))
+        );
+        let long = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":true,"retry_after_ms":60000}"#;
+        assert_eq!(
+            answer(503, long).owner_not_ready_hint(),
+            Some(MAX_RETRY_AFTER)
+        );
+        for body in [
+            r#"{"code":"PEER_UNAVAILABLE","execution":"unknown","retryable":true,"retry_after_ms":250}"#,
+            r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched"}"#,
+            r#"{"code":"ADMISSION_LIMIT","execution":"not_dispatched","retryable":true,"retry_after_ms":250}"#,
+            "not json",
+        ] {
+            assert_eq!(answer(503, body).owner_not_ready_hint(), None, "{body}");
+        }
+        assert_eq!(answer(502, refusal).owner_not_ready_hint(), None);
+        const { assert!(FREEZE_RESENDS >= 1) };
+    }
 
     fn outcome(fault: &str, settle: Settle) -> UnknownOutcomeEvidence {
         UnknownOutcomeEvidence {
@@ -3116,6 +3319,9 @@ mod tests {
             sessions_opened: 5,
             sessions_deleted: 3,
             children_after_stop: 0,
+            freeze_refusals: 0,
+            freeze_resends: 0,
+            unexplained_refusal: None,
             not_covered: NOT_COVERED.iter().map(|item| (*item).to_owned()).collect(),
         }
     }

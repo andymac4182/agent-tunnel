@@ -51,10 +51,10 @@ use crate::{HarnessError, Result};
 /// The smallest retry hint the relay sends with a retryable refusal
 /// (`OWNER_NOT_READY_RETRY_AFTER_MS`), and so the shortest wait between two
 /// resends of one request.
-pub(super) const MIN_RETRY_HINT_MS: u64 = 250;
+pub(in crate::production_cluster) const MIN_RETRY_HINT_MS: u64 = 250;
 /// Margin over the derived cap: a drain can be slower than its budget on a
 /// loaded machine, and a refusal may land just before the freeze starts.
-pub(super) const RETRY_MARGIN: u64 = 4;
+pub(in crate::production_cluster) const RETRY_MARGIN: u64 = 4;
 /// How many times one POST or standalone GET is sent again after a
 /// retryable `not_dispatched` refusal that coincided with a rotation
 /// freeze.
@@ -68,7 +68,7 @@ pub(super) const NOT_DISPATCHED_RETRIES: u64 =
     (super::MCP_GATE_ROTATION.handshake_timeout_seconds * 1_000).div_ceil(MIN_RETRY_HINT_MS)
         + RETRY_MARGIN;
 /// The longest retry hint honoured.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub(in crate::production_cluster) const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// How long after the last observed frozen owner sample a refusal still
 /// counts as coinciding with that freeze.
 const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
@@ -82,7 +82,7 @@ const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 /// fault state.  The gate samples the owner's session phase instead and
 /// resends only while that says a rotation is frozen.
 #[derive(Debug, Default)]
-pub(super) struct FreezeWatch {
+pub(in crate::production_cluster) struct FreezeWatch {
     frozen: AtomicBool,
     /// Whether any frozen sample was ever recorded.
     seen_frozen: AtomicBool,
@@ -126,7 +126,7 @@ impl FreezeWatch {
     /// Why a refusal was not attributed to a freeze: the connector state at
     /// the moment it was observed.  The owner freezes before the connector
     /// sees `ROTATE_QUIESCE`, so a refusal can land in that head gap.
-    fn unexplained(&self) -> String {
+    pub(in crate::production_cluster) fn unexplained(&self) -> String {
         let phase = self
             .phase
             .lock()
@@ -155,7 +155,7 @@ impl FreezeWatch {
     }
 
     /// Whether a refusal observed now coincides with a rotation freeze.
-    fn coincides(&self) -> bool {
+    pub(in crate::production_cluster) fn coincides(&self) -> bool {
         if self.frozen.load(Ordering::SeqCst) {
             return true;
         }
