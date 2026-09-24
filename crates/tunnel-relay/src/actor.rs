@@ -13522,7 +13522,32 @@ impl RelayActor {
                 .is_some_and(|session| session.profile.supports_rotation())
             && !self.begin_recovery_after_loss(&key, &carrier.connection_id)
         {
-            self.close_session(&key, "RECOVERY_START_FAILED").await;
+            // Retained recovery is coordinated over the control socket, so it
+            // cannot start once that socket is gone -- and a control sender
+            // that is closed means the socket task holding its receiver has
+            // finished. The device's transport has then ended on **both**
+            // sockets, which is `disconnect_control`'s event reached in the
+            // other order: close it as that, so an ingress reports the backend
+            // that went away (task row M4-49, a fourth teardown ordering first
+            // seen on hosted Linux, where the data socket's loss is processed
+            // before the control socket's). Any other refusal to start
+            // recovery keeps its own reason.
+            let control_gone = self
+                .session_for(&key)
+                .is_some_and(|session| session.control_tx.is_closed());
+            let reason = if control_gone {
+                CONTROL_CLOSED_REASON
+            } else {
+                "RECOVERY_START_FAILED"
+            };
+            tracing::info!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                control_gone,
+                stage = "recovery_start_failed",
+            );
+            self.close_session(&key, reason).await;
         }
         if recovery_candidate_lost
             && self
@@ -20441,6 +20466,61 @@ mod stream_identity_tests {
         assert_eq!(
             m4_37_session_close_code(&mut control).as_deref(),
             Some("RECOVERY_QUEUE_LIMIT")
+        );
+        drop(registration);
+    }
+
+    /// Task row M4-49: a connector that stops closes both sockets, and on
+    /// hosted Linux the relay can process the data socket's loss first. It
+    /// then tries to start retained recovery, which needs the control socket
+    /// that is also gone, and closed the session as `RECOVERY_START_FAILED` --
+    /// a reason that publishes no `DeviceGone`, so the consumer's close lost
+    /// its 1012 (`verify-m4-fs-epoch-change`, 2 of 5 hosted runs). With the
+    /// control sender closed that is the device going away, and it must
+    /// close as `CONTROL_CLOSED`.
+    #[tokio::test]
+    async fn data_loss_after_the_control_socket_ended_closes_as_control_closed() {
+        let (mut actor, control, _data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_491, "m4-49-order").await;
+        let now_ms = super::monotonic_millis();
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let attempt = RotationAttemptIdentity::new(
+                key.session_id.clone(),
+                key.epoch,
+                "owner",
+                "rotation-m4-49",
+                carrier.generation,
+                carrier.generation + 1,
+                carrier.connection_id.clone(),
+                "m4-49-next",
+            );
+            let mut rotation =
+                test_rotation_runtime(now_ms, attempt, now_ms.saturating_add(20_000));
+            rotation.attempt = None;
+            rotation.attempt_deadline_ms = None;
+            session.rotation = Some(rotation);
+        }
+        // The control socket's task has finished: its receiver is gone.
+        drop(control);
+        assert!(actor.sessions[&key.scope()].control_tx.is_closed());
+
+        actor.disconnect_data(carrier).await;
+
+        assert!(
+            !actor.sessions.contains_key(&key.scope()),
+            "the session ended"
+        );
+        let reason = actor
+            .session_terminal_events
+            .iter()
+            .rev()
+            .find(|event| event.session_id == key.session_id)
+            .map(|event| event.reason);
+        assert_eq!(
+            reason,
+            Some(super::CONTROL_CLOSED_REASON),
+            "with both sockets gone this is the device going away"
         );
         drop(registration);
     }
