@@ -824,6 +824,20 @@ impl Answer {
         (field("code"), field("execution"))
     }
 
+    /// A payload-free description of this answer for a failure message: the
+    /// status, the typed relay code and execution, and the JSON-RPC error
+    /// number of the final message, if any.
+    fn describe(&self) -> String {
+        let (code, execution) = self.error();
+        let rpc_error = self
+            .final_message()
+            .and_then(|message| message["error"]["code"].as_i64());
+        format!(
+            "status {} code={code:?} execution={execution:?} jsonrpc_error={rpc_error:?}",
+            self.status
+        )
+    }
+
     fn result_outcome(&self) -> String {
         let (code, execution) = self.error();
         match (
@@ -2043,11 +2057,32 @@ impl Gate<'_> {
                     .await
             })
         };
-        if !wait_file(&self.markers(SERVICE_2025).join("waiting-gatedup"), WAIT).await {
+        // Race the marker against the hold's own answer.  A hold that is
+        // answered without its side effect starting would otherwise leave
+        // this wait to expire with nothing said about what the consumer saw
+        // (M3-26).  Payload-free: status, typed code, execution and the
+        // JSON-RPC error number only.
+        let mut holder = holder;
+        let hold_marker = self.markers(SERVICE_2025).join("waiting-gatedup");
+        let started = tokio::select! {
+            started = wait_file(&hold_marker, WAIT) => started,
+            joined = &mut holder => {
+                let observed = match joined {
+                    Ok(Ok(answer)) => answer.describe(),
+                    Ok(Err(error)) => format!("request failed: {error}"),
+                    Err(error) => format!("task did not join: {error}"),
+                };
+                return Err(HarnessError::Process(format!(
+                    "the duplicate-probe hold was answered before it started: {observed}"
+                )));
+            }
+        };
+        if !started {
             holder.abort();
-            return Err(HarnessError::Timeout(
-                "the duplicate-probe hold never started".into(),
-            ));
+            return Err(HarnessError::Timeout(format!(
+                "the duplicate-probe hold never started and was still unanswered after {} s",
+                WAIT.as_secs()
+            )));
         }
         let duplicate_id = alice
             .send(

@@ -1257,8 +1257,13 @@ impl Gate<'_> {
         position: fn(&HttpRotationObservation) -> bool,
     ) -> Result<HttpRotationObservation> {
         let deadline = Instant::now() + OBSERVATION_BOUND;
+        let mut recorded_at_start = None;
+        let mut polls = 0_u64;
         loop {
             let snapshot = self.owner_snapshot().await?;
+            polls += 1;
+            let recorded_now = snapshot.http_forward.rotations_recorded;
+            let recorded_at_start = *recorded_at_start.get_or_insert(recorded_now);
             let observations = snapshot
                 .http_forward
                 .rotations
@@ -1277,10 +1282,44 @@ impl Gate<'_> {
             }
             if observations.len() as u64 >= MAX_ROTATIONS_PER_WAIT || Instant::now() >= deadline {
                 let session = self.session(&snapshot).ok();
+                // M3-22 forensics, payload-free: how much the owner's bounded
+                // observation ring saw during this wait, what it still holds,
+                // and which of the session's streams are open right now.
+                let ring = &snapshot.http_forward.rotations;
+                let after_any = ring
+                    .iter()
+                    .filter(|observation| observation.rotation > after)
+                    .count();
+                let ring_streams = ring
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|observation| (observation.stream_id, observation.rotation))
+                    .collect::<Vec<_>>();
+                let live = session
+                    .map(|session| {
+                        session
+                            .streams
+                            .iter()
+                            .map(|stream| {
+                                (
+                                    stream.stream_id,
+                                    stream.operation_id == operation_id,
+                                    stream
+                                        .http
+                                        .as_ref()
+                                        .map(|http| (http.request.ends, http.response.ends)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 return Err(HarnessError::Process(format!(
-                    "{label}: no rotation observed stream {stream_id} at its position after rotation {after}: observations={observations:?} phase={:?} rotations={:?}",
+                    "{label}: no rotation observed stream {stream_id} at its position after rotation {after}: observations={observations:?} phase={:?} rotations={:?} ring_len={} recorded_during_wait={} ring_after_rotation_any_stream={after_any} ring_newest={ring_streams:?} polls={polls} live_streams(id,same_operation,(request_ends,response_ends))={live:?}",
                     session.map(|session| session.phase.clone()),
                     session.map(|session| session.rotations_completed),
+                    ring.len(),
+                    recorded_now.saturating_sub(recorded_at_start),
                 )));
             }
             sleep(POLL).await;
