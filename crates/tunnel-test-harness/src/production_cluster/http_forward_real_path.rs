@@ -193,11 +193,12 @@ pub struct HttpForwardRealPathEvidence {
     pub sequential_session_id_stable: bool,
     pub sequential_phase_after: String,
     pub sequential_ready_after: bool,
-    /// The most OPEN journal entries seen after any sequential response.  A
-    /// **measurement, not a rule** (M3-31): an entry is released by the
-    /// owner's `STREAM_FORGET` after its carrier barriers, which nothing
-    /// orders before the next request's admission, so no request-count bound
-    /// on it can be derived.  Locally 1 or 2; 3 on some hosted runners.
+    /// The most OPEN journal entries seen after any sequential response.  No
+    /// request-count bound on it can be derived (M3-31): an entry is released
+    /// by the owner's `STREAM_FORGET` after its carrier barriers, which nothing
+    /// orders before the next request's admission.  The gate still holds it to
+    /// a *chosen* ceiling of a sixteenth of the journal cap, which catches
+    /// forgets published only on the maintenance tick.  Measured 1 or 2.
     pub open_journal_entries_peak: usize,
     /// The connector's OPEN journal entries when the sequential phase began
     /// (after waiting for the earlier phases' entries to be reclaimed), and
