@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "00d5eb1739f3ceaafe3a50fdf8bee14a0d5c4cd5",
-  "lastPublishedOriginMain": "00d5eb1739f3ceaafe3a50fdf8bee14a0d5c4cd5",
-  "lastReviewAt": "2026-09-25T05:03:14+10:00",
-  "lastReviewOutcome": "Reviewed MCP session diagnostic ordering, isolation and client harness evidence, hosted retained-OPEN gap and post-response cancellation semantics through 00d5eb1. Published scoped isolation verification without claiming a hosted suite pass, plus the completed-response versus transport-cancellation distinction. Runtime tests not rerun; CI and release gates unchanged by this update.",
+  "reviewedOriginMain": "7eb2433ef48f9bbb87429144db8ceed293117b26",
+  "lastPublishedOriginMain": "7eb2433ef48f9bbb87429144db8ceed293117b26",
+  "lastReviewAt": "2026-09-25T07:05:01+10:00",
+  "lastReviewOutcome": "Reviewed merged MCP consumer-release diagnostics, pre-head cancellation recording, prompt stream reclamation, retained-OPEN baseline corrections, sentinel group pinning and scoped harness evidence through 7eb2433. Published the upstream MCP documentation corrections, distinguishing hosted probe runs from repeated main CI results. Runtime tests not rerun; CI and release gates unchanged by this website update.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
   "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live MCP page exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T05:03:14+10:00",
-  "deploymentId": "dpl_6TuqvEzUf5uuonUAnxNbf9RRtnD4"
+  "verifiedAt": "2026-09-25T07:05:01+10:00",
+  "deploymentId": "dpl_BwhM2gC9ramTWvM9isLgbdf5ErZp"
 }
