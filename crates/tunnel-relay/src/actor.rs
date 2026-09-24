@@ -12245,6 +12245,35 @@ impl RelayActor {
                         release_m2_bytes(&queue_budget, stream, partial);
                     }
                     stream.orphaned_response_records = 0;
+                    // Task row M6-C86: every record the connector has not
+                    // answered now never will be, so its consumer waiter
+                    // fails here, at once, with a typed outcome. Before this
+                    // the waiter stayed parked and the consumer heard
+                    // nothing until its own deadline -- 30 s in the M2 gate
+                    // -- after the connector had reset the stream on an
+                    // authorization lapse. A dispatched record's effect is
+                    // unknown; a record still queued here was never sent.
+                    let code = if matches!(peer_terminal, Some(Terminal::Reset(_))) {
+                        "DEVICE_RESET"
+                    } else {
+                        "DEVICE_CLOSED"
+                    };
+                    for waiter in stream.response_records.drain(..) {
+                        let _ = waiter.send(Err(EchoOutcome::Failure {
+                            code,
+                            execution: "unknown",
+                        }));
+                    }
+                    // As in `release_echo_stream_state`: the queued records'
+                    // budget charge stays with the tombstone until
+                    // STREAM_FORGET; only the waiters and the byte count go.
+                    stream.pending_record_bytes = 0;
+                    for (_, waiter) in stream.pending_records.drain(..) {
+                        let _ = waiter.send(Err(EchoOutcome::Failure {
+                            code,
+                            execution: "not_dispatched",
+                        }));
+                    }
                 }
             }
             if !invalid && Self::should_ack_m2_frame(frame.kind) {

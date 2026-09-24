@@ -1609,6 +1609,11 @@ struct M2Actor {
     pending_authorization_refreshes: BTreeMap<u64, PendingAuthorizationRefresh>,
     accepting: bool,
     writes_frozen: bool,
+    /// Streams ended because their operation authorization lapsed.
+    auth_expired_streams: u64,
+    /// Every `expire_stream` call, for the M6-C88 regression test.
+    #[cfg(test)]
+    expire_stream_calls: u64,
     pending_outputs: VecDeque<PendingOutput>,
     pending_output_bytes: usize,
     peer_fence: Option<FenceSnapshot>,
@@ -1771,6 +1776,9 @@ async fn run_m2_session(
         pending_authorization_refreshes: BTreeMap::new(),
         accepting: true,
         writes_frozen: false,
+        auth_expired_streams: 0,
+        #[cfg(test)]
+        expire_stream_calls: 0,
         pending_outputs: VecDeque::new(),
         pending_output_bytes: 0,
         peer_fence: None,
@@ -2414,6 +2422,24 @@ impl M2Actor {
             open_retired_ranges_coalesced: self.retired_streams.coalesced_gaps,
             emitted_sequences: emitted,
             received_sequences: received,
+            stream_auth: crate::StreamAuthCounters {
+                unconfirmed_streams: self
+                    .streams
+                    .values()
+                    .filter(|stream| !stream.auth.confirmed)
+                    .count(),
+                refreshes_in_flight: self
+                    .streams
+                    .values()
+                    .filter(|stream| stream.auth.refresh_in_flight)
+                    .count(),
+                buffered_inputs: self
+                    .streams
+                    .values()
+                    .map(|stream| stream.pending.len())
+                    .sum(),
+                expired_streams: self.auth_expired_streams,
+            },
             drain_fences: rotation_status
                 .writers_frozen
                 .iter()
@@ -4659,12 +4685,16 @@ impl M2Actor {
         let wall_now = SystemTime::now();
         self.flush_pending_authorization_refreshes(now, wall_now)
             .await?;
+        // A stream `expire_stream` already invalidated is not selected again
+        // (task row M6-C88): before this, every tick re-ran the expiry for
+        // it until the stream was forgotten.
         let expired_ids: Vec<u64> = self
             .streams
             .iter()
             .filter_map(|(&stream_id, stream)| {
-                (stream.auth.deadline.expired_at(now, wall_now)
-                    || stream.auth.operation_deadline.expired_at(now, wall_now))
+                (!stream.auth.invalidated
+                    && (stream.auth.deadline.expired_at(now, wall_now)
+                        || stream.auth.operation_deadline.expired_at(now, wall_now)))
                 .then_some(stream_id)
             })
             .collect();
@@ -8266,6 +8296,10 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        #[cfg(test)]
+        {
+            self.expire_stream_calls = self.expire_stream_calls.saturating_add(1);
+        }
         if self.http_stream_settled(stream_id) {
             // Both terminals are in place; only the owner's STREAM_FORGET
             // remains, and a RESET now would be one it never acknowledges.
@@ -8273,6 +8307,12 @@ impl M2Actor {
         }
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            // Counted once per stream. The expired-stream selection skips
+            // streams already invalidated (task row M6-C88), and the guard
+            // also keeps a cancel-invalidated stream from counting as a lapse.
+            if !stream.auth.invalidated {
+                self.auth_expired_streams = self.auth_expired_streams.saturating_add(1);
+            }
             stream.auth.invalidated = true;
             // An expired authorization deadline stops filesystem dispatch at
             // the provider too: its next host call closes the session instead.
@@ -8975,6 +9015,9 @@ mod tests {
             pending_authorization_refreshes: BTreeMap::new(),
             accepting: true,
             writes_frozen: false,
+            auth_expired_streams: 0,
+            #[cfg(test)]
+            expire_stream_calls: 0,
             pending_outputs: VecDeque::new(),
             pending_output_bytes: 0,
             peer_fence: None,
@@ -9400,6 +9443,42 @@ mod tests {
         }
         assert!(saw_expired, "expired OPEN should receive a typed refusal");
         assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    /// M6-C88: a stream whose authorization has lapsed is expired once.
+    /// Before the fix every later tick selected it again, because the
+    /// selection never checked `auth.invalidated`, and re-ran the expiry
+    /// until the stream was forgotten -- 235 times for one stream in the
+    /// M6-C84 reproduction.
+    #[tokio::test]
+    async fn a_lapsed_stream_is_expired_once_not_on_every_tick() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("test stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .expect("a monotonic instant 10 ms ago");
+        stream.auth.deadline = DualDeadline::new(past, SystemTime::now(), Duration::from_millis(1))
+            .expect("an already-lapsed deadline");
+        actor.streams.insert(7, stream);
+
+        for _ in 0..5 {
+            actor
+                .refresh_authorizations()
+                .await
+                .expect("a refresh tick over a lapsed stream");
+        }
+        assert_eq!(actor.expire_stream_calls, 1, "expired once, then skipped");
+        assert_eq!(actor.auth_expired_streams, 1);
+        assert!(
+            actor
+                .streams
+                .get(&7)
+                .is_none_or(|stream| stream.auth.invalidated)
+        );
     }
 
     #[tokio::test]

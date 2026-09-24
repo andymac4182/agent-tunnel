@@ -989,7 +989,7 @@ async fn acknowledgement_beyond_the_relay_direction_fails_closed() {
 #[tokio::test]
 async fn connector_terminal_precedence_allows_one_reset_after_fin_and_nothing_after() {
     let mut fixture = LateFixture::new("terminal-precedence");
-    let _a1 = fixture.write(STREAM_A, b"a1");
+    let mut a1 = fixture.write(STREAM_A, b"a1");
     let mut b1 = fixture.write(STREAM_B, b"b1");
     fixture.drain_frames();
     fixture
@@ -1011,11 +1011,23 @@ async fn connector_terminal_precedence_allows_one_reset_after_fin_and_nothing_af
             .receive_terminal(),
         Some(Terminal::Fin)
     );
+    // M6-C86: the connector's FIN leaves a1 unanswered for good, so its
+    // waiter fails at once instead of parking until the consumer's deadline.
+    assert!(matches!(
+        resolved(&mut a1),
+        Some(Err(EchoOutcome::Failure {
+            code: "DEVICE_CLOSED",
+            execution: "unknown",
+        }))
+    ));
 
     // One RESET after FIN is accepted and acknowledged, but the relay emits
-    // no second terminal in its own direction.
+    // no second terminal in its own direction. The connector still has not
+    // acknowledged the relay's FIN (ack 1), which is what keeps the tombstone
+    // live for the checks below; before M6-C86 the unresolvable a1 waiter
+    // kept it live instead.
     fixture
-        .inbound(Frame::reset(EPOCH, GENERATION, STREAM_A, 2, 2, 4_010))
+        .inbound(Frame::reset(EPOCH, GENERATION, STREAM_A, 2, 1, 4_010))
         .await;
     assert!(fixture.session_alive());
     let frames = fixture.drain_frames();
@@ -1049,7 +1061,7 @@ async fn connector_terminal_precedence_allows_one_reset_after_fin_and_nothing_af
             GENERATION,
             STREAM_A,
             3,
-            2,
+            1,
             record(b"after"),
         ))
         .await;
@@ -1891,5 +1903,71 @@ async fn a_close_completed_by_the_shutdown_drain_latches_planned_drain() {
             Some(StreamTerminalCause::PeerMembershipExpired)
         ),
         "the drain preserves a cause the closing handler proved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M6-C86: a connector terminal must fail every response waiter it leaves
+// unanswered, promptly, instead of leaving the consumer to its own timeout.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_connector_reset_fails_every_outstanding_response_waiter_at_once() {
+    // The connector's stream authorization lapsed (M6-C87): it answered a1,
+    // discarded a2 and reset the stream. Before M6-C86 the relay marked the
+    // stream terminal and left a2's waiter pending, so the consumer heard
+    // nothing until its own 30 s timeout.
+    let mut fixture = LateFixture::new("connector-reset-waiters");
+    let mut a1 = fixture.write(STREAM_A, b"a1");
+    let mut a2 = fixture.write(STREAM_A, b"a2");
+    let mut b1 = fixture.write(STREAM_B, b"b1");
+    assert_eq!(
+        sequenced(&fixture.drain_frames()),
+        vec![
+            (STREAM_A, FrameKind::Data, 1),
+            (STREAM_A, FrameKind::Data, 2),
+            (STREAM_B, FrameKind::Data, 1)
+        ]
+    );
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            1,
+            2,
+            record(b"resp-a1"),
+        ))
+        .await;
+    fixture
+        .inbound(Frame::reset(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            2,
+            2,
+            tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED,
+        ))
+        .await;
+    assert!(
+        fixture.session_alive(),
+        "a stream RESET is not a session failure"
+    );
+    assert_eq!(resolved_ok(&mut a1), Some(record(b"resp-a1")));
+    assert!(
+        matches!(
+            resolved(&mut a2),
+            Some(Err(EchoOutcome::Failure {
+                code: "DEVICE_RESET",
+                execution: "unknown",
+            }))
+        ),
+        "the record the connector will never answer fails at once with a typed outcome"
+    );
+    assert!(fixture.stream(STREAM_A).response_records.is_empty());
+    assert!(fixture.stream(STREAM_A).terminal);
+    assert!(
+        resolved(&mut b1).is_none(),
+        "the sibling stream's outstanding record is untouched"
     );
 }
