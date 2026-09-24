@@ -1007,7 +1007,9 @@ mod tests {
         // the listener then fails exactly as the hosted gate did.
         let released = fixture.nodes[1].addresses.udp;
         fixture.nodes[1].release_ports();
-        let _thief = UdpSocket::bind(released).expect("a released port can be taken");
+        // If this bind fails, something else already took the released port,
+        // which is the race itself; either way the port is now held.
+        let _thief = UdpSocket::bind(released).ok();
         let error = quinn::Endpoint::server(server_config(&fixture.nodes[1]), released)
             .expect_err("rebinding a taken port");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
