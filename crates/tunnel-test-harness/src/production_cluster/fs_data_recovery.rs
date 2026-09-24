@@ -782,8 +782,34 @@ async fn run(
             client.status_snapshot()
         );
         eprintln!("fs data recovery partial evidence: {evidence:?}");
+        // Why the owner ended any device session, from its bounded terminal
+        // latch: reason labels, identifiers and monotonic times only.
+        if let Ok(snapshot) = owner_snapshot(cluster).await {
+            for event in &snapshot.session_terminal_events {
+                eprintln!(
+                    "fs data recovery owner session terminal: session={} epoch={} reason={} \
+                     active_generation={} candidate_generation={:?} closed_at_ms={}",
+                    event.session_id,
+                    event.epoch,
+                    event.reason,
+                    event.active_generation,
+                    event.candidate_generation,
+                    event.closed_at_ms
+                );
+            }
+        }
     }
     let stop = timeout(CLEANUP_TIMEOUT, client.stop()).await;
+    if scenario.is_err() {
+        // The connector's own terminal error, which a failed recovery (M4-29
+        // mode A, M4-48) otherwise leaves unstated: `phase="failed"` names that
+        // it ended, not why. `ClientError` renders bounded protocol text only.
+        match &stop {
+            Ok(Err(error)) => eprintln!("fs data recovery device terminal error: {error}"),
+            Ok(Ok(())) => eprintln!("fs data recovery device terminal error: none"),
+            Err(_) => eprintln!("fs data recovery device terminal error: stop timed out"),
+        }
+    }
     scenario?;
     match stop {
         Ok(Ok(())) => Ok(evidence),

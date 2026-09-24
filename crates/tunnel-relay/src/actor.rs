@@ -1817,6 +1817,12 @@ struct RecoveryRuntime {
     ready_sent: [bool; 2],
     deferred_frames: VecDeque<(CarrierKey, Frame, usize)>,
     deferred_bytes: usize,
+    /// Candidate DATA/FIN/RESET that arrived before the connector's
+    /// connector-to-relay `RESUMED` snapshot, and so could not yet be told
+    /// apart as in-range replay or a premature new write (task row M4-48).
+    /// Held, charged and bounded with `deferred_frames`, and classified the
+    /// moment that snapshot arrives.
+    unclassified_frames: VecDeque<(CarrierKey, Frame, usize)>,
     activated: bool,
     /// Candidate-loss retries are scheduled by the relay coordinator.  The
     /// client receives the authenticated RECOVERY_BEGIN immediately when this
@@ -7257,6 +7263,7 @@ impl RelayActor {
                 ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
+                unclassified_frames: VecDeque::new(),
                 activated: false,
                 retry_not_before_ms: None,
                 retry_failed_connection_id: None,
@@ -7593,6 +7600,7 @@ impl RelayActor {
                 ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
+                unclassified_frames: VecDeque::new(),
                 activated: false,
                 retry_not_before_ms: None,
                 retry_failed_connection_id: None,
@@ -9608,6 +9616,13 @@ impl RelayActor {
             recovery.remote_ready = [false, false];
             recovery.local_plans.clear();
             recovery.ready_sent = [false, false];
+            // Frames held for an earlier attempt's snapshot arrived on a
+            // candidate that attempt has released; return their charge.
+            for (_, frame, charged) in std::mem::take(&mut recovery.unclassified_frames) {
+                if let Some(stream) = session.streams.get_mut(&frame.stream_id) {
+                    release_m2_bytes(&session.queue_budget, stream, charged);
+                }
+            }
             rotation.last_message_id = messages[1].0.clone();
             rotation.snapshot_id = roster.snapshot_id;
         }
@@ -9830,6 +9845,9 @@ impl RelayActor {
                 {
                     recovery.remote_snapshots[index] = entries;
                     recovery.snapshot_reply_ids[index] = Some(reply_id);
+                }
+                if resumed.direction == Direction::ConnectorToRelay {
+                    self.classify_unclassified_recovery_frames(key).await;
                 }
                 let snapshot_ready = self.session_for(key).is_some_and(|session| {
                     session
@@ -10165,6 +10183,49 @@ impl RelayActor {
         // advertise the credit it released; pay it on the successor now, or
         // the connector's next write waits for it forever (M4-29).
         self.redrive_owed_http_credit(key);
+    }
+
+    /// Re-run every candidate frame held for the connector's
+    /// connector-to-relay snapshot through the ordinary receive path, in
+    /// arrival order, now that the snapshot can classify it (M4-48).  Each
+    /// frame's hold charge is returned first, because the receive path
+    /// charges it again.
+    async fn classify_unclassified_recovery_frames(&mut self, key: &SessionKey) {
+        let held = {
+            let Some(session) = self.session_mut(key) else {
+                return;
+            };
+            let Some(recovery) = session
+                .rotation
+                .as_mut()
+                .and_then(|rotation| rotation.recovery.as_mut())
+            else {
+                return;
+            };
+            let held = std::mem::take(&mut recovery.unclassified_frames);
+            for (_, frame, charged) in &held {
+                if let Some(stream) = session.streams.get_mut(&frame.stream_id) {
+                    release_m2_bytes(&session.queue_budget, stream, *charged);
+                }
+            }
+            held
+        };
+        for (carrier, frame, _) in held {
+            // Held frames arrived on a recovery candidate. Re-drive them as
+            // candidate frames only while that carrier still is the
+            // candidate; a frame from a candidate since released is stale and
+            // is dropped, as a late frame from a closed carrier would be.
+            let still_candidate = self.session_for(key).is_some_and(|session| {
+                session
+                    .rotation
+                    .as_ref()
+                    .and_then(|rotation| rotation.candidate.as_ref())
+                    .is_some_and(|candidate| candidate.context == carrier.context())
+            });
+            if still_candidate {
+                self.inbound_m2_stream_data(carrier, frame, true).await;
+            }
+        }
     }
 
     fn flush_recovered_records(&mut self, key: &SessionKey) {
@@ -11987,6 +12048,59 @@ impl RelayActor {
                             && recovery.ready_sent != [true, true]
                     })
             {
+                // Replay rides the candidate data socket and the connector's
+                // snapshot rides the control socket, so nothing orders them:
+                // the connector queues its retained replay when the relay's
+                // SNAPSHOT arrives, and that replay can reach this relay
+                // before the connector's own RESUMED does.  Until it has, an
+                // in-range replay frame cannot be told from a premature new
+                // write, and refusing it fenced the whole session as
+                // RECOVERY_QUEUE_LIMIT (task row M4-48, measured: sequence 11
+                // of a two-frame replay, `remote_snapshots` still empty,
+                // `ready_sent == [false, false]`).  docs/protocol.md requires
+                // in-range replay to "remain processable before activation",
+                // so such a frame is held, bounded and charged, and
+                // classified when the snapshot arrives.  A frame the snapshot
+                // then shows to be beyond the fence is refused exactly as
+                // before.
+                let snapshot_pending = session
+                    .rotation
+                    .as_ref()
+                    .and_then(|rotation| rotation.recovery.as_ref())
+                    .is_some_and(|recovery| {
+                        recovery.snapshot_reply_ids[direction_index(Direction::ConnectorToRelay)]
+                            .is_none()
+                    });
+                if snapshot_pending {
+                    let queue_budget = session.queue_budget.clone();
+                    let input_bytes = frame.payload.len();
+                    let held_available = session
+                        .rotation
+                        .as_ref()
+                        .and_then(|rotation| rotation.recovery.as_ref())
+                        .is_some_and(|recovery| {
+                            recovery
+                                .deferred_frames
+                                .len()
+                                .saturating_add(recovery.unclassified_frames.len())
+                                < deferred_limit
+                        });
+                    let Some(stream) = session.streams.get_mut(&frame.stream_id) else {
+                        return;
+                    };
+                    if held_available && reserve_m2_bytes(&queue_budget, stream, input_bytes) {
+                        if let Some(rotation) = session.rotation.as_mut()
+                            && let Some(recovery) = rotation.recovery.as_mut()
+                        {
+                            recovery.unclassified_frames.push_back((
+                                carrier.clone(),
+                                frame,
+                                input_bytes,
+                            ));
+                        }
+                        return;
+                    }
+                }
                 deferred_rejected = true;
                 break 'data;
             }
@@ -20199,6 +20313,138 @@ mod stream_identity_tests {
         }
     }
 
+    /// Task row M4-48 (M4-29's mode A), measured before it was fixed: the
+    /// connector queues its retained replay on the recovery candidate when the
+    /// relay's SNAPSHOT arrives, and replay (data socket) can overtake the
+    /// connector's own `RESUMED` (control socket). The relay refused an
+    /// in-range replay frame it could not yet classify and fenced the session
+    /// as `RECOVERY_QUEUE_LIMIT`. It must hold the frame until the snapshot
+    /// arrives, then process it as replay -- and still refuse a frame the
+    /// snapshot shows to be a premature new write.
+    #[tokio::test]
+    async fn replay_that_overtakes_the_connector_snapshot_is_held_then_classified() {
+        let (mut actor, mut control, _data_rx, _carrier, key, registration) =
+            m4_37_opened_echo_stream(4_481, "m4-48-replay-first").await;
+        let stream_id = registration.stream_id;
+        let now_ms = super::monotonic_millis();
+        let candidate = CarrierKey {
+            session: key.clone(),
+            generation: 2,
+            connection_id: "m4-48-candidate".to_owned(),
+        };
+        let (candidate_tx, mut candidate_rx) =
+            mpsc::channel(actor.options.limits.max_queue_messages);
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            // The active data socket failed; a recovery candidate is attached
+            // and no RESUMED has arrived from the connector yet.
+            session.data_tx = None;
+            session.active_carrier = None;
+            let mut rotation = test_rotation_runtime(
+                now_ms,
+                session_attempt(&key, "owner", "m4-48", 1),
+                now_ms.saturating_add(20_000),
+            );
+            rotation.recovery = Some(test_recovery_runtime(now_ms, stream_id));
+            rotation.candidate = Some(DataCarrier {
+                context: candidate.context(),
+                tx: candidate_tx,
+            });
+            session.rotation = Some(rotation);
+        }
+        let c2r = super::direction_index(Direction::ConnectorToRelay);
+
+        // Sequence 1 of the connector's retained replay, ahead of its RESUMED.
+        actor
+            .inbound_m2_stream_data(
+                candidate.clone(),
+                Frame::data(key.epoch, 2, stream_id, 1, 0, vec![0, 0, 0, 16, 1, 2, 3, 4]),
+                true,
+            )
+            .await;
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "replay that overtook the connector's snapshot must be held, not fenced \
+             (it closed as {close:?})"
+        );
+        assert_eq!(
+            actor.sessions[&key.scope()]
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .map(|recovery| recovery.unclassified_frames.len()),
+            Some(1),
+            "held for classification"
+        );
+
+        // The connector's connector-to-relay snapshot arrives: its immutable
+        // fence covers sequence 1, so the held frame is in-range replay.
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let recovery = session
+                .rotation
+                .as_mut()
+                .and_then(|rotation| rotation.recovery.as_mut())
+                .expect("recovery");
+            recovery.snapshot_reply_ids[c2r] = Some("m4-48-resumed".to_owned());
+            recovery.remote_snapshots[c2r].insert(
+                stream_id,
+                tunnel_protocol::rotation_control::ResumeDirectionState {
+                    stream_id,
+                    last_emitted: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        actor.classify_unclassified_recovery_frames(&key).await;
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "still live ({close:?})"
+        );
+        let session = &actor.sessions[&key.scope()];
+        assert_eq!(
+            session.streams[&stream_id]
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .recv_contiguous(),
+            1,
+            "the held replay was received"
+        );
+        assert!(
+            session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .is_some_and(|recovery| recovery.unclassified_frames.is_empty())
+        );
+        let Ok(DataOutbound::Binary(mut ack)) = candidate_rx.try_recv() else {
+            panic!("the replay is acknowledged on the candidate");
+        };
+        assert_eq!(
+            Frame::decode(ack.as_slice()).expect("ack").kind,
+            FrameKind::Ack
+        );
+        ack.release();
+
+        // Control: with the snapshot known, a frame beyond its fence before
+        // READY is still an unaccounted write and is still refused.
+        actor
+            .inbound_m2_stream_data(
+                candidate,
+                Frame::data(key.epoch, 2, stream_id, 2, 0, b"premature".to_vec()),
+                true,
+            )
+            .await;
+        assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
+        assert_eq!(
+            m4_37_session_close_code(&mut control).as_deref(),
+            Some("RECOVERY_QUEUE_LIMIT")
+        );
+        drop(registration);
+    }
+
     #[tokio::test]
     async fn connector_stream_forget_cannot_reclaim_failed_relay_fin() {
         let now = Utc::now();
@@ -20906,6 +21152,7 @@ mod stream_identity_tests {
             ready_sent: [false, false],
             deferred_frames: VecDeque::new(),
             deferred_bytes: 0,
+            unclassified_frames: VecDeque::new(),
             activated: false,
             retry_not_before_ms: None,
             retry_failed_connection_id: None,
