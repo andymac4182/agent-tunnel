@@ -164,8 +164,8 @@ def the_preflight_refuses_a_stalled_anchor() -> None:
               [(path, "fn gone()", "")])]
         )
     check(code == 1, f"a stalled anchor must fail the run, got exit {code}")
-    check("STALLED: guard text not found" in output,
-          f"a stalled anchor must be named STALLED, got {output!r}")
+    check("STALLED: guard text not found" in output and "AMBIGUOUS" not in output,
+          f"a stalled anchor must be named STALLED and only STALLED, got {output!r}")
     check("a guard whose anchor a formatter rewrapped" in output,
           f"the stalled case must be named, got {output!r}")
 
@@ -184,8 +184,9 @@ def the_preflight_refuses_an_ambiguous_anchor() -> None:
               [(path, "let x = 1;", "")])]
         )
     check(code == 1, f"an ambiguous anchor must fail the run, got exit {code}")
-    check("AMBIGUOUS: 2 occurrences" in output,
-          f"an ambiguous anchor must be named with its count, got {output!r}")
+    check("AMBIGUOUS: 2 occurrences" in output and "STALLED" not in output,
+          f"an ambiguous anchor must be named with its count, and not as "
+          f"STALLED, got {output!r}")
 
 
 def the_preflight_refuses_an_empty_selection() -> None:
@@ -198,8 +199,11 @@ def the_preflight_refuses_an_empty_selection() -> None:
     """
     code, output = run_preflight([])
     check(code == 1, f"an empty selection must refuse, got exit {code}")
-    check("not evidence" in output,
-          f"the refusal must say why it refused, got {output!r}")
+    # **The empty-selection refusal's own text (M4-43).**  "not evidence"
+    # alone is generic enough for any refusal to say; this names the branch.
+    check("selected no cases" in output and "anchor problem(s)" not in output,
+          f"the refusal must be the empty-selection one and say why it refused, "
+          f"got {output!r}")
     check("every anchor resolves" not in output,
           f"an empty selection must never claim a clean sweep, got {output!r}")
 
@@ -1015,9 +1019,24 @@ def an_undeclared_case_is_refused_before_anything_is_edited() -> None:
             return str(stop)
         return ""
 
+    # **Each refusal is matched by its own suffix, and its siblings' are
+    # required absent (M4-43).**  The three share one `sys.exit` and one
+    # preamble, so a substring of the preamble -- or of the case name --
+    # would be satisfied by whichever sibling fired.
+    suffixes = {
+        "missing": "[gate4] a case (names no witness)",
+        "contradictory": "[gate4] a case (compiler refusal may not name a witness)",
+        "stale": "[gate4] a case (declares a witness but is still in the debt ledger)",
+    }
+
+    def only(text: str, kind: str) -> bool:
+        return suffixes[kind] in text and all(
+            suffixes[other] not in text for other in suffixes if other != kind
+        )
+
     undeclared = refuse([("gate4", "a case", False, frozenset())])
     check(
-        "a case" in undeclared and "names no witness" in undeclared,
+        only(undeclared, "missing"),
         f"an undeclared value case must be refused by name, got {undeclared!r}",
     )
 
@@ -1033,7 +1052,7 @@ def an_undeclared_case_is_refused_before_anything_is_edited() -> None:
     # A compiler refusal names no test, and must not be made to.
     contradictory = refuse([("gate4", "a case", True, frozenset({"a_test"}))])
     check(
-        "compiler refusal" in contradictory,
+        only(contradictory, "contradictory"),
         f"a compiler-refusal case with a witness must be refused, got {contradictory!r}",
     )
 
@@ -1044,7 +1063,7 @@ def an_undeclared_case_is_refused_before_anything_is_edited() -> None:
         WitnessDebt([("gate4", "a case")]),
     )
     check(
-        "debt ledger" in stale,
+        only(stale, "stale"),
         f"a case in both the table and the ledger must be refused, got {stale!r}",
     )
 
@@ -1571,8 +1590,11 @@ def a_lost_check_anchors_dispatch_cannot_delete_anything() -> None:
             # It reached the deletion loop, so what stopped it must be the
             # missing capability and not some unrelated refusal -- a control
             # that reddens for a sibling's reason proves nothing (M4-43).
+            # `Probe.apply_all` writes with `Path.write_text`, so that is the
+            # barrier that must have fired; "write capability" alone is in
+            # every `refuse(...)` message and names no primitive.
             check(
-                refused is not None and "write capability" in refused,
+                refused is not None and "called Path.write_text" in refused,
                 f"{script_name}: the deletion loop was reached under "
                 "--check-anchors and something other than the write barrier "
                 f"stopped it; refusal was {refused!r}",

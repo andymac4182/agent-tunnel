@@ -64,6 +64,19 @@ def findings_for(line: str, pins: "set[str]", ancestry=unresolvable) -> "list[st
     return found
 
 
+#: The two commit findings `row_findings` can emit, which are siblings: a hash
+#: git cannot resolve (and sources.md does not pin), and a hash git resolves
+#: to a commit that is not an ancestor.  Every red below names which one it
+#: expects and requires the other to be absent (M4-43), so a finding produced
+#: for the wrong reason cannot satisfy a count.
+UNRESOLVED = "which git cannot resolve to any commit"
+NON_ANCESTOR = "NOT an ancestor of HEAD"
+
+
+def only_finding(found: "list[str]", expected: str, sibling: str) -> bool:
+    return len(found) == 1 and expected in found[0] and sibling not in found[0]
+
+
 def row(body: str) -> str:
     """A verified tasks.md row carrying `body` as its evidence cell."""
     return f"| M8-01 | [x] Pin stable ACP v1. | verified local | m8c1 worker | {body} | — |"
@@ -104,14 +117,18 @@ def main() -> int:
     red = findings_for(
         row(f"upstream pin (recorded, verified) at commit `{UNRECORDED}`."), pins
     )
-    check(len(red) == 1, f"the unrecorded upstream hash must be one finding, got {red}")
+    check(
+        only_finding(red, UNRESOLVED, NON_ANCESTOR),
+        f"the unrecorded upstream hash must be one unresolved-commit finding, got {red}",
+    )
     check(
         "sources.md" in red[0],
         f"the finding must name the record that is missing, got {red[0]}",
     )
+    short = findings_for(row(f"commit `{UNRECORDED[:8]}`."), pins)
     check(
-        len(findings_for(row(f"commit `{UNRECORDED[:8]}`."), pins)) == 1,
-        "the short form of an unrecorded hash must fail as well",
+        only_finding(short, UNRESOLVED, NON_ANCESTOR),
+        f"the short form of an unrecorded hash must fail as well, by the same rule: {short}",
     )
 
     # --- a record that exists but records too little ------------------------
@@ -122,9 +139,10 @@ def main() -> int:
         "path and must not create a pin",
     )
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."),
-                         guard.recorded_upstream_pins(hollow))) == 1,
-        "a row whose sources.md entry lacks the URL must fail",
+        only_finding(findings_for(row(f"at commit `{RFD_COMMIT}`."),
+                                  guard.recorded_upstream_pins(hollow)),
+                     UNRESOLVED, NON_ANCESTOR),
+        "a row whose sources.md entry lacks the URL must fail as an unresolved commit",
     )
 
     no_digest = (
@@ -138,9 +156,10 @@ def main() -> int:
         "artifact contained and must not create a pin",
     )
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."),
-                         guard.recorded_upstream_pins(no_digest))) == 1,
-        "a row whose sources.md entry lacks the digest must fail",
+        only_finding(findings_for(row(f"at commit `{RFD_COMMIT}`."),
+                                  guard.recorded_upstream_pins(no_digest)),
+                     UNRESOLVED, NON_ANCESTOR),
+        "a row whose sources.md entry lacks the digest must fail as an unresolved commit",
     )
 
     unlabelled = no_digest[:-1] + f", `{RFD_DIGEST}`."
@@ -151,11 +170,12 @@ def main() -> int:
     )
 
     # --- what the exemption must NOT launder --------------------------------
+    laundered = findings_for(row(f"at commit `{RFD_COMMIT}`."), pins, resolvable_non_ancestor)
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."), pins,
-                         resolvable_non_ancestor)) == 1,
+        only_finding(laundered, NON_ANCESTOR, UNRESOLVED),
         "a hash git DOES resolve is a claim about this repository's history; "
-        "being listed in sources.md must not excuse a non-ancestor commit",
+        "being listed in sources.md must not excuse a non-ancestor commit, and "
+        f"the finding must be the non-ancestor one: {laundered}",
     )
     check(
         guard.is_recorded_pin(RFD_COMMIT[:8], pins),

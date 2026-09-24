@@ -22,7 +22,9 @@ Exit codes: 0 pass, non-zero on the first failed case.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -318,29 +320,53 @@ def main() -> int:
     # to zero rows.  That is exactly the shape of the silent failure: a guard
     # that still prints its verbose line, still reports tables and rows, and
     # has quietly stopped checking any evidence at all.
+    #
+    # **Each fixture names the refusal it expects (M4-43).**  Both conditions
+    # exit 2 through the same `die`, so an assertion on the exit code alone is
+    # satisfied by either -- and the "no tables at all" fixture trips BOTH, so
+    # deleting the table-shape `die` left it passing on the verified-rows
+    # `die` below it: a control reddening for its sibling's reason.  Measured
+    # before this change by deleting that `die`; the file stayed green.
+    shape_refusal = "table-shape scan matched nothing"
+    verified_refusal = "no verified rows matched"
     fatal_fixtures = {
-        "no tables at all": "# A document with prose and no tables at all.\n",
+        "no tables at all": (
+            "# A document with prose and no tables at all.\n",
+            shape_refusal,
+            verified_refusal,
+        ),
         "tables and rows, but NO verified row": (
             HEADER
             + "\n"
             + SEPARATOR
             + "\n| M5-C13 | [ ] A task. | planned | a worker | prose | — |\n"
-            + "| M5-C14 | [ ] Another. | in progress | a worker | prose | — |\n"
+            + "| M5-C14 | [ ] Another. | in progress | a worker | prose | — |\n",
+            verified_refusal,
+            shape_refusal,
         ),
     }
-    for label, body in fatal_fixtures.items():
+    for label, (body, expected, sibling) in fatal_fixtures.items():
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Path(tmp) / "fixture.md"
             fixture.write_text(body, encoding="utf-8")
             saved = guard.DOCS
             guard.DOCS = [str(fixture)]
+            stderr = io.StringIO()
             try:
-                guard.scan(set(), set(), False)
+                with contextlib.redirect_stderr(stderr):
+                    guard.scan(set(), set(), False)
             except SystemExit as exit_code:
                 check(
                     exit_code.code == 2,
                     f"the '{label}' scan must exit 2 (environment error), got "
                     f"{exit_code.code}",
+                )
+                said = stderr.getvalue()
+                check(
+                    expected in said and sibling not in said,
+                    f"the '{label}' scan must be refused by its own check "
+                    f"({expected!r}) and not by its sibling ({sibling!r}); "
+                    f"stderr was {said!r}",
                 )
             else:
                 sys.exit(
