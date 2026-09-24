@@ -18,6 +18,12 @@ package than the tests it runs is the M3-19 failure this whole family of
 scripts exists to avoid.  A second file would have had to duplicate the
 suite definition to avoid duplicating nothing.
 
+A third suite, `m0c06-recovery-debug`, covers task row M0-06: the relay's
+recovery-workflow `Debug` redaction, whose test could not tell redaction from
+deletion.  It lives here because it is the same kind of evidence -- an
+operator diagnostic's redaction -- and names its own package, as the
+classifier suite does.
+
 **What the row is about.** `CliError::exit_code` used to match `&'static str`
 with a `_ => 1` arm.  Six live causes had no entry in that table, so they
 exited `1`, "unexpected internal failure" -- including `OWNER_BUSY` (another
@@ -970,9 +976,100 @@ HARNESS_CASES: list[Case] = [
     ),
 ]
 
+#: A third suite, for task row M0-06: the relay's recovery-workflow `Debug`
+#: impls.  Its old test asserted only absences, so deleting the diagnostic
+#: outright left it green (measured, log nonce
+#: `m0m2-m006-old-test-gutted-20260924T132242Z-11032`).  The test now compares
+#: each rendering whole, and every case here must redden **that** test: two
+#: deletions, one over-redaction of a correlation identifier, and one leak.
+#: Separate from the other suites because it names a different package, for
+#: the same M3-19 reason as `m0c03-classifier`.
+RELAY = REPO / "crates" / "tunnel-relay"
+RECOVERY = RELAY / "src" / "recovery.rs"
+
+RELAY_RECOVERY_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--lib",
+    "--locked",
+    "--no-fail-fast",
+    "recovery::tests::workflow_debug_",
+]
+
+RECOVERY_DEBUG_WITNESS = frozenset(
+    {"recovery::tests::workflow_debug_redacts_authority_credentials_and_control_paths"}
+)
+
+RECOVERY_DEBUG_CASES: list[Case] = [
+    Case(
+        # The row's own example: redaction replaced by deletion.
+        "a deleted recovery config diagnostic is not reported as redaction",
+        [
+            (
+                RECOVERY,
+                '        formatter\n            .debug_struct("RecoveryWorkflowConfig")\n'
+                '            .field("has_redis_url", &(!self.redis_url.is_empty()))\n'
+                '            .field("deployment_id", &self.deployment_id)\n'
+                '            .field("redis_namespace", &self.redis_namespace)\n'
+                '            .field("deployment_incarnation", &self.deployment_incarnation)\n'
+                '            .field("fence_path", &"<redacted>")\n'
+                '            .field("trusted_keys_path", &"<redacted>")\n'
+                '            .field("redis_tls_material", &self.redis_tls_material)\n'
+                "            .finish()",
+                '        formatter.write_str("RecoveryWorkflowConfig")',
+            )
+        ],
+        RECOVERY_DEBUG_WITNESS,
+    ),
+    Case(
+        "a deleted recover request diagnostic is not reported as redaction",
+        [
+            (
+                RECOVERY,
+                '        formatter\n            .debug_struct("RecoverRequest")\n'
+                '            .field("has_expected_nonce", &(!self.expected_nonce.is_empty()))\n'
+                '            .field("approval_path", &"<redacted>")\n'
+                '            .field("quiescence", &self.quiescence)\n'
+                "            .finish()",
+                '        formatter.write_str("RecoverRequest")',
+            )
+        ],
+        RECOVERY_DEBUG_WITNESS,
+    ),
+    Case(
+        # Over-redaction: the correlation identifier runtime.md requires is
+        # dropped while every secret stays hidden.
+        "an over-redacted deployment identifier is noticed",
+        [
+            (
+                RECOVERY,
+                '            .field("deployment_id", &self.deployment_id)\n',
+                '            .field("deployment_id", &"<redacted>")\n',
+            )
+        ],
+        RECOVERY_DEBUG_WITNESS,
+    ),
+    Case(
+        # And the direction the old test did cover, kept so the rewrite is
+        # shown not to have lost it.
+        "a leaked recovery fence path is noticed",
+        [
+            (
+                RECOVERY,
+                '            .field("fence_path", &"<redacted>")\n',
+                '            .field("fence_path", &self.fence_path)\n',
+            )
+        ],
+        RECOVERY_DEBUG_WITNESS,
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m0c03-exit-codes", [CLIENT], CARGO_TEST, CASES),
     Suite("m0c03-classifier", [HARNESS], HARNESS_TEST, HARNESS_CASES),
+    Suite("m0c06-recovery-debug", [RELAY], RELAY_RECOVERY_TEST, RECOVERY_DEBUG_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
@@ -1116,7 +1213,10 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m0c03-exit-codes, m0c03-classifier)")
+    parser.add_argument(
+        "--suite",
+        help="run only this suite (m0c03-exit-codes, m0c03-classifier, m0c06-recovery-debug)",
+    )
     arguments = parser.parse_args()
 
     # **M4-36, and this is the load-bearing line.**  Write capability is
