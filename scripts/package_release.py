@@ -91,6 +91,21 @@ def version(root, sha, run):
     return f"v{base}-main.{run}.{sha[:12]}"
 
 
+def normalised_member(member):
+    """Give a tar member the same mode and owner on every build host.
+
+    Copying modes from the staging tree made the archive depend on the host:
+    a Windows runner has no execute bits, so its Unix archives would ship
+    binaries that cannot run. Directories and `bin/` entries are 0755,
+    everything else 0644, owned by root.
+    """
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    executable = member.isdir() or member.name.startswith("bin/")
+    member.mode = 0o755 if executable else 0o644
+    return member
+
+
 def package(root, target, sha, run, output, metadata):
     # Read from the manifest under `root` rather than from the module-level
     # TARGETS, so a caller packaging a different checkout is checked against
@@ -147,7 +162,7 @@ def package(root, target, sha, run, output, metadata):
         else:
             with tarfile.open(archive, "w:gz") as handle:
                 for file in sorted(staging.iterdir()):
-                    handle.add(file, arcname=file.name)
+                    handle.add(file, arcname=file.name, filter=normalised_member)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (output / f"{filename}.sha256").write_text(f"{digest}  {filename}\n")
     return archive
