@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "77bfd28cbb8c275f9826046a3197c8f63f446823",
-  "lastPublishedOriginMain": "77bfd28cbb8c275f9826046a3197c8f63f446823",
-  "lastReviewAt": "2026-09-24T23:04:23+10:00",
-  "lastReviewOutcome": "Reviewed Fly entrypoint catalog commands, configuration override refusal, local proof and operator workflow through 77bfd28. Replaced the old entrypoint restriction with image-version requirements, one-off machine operation and cleanup, dry-run limits and explicit local-versus-hosted evidence. No Fly or runtime operations executed; CI and release gates unchanged.",
-  "reviewedDate": "2026-09-24",
+  "reviewedOriginMain": "fbf94b196651b4d0fd9067a59055a39f290df2c4",
+  "lastPublishedOriginMain": "fbf94b196651b4d0fd9067a59055a39f290df2c4",
+  "lastReviewAt": "2026-09-25T00:03:24+10:00",
+  "lastReviewOutcome": "Reviewed the recorded hosted Fly catalog dry run through fbf94b1. Updated setup to distinguish successful hosted entrypoint execution and cleanup from unverified catalog writes and Redis access. No Fly or runtime operations executed; CI and release gates unchanged.",
+  "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
   "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T23:04:23+10:00",
-  "deploymentId": "dpl_Em48TnWuvDviQKD22K88Zr7xvg8x"
+  "verifiedAt": "2026-09-25T00:03:24+10:00",
+  "deploymentId": "dpl_65ZvyGzmEhVhQugYq3QYx9nVhfiw"
 }
