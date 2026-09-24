@@ -232,6 +232,25 @@ test computer. Never run a computer-control test against a contributor's active
 desktop. M1's harness does not open a desktop session or invoke a remote
 adapter.
 
+## Hosted CI evidence
+
+Recorded for task row M1-04, which asks for the exact commit, runner and
+command. Hosted GitHub Actions runs again since 2026-09-24; the dated local
+results above are unchanged by it.
+
+| Commit | Run and job | Runner | Command | Result |
+| --- | --- | --- | --- | --- |
+| `50b12df` | 36006258279, `M1 real-socket acceptance (Redis)` 107655066179 | ubuntu-latest (ubuntu-24.04), Redis `8.4.0-alpine` service container | `cargo test -p tunnel-catalog --test redis_catalog --locked -- --ignored`; `cargo run --locked -p tunnel-test-harness -- verify`; `bash scripts/m1-redis-restart-verify.sh`; `sh scripts/m6-redis-restart-verify.sh` | success; `M1 acceptance passed: clients=5 echo_requests=21 ... auth_rejections=4` |
+| `50b12df` | 36006258279, `M1 real-socket acceptance (macOS, Redis)` 107655066592 | macos-latest (macos-26-arm64), Homebrew Redis 8.10.1 started by the job | the `redis_catalog` tests and `verify` as above; the two restart scripts need Docker and are Linux-only | success; same acceptance line |
+| `50b12df` | 36006258279, `Rust (ubuntu-latest)`, `Rust (macos-latest)`, `Rust (windows-latest)` | ubuntu-24.04, macos-26-arm64, windows-2025-vs2026 | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace --all-targets --locked --no-fail-fast` (Windows adds `--exclude tunnel-relay`, M6-C83); the example-configuration dry runs | success on all three |
+
+There is **no Windows M1 acceptance**: the relay refuses to start off Unix
+(M6-C83) and credential creation and import are unsupported there. Whether
+Windows is advertised as a client-only target is an open owner decision on
+M1-04. The hosted Linux acceptance is **not reliably green**: its pre-body
+admission assertion has failed on four hosted runs (M6-C85, still
+undiagnosed), so one green run is not a repeated acceptance.
+
 ## Required checks and evidence
 
 The required repository checks are:

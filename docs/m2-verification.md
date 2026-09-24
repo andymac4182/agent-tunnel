@@ -14,6 +14,17 @@ verification does not claim a released alpha or implemented remote adapters.
 | Actual default | Three rotations at the 300-second policy, generations 1–4, 903.05 seconds, with traffic and cleanup. |
 | Targeted faults | Retained data recovery, deterministic pre-commit candidate abort, control loss, cancellation and revocation pass with bounded cleanup. |
 
+**Rerun on 2026-09-24 at `50b12df` (task rows M2-05 and M2-06).** Every
+command in the validation list below passed locally on macOS arm64, including
+three actual 300-second rotations (`verify-m2-default`, `rotations=3
+records=99635 replayed_frames=0`) and the fault suite, and on hosted CI run
+36006258279 (job `M2 rotation and recovery (Redis)` 107655066699, ubuntu-24.04:
+accelerated with faults, then the default plan). The M2 contract through M7
+owner forwarding (non-owner ingress, three rotations with replacement data
+carriers, no per-direction sequence reset, owner loss as an interruption) is
+enforced by the I08 rotation gates' validators since `3026dd2`; see M2-06 in
+[the task tracker](tasks.md). The table above keeps its historical figures.
+
 The default run used the final runtime. A subsequent harness-only cleanup
 adjustment accepts terminal socket errors when a peer Close frame was already
 observed; the updated accelerated and fault suites passed separately. It does
