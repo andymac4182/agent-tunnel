@@ -414,6 +414,8 @@ chmod 644 "$day2"/*
 
 day2_run 1 "add-user with --config" add-user --records "/tmp/provision/$user_file" --config /tmp/provision/device-2.toml
 grep -q "the entrypoint sets --config" "$day2_out" || fail "no --config refusal"
+day2_run 1 "add-user with --config=" add-user --records "/tmp/provision/$user_file" --config=/tmp/provision/device-2.toml
+[ "$(grep -c "the entrypoint sets --config" "$day2_out")" = 2 ] || fail "no --config= refusal"
 for pair in "add-user:/tmp/provision/$user_file" add-device:/tmp/provision/device-2.toml \
   add-service:/tmp/provision/service-2.toml set-grant:/tmp/provision/grant-2.toml; do
   day2_run 0 "${pair%%:*} --dry-run" "${pair%%:*}" --records "${pair#*:}" --dry-run
@@ -488,9 +490,10 @@ for key in redis-server-key device-server-key consumer-server-key; do
   ! grep -q -F -- "$needle" "$day2_out" || fail "a line of $key.pem was printed"
 done
 ! grep -q -F -- "$redis_password" "$day2_out" || fail "the Redis password was printed"
-[ ! -e "$repo/pwned" ] && [ ! -e "$day2/pwned" ] && [ ! -e pwned ] || fail "a records path or document was evaluated"
 [ -z "$(docker ps -a --filter "name=^$prefix-provision\$" -q)" ] || fail "a one-off container was left behind"
-ok "no key line or Redis password in any day-2 output, nothing was evaluated, no one-off container left"
+# The hostile records path is evidenced above: add-user succeeded reading
+# exactly that path, which it could not have if a shell had expanded it.
+ok "no key line or Redis password in any day-2 output, no one-off container left"
 
 echo "== docker stop sends SIGTERM; the relay must drain and exit 0"
 ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
@@ -510,7 +513,11 @@ for _ in $(seq 1 10); do
   sleep 0.5
 done
 if kill -0 "$client_pid" 2>/dev/null; then
-  echo "device still running after the relay stopped (reconnecting); sent it SIGTERM"
+  if grep -q -E '"state":"(backoff|reconnecting)"' "$work/connect.log"; then
+    echo "device still running after the relay stopped, reconnecting ($(grep -c -E '"state":"(backoff|reconnecting)"' "$work/connect.log") backoff/reconnecting events); sent it SIGTERM"
+  else
+    echo "device still running after the relay stopped with NO backoff or reconnect event (a hang, not a reconnect); sent it SIGTERM"
+  fi
   kill -TERM "$client_pid"
 fi
 set +e

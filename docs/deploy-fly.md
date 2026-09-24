@@ -895,26 +895,46 @@ well under one cent each ($0.00000095 a second in `syd`, section 8). Creating
 the records and the device credential is local and free.
 
 **Destroy every one-off machine.** A leftover machine becomes a second relay
-at the next `fly deploy` (section 6.3). The helper below destroys the machine
-whether the command succeeded or not; check `fly machine list -a
-agentuplink-relay` shows only the serving relay when you finish.
+at the next `fly deploy` (section 6.3). The helper below tries to destroy
+its machine on every path: after the command, whether it succeeded or not;
+after a `fly machine run` that failed once the machine existed; and after a
+`fly machine wait` that timed out, by stopping the machine first, because
+`destroy` without `--force` refuses a running one. It cannot cover a flyctl or
+network failure in the middle of those calls, so **always finish with `fly
+machine list -a agentuplink-relay`** and check it shows only the serving
+relay; destroy anything else as section 6.3 does.
 
-The helper is section 6.2's five commands in order. It needs `jq`. It stops if
-the machine did not start or cannot be found. The command's exit code is in
-the `fly machine status` events: `0` for success, `1` for any refusal, and the
-log line names the reason:
+The helper is section 6.2's five commands in order. It needs `jq`. The
+command's exit code is in the `fly machine status` events: `0` for success,
+`1` for any refusal, and the log line names the reason. If the helper had to
+stop a write command that had not finished, the command finished its current
+Redis step on that signal and printed its own outcome (section 6.2); read the
+log before repeating it:
 
 ```text
 cd ~/agentuplink-fly
 IMAGE=registry.fly.io/agentuplink-relay:<label the relay serves>
 # oneoff NAME [--file-local /tmp/provision/FILE=LOCAL]... -- COMMAND ARGS...
+machine_id() {
+  fly machine list -a agentuplink-relay --json | jq -r --arg n "$1" '.[] | select(.name == $n) | .id'
+}
 oneoff() {
   name=$1; shift
-  fly machine run "$IMAGE" --name "$name" -a agentuplink-relay -r syd --restart no --detach "$@" \
-    || { echo "STOP: $name did not start"; return 1; }
-  ID=$(fly machine list -a agentuplink-relay --json | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+  if ! fly machine run "$IMAGE" --name "$name" -a agentuplink-relay -r syd --restart no --detach "$@"; then
+    echo "STOP: $name did not start"
+    ID=$(machine_id "$name")
+    if [ -n "$ID" ]; then
+      fly machine stop "$ID" -a agentuplink-relay
+      fly machine destroy "$ID" -a agentuplink-relay
+    fi
+    return 1
+  fi
+  ID=$(machine_id "$name")
   [ -n "$ID" ] || { echo "STOP: no machine named $name"; return 1; }
-  fly machine wait "$ID" -a agentuplink-relay --state stopped
+  if ! fly machine wait "$ID" -a agentuplink-relay --state stopped; then
+    echo "$name did not stop in time; stopping it"
+    fly machine stop "$ID" -a agentuplink-relay
+  fi
   fly logs -a agentuplink-relay --machine "$ID" --no-tail
   fly machine status "$ID" -a agentuplink-relay
   fly machine destroy "$ID" -a agentuplink-relay
@@ -927,9 +947,25 @@ Free, on the Mac: the tester's user, device and grant. The tester creates the
 device key and certificate request on their own machine with
 `tunnel-client credentials create`, exactly as in [operator.md section
 2.1](operator.md#21-device-credentials), with their own device UUID and export
-(service) UUID in the profile, and sends you only the request. Sign it with
-`device-ca.pem` (section 3.1) and a `urn:agent-tunnel:device:<device UUID>`
-SAN, and send back the certificate and `relay-ca.pem`. Then write the four
+(service) UUID in the profile, and sends you only the request; save it as
+`~/agentuplink-fly/tester-2/device.csr`. Sign it with
+`device-ca.pem` (section 3.1), with an extensions file so the certificate is
+X.509 v3 with `clientAuth` and the device's
+`urn:agent-tunnel:device:<device UUID>` SAN (without `-extfile`, macOS's
+`openssl x509 -req` issues a v1 certificate with no SAN, which `add-device`
+refuses):
+
+```text
+cd ~/agentuplink-fly/tester-2
+DEVICE=<device UUID>
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:%s\n' "$DEVICE" > device.ext
+openssl x509 -req -in device.csr -CA ../device-ca.pem -CAkey ../device-ca-key.pem \
+  -CAcreateserial -days 90 -extfile device.ext -out device-cert.pem
+openssl x509 -in device-cert.pem -noout -text | grep -E 'Version|URI:|TLS Web Client'
+```
+
+Expect `Version: 3`, the `URI:urn:agent-tunnel:device:` SAN and `TLS Web
+Client Authentication`. Send back the certificate and `relay-ca.pem`. Then write the four
 records documents in `~/agentuplink-fly/tester-2/`, as in [operator.md section
 2.5](operator.md): `user.toml` (the tenant of `catalog.toml`, a new user UUID,
 and the `sub` your issuer gives the tester as `oidc_subject`), `device.toml`
@@ -938,14 +974,24 @@ and the `sub` your issuer gives the tester as `oidc_subject`), `device.toml`
 The files go to the same directory in the machine, so the relative
 `certificate` path still works.
 
-**Costs money: four or five one-off machines, a few seconds each.** First
-the dry run, which checks every document against the image's configuration and
-contacts no Redis, then the four writes in this order:
+**Costs money: eight one-off machines, a few seconds each.** First the four
+dry runs, which check every document against the image's configuration and
+contact no Redis. `add-device --dry-run` is the one most likely to catch a
+mistake: it checks the certificate's SAN names `device.id` and its validity
+window. Do not start the writes until all four dry runs exit `0`. Then the
+four writes in this order:
 
 ```text
 cd ~/agentuplink-fly/tester-2
 oneoff user2-dry --file-local /tmp/provision/user.toml=user.toml \
   -- add-user --records /tmp/provision/user.toml --dry-run
+oneoff device2-dry --file-local /tmp/provision/device.toml=device.toml \
+  --file-local /tmp/provision/device-cert.pem=device-cert.pem \
+  -- add-device --records /tmp/provision/device.toml --dry-run
+oneoff service2-dry --file-local /tmp/provision/service.toml=service.toml \
+  -- add-service --records /tmp/provision/service.toml --dry-run
+oneoff grant2-dry --file-local /tmp/provision/grant.toml=grant.toml \
+  -- set-grant --records /tmp/provision/grant.toml --dry-run
 oneoff user2 --file-local /tmp/provision/user.toml=user.toml \
   -- add-user --records /tmp/provision/user.toml
 oneoff device2 --file-local /tmp/provision/device.toml=device.toml \
@@ -959,7 +1005,7 @@ fly machine list -a agentuplink-relay
 ```
 
 Success lines: `Catalog change is valid for namespace ... This dry run
-contacted no Redis authority and wrote nothing.` for the dry run, `Added to
+contacted no Redis authority and wrote nothing.` for each dry run, `Added to
 namespace ...` for each addition, and `Added grant ... revision=1` for the
 grant. **Keep `add-device`'s log line:** its `credential=` is what
 `revoke-credential` needs, and nothing lists credentials. A refusal exits
@@ -1051,29 +1097,27 @@ development differ only in the stop time.
 | Device listener, TLS client without a certificate | `tlsv13 alert certificate required` |
 | Host `tunnel-client` with its device certificate, then a consumer echo | HTTP 200, body = canary + payload |
 | `docker stop -t 60` on the relay with the device connected | `tunnel-relay stopping: signal=SIGTERM`, `stopped: signal=SIGTERM`, exit `0`, 407 ms |
-| The device when the relay stopped | exit `4`, `TRANSPORT_ERROR`, retryable |
+| The device when the relay stopped | At `b459155`: exit `4`, `TRANSPORT_ERROR`, retryable. At `332cf39`, a client with reconnect (M6-C23): it does not exit, it backs off and retries; the proof stops it after 5 s (M6-C92), exit `130`, `CANCELLED` "while waiting to reconnect (attempt 3, after TRANSPORT_ERROR)" |
 | A second relay on the same Redis | serves; the device reconnects and echoes |
 | `docker stop` on Redis | exit `0`, "Redis is now ready to exit" |
-| The running relay while Redis is down, and after Redis restarted with a new `run_id` (AOF kept 24 keys) | `/readyz` ready both times; echo `503` `AUTHORIZATION_UNAVAILABLE`, `not_dispatched`; the device session ended, exit `4` |
-| A fresh relay on the restarted Redis | exit `1`, `Redis catalog connection failed; stage=authority_identity` |
+| The running relay while Redis is down, and after Redis restarted with a new `run_id` | At `b459155` (AOF kept 24 keys): `/readyz` ready both times; echo `503` `AUTHORIZATION_UNAVAILABLE`, `not_dispatched`; the device session ended, exit `4`. At `332cf39` (AOF kept 43 keys, the day-2 records included): `/readyz` ready both times; echo `503` while down and `503` `DEVICE_OFFLINE`, `not_dispatched` 3 s after the restart; the device was still reconnecting (`OWNER_BUSY`), so the proof stopped it, exit `130` |
+| A fresh relay on the restarted Redis | At `b459155`: exit `1`, `Redis catalog connection failed; stage=authority_identity`. At `332cf39`, with M6-C65: still running after 5 s, `tunnel-relay listening` and `Redis restart continuity: interval_seconds=5` |
 | Memory with one device connected (`docker stats`) | relay 2.6 MiB, Redis 6.1 MiB |
 
 **Re-run for M6-C91** on the committed tree: log nonce
 `m6c60-proof-20260924T111646Z-86279`, head `332cf39`, 0 uncommitted paths,
 arm64 relay image `ddb0496c8ea8`, a `tunnel-client` built from the same tree,
-exit `0`. Every check above that the script asserts passed again. Two rows of
-the table above describe the older binaries and are superseded by this run:
-a device with reconnect (M6-C23) does not exit when the relay stops, so the
-proof now gives it 5 s and then stops it (M6-C92; it printed `sent it
-SIGTERM`, device exit `130`); and with M6-C65 a fresh relay on the restarted
-Redis kept running (`Redis restart continuity: interval_seconds=5`). The day-2
-phase, each command in its own one-off container, with `serve` running:
+exit `0`. Every check above that the script asserts passed again. The three
+rows above that changed with the newer binaries (the device when the relay
+stopped, the relay across a Redis restart, a fresh relay on the restarted
+Redis) give both runs' results. The day-2 phase, each command in its own
+one-off container, with `serve` running:
 
 | Check | Result |
 | --- | --- |
-| An unknown command; `add-user ... --config ...` | both refused by the entrypoint, exit `1` |
+| An unknown command; `add-user ... --config X`; `add-user ... --config=X` | all refused by the entrypoint, exit `1` |
 | All seven catalog commands with `--dry-run` | exit `0`, each `This dry run contacted no Redis authority and wrote nothing.` |
-| `add-user`, with a records path holding a space, `$(...)`, a backquote and a quote | exit `0`; the same again exit `1`, `catalog conflict: user already exists` |
+| `add-user`, with a records path holding a space, `$(...)`, a backquote and a quote | exit `0`, so `tunnel-relay` read exactly that path, unexpanded; the same again exit `1`, `catalog conflict: user already exists` |
 | `add-device` (certificate from the proof's device CA), `add-service`, `set-grant` | exit `0` each; the grant `revision=1` |
 | The new tester's echo through the new device | HTTP 200, body = canary + payload, no relay restart |
 | `revoke-grant`, then that echo | exit `0`; HTTP 404 `DEVICE_NOT_FOUND` |
