@@ -1663,6 +1663,19 @@ mod tests {
         );
     }
 
+    /// Redaction is checked in both directions (M0-06).
+    ///
+    /// The absence assertions alone could not tell redaction from deletion:
+    /// reducing either `Debug` impl to `write_str("RecoveryWorkflowConfig")`
+    /// left every one of them passing.  So the rendering is compared **whole**
+    /// against the exact redacted form.  That pins three things at once: every
+    /// secret and path is absent, each redacted field still appears with its
+    /// marker (`<redacted>` or a presence boolean) so an operator can see the
+    /// input was supplied, and the correlation identifiers `runtime.md`
+    /// requires diagnostics to carry (`deployment_id`, `redis_namespace`,
+    /// `deployment_incarnation`, the quiescence declaration) survive.  A
+    /// change that deletes the diagnostic, drops a field, or over-redacts an
+    /// identifier fails here, and so does one that leaks.
     #[test]
     fn workflow_debug_redacts_authority_credentials_and_control_paths() {
         let config = RecoveryWorkflowConfig {
@@ -1672,13 +1685,36 @@ mod tests {
             deployment_incarnation: "incarnation-b".to_owned(),
             fence_path: PathBuf::from("/owner/private/recovery-fence.json"),
             trusted_keys_path: PathBuf::from("/owner/private/trusted-keys.json"),
-            redis_tls_material: RedisTlsMaterialPaths::default(),
+            redis_tls_material: RedisTlsMaterialPaths {
+                root_ca_path: Some(PathBuf::from("/owner/private/redis-ca.pem")),
+                client_cert_path: None,
+                client_key_path: None,
+            },
         };
         let rendered = format!("{config:?}");
-        assert!(!rendered.contains("super-secret"));
-        assert!(!rendered.contains("redis.example.test"));
-        assert!(!rendered.contains("recovery-fence.json"));
-        assert!(!rendered.contains("trusted-keys.json"));
+        for secret in [
+            "super-secret",
+            "operator:",
+            "redis.example.test",
+            "recovery-fence.json",
+            "trusted-keys.json",
+            "redis-ca.pem",
+            "/owner/private",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "config rendering leaked {secret:?}: {rendered}"
+            );
+        }
+        assert_eq!(
+            rendered,
+            "RecoveryWorkflowConfig { has_redis_url: true, deployment_id: \"deployment-a\", \
+             redis_namespace: \"cluster-a\", deployment_incarnation: \"incarnation-b\", \
+             fence_path: \"<redacted>\", trusted_keys_path: \"<redacted>\", \
+             redis_tls_material: RedisTlsMaterialPaths { has_root_ca_path: true, \
+             has_client_cert_path: false, has_client_key_path: false } }",
+            "the redacted config must keep its correlation identifiers and redaction markers"
+        );
 
         let request = RecoverRequest {
             expected_nonce: "externally-supplied-secret-challenge".to_owned(),
@@ -1690,8 +1726,23 @@ mod tests {
             },
         };
         let rendered = format!("{request:?}");
-        assert!(!rendered.contains("externally-supplied-secret-challenge"));
-        assert!(!rendered.contains("approval.json"));
+        for secret in [
+            "externally-supplied-secret-challenge",
+            "approval.json",
+            "/owner/private",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "request rendering leaked {secret:?}: {rendered}"
+            );
+        }
+        assert_eq!(
+            rendered,
+            "RecoverRequest { has_expected_nonce: true, approval_path: \"<redacted>\", \
+             quiescence: QuiescenceAcknowledgement { declaration_id: \
+             \"operator-declaration-1\", old_primary_fenced: true, old_relays_fenced: true } }",
+            "the redacted request must keep its declaration identity and redaction markers"
+        );
     }
 
     fn write_private_control_file(path: &Path, bytes: &[u8]) {

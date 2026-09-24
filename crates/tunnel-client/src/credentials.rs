@@ -486,6 +486,48 @@ mod tests {
         assert!(create_csr(&config, &csr_path).is_err());
     }
 
+    /// M1-05, owner-only key handling: the locally generated private key is
+    /// created `0600` inside a directory created `0700`, and the CSR written
+    /// beside it carries no private key.  The CSR test above only proved the
+    /// files exist and are not overwritten, so a key written world-readable
+    /// would have passed it.
+    #[test]
+    #[cfg(unix)]
+    fn a_created_device_key_is_owner_only_and_absent_from_the_csr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("temporary directory");
+        let mut config = RuntimeConfig::default();
+        let key_dir = dir.path().join("private");
+        config.credentials.client_key = key_dir.join("device-key.pem");
+        let csr_path = dir.path().join("device.csr.pem");
+        create_csr(&config, &csr_path).expect("create CSR");
+
+        let key_mode = fs::metadata(&config.credentials.client_key)
+            .expect("key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o600, "device key mode {key_mode:o}");
+        let dir_mode = fs::metadata(&key_dir)
+            .expect("key directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "device key directory mode {dir_mode:o}");
+
+        let key_pem = fs::read_to_string(&config.credentials.client_key).expect("key");
+        assert!(
+            key_pem.contains("PRIVATE KEY"),
+            "the key file holds the key"
+        );
+        let csr_pem = fs::read_to_string(&csr_path).expect("CSR");
+        assert!(csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
+        assert!(
+            !csr_pem.contains("PRIVATE KEY"),
+            "the CSR must not carry the private key"
+        );
+    }
+
     #[test]
     #[cfg(not(unix))]
     fn provisioning_is_rejected_without_creating_files() {
@@ -746,6 +788,31 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// M1-05, certificate-role separation on import: a relay **peer**
+    /// certificate is refused even when its identifier is this device's own
+    /// UUID and its key matches -- the right name in the wrong role -- and
+    /// nothing is installed.  The relay would refuse it at the device
+    /// listener; refusing it here tells the operator before they try.
+    #[test]
+    #[cfg(unix)]
+    fn a_relay_peer_certificate_is_refused_on_import_even_naming_this_device() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let peer_san = rcgen::SanType::URI(
+            format!("urn:agent-tunnel:peer:{}", material::DEVICE)
+                .try_into()
+                .expect("URI SAN"),
+        );
+        let certificate = material::v3_pem(&key, vec![peer_san]);
+        let (result, dir) = import_with(&key, &certificate);
+        let error = result.expect_err("a peer-role certificate is not a device credential");
+        assert!(
+            matches!(&error, CredentialError::MissingDeviceRole(detail) if detail.contains("relay peer role")),
+            "{error:?}"
+        );
+        assert!(!dir.path().join("installed-cert.pem").exists());
+        assert!(!dir.path().join("installed-ca.pem").exists());
     }
 
     /// The relay compares device identifiers as UUIDs, so an uppercase or
