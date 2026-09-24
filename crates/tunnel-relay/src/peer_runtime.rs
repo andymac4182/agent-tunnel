@@ -1290,15 +1290,15 @@ impl PeerRuntime {
         scope: OwnerScope,
         now: DateTime<Utc>,
     ) -> Result<OwnerRoute, PeerRuntimeError> {
-        let route = self.router.resolve(scope, now, None).await?;
+        let (route, observed_at) = self.router.resolve_observed(scope, now, None).await?;
         let OwnerRoute::Remote { owner, .. } = &route else {
             return Ok(route);
         };
         let binding = self
             .bindings
-            .binding(&owner.token.node_id, &owner.token.boot_id, now)
+            .binding(&owner.token.node_id, &owner.token.boot_id, observed_at)
             .await?;
-        if binding.valid_until() <= now
+        if binding.valid_until() <= observed_at
             || binding.node_id() != owner.token.node_id
             || binding.boot_id() != owner.token.boot_id
         {
@@ -1308,7 +1308,7 @@ impl PeerRuntime {
         // generation of the same node (M7-C107).  A cached remote owner is
         // still never used without current signed trust evidence.
         self.router
-            .bind_remote(scope, owner.clone(), now, &binding)
+            .bind_remote(scope, route, observed_at, &binding)
             .await
             .map_err(Into::into)
     }

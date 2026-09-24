@@ -1760,7 +1760,13 @@ async fn run_no_fallback_and_zero_rtt_case(
     let handler = move |_identity: TlsIdentity, _request: Request<()>, stream: PeerServerStream| {
         handler_admissions.fetch_add(1, Ordering::SeqCst);
         async move {
-            let (mut send, _recv) = stream.split();
+            let (mut send, mut recv) = stream.split();
+            // Read the request to its end before answering.  A handler that
+            // answered and returned first dropped its receive half, whose
+            // STOP_SENDING could reach the client before the client had
+            // finished its request, failing the positive control's own
+            // `finish` with "Remote reset: 0x0" (M7-C117).
+            while recv.recv_chunk().await?.is_some() {}
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .body(())

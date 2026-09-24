@@ -225,6 +225,20 @@ impl RelayNodeFixture {
         self.ports.take_udp()
     }
 
+    /// Transfer the reserved UDP socket for this node's QUIC listener and
+    /// release the TCP reservation, which no QUIC-only relay uses.
+    ///
+    /// Releasing the UDP reservation and binding its address again later is a
+    /// race: anything else binding an ephemeral port in between, a sibling
+    /// relay's peer client or UDP proxy among them, can be given that port,
+    /// and the listener then fails `Address already in use` (M7-C118).  Bind
+    /// the listener on the returned socket with [`quic_server_on`] instead.
+    pub fn take_quic_socket(&mut self) -> Result<UdpSocket> {
+        let socket = self.ports.take_udp()?;
+        self.ports.release();
+        Ok(socket)
+    }
+
     /// Release both reservations.  The node's addresses remain available for
     /// diagnostics, but a later listener may bind them after this call.
     pub fn release_ports(&mut self) {
@@ -235,6 +249,22 @@ impl RelayNodeFixture {
     pub fn ports_reserved(&self) -> bool {
         self.ports.is_fully_reserved()
     }
+}
+
+/// Start a QUIC server endpoint on an already bound, reserved UDP socket.
+pub fn quic_server_on(
+    config: quinn::ServerConfig,
+    socket: UdpSocket,
+) -> std::io::Result<quinn::Endpoint> {
+    let runtime = quinn::default_runtime().ok_or_else(|| {
+        std::io::Error::other("no async runtime is available for the QUIC endpoint")
+    })?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        runtime,
+    )
 }
 
 /// Compatibility aliases for the cluster crate's canonical payload types.
@@ -942,5 +972,46 @@ mod tests {
         assert_eq!(fanout.node_for(IngressKind::ActiveData), "relay-b");
         assert_eq!(fanout.node_for(IngressKind::ReplacementData), "relay-c");
         assert_eq!(fanout.node_for(IngressKind::Consumer), "relay-b");
+    }
+
+    /// Task row M7-C118: a QUIC listener started on a node's reserved socket
+    /// holds that node's address throughout, while the old release-then-bind
+    /// path leaves a window in which anything else can take the port.
+    #[tokio::test]
+    async fn quic_listener_binds_the_reserved_socket_without_releasing_its_port() {
+        let pki = FixturePki::new().expect("fixture PKI");
+        let mut fixture = ClusterFixture::new(&pki).expect("cluster fixture");
+        let server_config = |node: &super::RelayNodeFixture| {
+            tunnel_transport::load_peer_server_config_from_pem(
+                node.peer_certificate_chain_pem().as_bytes(),
+                node.peer_certificate.private_key_pem.as_bytes(),
+                node.peer_ca_pem().as_bytes(),
+            )
+            .expect("peer server TLS")
+        };
+
+        let reserved = fixture.nodes[0].addresses.udp;
+        let socket = fixture.nodes[0]
+            .take_quic_socket()
+            .expect("take the QUIC reservation");
+        assert!(
+            UdpSocket::bind(reserved).is_err(),
+            "the reserved port was free to take"
+        );
+        let endpoint = super::quic_server_on(server_config(&fixture.nodes[0]), socket)
+            .expect("listener on the reserved socket");
+        assert_eq!(endpoint.local_addr().expect("listener address"), reserved);
+        endpoint.close(0_u32.into(), b"test done");
+
+        // Control: releasing first lets another socket take the port, and
+        // the listener then fails exactly as the hosted gate did.
+        let released = fixture.nodes[1].addresses.udp;
+        fixture.nodes[1].release_ports();
+        // If this bind fails, something else already took the released port,
+        // which is the race itself; either way the port is now held.
+        let _thief = UdpSocket::bind(released).ok();
+        let error = quinn::Endpoint::server(server_config(&fixture.nodes[1]), released)
+            .expect_err("rebinding a taken port");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
 }

@@ -295,6 +295,27 @@ impl Sentinel {
     pub fn has_value(&self, value: &[u8]) -> bool {
         self.value == value
     }
+
+    /// Replace every exact occurrence of this value in `text` with a typed
+    /// placeholder naming only the sentinel's kind.
+    ///
+    /// Like [`Self::has_value`], a transformation rather than an accessor: the
+    /// value is compared inside this type and never handed out.
+    pub fn redact(&self, text: &[u8]) -> Vec<u8> {
+        let placeholder = format!("[redacted:{}]", self.kind.label());
+        let mut output = Vec::with_capacity(text.len());
+        let mut index = 0;
+        while index < text.len() {
+            if text[index..].starts_with(&self.value) {
+                output.extend_from_slice(placeholder.as_bytes());
+                index += self.value.len();
+            } else {
+                output.push(text[index]);
+                index += 1;
+            }
+        }
+        output
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

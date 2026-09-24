@@ -683,17 +683,18 @@ impl RawStream {
 pub(crate) async fn start_running(setup: FixtureSetup) -> Result<RunningFixture> {
     let pki = FixturePki::new()?;
     let mut cluster = ClusterFixture::new(&pki)?;
-    cluster
+    // The owner's listener takes its reserved UDP socket (M7-C118).
+    let owner_socket = cluster
         .node_mut(OWNER_NODE_ID)
         .ok_or_else(|| HarnessError::InvalidInput("ec044 owner node missing".to_owned()))?
-        .release_ports();
+        .take_quic_socket()?;
     cluster
         .node_mut(SOURCE_NODE_ID)
         .ok_or_else(|| HarnessError::InvalidInput("ec044 source node missing".to_owned()))?
         .release_ports();
 
     let source_binding = verified_binding(&cluster, SOURCE_NODE_ID)?;
-    start_fixture(&cluster, source_binding, setup).await
+    start_fixture(&cluster, source_binding, setup, owner_socket).await
 }
 
 /// Run the EC-044 peer-path frame gate.
@@ -1572,6 +1573,7 @@ async fn start_fixture(
     cluster: &ClusterFixture,
     source_binding: VerifiedPeerBinding,
     setup: FixtureSetup,
+    owner_socket: std::net::UdpSocket,
 ) -> Result<RunningFixture> {
     let owner = cluster
         .node(OWNER_NODE_ID)
@@ -1615,7 +1617,7 @@ async fn start_fixture(
         owner.peer_ca_pem().as_bytes(),
     )
     .map_err(|error| HarnessError::Pki(format!("ec044 server TLS: {error}")))?;
-    let server_endpoint = quinn::Endpoint::server(server_config, owner.addresses.udp)
+    let server_endpoint = crate::cluster_fixture::quic_server_on(server_config, owner_socket)
         .map_err(|error| HarnessError::Http(format!("binding ec044 peer server: {error}")))?;
     let server_pins = SharedPeerPins::new(
         ApprovedPeerPins::new([source_pin])

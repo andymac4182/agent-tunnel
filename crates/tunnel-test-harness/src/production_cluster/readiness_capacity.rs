@@ -1566,12 +1566,14 @@ async fn wait_for_owner(
     resources: &mut CapacityResources,
 ) -> Result<OwnerToken> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
+    // The last catalog owner and target-relay session this loop saw, so a
+    // timeout names which half never arrived (M7-C87's named gate failed with
+    // only the bound in its message).
+    let mut last_observed = "no poll completed".to_owned();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(HarnessError::Timeout(
-                "peer-capacity CLI did not establish an active owner within its bound".into(),
-            ));
+            break;
         }
         let exited = resources
             .processes
@@ -1604,6 +1606,13 @@ async fn wait_for_owner(
                 ));
             }
         };
+        last_observed = match &owner {
+            None => "catalog_owner=none".to_owned(),
+            Some(owner) => format!(
+                "catalog_owner_node={} epoch={}",
+                owner.token.node_id, owner.token.epoch
+            ),
+        };
         if let Some(owner) = owner
             && owner.token.node_id == TARGET_NODE
         {
@@ -1631,6 +1640,22 @@ async fn wait_for_owner(
             if owner_ready {
                 return Ok(owner.token);
             }
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.device_id == device.id.to_string());
+            last_observed = match session {
+                None => format!("{last_observed} target_session=none"),
+                Some(session) => format!(
+                    "{last_observed} target_session_epoch={} same_session={} phase={} sockets={} active_connection={} candidate={:?}",
+                    session.epoch,
+                    session.session_id == owner.token.session_id,
+                    session.phase,
+                    session.sockets,
+                    !session.active_connection_id.is_empty(),
+                    session.candidate_generation,
+                ),
+            };
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1638,9 +1663,9 @@ async fn wait_for_owner(
         }
         let _ = timeout(remaining, sleep(POLL_INTERVAL)).await;
     }
-    Err(HarnessError::Timeout(
-        "peer-capacity CLI did not establish an active owner within its bound".into(),
-    ))
+    Err(HarnessError::Timeout(format!(
+        "peer-capacity CLI did not establish an active owner within its bound: last_observed={last_observed}"
+    )))
 }
 
 fn peer_admission_harness_error(stage: &str, error: PeerRuntimeError) -> HarnessError {

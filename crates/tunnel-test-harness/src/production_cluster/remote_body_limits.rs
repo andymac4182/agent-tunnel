@@ -455,18 +455,49 @@ enum CloseOutcome {
 /// Send raw public frames on a fresh stream and report whether the relay
 /// closes it within the rejection budget.  Any Binary response is a failure
 /// classification (`Echoed`), never a success.
+///
+/// Every caller sends a frame the relay must refuse.  The relay may refuse it
+/// from the WebSocket frame header alone (a frame above its configured frame
+/// bound) and close while this side is still writing the payload; the unread
+/// bytes then make the relay's kernel reset the connection, so the write fails
+/// with `EPIPE` or `ECONNRESET` and the relay's Close frame, if it sent one, can
+/// be discarded with the reset (task row M7-C115).  That failure is the relay
+/// closing the stream, so it is observed as the close, with its latency, and
+/// the socket is still drained for a Close or an echo within the same budget.
+/// Any other send failure remains an error, and the owner read and dispatch
+/// counters the caller checks are unchanged by this.
 async fn probe_rejection(stream: &mut ConsumerStream, frames: &[Vec<u8>]) -> Result<CloseOutcome> {
     let started = Instant::now();
+    let mut closed_during_send = None;
     for frame in frames {
-        stream
+        match stream
             .socket
             .send(Message::Binary(frame.clone().into()))
             .await
-            .map_err(|error| {
-                HarnessError::Http(format!("remote body limits probe send failed: {error}"))
-            })?;
+        {
+            Ok(()) => {}
+            Err(error) if relay_closed_during_send(&error) => {
+                closed_during_send = Some(started.elapsed());
+                break;
+            }
+            Err(error) => {
+                return Err(HarnessError::Http(format!(
+                    "remote body limits probe send failed: {error}"
+                )));
+            }
+        }
     }
     let deadline = started + REJECTION_CLOSE_BUDGET;
+    if let Some(elapsed) = closed_during_send {
+        // The transport is gone; read whatever the relay delivered before it
+        // closed.  Only an echo changes the outcome.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        stream.closed = true;
+        return match timeout(remaining, stream.socket.next()).await {
+            Ok(Some(Ok(Message::Binary(_)))) => Ok(CloseOutcome::Echoed),
+            _ => Ok(CloseOutcome::Closed(elapsed)),
+        };
+    }
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -489,6 +520,20 @@ async fn probe_rejection(stream: &mut ConsumerStream, frames: &[Vec<u8>]) -> Res
             }
             Ok(Some(Ok(_))) => {}
         }
+    }
+}
+
+/// Whether a send failed because the relay had already closed the connection:
+/// a reset or broken pipe on the socket, or the WebSocket already closed.
+fn relay_closed_during_send(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ),
+        Error::ConnectionClosed | Error::AlreadyClosed => true,
+        _ => false,
     }
 }
 

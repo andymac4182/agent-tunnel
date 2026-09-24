@@ -555,6 +555,104 @@ async fn redis_authority_clock_bounds_expiry_checks() {
         .expect("cleanup clock fixture namespace");
 }
 
+/// Task row M7-C114: an owner whose lease has expired may not release the
+/// hash it names, even in the window where Redis has not yet removed the key.
+///
+/// `current_owner` reports an owner absent once the authority's microsecond
+/// clock reaches `lease_expires_at_us`, but the key's `PEXPIREAT` is at
+/// millisecond granularity and Redis removes it only when its clock is
+/// strictly past that, so for about a millisecond the hash of an expired owner
+/// is still present.  A compare-and-release landing there used to delete it
+/// and report success; the hosted `verify-m7-owner-lease-expiry` run failed
+/// on exactly that (`stale_release_refused_after_expiry`).  The test builds
+/// that state directly: the lease field in the past, the key's TTL ahead.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn redis_expired_owner_release_is_refused_while_the_key_is_still_present() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M1 Redis harness must set TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-expired-release-{}", Uuid::new_v4());
+    let catalog = RedisCatalog::connect_for_recovery(&url, &namespace, "fixture-incarnation")
+        .await
+        .expect("connect Redis catalog");
+    catalog
+        .activate_deployment_incarnation()
+        .await
+        .expect("activate explicit fixture incarnation");
+    let fixture = fixture();
+    catalog.seed_fixture(&fixture).await.expect("seed fixture");
+    let tenant_id = fixture.tenants[0].tenant_id;
+    let device_id = fixture.devices[0].device_id;
+    let claim = |session: &str| OwnerClaimRequest {
+        deployment_incarnation: "fixture-incarnation".into(),
+        tenant_id,
+        device_id,
+        node_id: "node-a".into(),
+        boot_id: "boot-a".into(),
+        session_id: session.into(),
+        lease_expires_at: Utc::now() + Duration::seconds(30),
+    };
+
+    // Positive control: a live owner's exact release succeeds.
+    let live = catalog.claim_owner(&claim("live")).await.expect("claim");
+    assert!(catalog.release_owner(&live.token).await.expect("release"));
+
+    let expired = catalog
+        .claim_owner(&claim("expired"))
+        .await
+        .expect("reclaim");
+    let client = redis::Client::open(url.as_str()).expect("open Redis client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis client");
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("tunnel-catalog:{namespace}:coord:owner:*"))
+        .query_async(&mut connection)
+        .await
+        .expect("find owner hash");
+    assert_eq!(keys.len(), 1, "one owner hash: {keys:?}");
+    let past = (Utc::now() - Duration::milliseconds(100))
+        .timestamp_micros()
+        .to_string();
+    redis::cmd("HSET")
+        .arg(&keys[0])
+        .arg("lease_expires_at_us")
+        .arg(&past)
+        .query_async::<()>(&mut connection)
+        .await
+        .expect("move the lease into the past");
+    let ttl_ms: i64 = redis::cmd("PTTL")
+        .arg(&keys[0])
+        .query_async(&mut connection)
+        .await
+        .expect("read owner TTL");
+    assert!(
+        ttl_ms > 0,
+        "the key itself must still be present, PTTL {ttl_ms}"
+    );
+
+    assert!(
+        catalog
+            .current_owner(tenant_id, device_id, Utc::now())
+            .await
+            .expect("read owner")
+            .is_none(),
+        "an owner past its lease is absent"
+    );
+    assert!(
+        !catalog
+            .release_owner(&expired.token)
+            .await
+            .expect("release an expired owner"),
+        "an expired owner's compare-and-release was accepted"
+    );
+    catalog
+        .cleanup_fixture_namespace()
+        .await
+        .expect("cleanup expired-release namespace");
+}
+
 /// A caller timestamp that lags the authority by more than the clock-skew
 /// budget but still arrives inside the 2 second authority deadline must be
 /// honoured, not rejected as clock skew.

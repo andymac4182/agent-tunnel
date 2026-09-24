@@ -1874,3 +1874,119 @@ async fn peer_client_treats_a_clean_remote_close_during_drain_as_success() -> Te
     client_shutdown?;
     Ok(())
 }
+
+/// A raw authenticated HTTP/3 owner that admits one request, announces its
+/// planned close, and closes the connection with QUIC application code 0 --
+/// the close every relay shutdown performs -- only when the test says so.
+async fn serve_goaway_then_code_zero_on_signal(
+    endpoint: quinn::Endpoint,
+    admitted: Arc<Notify>,
+    close_now: Arc<Notify>,
+) -> TestResult {
+    let incoming = timeout(CASE_TIMEOUT, endpoint.accept())
+        .await?
+        .ok_or("code-zero-on-signal server saw no incoming connection")?;
+    let connection = timeout(CASE_TIMEOUT, incoming).await??;
+    let quic = h3_quinn::Connection::new(connection.clone());
+    let mut h3_connection =
+        timeout(CASE_TIMEOUT, h3::server::builder().build::<_, Bytes>(quic)).await??;
+    let resolver = timeout(CASE_TIMEOUT, h3_connection.accept())
+        .await??
+        .ok_or("code-zero-on-signal server ended before the first request")?;
+    let (_request, _stream) = resolver.resolve_request().await?;
+    admitted.notify_waiters();
+    let _ = timeout(CASE_TIMEOUT, h3_connection.shutdown(0)).await;
+    timeout(CASE_TIMEOUT, close_now.notified())
+        .await
+        .map_err(|_| "code-zero-on-signal server was never told to close")?;
+    connection.close(quinn::VarInt::from_u32(0), b"code-zero after goaway");
+    endpoint.close(quinn::VarInt::from_u32(0), b"code-zero server shutdown");
+    Ok(())
+}
+
+/// Task row M7-C116: after a peer's GOAWAY, a lease released just before the
+/// peer closes with application code 0 sends this client's driver to write
+/// its GOAWAY acknowledgement into a connection that is already closed.  That
+/// clean close is the end the drain waits for, not a transport failure.
+///
+/// This is the hosted `verify-m7-saturated-peer-frames` cleanup failure
+/// (`Remote error: ApplicationClose: 0x0`): that gate drains its peer
+/// connection with a real GOAWAY while a sibling stream holds a lease, and
+/// its cleanup stops the server before the client.  Whether the close beats
+/// the acknowledgement is a race; the red for this row was taken with a
+/// 200 ms delay injected before the acknowledgement, which the close then
+/// always beats.
+#[tokio::test]
+async fn peer_client_drain_accepts_a_code_zero_close_that_beats_its_goaway_acknowledgement()
+-> TestResult {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("code-zero-ack-client");
+    let server_leaf = pki.issue_peer("code-zero-ack-server");
+    let server_config = load_peer_server_config_from_pem(
+        pki.chain(&server_leaf).as_bytes(),
+        server_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("code-zero ack server TLS config");
+    let endpoint = quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("code-zero ack server endpoint");
+    let destination = PeerDestination::new(
+        endpoint.local_addr().expect("code-zero ack server address"),
+        SERVER_NAME.to_owned(),
+    );
+    let admitted = Arc::new(Notify::new());
+    let close_now = Arc::new(Notify::new());
+    let server = tokio::spawn(serve_goaway_then_code_zero_on_signal(
+        endpoint,
+        Arc::clone(&admitted),
+        Arc::clone(&close_now),
+    ));
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("code-zero ack client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("code-zero ack client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("code-zero ack server pin")
+    ])
+    .expect("code-zero ack client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("code-zero ack client");
+
+    let scenario = async {
+        let connection = client.connect(destination).await?;
+        let lease = connection.open(request()).await?;
+        timeout(CASE_TIMEOUT, admitted.notified())
+            .await
+            .map_err(|_| "code-zero ack server did not admit the stream")?;
+        // Let the driver observe the GOAWAY and wait on the held lease.
+        sleep(GOAWAY_DRAIN_QUIET).await;
+        // Release the lease; the driver goes on to acknowledge.  The peer's
+        // code-zero close follows closely, as a cluster's cleanup does.
+        drop(lease);
+        sleep(Duration::from_millis(50)).await;
+        close_now.notify_one();
+        // Let the driver finish on its own before this client is stopped.
+        sleep(Duration::from_millis(400)).await;
+        drop(connection);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    let client_shutdown = client.shutdown().await;
+    let server_join = timeout(CASE_TIMEOUT, server)
+        .await
+        .map_err(|_| "code-zero ack server did not join")?;
+    scenario?;
+    server_join??;
+    client_shutdown.map_err(|error| {
+        format!(
+            "drain whose GOAWAY acknowledgement lost the race to a code-zero close failed: {error}"
+        )
+    })?;
+    Ok(())
+}

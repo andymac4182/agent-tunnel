@@ -1373,3 +1373,143 @@ async fn peer_readiness_withdrawal_drops_stale_probe_evidence() {
 
     fixture.shutdown().await;
 }
+
+/// Binding provider that verifies every requested node/boot with a fresh
+/// signed membership record, as the live membership runtime would.
+struct SignedBindingProvider;
+
+impl PeerBindingProvider for SignedBindingProvider {
+    fn binding<'a>(
+        &'a self,
+        node_id: &'a str,
+        boot_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> PeerBindingFuture<'a> {
+        Box::pin(async move { Ok(crate::routing::tests::remote_binding(node_id, boot_id, now)) })
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+/// Task row M7-C107, at the layer that failed: a device reconnecting to the
+/// same owner relay takes a new owner epoch on the same node and boot, while
+/// an ingress still holds the previous session's route in its cache.
+/// `PeerRuntime::resolve` must return the epoch the catalog now names.
+///
+/// Red without the wiring: if `resolve` re-resolves through the router with
+/// the binding (the pre-fix code) instead of binding the read it just made,
+/// the cache answers with the superseded epoch 1 and the owner would refuse
+/// every request naming it ("peer request is not for this owner").
+#[tokio::test]
+async fn peer_runtime_resolve_returns_the_read_epoch_not_a_superseded_cached_one() {
+    use tunnel_catalog::{
+        CatalogFixture, FixtureDevice, MembershipRecord, MembershipRole, OwnerClaimRequest,
+        TenantRecord, UserRecord,
+    };
+
+    let tenant_id = uuid::Uuid::from_u128(1);
+    let device_id = uuid::Uuid::from_u128(2);
+    let owner_user_id = uuid::Uuid::from_u128(3);
+    let catalog = Arc::new(MemoryCatalog::new());
+    catalog
+        .seed_fixture(&CatalogFixture {
+            tenants: vec![TenantRecord {
+                tenant_id,
+                display_name: "tenant".to_owned(),
+                active: true,
+            }],
+            users: vec![UserRecord {
+                user_id: owner_user_id,
+                display_name: "owner".to_owned(),
+            }],
+            memberships: vec![MembershipRecord {
+                tenant_id,
+                user_id: owner_user_id,
+                role: MembershipRole::Member,
+                active: true,
+            }],
+            devices: vec![FixtureDevice {
+                tenant_id,
+                device_id,
+                owner_user_id,
+                display_name: "device".to_owned(),
+                active: true,
+                last_seen_at: None,
+            }],
+            ..CatalogFixture::default()
+        })
+        .await
+        .expect("seed device");
+    let claim = |session_id: &str| OwnerClaimRequest {
+        deployment_incarnation: "inc-1".to_owned(),
+        tenant_id,
+        device_id,
+        node_id: "node-b".to_owned(),
+        boot_id: "boot-b".to_owned(),
+        session_id: session_id.to_owned(),
+        lease_expires_at: Utc::now() + chrono::Duration::seconds(30),
+    };
+
+    let directory: Arc<dyn Catalog> = catalog.clone();
+    let router = Arc::new(
+        OwnerRouter::with_cache_ttl(
+            directory,
+            RelayIdentity::new("inc-1", "node-a", "boot-a").expect("identity"),
+            Duration::from_secs(5),
+        )
+        .expect("router"),
+    );
+    let pki = FixturePki::new();
+    let leaf = pki.issue_peer("node-a");
+    let client = PeerClient::new(
+        quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).expect("endpoint"),
+        ApprovedPeerPins::new([spki_sha256_from_der(&leaf.der).expect("pin")]).expect("pins"),
+        PeerTransportLimits::default(),
+    )
+    .expect("peer client");
+    let runtime = PeerRuntime::new(
+        client,
+        router,
+        Arc::new(SignedBindingProvider),
+        "node-a",
+        "boot-a",
+    );
+    let scope = crate::routing::OwnerScope::new(tenant_id, device_id);
+
+    // The previous session: resolved, bound and cached by this ingress.
+    let first = catalog
+        .claim_owner(&claim("session-1"))
+        .await
+        .expect("claim");
+    let route = runtime
+        .resolve(scope, Utc::now())
+        .await
+        .expect("first route");
+    assert_eq!(route.owner_token(), &first.token);
+    assert!(route.peer_binding().is_some());
+
+    // The device reconnects to the same relay: same node and boot, new epoch.
+    assert!(catalog.release_owner(&first.token).await.expect("release"));
+    let second = catalog
+        .claim_owner(&claim("session-2"))
+        .await
+        .expect("reclaim");
+    assert!(second.token.epoch > first.token.epoch);
+    assert_eq!(
+        (second.token.node_id.as_str(), second.token.boot_id.as_str()),
+        ("node-b", "boot-b")
+    );
+
+    let route = runtime
+        .resolve(scope, Utc::now())
+        .await
+        .expect("second route");
+    assert_eq!(
+        route.owner_token(),
+        &second.token,
+        "PeerRuntime::resolve returned a superseded cached owner epoch"
+    );
+    assert!(route.peer_binding().is_some());
+}

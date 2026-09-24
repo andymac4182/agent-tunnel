@@ -2200,8 +2200,11 @@ impl ProductionCluster {
     ) -> Result<Self> {
         let mut fixture =
             ClusterFixture::with_deployment(&harness.pki, DEPLOYMENT_ID, DEPLOYMENT_INCARCATION)?;
+        // Each relay's QUIC listener takes its node's reserved UDP socket
+        // rather than rebinding a released address (M7-C118).
+        let mut reserved_peer_sockets = BTreeMap::new();
         for node in &mut fixture.nodes {
-            node.release_ports();
+            reserved_peer_sockets.insert(node.node_id.clone(), node.take_quic_socket()?);
         }
 
         // Keep the relay's real QUIC listeners on the fixture's reserved
@@ -2445,10 +2448,26 @@ impl ProductionCluster {
                     .and_then(|(target_node_id, barrier)| {
                         (*target_node_id == node.node_id.as_str()).then(|| Arc::clone(barrier))
                     });
+            let Some(peer_socket) = reserved_peer_sockets.remove(&node.node_id) else {
+                let cleanup_errors = shutdown_startup_resources_until(
+                    &mut relays,
+                    &mut peer_proxies,
+                    startup_cleanup_deadline,
+                )
+                .await;
+                return Err(startup_cleanup_error(
+                    HarnessError::InvalidInput(format!(
+                        "relay {} has no reserved peer socket",
+                        node.node_id
+                    )),
+                    cleanup_errors,
+                ));
+            };
             match start_relay(
                 harness,
                 &fixture,
                 node,
+                peer_socket,
                 &files_path,
                 signer_trust_path.clone(),
                 server_ca_path.clone(),
@@ -3231,9 +3250,12 @@ impl ProductionCluster {
             {
                 true
             }
-            Err(StreamConnectFailure::Status { status, .. }) => {
+            Err(StreamConnectFailure::Status { status, body }) => {
+                // M7-C108: name the typed code so the next red says which
+                // refusal the ingress chose instead of only its status.
                 return Err(HarnessError::Http(format!(
-                    "owner-death probe returned unexpected HTTP status {status}"
+                    "owner-death probe returned unexpected HTTP status {status}: {}",
+                    typed_error_fields(body.as_deref())
                 )));
             }
             Err(StreamConnectFailure::Harness(error)) => return Err(error),
@@ -5513,6 +5535,7 @@ async fn start_relay(
     harness: &RunningHarness,
     fixture: &ClusterFixture,
     node: &crate::cluster_fixture::RelayNodeFixture,
+    peer_socket: std::net::UdpSocket,
     files: &Path,
     signer_trust_path: PathBuf,
     server_ca_path: PathBuf,
@@ -5709,7 +5732,7 @@ async fn start_relay(
         .max_connections
         .min(peer_limits.max_streams_per_connection);
     let peer_endpoint =
-        quinn::Endpoint::server(peer_server, node.addresses.udp).map_err(|error| {
+        crate::cluster_fixture::quic_server_on(peer_server, peer_socket).map_err(|error| {
             HarnessError::Process(format!("binding peer {}: {error}", node.node_id))
         })?;
     let client_bind = SocketAddr::new(node.addresses.udp.ip(), 0);
@@ -6882,6 +6905,29 @@ fn is_expected_revocation_close(error: &HarnessError) -> bool {
         }
         _ => false,
     }
+}
+
+/// The typed `code` and `execution` of a relay error envelope, for a failure
+/// message. Only those two fields cross; message text and payload never do.
+fn typed_error_fields(body: Option<&[u8]>) -> String {
+    let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+    else {
+        return "untyped".to_owned();
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| {
+                text.len() <= 64
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .unwrap_or("absent")
+            .to_owned()
+    };
+    format!("code={} execution={}", field("code"), field("execution"))
 }
 
 fn is_explicit_no_owner_response(status: u16, body: Option<&[u8]>) -> bool {

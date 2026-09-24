@@ -315,9 +315,10 @@ async fn run_case(
     if !captured.status.success() {
         let preserved = preserve_child_failure(case.name, &captured);
         return Err(HarnessError::Process(format!(
-            "C11 {} acceptance child exited unsuccessfully: {}{}",
+            "C11 {} acceptance child exited unsuccessfully: {},child_error={}{}",
             case.name,
             child_failure_summary(&captured),
+            child_error_line(&captured),
             preserved.map_or_else(String::new, |path| format!(
                 ",preserved={}",
                 path.to_string_lossy()
@@ -520,7 +521,51 @@ fn preserve_child_failure(case: &str, child: &ChildOutput) -> Option<PathBuf> {
     std::fs::write(&path, &child.stderr.bytes).ok()?;
     let stdout_path = directory.join(format!("c11-child-{case}-{started}.stdout"));
     std::fs::write(&stdout_path, &child.stdout.bytes).ok()?;
+    // The child's own managed processes (the CLI, above all) hold the other
+    // half of a failure; keep them beside the child's streams.
+    for (index, process) in child.inner.iter().enumerate() {
+        let stem = format!("c11-child-{case}-{started}-inner{index}");
+        std::fs::write(directory.join(format!("{stem}.stdout")), &process.stdout).ok()?;
+        std::fs::write(directory.join(format!("{stem}.stderr")), &process.stderr).ok()?;
+    }
     Some(path)
+}
+
+/// The child's own typed failure line, with every recorded fixture value
+/// redacted.
+///
+/// A counts-and-markers summary could not name which check failed, so a
+/// hosted red (M7-C112) left nothing to diagnose from once the runner was
+/// gone. The harness prints its failure as one `tunnel-test-harness: ...` line;
+/// this returns the last such line after replacing every exact value in the
+/// child's sentinel manifest (credentials, payloads, paths, endpoints) with a
+/// typed placeholder, bounded in length, quoted with `{:?}` so control bytes
+/// cannot forge output. The manifest is the same exact-value set the success
+/// path scans for, so a value the scan would reject never reaches the error.
+fn child_error_line(child: &ChildOutput) -> String {
+    const PREFIX: &[u8] = b"tunnel-test-harness:";
+    const MAX_LINE: usize = 2048;
+    let Some(line) = child
+        .stderr
+        .bytes
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| line.starts_with(PREFIX))
+    else {
+        return "none".to_owned();
+    };
+    let mut redacted = line.to_vec();
+    for sentinel in &child.sentinels {
+        redacted = sentinel.redact(&redacted);
+    }
+    let truncated = redacted.len() > MAX_LINE;
+    redacted.truncate(MAX_LINE);
+    let text = String::from_utf8_lossy(&redacted);
+    if truncated {
+        format!("{text:?}...")
+    } else {
+        format!("{text:?}")
+    }
 }
 
 fn child_failure_summary(child: &ChildOutput) -> String {
@@ -1088,5 +1133,64 @@ mod sentinel_manifest_tests {
             read_sentinel_manifest(path.path()).expect("reread sentinel manifest again");
         assert_eq!(sentinels.len(), 1);
         assert_eq!(sentinels[0].kind(), SentinelKind::Credential);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_error_line_tests {
+    use super::{CapturedStream, ChildOutput, Sentinel, SentinelKind, child_error_line};
+    use std::os::unix::process::ExitStatusExt;
+
+    fn child(stderr: &[u8], sentinels: Vec<Sentinel>) -> ChildOutput {
+        let stream = |bytes: &[u8]| CapturedStream {
+            bytes: bytes.to_vec(),
+            overflow: false,
+            read_error: false,
+        };
+        ChildOutput {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: stream(b""),
+            stderr: stream(stderr),
+            inner: Vec::new(),
+            snapshots: Vec::new(),
+            sentinels,
+        }
+    }
+
+    #[test]
+    fn names_the_last_typed_failure_line_with_every_sentinel_redacted() {
+        let stderr = b"{\"level\":\"INFO\"}\n\
+            tunnel-test-harness: earlier line\n\
+            {\"level\":\"WARN\",\"token\":\"tok-SECRET\"}\n\
+            tunnel-test-harness: lifecycle probe to 127.0.0.1:4555 with tok-SECRET failed\n";
+        let sentinels = vec![
+            Sentinel::new(SentinelKind::Credential, b"tok-SECRET".to_vec()).unwrap(),
+            Sentinel::new(SentinelKind::PrivateEndpoint, b"127.0.0.1:4555".to_vec()).unwrap(),
+        ];
+        let line = child_error_line(&child(stderr, sentinels));
+        assert_eq!(
+            line,
+            "\"tunnel-test-harness: lifecycle probe to [redacted:private_endpoint] \
+             with [redacted:credential] failed\""
+        );
+        assert!(!line.contains("tok-SECRET") && !line.contains("4555"));
+    }
+
+    #[test]
+    fn reports_none_when_the_child_printed_no_typed_failure() {
+        assert_eq!(
+            child_error_line(&child(b"{\"level\":\"INFO\"}\n", Vec::new())),
+            "none"
+        );
+    }
+
+    #[test]
+    fn bounds_the_line_and_quotes_control_bytes() {
+        let mut stderr = b"tunnel-test-harness: \x1b[31m".to_vec();
+        stderr.extend(std::iter::repeat_n(b'x', 5000));
+        let line = child_error_line(&child(&stderr, Vec::new()));
+        assert!(line.ends_with("..."));
+        assert!(line.len() < 2100);
+        assert!(!line.contains('\x1b'));
     }
 }
