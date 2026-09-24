@@ -2120,7 +2120,7 @@ cargo run -p tunnel-test-harness --locked -- verify-m3-mcp-cloud-client
 
 M3-03. The gate runs the pinned official Rust MCP SDK (rmcp 3.4.0) as a cloud consumer against the three-relay production cluster: every request carries the consumer bearer token into relay-c's public route, crosses the peer HTTP/3 hop to the owner relay-a, the rotating device data WebSocket and `tunnel-client`, which serves the MCP exports it registers from its own `[exports.<service>.mcp]` configuration, exactly as `tunnel-client connect` does. The relays serve both profiles from a `ServeConfig [http_forward] profiles` table, and each of the four seeded catalog services selects its profile through the `http_forward_profile` capability. The device runs the same short rotation policy as gate 4 (interval 6 s, handshake 2 s, overlap 5 s). A run takes about 160 s.
 
-The desktop fixture is `tunnel-mcp-fixture`: a stdio child per export (one child per request for `mcp-2026-07-28`, one per session for `mcp-2025-11-25`) or its rmcp Streamable HTTP server as a separate loopback process. rmcp 3.4.0 has no TLS client without `reqwest`, which this workspace does not pin, so the gate puts rmcp's own Unix-socket HTTP client behind a byte-copying TLS sidecar: it parses no HTTP, so every header and body byte the relay sees is rmcp's, and so is every disconnect but one. rmcp drains a POST's SSE stream for only 50 ms after its final response and then drops it; when the device's END and FIN reach the ingress later than that, the ingress rightly records the consumer's departure as `HTTP_CANCELLED` (M3-23). The gate's transport ledger therefore reads a POST stream that has already carried its final response on to its end, bounded at 30 s, after rmcp releases it, and counts it as `post_streams_drained_after_response`. A stream released before its response (the 2026 cancellation) is dropped at once, as rmcp dropped it.
+The desktop fixture is `tunnel-mcp-fixture`: a stdio child per export (one child per request for `mcp-2026-07-28`, one per session for `mcp-2025-11-25`) or its rmcp Streamable HTTP server as a separate loopback process. rmcp 3.4.0 has no TLS client without `reqwest`, which this workspace does not pin, so the gate puts rmcp's own Unix-socket HTTP client behind a byte-copying TLS sidecar: it parses no HTTP, so every header and body byte the relay sees is rmcp's, and so is every disconnect but one. rmcp drains a POST's SSE stream for only 50 ms after its final response and then drops it; when the device's END and FIN reach the ingress later than that, the ingress records the consumer's departure as `HTTP_CANCELLED` (M3-23) for a call whose final response was delivered -- accurate about the transport, and an open product question (M3-32). The gate's transport ledger therefore reads a POST stream that has already carried its final response on to its end, bounded at 30 s, after rmcp releases it, and counts it as `post_streams_drained_after_response`. A stream released before its response (the 2026 cancellation) is dropped at once, as rmcp dropped it.
 
 It runs seven cases for each of the four combinations (stdio and Streamable HTTP × both profiles), each with a fresh client:
 
@@ -2178,9 +2178,11 @@ stream admission pauses from QUIESCE to COMMIT, and a request that lands there
 is refused with a retryable `503 PEER_UNAVAILABLE` `not_dispatched` answer and
 a bounded hint (M3-15). The gate resends such a refusal after its hint only
 while the connector's rotation phase is observed frozen, at most a cap derived
-from the rotation handshake budget, exactly as the M3-03 gate does; the same
-body outside a freeze, including a dial refused on an empty pin set, reaches
-its case unchanged. Refusals and resends are printed with the evidence
+from the rotation handshake budget, as the M3-03 gate does. It is recognised
+by its message and a hint of at most 250 ms, not by its code alone: the
+empty-pin-set refusal (M7-C83) shares the code and execution but has its own
+message and a 5000 ms hint, and is never resent. The owner-not-ready body
+outside a freeze reaches its case unchanged. Refusals and resends are printed with the evidence
 (M3-30: on a hosted runner the rotation-span case starts inside the first
 freeze). Everything else on the path is production: relay-c's public route, the
 peer HTTP/3 hop, relay-a's owner actor, the rotating device data WebSocket and
