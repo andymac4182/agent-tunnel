@@ -238,8 +238,10 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M7 I08 partial-response rotation passed: relays={} session={} epoch={} stream={} operation={} fid={} synthetic_operation={} request_record_bytes={} response_record_bytes={} response_frames={} resume_unit={} byte_cursor_resume_supported={} responses_delivered={} checksums_matched={} multi_chunk={} bracketing_commit={} partial_resume_offsets={:?} cursor_gaps={} duplicated_bytes={} rotations_retaining_replay={} rotations={} adapter_shutdown_phase={} adapter_shutdown_in_overlap={} adapter_shutdown_graceful={} post_shutdown_outcome={} socket_high_water={} cleanup_joined={} elapsed_ms={}",
+                        "M7 I08 partial-response rotation passed: relays={} ingress={} owner={} session={} epoch={} stream={} operation={} fid={} synthetic_operation={} request_record_bytes={} response_record_bytes={} response_frames={} resume_unit={} byte_cursor_resume_supported={} responses_delivered={} checksums_matched={} multi_chunk={} bracketing_commit={} partial_resume_offsets={:?} cursor_gaps={} duplicated_bytes={} rotations_retaining_replay={} rotations={} adapter_shutdown_phase={} adapter_shutdown_in_overlap={} adapter_shutdown_graceful={} post_shutdown_outcome={} socket_high_water={} cleanup_joined={} elapsed_ms={}",
                         evidence.relay_count,
+                        evidence.public_ingress_relay,
+                        evidence.owner_relay,
                         evidence.session_id,
                         evidence.epoch,
                         evidence.stream_id,
