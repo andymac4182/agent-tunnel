@@ -73,12 +73,13 @@ class PackagingTests(unittest.TestCase):
         # A Windows runner's file system has no execute bits, so the release
         # job's packaging test saw mode 0 for bin/tunnel-client. Simulate that
         # host here by clearing the execute bits before packaging: the archive
-        # must still mark the binaries executable and nothing else.
+        # must still mark the binaries executable and nothing else, and must not
+        # carry host bits the other way either (LICENSE is 0777 on this "host").
         target = next(t for t in TARGETS if not t.endswith("windows-msvc"))
         release = self.root / "target" / target / "release"
         for name in binaries_for(target):
             (release / name).chmod(0o644)
-        (self.root / "LICENSE").chmod(0o600)
+        (self.root / "LICENSE").chmod(0o777)
         archive = package(self.root, target, self.sha, "123", self.output, {"packages": []})
         with tarfile.open(archive) as handle:
             for member in handle.getmembers():
