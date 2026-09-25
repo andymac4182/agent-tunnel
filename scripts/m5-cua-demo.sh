@@ -156,8 +156,8 @@ gexec_in sudo install -m 0755 /dev/stdin /opt/cua-fixture/cua-backend-supervised
 # The relay's name, pinned in the disposable clone only.
 echo "${HOST_IP} ${RELAY_HOST}" | gexec_in sudo tee -a /etc/hosts >/dev/null
 GD=/home/cua/demo
-gexec sudo -u cua mkdir -p "${GD}/credentials" /home/cua/cua-export
-gexec_in sudo -u cua tee "${GD}/credentials/relay-ca.pem" >/dev/null <"${S}/server-ca.pem"
+gexec sudo -u cua mkdir -p "${GD}" /home/cua/cua-export
+gexec_in sudo -u cua tee "${GD}/server-ca.pem" >/dev/null <"${S}/server-ca.pem"
 python3 - "${ROOT}/examples/m1-client.toml" <<EOF | gexec_in sudo -u cua tee "${GD}/client.toml" >/dev/null
 import re, sys
 text = open(sys.argv[1]).read()
@@ -191,7 +191,7 @@ openssl x509 -req -in "${S}/device.csr" -CA "${S}/device-ca.pem" -CAkey "${S}/de
   -CAcreateserial -days 1 -extfile "${S}/device-ext.cnf" -out "${S}/device-cert.pem" 2>/dev/null
 gexec_in sudo -u cua tee "${GD}/device-cert.pem" >/dev/null <"${S}/device-cert.pem"
 gexec sudo -u cua /opt/agentuplink/bin/tunnel-client credentials import --config "${GD}/client.toml" \
-  --certificate device-cert.pem --server-ca "${GD}/credentials/relay-ca.pem" >&2
+  --certificate device-cert.pem --server-ca "${GD}/server-ca.pem" >&2
 
 # ---- the operator's steps (host): provision and serve --------------------------
 cp "${RECORDS}" "${S}/catalog.toml"

@@ -2077,6 +2077,146 @@ CASES_C9: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# -------------------------------------------------------------- chunk 20
+#: `feat-cua-demo`: M5-C19 option (b) (a declared point space, a ratio
+#: derived per capture, applied by default pending owner confirmation), the
+#: real server's chunked `/cmd` framing (M5-C22), and the Lane B export in
+#: `tunnel-client` (M5-C20, M5-C21). Every case names its witness in
+#: `WITNESSES`.
+CLIENT_CRATE = REPO / "crates" / "tunnel-client"
+CLIENT_CUA_EXPORT = CLIENT_CRATE / "src" / "cua_export.rs"
+CLIENT_HTTP_FORWARD = CLIENT_CRATE / "src" / "http_forward.rs"
+
+CASES_C20: list[tuple[str, list[Edit], bool]] = [
+    (
+        "M5-C19: a point space the capture's aspect ratio contradicts is refused",
+        [
+            (
+                CAPTURE,
+                """        if horizontal.abs_diff(vertical) > 1 {
+            return Err(ScaleDerivationError::AspectMismatch);
+        }""",
+                """        let _ = (&horizontal, &vertical);""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C19: the derived ratio rounds up so every pixel maps inside the display",
+        [
+            (
+                CAPTURE,
+                """(u64::from(pixels) * identity).div_ceil(u64::from(points))""",
+                """(u64::from(pixels) * identity + u64::from(points) / 2) / u64::from(points)""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C19: the device derives each capture's scale from the declared point space",
+        [
+            (
+                CLIENT,
+                """            Some(space) => space.scale_percent_for(width, height).ok(),""",
+                """            Some(_space) => None,""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C19: a point space the capture contradicts is never used unguarded",
+        [
+            (
+                CLIENT,
+                """            Some(space) => space.scale_percent_for(width, height).ok(),""",
+                """            Some(space) => Some(width * 100 / space.width()),""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C22: a chunked /cmd answer is de-chunked before it is classified",
+        [
+            (
+                CLIENT,
+                """    if chunked {
+        return Some((status, dechunk(body)?));
+    }""",
+                """    let _ = (chunked, dechunk);""",
+            )
+        ],
+        False,
+    ),
+]
+
+#: The Lane B export lives in `tunnel-client` behind the non-default `cua`
+#: feature, so its suite builds that crate with the feature; the workspace
+#: test run never does.
+CLIENT_CUA_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-client",
+    "--features",
+    "cua",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "cua",
+]
+
+CASES_C20_CLIENT: list[tuple[str, list[Edit], bool]] = [
+    (
+        "M5-C21: a cua build refuses a cua export without the environment opt-in",
+        [
+            (
+                CLIENT_HTTP_FORWARD,
+                """                if !opted_in {""",
+                """                if !opted_in && false {""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C20: each principal binding is its own device-side session",
+        [
+            (
+                CLIENT_CUA_EXPORT,
+                """        if let Some(entry) = sessions.by_binding.get(binding) {""",
+                """        let _ = binding;
+        let binding = "shared";
+        if let Some(entry) = sessions.by_binding.get(binding) {""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C19: the export declares no point space the backend's screen size contradicts",
+        [
+            (
+                CLIENT_CUA_EXPORT,
+                """    space.agrees_with_screen_size(width, height, pixel_multiples())""",
+                """    let _ = (space, width, height, pixel_multiples());
+    true""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C20: a lease request is the bare envelope and nothing else",
+        [
+            (
+                CLIENT_CUA_EXPORT,
+                """        .all(|key| matches!(key.as_str(), "version" | "operation" | "params"))""",
+                """        .all(|_| true)""",
+            )
+        ],
+        False,
+    ),
+]
+
+
 @dataclass
 class Suite:
     name: str
@@ -2143,6 +2283,22 @@ SUITES: list[Suite] = [
         C4_CARGO_TEST,
         CASES_C9,
         build=C4_BUILD,
+    ),
+    # `feat-cua-demo`. Restore set and test set match: the pure crate and the
+    # fixture's device-side facade.
+    Suite(
+        "m5c20",
+        [CRATE, EXPORT, FIXTURE],
+        C4_CARGO_TEST,
+        CASES_C20,
+        build=C4_BUILD,
+    ),
+    # The Lane B export, tested with `--features cua`.
+    Suite(
+        "m5c20-client",
+        [CLIENT_CRATE, CRATE, FIXTURE],
+        CLIENT_CUA_CARGO_TEST,
+        CASES_C20_CLIENT,
     ),
 ]
 
@@ -2422,6 +2578,58 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
         "m5c9",
         "M5-C05: ending a session releases the leases it holds",
     ): frozenset({"ending_a_session_releases_its_lease_and_only_its_lease"}),
+    # `m5c20` (feat-cua-demo): each witness measured by running the case's
+    # mutation by hand first and reading which test reddened (logs
+    # `red-point-space-*.log`, `red-dechunk.log`, `red-client-*.log`).
+    (
+        "m5c20",
+        "M5-C19: a point space the capture's aspect ratio contradicts is refused",
+    ): frozenset({"capture::tests::a_point_space_that_contradicts_the_capture_is_refused"}),
+    (
+        "m5c20",
+        "M5-C19: the derived ratio rounds up so every pixel maps inside the display",
+    ): frozenset({"capture::tests::every_pixel_of_a_capture_maps_inside_the_declared_space"}),
+    (
+        "m5c20",
+        "M5-C19: the device derives each capture's scale from the declared point space",
+    ): frozenset(
+        {
+            "a_declared_point_space_derives_the_scale_of_every_capture",
+            "a_point_space_outranks_a_declared_percentage",
+            "a_contradicted_or_missing_point_space_refuses_every_coordinate",
+        }
+    ),
+    (
+        "m5c20",
+        "M5-C19: a point space the capture contradicts is never used unguarded",
+    ): frozenset({"a_contradicted_or_missing_point_space_refuses_every_coordinate"}),
+    (
+        "m5c20",
+        "M5-C22: a chunked /cmd answer is de-chunked before it is classified",
+    ): frozenset(
+        {
+            "client::tests::a_chunked_response_is_dechunked",
+            "client::tests::a_truncated_chunked_response_is_not_a_body",
+        }
+    ),
+    (
+        "m5c20-client",
+        "M5-C21: a cua build refuses a cua export without the environment opt-in",
+    ): frozenset({"config::tests::a_cua_build_refuses_a_cua_export_without_the_opt_in"}),
+    (
+        "m5c20-client",
+        "M5-C20: each principal binding is its own device-side session",
+    ): frozenset({"cua_export::tests::a_consumer_captures_clicks_and_types_through_the_export"}),
+    (
+        "m5c20-client",
+        "M5-C19: the export declares no point space the backend's screen size contradicts",
+    ): frozenset(
+        {"cua_export::tests::a_point_space_the_backend_contradicts_refuses_every_coordinate"}
+    ),
+    (
+        "m5c20-client",
+        "M5-C20: a lease request is the bare envelope and nothing else",
+    ): frozenset({"cua_export::tests::a_lease_request_is_the_bare_envelope_and_nothing_else"}),
 }
 
 #: The pinned ledger, loaded once.

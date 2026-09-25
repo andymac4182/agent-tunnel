@@ -1363,7 +1363,7 @@ C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
                 RELAY_CONFIG,
                 """            } else {
                 return Err(ConfigError::Invalid(
-                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25, acp-http-v1 and computer-v1",
                 ));
             };""",
                 """            } else {
