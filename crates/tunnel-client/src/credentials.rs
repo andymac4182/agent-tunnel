@@ -487,17 +487,21 @@ fn remove_stale_staging(destination: &Path) {
 /// check.
 #[cfg(unix)]
 fn stage_and_link(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
-    stage_and_link_with(installs, |staging, destination| {
-        fs::hard_link(staging, destination)
-    })
+    stage_and_link_with(
+        installs,
+        |staging, destination| fs::hard_link(staging, destination),
+        |destination, bytes| write_new(destination, bytes, false),
+    )
 }
 
-/// [`stage_and_link`] with the linking step injected, so the copy fallback
-/// can be exercised on a filesystem that does support hard links.
+/// [`stage_and_link`] with the linking step and the no-link fallback write
+/// injected, so the fallback, and a fallback write that fails part-way, can
+/// be exercised on a filesystem that does support hard links.
 #[cfg(unix)]
 fn stage_and_link_with(
     installs: &[(&Path, &Path)],
     link: impl Fn(&Path, &Path) -> io::Result<()>,
+    fallback_write: impl Fn(&Path, &[u8]) -> Result<(), CredentialError>,
 ) -> Result<(), CredentialError> {
     let mut staged: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(installs.len());
     let mut linked: Vec<PathBuf> = Vec::with_capacity(installs.len());
@@ -520,8 +524,19 @@ fn stage_and_link_with(
                     return Err(CredentialError::AlreadyExists((*destination).to_owned()));
                 }
                 // No hard links here: write the destination directly, still
-                // with `create_new`, so it is never overwritten.
-                Err(_) => write_new(destination, bytes, false)?,
+                // with `create_new`, so it is never overwritten.  If that
+                // write created the file and then failed (a full disk during
+                // `write_all` or `sync_all`), the partial file is this call's
+                // and is removed, so the refusal leaves the profile unchanged.
+                // `AlreadyExists` means the file is someone else's: leave it.
+                Err(_) => match fallback_write(destination, bytes) {
+                    Ok(()) => {}
+                    Err(error @ CredentialError::AlreadyExists(_)) => return Err(error),
+                    Err(error) => {
+                        let _ = fs::remove_file(destination);
+                        return Err(error);
+                    }
+                },
             }
             linked.push((*destination).to_owned());
             sync_parent(destination)?;
@@ -1351,6 +1366,7 @@ mod tests {
         stage_and_link_with(
             &[(&first_source, &first), (&second_source, &second)],
             |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |destination, bytes| write_new(destination, bytes, false),
         )
         .expect("the fallback installs both");
         assert_eq!(fs::read_to_string(&first).expect("first"), "first");
@@ -1367,6 +1383,50 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec!["first".to_owned(), "second".to_owned()]);
+    }
+
+    /// Review of M6-C55: a fallback write that creates the destination and
+    /// then fails (a full disk during `write_all` or `sync_all`) leaves no
+    /// partial file behind, and the first destination is rolled back too, so
+    /// the refusal leaves the profile unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn a_fallback_write_that_fails_part_way_leaves_no_partial_file() {
+        let dir = tempdir().expect("temporary directory");
+        let first_source = dir.path().join("first-source");
+        let second_source = dir.path().join("second-source");
+        fs::write(&first_source, "first").expect("first source");
+        fs::write(&second_source, "second").expect("second source");
+        let out = dir.path().join("out");
+        let first = out.join("first");
+        let second = out.join("second");
+        let result = stage_and_link_with(
+            &[(&first_source, &first), (&second_source, &second)],
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |destination, bytes| {
+                if destination.ends_with("second") {
+                    // Created, then the disk filled: half the bytes landed.
+                    fs::write(destination, &bytes[..bytes.len() / 2]).expect("partial write");
+                    return Err(CredentialError::Io(io::Error::other("no space left")));
+                }
+                write_new(destination, bytes, false)
+            },
+        );
+        assert!(matches!(result, Err(CredentialError::Io(_))), "{result:?}");
+        let left: Vec<String> = fs::read_dir(&out)
+            .expect("destination directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            left.is_empty(),
+            "no partial, installed or staging file: {left:?}"
+        );
     }
 
     /// M6-C54: an expired certificate is refused on import, before any file
