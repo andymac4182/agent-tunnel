@@ -1,17 +1,28 @@
 name: Release packaging tests
 on:
   push:
-    paths: ['scripts/*release*.py', '.github/workflows/release*.yml']
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/operator.md']
   pull_request:
-    paths: ['scripts/*release*.py', '.github/workflows/release*.yml']
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml', 'docs/operator.md']
 permissions:
   contents: read
 jobs:
   packaging:
-    runs-on: ubuntu-24.04
+    # Every host OS a release archive is packed on: the archives now carry
+    # documents whose paths and bytes must not depend on the packing host
+    # (docs/tasks.md M6-C50), and the Windows zip is packed on Windows.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - run: python3 scripts/test_package_release.py
+      - run: python3 scripts/test_release_artifact_cli.py

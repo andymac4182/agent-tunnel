@@ -35,8 +35,10 @@ that is **not the build machine**.  Every check here therefore runs against the
                 `Cargo.lock` rather than hand-written, and re-derived at check
                 time from that same lockfile.  A hand-written NOTICE goes
                 stale silently; a generated one that is re-derived cannot.
-  `assets`      The required runtime assets are in the bundle and work.
-                `tunnel-deadman` is the sharp case: `resolve_sentinel` looks
+  `assets`      The required runtime assets are in the bundle and work,
+                including `docs/operator.md` and the documents it links, with
+                every relative link in them naming a file in the bundle
+                (M6-C50).  `tunnel-deadman` is the sharp case: `resolve_sentinel` looks
                 for it *beside the running executable*, and its absence is a
                 `degraded` doctor result and a one-line warning -- not an
                 error.  A bundle that omits it ships a client whose process
@@ -84,9 +86,11 @@ that is **not the build machine**.  Every check here therefore runs against the
                 Given an archive, the guide's first step checks that archive
                 and its own sidecar.  It also holds
                 docs/runtime.md's client exit-code table to the `Cause`
-                mapping in the client source.  It reads the guide and the
-                source from the checkout, so unlike the checks above it needs
-                a repository beside the bundle (docs/tasks.md M6-02).
+                mapping in the client source.  **The guide and runtime.md it
+                executes and compares are the copies the bundle ships**
+                (docs/tasks.md M6-C50), so a bundle without a guide is red;
+                the client source still comes from the checkout, so unlike the
+                checks above it needs a repository beside the bundle (M6-02).
 
 Why every check carries a control
 ---------------------------------
@@ -150,6 +154,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# The documentation rules are shared with the CI packager rather than copied:
+# which documents ship, how their links are pinned, and what counts as a
+# dangling link are one implementation for both archive formats (M6-C50).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from package_release import GUIDE, stage_documents, unresolved_links  # noqa: E402
 
 # The pinned toolchain, asserted rather than hoped for.  A bundle built by a
 # different rustc is a different artifact; recording the version without
@@ -1087,6 +1097,22 @@ def check_assets(bundle: Path) -> Result:
         return Result("assets", False, summary="no LICENSE in bundle",
                       witness="license-missing")
 
+    # The operator guide and the documents it links (M6-C50).  Present, and
+    # every relative link in every shipped document names a file in the
+    # bundle -- the rule the CI packager applies, imported rather than copied.
+    if not (bundle / GUIDE).is_file():
+        return Result("assets", False,
+                      summary=f"no {GUIDE} in the bundle; a tester holding only the "
+                              f"bundle has no guide",
+                      witness="guide-missing")
+    documents = sorted((bundle / "docs").rglob("*.md"))
+    dangling = unresolved_links(bundle)
+    if dangling:
+        return Result("assets", False,
+                      summary=f"{len(dangling)} link(s) in the shipped documents name "
+                              f"no file in the bundle: {dangling[:3]}",
+                      witness="doc-link-unresolved")
+
     # The sentinel, checked by replaying the product's own resolution rule and
     # then executing the result.
     #
@@ -1161,7 +1187,8 @@ def check_assets(bundle: Path) -> Result:
 
     result = Result("assets", True,
                     summary=f"{len(BUNDLE_BINARIES)} binaries, {len(examples)} config "
-                            f"examples, LICENSE; the sentinel resolves beside the "
+                            f"examples, LICENSE, {len(documents)} documents with every "
+                            f"relative link resolving; the sentinel resolves beside the "
                             f"client and runs, answering both usage probes as "
                             f"tunnel-deadman does")
     result.note("resolution replays tunnel_deadman::resolve_sentinel; both usage "
@@ -1600,7 +1627,8 @@ DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 # guide must update this table in the same change; that is the point.
 DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # section title: (executed commands, output assertions, shape-only commands)
-    "1. Download and verify": (9, 10, 0),
+    # M6-C50 added `ls docs/operator.md` (one assertion): the guide ships.
+    "1. Download and verify": (10, 11, 0),
     # M6-C21 added section 2.3: `cp` of the records example (exit status
     # only), the `provision-catalog --dry-run` transcript (one assertion), and
     # the two Redis-writing commands as shape-only.  M6-C57 added the
@@ -1970,8 +1998,19 @@ def check_exit_table(runtime_doc: Path, client_main: Path) -> Result | None:
 def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None = None,
                client_main: Path | None = None, archive: Path | None = None,
                pins: dict[str, tuple[int, int, int]] | None = None) -> Result:
-    doc = doc or DOCS_OPERATOR
-    runtime_doc = runtime_doc or DOCS_RUNTIME
+    # **The copy that ships is the copy executed** (M6-C50).  A bundle that
+    # carries no guide is a red, not a fallback to the checkout's guide: the
+    # checkout's copy may describe a different commit than the binaries.
+    if doc is None:
+        doc = bundle / GUIDE
+        if not doc.is_file():
+            return Result("docs", False,
+                          summary=f"the bundle ships no {GUIDE}; the guide executed "
+                                  f"must be the one a tester receives",
+                          witness="guide-not-shipped")
+    if runtime_doc is None:
+        shipped_runtime = bundle / "docs" / DOCS_RUNTIME.name
+        runtime_doc = shipped_runtime if shipped_runtime.is_file() else DOCS_RUNTIME
     client_main = client_main or DOCS_CLIENT_MAIN
     for needed in (doc, runtime_doc, client_main):
         if not needed.is_file():
@@ -3082,6 +3121,65 @@ def _replace_at_line(text: str, line: int, old: str, new: str) -> str:
     return "\n".join(lines)
 
 
+def control_assets_guide_removed(bundle: Path) -> tuple[bool, str]:
+    """A bundle without the operator guide is red for that reason (M6-C50)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        guide = copy / GUIDE
+        if not guide.is_file():
+            return False, f"the bundle under test ships no {GUIDE}; nothing to remove"
+        guide.unlink()
+        return expect_red("assets", copy, "guide-missing")
+
+
+def control_assets_linked_document_removed(bundle: Path) -> tuple[bool, str]:
+    """A document the guide links, missing from the bundle, is a dangling link."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        linked = copy / "docs" / DOCS_RUNTIME.name
+        if not linked.is_file():
+            return False, f"the bundle under test ships no docs/{DOCS_RUNTIME.name}"
+        linked.unlink()
+        return expect_red("assets", copy, "doc-link-unresolved")
+
+
+def control_docs_guide_not_shipped(bundle: Path) -> tuple[bool, str]:
+    """Without a shipped guide the check is red, not a fallback to the checkout's."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        (copy / GUIDE).unlink(missing_ok=True)
+        return expect_red("docs", copy, "guide-not-shipped")
+
+
+def control_docs_the_shipped_copy_is_executed(bundle: Path) -> tuple[bool, str]:
+    """Editing only the bundle's guide changes the verdict, so that copy runs.
+
+    The same rename as `control_docs_renamed_subcommand`, applied to the
+    guide inside a bundle copy and to nothing else -- no `doc=` override.  If
+    the check still read the checkout's guide it would stay green.
+    """
+    command = _first_session_command(
+        lambda c: c.text.startswith("tunnel-client config check") and "exit=" not in c.text)
+    if command is None:
+        return False, "the guide documents no plain `tunnel-client config check` to rename"
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        shipped = copy / GUIDE
+        if not shipped.is_file():
+            return False, f"the bundle under test ships no {GUIDE}"
+        write_exact(shipped, _replace_at_line(read_exact(shipped), command.line,
+                                              "config check", "config verify"))
+        # Re-list the edited guide, as a tampered bundle would, so the guide's
+        # own `shasum -c` step passes and the session reaches the command.
+        sums = copy / SHA256SUMS
+        lines = [line for line in sums.read_text().splitlines()
+                 if not line.endswith(f"  {GUIDE}")]
+        lines.append(f"{sha256_file(shipped)}  {GUIDE}")
+        sums.write_text("\n".join(sorted(lines)) + "\n")
+        return _expect_red_at(f"docs/operator.md:{command.line} ", copy,
+                              "documented-command-failed")
+
+
 def control_docs_renamed_subcommand(bundle: Path) -> tuple[bool, str]:
     """A documented command the binary no longer accepts must go red.
 
@@ -3370,6 +3468,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("the tunnel-deadman sentinel removed", control_assets_sentinel_removed),
         ("a decoy file of the sentinel's name", control_assets_sentinel_is_a_decoy),
         ("a decoy that also exits 2", control_assets_decoy_that_exits_two),
+        ("the operator guide removed", control_assets_guide_removed),
+        ("a document the guide links removed", control_assets_linked_document_removed),
     ],
     "targets": [
         ("a bundle built for a triple outside the declared set",
@@ -3424,6 +3524,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
          control_docs_exit_table_row_edited),
         ("the code's exit mapping moved under the table", control_docs_exit_source_edited),
         ("an exit mapping the parser cannot find", control_docs_exit_source_unparsed),
+        ("a bundle that ships no guide", control_docs_guide_not_shipped),
+        ("only the shipped guide edited", control_docs_the_shipped_copy_is_executed),
     ],
 }
 
@@ -3539,6 +3641,22 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     if not commit:
         print("receipt records no base_head", file=sys.stderr)
         return 2
+
+    # The guide and the documents it links, with links to anything unshipped
+    # pinned to the commit these bytes were built from (M6-C50).  They are
+    # taken from the checkout, like the examples; the checkout must therefore
+    # be the receipt's commit for the documents to describe the binaries, and
+    # `provenance` binds the commit, not the documents' bytes.
+    try:
+        documents = stage_documents(REPO, out, commit)
+    except ValueError as error:
+        print(f"refusing to bundle the documentation: {error}", file=sys.stderr)
+        return 2
+    dangling = unresolved_links(out)
+    if dangling:
+        print(f"shipped documents link files the bundle lacks: {dangling[:3]}",
+              file=sys.stderr)
+        return 1
     for key, expected in (("build_profile", args.profile),
                           ("rustc_host", None)):
         if expected is not None and receipt_field(receipt_text, key) != expected:
@@ -3627,7 +3745,8 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         f"{archive_digest}  {archive.name}\n"
     )
 
-    print(f"bundle at {out}: {len(sums)} files, {len(digests)} binaries, target {triple}")
+    print(f"bundle at {out}: {len(sums)} files, {len(digests)} binaries, "
+          f"{len(documents)} documents, target {triple}")
     print(f"archive at {archive}: sha256 {archive_digest}")
     return 0
 
@@ -3741,6 +3860,20 @@ def main() -> int:
     verify.add_argument("--check", choices=sorted(CHECKS))
 
     args = parser.parse_args()
+    # The top-level `--bundle` and `--check` belong to `--self-test` alone,
+    # and nothing in argparse ties them to it.  Misuse is refused here, before
+    # dispatch, with argparse's own exit 2 -- "could not run", in this
+    # script's vocabulary -- rather than reaching `Path(None)` and dying in a
+    # traceback that exits 1, which reads as a failed check (M6-C12).
+    if args.self_test and args.command is not None:
+        parser.error(f"--self-test runs controls; it cannot be combined with {args.command!r}")
+    if args.self_test and not args.bundle:
+        parser.error("--self-test requires --bundle DIR, an unpacked bundle directory "
+                     "(`bundle --out DIR` writes one); no control ran")
+    if not args.self_test and args.command is None and (args.check or args.bundle):
+        parser.error("--check selects the controls, and --bundle the bundle, that "
+                     "--self-test uses; to check a bundle, use "
+                     "`verify --bundle DIR [--check NAME]`")
     if args.self_test:
         return cmd_self_test(args)
     if args.command == "notices":

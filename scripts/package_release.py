@@ -9,7 +9,7 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
@@ -82,6 +82,127 @@ def advertised_targets(root=ROOT):
 TARGETS = advertised_targets()
 
 
+# --------------------------------------------------------------------------
+# Documentation in the archive (docs/tasks.md M6-C50)
+#
+# The archive used to carry no documentation at all, so a tester holding only
+# the download had no guide.  It now carries `docs/operator.md` and every
+# local document the guide links, at the same relative paths, so the guide's
+# links resolve inside the unpacked archive exactly as they do in the
+# repository.  **The set is derived from the guide's own links**, not listed
+# here: a link added to the guide ships its target with no second edit.
+#
+# The linked documents link further documents, and shipping that closure
+# would ship the whole repository (it reaches 56 files, `docs/tasks.md`
+# included).  So in the *shipped copies* only, a relative link to a file the
+# archive does not carry is rewritten to that file at the archive's own
+# source commit on GitHub -- the same commit `release.json` or
+# `PROVENANCE.txt` names -- so every link in the archive either resolves
+# inside it or names the exact source it was built from.  The guide itself is
+# never rewritten: every local link it has must ship, and `release_documents`
+# refuses a guide with a local link that cannot.  So the guide in the archive
+# is byte-identical to the repository's, which is what lets
+# `scripts/m6-release-artifact.py verify --check docs` execute the shipped
+# copy.
+# --------------------------------------------------------------------------
+GUIDE = "docs/operator.md"
+SOURCE_URL = "https://github.com/andymac4182/agentuplink"
+_LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
+
+
+def _local_link(link):
+    """The (path, fragment) a relative link names, or None for any other link."""
+    if link.startswith("#") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", link):
+        return None
+    path, _, fragment = link.partition("#")
+    return path, fragment
+
+
+def _resolve(document, path):
+    """A link's target as a repository-relative POSIX path, or None if it escapes."""
+    parts = []
+    for part in PurePosixPath(document).parent.joinpath(path).parts:
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+        elif part not in (".", ""):
+            parts.append(part)
+    return "/".join(parts)
+
+
+def release_documents(root):
+    """The guide and every local document it links, as repository paths."""
+    guide = (root / GUIDE).read_bytes().decode("utf-8")
+    shipped = {GUIDE}
+    for link in _LINK_RE.findall(guide):
+        local = _local_link(link)
+        if local is None or not local[0]:
+            continue
+        target = _resolve(GUIDE, local[0])
+        if target is None or not target.endswith(".md") or not (root / target).is_file():
+            raise ValueError(
+                f"{GUIDE} links {link!r}, which cannot ship as a document beside it; "
+                "link a document under docs/ or an absolute URL"
+            )
+        shipped.add(target)
+    return sorted(shipped)
+
+
+def staged_document(root, document, shipped, sha):
+    """One shipped document's text, with links to unshipped files pinned to `sha`."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("documents are pinned to a full 40-character source commit")
+    # Bytes decoded, not `read_text`: text mode translates line endings, and
+    # the guide must ship byte-identical to the checkout it came from.
+    text = (root / document).read_bytes().decode("utf-8")
+
+    def pin(match):
+        link = match.group(1)
+        local = _local_link(link)
+        if local is None or not local[0]:
+            return match.group(0)
+        target = _resolve(document, local[0])
+        if target in shipped:
+            return match.group(0)
+        if target is None:
+            raise ValueError(f"{document} links {link!r} outside the repository")
+        if document == GUIDE:
+            raise ValueError(f"{GUIDE} links {link!r}, which does not ship")
+        fragment = f"#{local[1]}" if local[1] else ""
+        # GitHub serves a directory under /tree/ and a file under /blob/.
+        kind = "tree" if (root / target).is_dir() else "blob"
+        return f"]({SOURCE_URL}/{kind}/{sha}/{target}{fragment})"
+
+    return _LINK_RE.sub(pin, text)
+
+
+def stage_documents(root, destination, sha):
+    """Write the shipped documents under `destination`; return their paths."""
+    shipped = release_documents(root)
+    for document in shipped:
+        path = destination.joinpath(*document.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Bytes, not text mode, for the same reason in the other direction.
+        path.write_bytes(staged_document(root, document, set(shipped), sha).encode("utf-8"))
+    return shipped
+
+
+def unresolved_links(bundle):
+    """Every relative link in a bundle's documents that names no file in it."""
+    problems = []
+    for path in sorted((bundle / "docs").rglob("*.md")):
+        document = path.relative_to(bundle).as_posix()
+        for link in _LINK_RE.findall(path.read_bytes().decode("utf-8")):
+            local = _local_link(link)
+            if local is None or not local[0]:
+                continue
+            target = _resolve(document, local[0])
+            if target is None or not (bundle / target).is_file():
+                problems.append(f"{document} -> {link}")
+    return problems
+
+
 def version(root, sha, run):
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[1-9][0-9]*", run):
         raise ValueError("invalid source SHA or CI run ID")
@@ -127,6 +248,10 @@ def package(root, target, sha, run, output, metadata):
                 raise ValueError(f"missing release binary: {name}")
             shutil.copy2(source, staging / "bin" / name)
         shutil.copy2(root / "LICENSE", staging / "LICENSE")
+        stage_documents(root, staging, sha)
+        dangling = unresolved_links(staging)
+        if dangling:
+            raise ValueError(f"shipped documents link files the archive lacks: {dangling[:3]}")
         (staging / "examples").mkdir()
         examples = ("m1-client.toml",) if windows else ("m1-client.toml", "m1-relay.toml")
         for name in examples:
@@ -153,7 +278,7 @@ def package(root, target, sha, run, output, metadata):
             if windows
             else "Keep all three binaries together, including tunnel-deadman.\n"
         )
-        (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
+        (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting. Start with docs/operator.md in this archive; it and the documents it links describe this build's source commit.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
         if windows:
             # strict_timestamps=False stores a pre-1980 mtime (crates.io sources
             # carry some, e.g. mtime 1 and 123456789) as 1980-01-01, which ZIP can encode,
