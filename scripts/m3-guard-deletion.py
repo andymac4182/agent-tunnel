@@ -1054,6 +1054,10 @@ WIRE_CASES: list[Case] = [
 #: defeating it leaves every test green; and the release hooks at the commit
 #: and abort handlers are duplicated by the actor's after-command service, so
 #: defeating one is only visible to a test that bypasses the actor loop.
+#: The bound case deletes the refusal rather than the deadline check: without
+#: the check an expired entry is kept and the actor loop's deadline branch
+#: fires again at once, so the paused-time run-loop test livelocks instead of
+#: going red (measured: the first form of the case timed out).
 FREEZE_HOLD = RELAY / "src" / "actor_freeze_hold.rs"
 RELAY_HTTP = RELAY / "src" / "http.rs"
 RELAY_FS = RELAY / "src" / "http" / "fs.rs"
@@ -1090,14 +1094,9 @@ FREEZE_HOLD_CASES: list[Case] = [
         [
             (
                 FREEZE_HOLD,
-                "                    if now >= held.deadline {\n"
-                "                        self.freeze_hold.record_wait(&held, now);\n"
                 "                        self.freeze_hold.counters.refused_after_bound += 1;\n"
-                "                        held.refuse(HoldRefusal::RotationFreeze);\n"
-                "                    } else {\n"
-                "                        keep.push_back(held);\n"
-                "                    }",
-                "                    keep.push_back(held);",
+                "                        held.refuse(HoldRefusal::RotationFreeze);\n",
+                "                        self.freeze_hold.counters.refused_after_bound += 1;\n",
             )
         ],
         frozenset({HOLD + "an_open_held_past_the_bound_is_refused_with_rotation_freeze"}),
