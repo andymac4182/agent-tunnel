@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "80aa5c29f9a2a89e134fbc649d43028f5035ec92",
-  "lastPublishedOriginMain": "80aa5c29f9a2a89e134fbc649d43028f5035ec92",
-  "lastReviewAt": "2026-09-25T22:04:43+10:00",
-  "lastReviewOutcome": "Reviewed integrated release documentation, tester quickstart, delayed terminal-ACK reconnect classification and read-only CUA VM evidence through 80aa5c2. Published the join guide and scoped setup/archive guidance, corrected generic protocol retry advice, and distinguished read-only backend observations from tunnel/input acceptance. Runtime tests not rerun; no VM, credential or relay operations performed; CI and release gates unchanged.",
+  "reviewedOriginMain": "cb94dc3ccbf4b75b487069bdbb92d35ef92f4419",
+  "lastPublishedOriginMain": "cb94dc3ccbf4b75b487069bdbb92d35ef92f4419",
+  "lastReviewAt": "2026-09-25T23:09:13+10:00",
+  "lastReviewOutcome": "Reviewed integrated operations and rotation admission changes through cb94dc3. Updated private metrics and rollback compatibility, cached single-relay authority readiness, seed rollback limits, live Redis reconnect budgets, best-effort control Pongs and bounded rotation admission with cluster upgrade restrictions. Historical Fly observations remain explicitly older-build evidence. Runtime tests not rerun; no credential, VM or relay operations performed; CI and release gates unchanged.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, ten docs pages, links, images, light/dark/system themes and overflow. Live join, support, downloads, setup and CUA pages exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T22:04:43+10:00",
-  "deploymentId": "dpl_5J6pDyoJeBgaW4oLeTP9rfA33QEo"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, ten docs pages, links, images, light/dark/system themes and overflow. Live support and setup pages exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-25T23:09:13+10:00",
+  "deploymentId": "dpl_GoUUJ96rM4ve7EB9HygVwVnpLSS5"
 }
