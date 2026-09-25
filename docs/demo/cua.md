@@ -47,6 +47,14 @@ needs no exception, and no host security setting is changed.
   that is deleted on exit. The bearer token is passed to `curl` in a header
   file, never on a command line. Typed text is never logged.
 
+> **Grant scope: read this before exporting anything but this demo VM.**
+> The relay grants `http:invoke` on the whole service. It does not grant
+> individual operations, so **every principal granted the service may use
+> every operation the export lists** (task row M5-C28, a blocker for any
+> hosted or non-VM use). An input-capable export must list only operations
+> that every grantee may use. For read-only access, list only `describe`,
+> `capture`, `screen_info` and `cursor_position`.
+
 ## Prerequisites
 
 | What | Why | Check |
@@ -237,7 +245,7 @@ status.**
 | --- | --- | --- |
 | `ok` | dispatched and succeeded | n/a |
 | `answered_locally` | answered by the device, nothing sent to the backend | safe |
-| `not_dispatched` | refused before dispatch, for example `lease_not_held`, `capture_superseded`, `capture_scale_undeclared`, `not_permitted` or `backend_unavailable` | `error.retryable` says |
+| `not_dispatched` | refused before dispatch, for example `lease_not_held`, `capture_superseded`, `capture_scale_undeclared`, `not_permitted`, `backend_unavailable` or `principal_binding_missing` (no relay principal binding; never through the relay) | `error.retryable` says |
 | `failed` | dispatched and the backend reported failure | only for reads |
 | `unknown` | dispatched, and the effect is not known | **never** |
 
@@ -268,6 +276,7 @@ status.**
 - **A non-identity display scale** (M5-C19): the Linux guest runs at 1x, so
   the point-space derivation is proven at 2x only against the Lane A
   fixture.
+- **Session eviction and an idle bound on a lease holder** (M5-C29).
 - **Restart on a failed health probe** (M5-C23), **grant revision delivery**
   (M5-C05) and **per-operation grants** (M5-C28).
 - **CI**: the Lane B tests need `--features cua`, which the workspace run

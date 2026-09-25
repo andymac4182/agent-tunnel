@@ -328,10 +328,21 @@ dropped at the ingress for this profile (M5-C26).
 
 - **Sessions** are keyed by the relay's opaque principal binding, so each
   authenticated principal has its own input lease and capture identities.
-- **The lease has a wire form** in this export, pending owner confirmation
-  (M5-C20): `acquire_input_lease` and `release_input_lease`, with empty
-  `params`, are answered locally (`answered_locally`) before the schema
-  sees the body.
+- **A request with no principal binding is refused**
+  (`principal_binding_missing`, not retryable). It is never given a shared
+  session.
+- **Two provisional `computer.v1` operations carry the lease** (M5-C20; the
+  owner decision on whether they move into the pure schema is still open):
+
+  | Operation | Request `params` | Answer |
+  | --- | --- | --- |
+  | `acquire_input_lease` | `{}` (may be omitted; nothing else allowed) | `answered_locally`, `result: {"held": true, "lease": <id>, "target": <name>}`; or `not_dispatched` with `lease_held_by_another_session`, retryable |
+  | `release_input_lease` | `{}` | `answered_locally`, `result: {"held": false, "lease": null, "target": <name>}`; or `not_dispatched` with `lease_not_held`, retryable |
+
+  Both are answered from device state before the schema sees the body, and
+  never reach the backend. An input operation never takes the lease itself:
+  without it, input is refused with `lease_not_held`. The lease belongs to the
+  principal binding's session, and there is no idle expiry (M5-C29).
 - **The display scale** comes from a declared point space (`point_width`,
   `point_height`; M5-C19 option (b), applied by default pending owner
   confirmation). Each capture's ratio is derived from its own PNG, and a
