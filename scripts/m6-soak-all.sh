@@ -44,5 +44,5 @@ case " ${M6_SOAK_EXPERIMENTS:-chaos load fairness soak} " in *" soak "*) ;; *) e
 quiet
 echo "m6-soak-all: soak start $(date +%Y-%m-%dT%H:%M:%S%z) $(host)"
 nice -n 10 python3 "$here/m6-soak.py" soak --bin-dir "$bins" --bin-head "$head" --logs "$logs" \
-  --max-load "$max" --duration "${M6_SOAK_DURATION:-7260}" > "$logs/soak-driver.log" 2>&1
+  --redis "$redis" --max-load "$max" --duration "${M6_SOAK_DURATION:-7260}" > "$logs/soak-driver.log" 2>&1
 echo "m6-soak-all: soak exit=$? $(date +%Y-%m-%dT%H:%M:%S%z) $(host)"
