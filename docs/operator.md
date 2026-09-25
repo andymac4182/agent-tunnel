@@ -196,15 +196,22 @@ and hyphens do not matter. If the profile or the catalog changes afterwards, the
 relay refuses the session and `connect` exits `3` with a non-retryable
 `CREDENTIAL_ERROR`, "the relay refused this device's identity" (M6-C32). The
 relay gives the same refusal for a certificate key the catalog does not hold,
-and it does not say which check failed. A credential whose catalog
+and it does not say which check failed; its log does (section 5). `doctor`
+catches the profile half locally: a `device_id` that no longer names the
+certificate's device fails its `device_identity` check with
+`CREDENTIAL_DEVICE_MISMATCH`, exit `3`, compared as UUIDs as the relay compares
+them (M6-C44). A credential whose catalog
 `not_before` is still in the future is different. That is clock skew, not a
 wrong identity, so `connect` reports it as a retryable `TRANSPORT_ERROR` and
 retries it with backoff until the credential is valid (section 3.1). A cluster
-relay is different. It looks the key up before routing and, for an unknown
-key, still closes the socket without a reason. That reads as a retryable
-`TRANSPORT_ERROR`, which `connect` retries (M6-C43, read from the source, not
-measured; M6-C38). A wrong export name still makes every
-call fail with `DEVICE_REJECTED`:
+relay now gives an unknown key the same `1008 DEVICE_IDENTITY_REJECTED` close
+before routing, and turns an owner relay's refusal of a forwarded session into
+the same close the owner itself would send (M6-C43, M6-C38). That cluster path
+is covered by unit tests of the mapping and has not been run in a cluster
+process gate. A relay that does not speak the client's protocol major closes
+the control socket `1002 PROTOCOL_UNSUPPORTED`, and `connect` exits `1` with a
+non-retryable `PROTOCOL_ERROR` instead of retrying (M6-C38). A wrong export
+name still makes every call fail with `DEVICE_REJECTED`:
 
 ```console
 $ mkdir trial
@@ -270,7 +277,19 @@ relay also needs the device's CA in its `device_tls_client_ca` file, and a
 matching device and credential record in the Redis catalog, which section 2.3
 creates. Certificate renewal and self-service enrollment are not implemented
 (`credentials renew` and `enroll` in
-[runtime.md](runtime.md#proposed-cli-surface)).
+[runtime.md](runtime.md#proposed-cli-surface); the renewal shape is an open
+owner decision, M6-C56 and M0-03).
+
+`credentials import` installs the certificate and the server CA together or
+not at all (M6-C55). It checks both destinations before writing either,
+writes each under a staging name beside it, and links it into place without
+replacing anything, so a refusal -- `refusing to overwrite` either file, or
+anything else -- leaves the profile exactly as it was. It refuses a certificate
+that is already past its `notAfter` on this host's clock, which `connect` would
+only refuse later. A certificate whose `notBefore` is still ahead is imported
+with a warning on stderr naming that time, because a host whose clock is behind
+sees every fresh certificate that way and `connect` retries it until it is
+valid (M6-C54).
 
 ### 2.2 Relay listener identities
 
@@ -297,9 +316,16 @@ A token is accepted only if its header has `alg` `RS256` and a `kid` from that
 file, and its claims have `iss` equal to `oidc_issuer` **byte for byte**
 (including any trailing `/`), an `aud` in `oidc_audience`, a non-empty `sub`,
 and an unexpired `exp`. `nbf` is checked if present. There is no clock leeway.
-`scope` is one space-separated string. Every refusal of these, and a `sub`
-without a catalog user, gets the same `401`, and the relay logs nothing about
-it (M6-C52), so check the claims before looking anywhere else. The project
+`scope` is one space-separated string. A request with no bearer token gets
+`401` "a consumer access token is required". Every refusal of a token that was
+sent -- malformed, badly signed, an unknown `kid`, a claim above, or a `sub`
+without a catalog user -- gets `401` "the consumer access token was not
+accepted", and a token that passes all of them but lacks the route's scope gets
+`403` (M6-C53). Every consumer route says the same for the same cause; the
+filesystem route uses its contract's codes (`UNAUTHENTICATED`,
+`ACCESS_DENIED`) for the same statuses and messages. The response never says
+which check failed. The relay's log does: one `consumer request refused` line
+per refusal, naming the route and the stage (section 5, M6-C52). The project
 ships no issuer and no token tool.
 
 Keep private keys owner-only and outside source control. Use separate CAs for
@@ -485,14 +511,15 @@ The other types use other routes on the same listener, with the same token
 rules, and each needs its own operation in the token's `scope`:
 
 * **MCP**: `/v1/devices/<device.id>/services/<service.id>/http/mcp`, scope
-  `http:invoke`, speaking MCP's Streamable HTTP. The request must not carry a
-  `User-Agent` or `Accept-Encoding` header, or it gets `400
-  HTTP_INVALID_HEAD`, and most HTTP clients send both by default (M6-C58).
+  `http:invoke`, speaking MCP's Streamable HTTP. The relay drops a request's
+  `User-Agent` and `Accept-Encoding` headers, which most HTTP clients send by
+  default, rather than refusing it; any other header the profile does not list
+  gets `400 HTTP_INVALID_HEAD` with the header's name in the body's `header`
+  field (M6-C58).
 * **ACP**: `/v1/devices/<device.id>/services/<service.id>/http/acp`, scope
   `http:invoke`, over **HTTP/2** only. An HTTP/1.1 request gets `501
-  HTTP_UNSUPPORTED_FEATURE`. As for MCP, the request must not carry a
-  `User-Agent` or `Accept-Encoding` header: the ACP profile refuses both
-  (M6-C58).
+  HTTP_UNSUPPORTED_FEATURE`. As for MCP, `User-Agent` and `Accept-Encoding`
+  are dropped and any other unlisted header is refused by name (M6-C58).
 * **Filesystem**: `/v1/devices/<device.id>/services/<service.id>/fs`, scope
   `fs:connect`. A `GET` returns the export's descriptor. A WebSocket upgrade
   with subprotocol `agent-tunnel.9p.v1` opens a 9P2000.L session
@@ -1174,10 +1201,37 @@ What an operator can read today:
 
 | Surface | Where | Content |
 | --- | --- | --- |
-| Relay log | stderr of `tunnel-relay serve`, JSON lines, level from `RUST_LOG` | Bounded warnings and errors. No retention or rotation: that is your log shipper's job |
+| Relay log | stderr of `tunnel-relay serve`, JSON lines, level from `RUST_LOG` | Bounded warnings and errors, session admission and closure, and one line per refusal (below). No retention or rotation: that is your log shipper's job |
 | `/livez`, `/readyz` | Consumer listener | Section 3.2 |
 | `connect --json` | stdout of `tunnel-client connect` | One JSON object per lifecycle change: session, epoch, generation, connection IDs, rotation and recovery progress and deadlines, and the **local socket addresses** of the control, active and candidate connections. No payloads or credentials |
 | `doctor --json` | Section 6 | Local checks only |
+
+**Refusals are logged at the default level** (M6-C52), one bounded line each,
+carrying fixed labels and identifiers only -- never a token, a claim, a path,
+a certificate or a body:
+
+- `consumer request refused`, with `route` (`devices`, `services`, `echo`,
+  `stream`, `http-forward`, `fs`), `stage` and `status`. The stage is
+  `bearer` (no token), `token` (malformed or badly signed), `algorithm`,
+  `kid`, `claims` (`iss`, `aud`, `sub`, `exp` or `nbf`), `identity` (no
+  catalog user), `scope`, `identity_lookup_unavailable` (the catalog could not
+  be read) or `grant` (authenticated, but no grant for the service; with
+  `tenant_id`, `device_id` and `service_id`).
+- `device session refused`, with `stage` (`control_hello`, `control_route`
+  on a cluster relay, `control_forwarded`), `refusal` (`identity_rejected`,
+  `credential_not_active`, `protocol_major_unsupported`, `owner_busy`) and
+  `certificate_device`, the UUID in the TLS-verified certificate's role SAN.
+- `TLS handshake refused`, with `refusal`: `client_certificate_missing`,
+  `..._expired`, `..._not_yet_valid`, `..._unknown_issuer`,
+  `..._bad_signature`, `..._revoked`, `..._wrong_purpose`, `..._invalid`, or
+  `peer_refused_server_certificate` (with `_unknown_ca` or `_expired` when the
+  peer's alert says so). Other handshake failures, such as a bare TCP close,
+  stay at `debug`.
+
+The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay
+writes it when it admits the device's session and at every owner-lease renewal
+while the session lives, so it trails a connected device by at most one
+renewal interval (M6-C63).
 
 **Redaction.** These guarantees are claimed and tested today. The
 `connect --json` events are **not** among them beyond carrying no payloads or
