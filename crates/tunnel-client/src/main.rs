@@ -90,6 +90,9 @@ enum Cause {
     SupervisorAbsent,
     /// `connect`: another supervisor already holds this profile (M6-06).
     SupervisorRunning,
+    /// `connect`: the profile lock could not be taken for another reason
+    /// (M6-06 review); the supervisor fails closed.
+    SupervisorLockFailed,
     /// The local supervisor IPC failed its same-user check (M6-06).
     IpcUnauthorized,
 }
@@ -117,6 +120,7 @@ impl Cause {
             Self::SignalError => "SIGNAL_ERROR",
             Self::SupervisorAbsent => "SUPERVISOR_ABSENT",
             Self::SupervisorRunning => "SUPERVISOR_RUNNING",
+            Self::SupervisorLockFailed => "SUPERVISOR_LOCK_FAILED",
             Self::IpcUnauthorized => "IPC_UNAUTHORIZED",
         }
     }
@@ -156,10 +160,15 @@ impl Cause {
     /// * `8` — `status` found no supervisor running for the profile (M6-06).
     ///   Not a failure of anything: nothing is running. Kept apart from `4`
     ///   because the action is to start `connect`, not to check a network.
-    ///   A second `connect` on a profile whose supervisor is live is `7`
-    ///   (`SUPERVISOR_RUNNING`, refused before dispatch), and a supervisor
-    ///   socket or peer that fails the same-user check is `3`
-    ///   (`IPC_UNAUTHORIZED`, authorization denied).
+    ///   A supervisor socket, lock or peer that fails the same-user check is
+    ///   `3` (`IPC_UNAUTHORIZED`, authorization denied).
+    /// * `9` — `connect` did not start because it cannot hold the profile
+    ///   lock: another supervisor holds it (`SUPERVISOR_RUNNING`), or it
+    ///   could not be taken (`SUPERVISOR_LOCK_FAILED`). Its own status, and
+    ///   not `7`, since the M6-06 review: `7` is restarted by the example
+    ///   service unit (a relay's stale `OWNER_BUSY` heals by waiting), while
+    ///   a second supervisor never heals by restarting, so the unit lists `9`
+    ///   in `RestartPreventExitStatus`.
     /// * `1` — genuinely unexpected: a protocol violation, a failed
     ///   supervisor, or a signal subsystem error. After this change `1`
     ///   means what it says.
@@ -176,7 +185,7 @@ impl Cause {
             Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
             Self::OwnerBusy | Self::ResourceExhausted => 7,
-            Self::SupervisorRunning => 7,
+            Self::SupervisorRunning | Self::SupervisorLockFailed => 9,
             Self::SupervisorAbsent => 8,
             Self::Cancelled => 130,
             Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => 1,
@@ -216,6 +225,7 @@ impl Cause {
             IpcError::Timeout => Self::DeadlineExceeded,
             IpcError::Malformed => Self::ProtocolError,
             IpcError::Io(_) => Self::TransportError,
+            IpcError::LockFailed(_) => Self::SupervisorLockFailed,
             IpcError::Unsupported => Self::InvalidInvocation,
         }
     }
@@ -868,9 +878,10 @@ impl Cause {
             }
             // Supervisor IPC causes arise before the first attempt (the
             // profile lock) or in `status`, never from a session.
-            Self::SupervisorAbsent | Self::SupervisorRunning | Self::IpcUnauthorized => {
-                ReconnectClass::Terminal
-            }
+            Self::SupervisorAbsent
+            | Self::SupervisorRunning
+            | Self::SupervisorLockFailed
+            | Self::IpcUnauthorized => ReconnectClass::Terminal,
         }
     }
 }
@@ -1154,19 +1165,36 @@ fn interrupted_during_backoff(signal: StopSignal, attempt: u32, last: &CliError)
 struct SupervisorPublisher {
     status: tokio::sync::watch::Sender<tunnel_client::supervisor_ipc::SupervisorStatus>,
     server: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    /// The profile lock, held until the publisher is dropped at the end of
+    /// `run_connect` (and released by the kernel on any exit).
+    _lock: ProfileLockHold,
 }
 
+/// What holds the profile lock: the `flock` on Unix; nothing on other
+/// platforms, which have no supervisor IPC and so no lock yet (documented
+/// in docs/runtime.md, "Supervisor status IPC").
+#[cfg(unix)]
+type ProfileLockHold = Option<tunnel_client::supervisor_ipc::ProfileLock>;
+#[cfg(not(unix))]
+type ProfileLockHold = Option<()>;
+
+type IpcServer = Option<(CancellationToken, tokio::task::JoinHandle<()>)>;
+
 impl SupervisorPublisher {
-    /// Bind the profile's supervisor socket, which is also the profile lock.
+    /// Take the profile lock, then bind the profile's supervisor socket.
     ///
-    /// A live supervisor already listening is refused (`SUPERVISOR_RUNNING`,
-    /// exit `7`): two connectors on one profile would share one credential
-    /// and fight over one owner slot. Any other failure to bind -- a missing
-    /// or unsafe directory, a path too long for `sun_path` -- leaves this
-    /// supervisor running **without** IPC, with one stderr line naming the
-    /// code, so an operator's existing profile keeps working; `status` then
-    /// reports no supervisor. The socket is never created somewhere the
-    /// same-user checks refuse.
+    /// **The lock fails closed** (M6-06 review, task row M6-C136): another
+    /// supervisor holding it is refused `SUPERVISOR_RUNNING`, exit `9`, and
+    /// a lock that cannot be taken for any other reason -- a missing
+    /// directory, one other users can write, a lock file that is a symlink or
+    /// open to others -- refuses to start as well (`SUPERVISOR_LOCK_FAILED`,
+    /// exit `9`, or `IPC_UNAUTHORIZED`, exit `3`): two connectors on one
+    /// profile would share one credential and fight over one owner slot, and
+    /// a supervisor that cannot prove it is alone must not run. **Only the
+    /// socket is optional:** with the lock held, a socket that cannot be
+    /// bound (a path too long for `sun_path`, say) leaves this supervisor
+    /// running without IPC, with one stderr line naming the code; `status`
+    /// then reports no supervisor.
     fn start(config: &ConnectConfig) -> Result<Self, CliError> {
         use tunnel_client::supervisor_ipc::{ExportStatus, RotationPolicyStatus, SupervisorStatus};
         let initial = SupervisorStatus {
@@ -1194,8 +1222,12 @@ impl SupervisorPublisher {
             ..SupervisorStatus::default()
         };
         let (status, receiver) = tokio::sync::watch::channel(initial);
-        let server = start_ipc_server(config, receiver)?;
-        Ok(Self { status, server })
+        let (server, lock) = start_ipc_server(config, receiver)?;
+        Ok(Self {
+            status,
+            server,
+            _lock: lock,
+        })
     }
 
     fn update(&self, change: impl FnOnce(&mut tunnel_client::supervisor_ipc::SupervisorStatus)) {
@@ -1215,21 +1247,28 @@ impl SupervisorPublisher {
 fn start_ipc_server(
     config: &ConnectConfig,
     receiver: tokio::sync::watch::Receiver<tunnel_client::supervisor_ipc::SupervisorStatus>,
-) -> Result<Option<(CancellationToken, tokio::task::JoinHandle<()>)>, CliError> {
-    use tunnel_client::supervisor_ipc::{IpcError, SupervisorIpc};
-    match SupervisorIpc::bind(&config.supervisor_socket_path()) {
+) -> Result<(IpcServer, ProfileLockHold), CliError> {
+    use tunnel_client::supervisor_ipc::{IpcError, ProfileLock, SupervisorIpc};
+    let socket = config.supervisor_socket_path();
+    let lock = match ProfileLock::acquire(&socket) {
+        Ok(lock) => lock,
+        // Fail closed: never run without the lock.
+        Err(error) => return Err(CliError::from_ipc(error)),
+    };
+    match SupervisorIpc::bind(&socket, &lock) {
         Ok(ipc) => {
             let cancel = CancellationToken::new();
             let task = tokio::spawn(ipc.serve(receiver, cancel.clone()));
-            Ok(Some((cancel, task)))
+            Ok((Some((cancel, task)), Some(lock)))
         }
         Err(IpcError::Busy) => Err(CliError::from_ipc(IpcError::Busy)),
         Err(error) => {
             eprintln!(
-                "tunnel-client: warning: supervisor status IPC unavailable ({}): {error};                  `status` will report no supervisor",
+                "tunnel-client: warning: supervisor status IPC unavailable ({}): {error}; \
+                 `status` will report no supervisor",
                 error.code()
             );
-            Ok(None)
+            Ok((None, Some(lock)))
         }
     }
 }
@@ -1238,8 +1277,8 @@ fn start_ipc_server(
 fn start_ipc_server(
     _config: &ConnectConfig,
     _receiver: tokio::sync::watch::Receiver<tunnel_client::supervisor_ipc::SupervisorStatus>,
-) -> Result<Option<(CancellationToken, tokio::task::JoinHandle<()>)>, CliError> {
-    Ok(None)
+) -> Result<(IpcServer, ProfileLockHold), CliError> {
+    Ok((None, None))
 }
 
 async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<(), CliError> {
@@ -2482,7 +2521,7 @@ mod tests {
     /// exhaustive match with no fallback arm into this array, and the test
     /// below requires the two to agree, so a new variant now fails to build
     /// until it is listed here.
-    const ALL_CAUSES: [Cause; 17] = [
+    const ALL_CAUSES: [Cause; 18] = [
         Cause::InvalidInvocation,
         Cause::ConfigError,
         Cause::InvalidConfig,
@@ -2500,6 +2539,7 @@ mod tests {
         Cause::SupervisorAbsent,
         Cause::SupervisorRunning,
         Cause::IpcUnauthorized,
+        Cause::SupervisorLockFailed,
     ];
 
     fn cause_index(cause: Cause) -> usize {
@@ -2521,6 +2561,7 @@ mod tests {
             Cause::SupervisorAbsent => 14,
             Cause::SupervisorRunning => 15,
             Cause::IpcUnauthorized => 16,
+            Cause::SupervisorLockFailed => 17,
         }
     }
 

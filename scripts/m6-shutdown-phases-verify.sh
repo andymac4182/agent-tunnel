@@ -10,7 +10,8 @@
 #    The hook (`TUNNEL_CLIENT_TEST_HOLD`) holds a rotation at a chosen step;
 #    the default build has no such variable.
 # 2. Runs `crates/tunnel-relay/tests/m6_shutdown_phases_process.rs`: for each
-#    of active, preparing, quiescing, draining, committing and aborting, the
+#    of active, preparing, quiescing, draining, committing, aborting, retiring
+#    and recovering, the
 #    client (first test) and the relay (second test) is sent SIGTERM while it
 #    reports that phase, and must exit 0 in order, leave no process in its
 #    group, release the device's owner slot, and give the echo in flight an
@@ -45,7 +46,7 @@ cargo test -p tunnel-relay --test m6_shutdown_phases_process --locked -- --ignor
   > "$scratch/shutdown.log" 2>&1 || { cat "$scratch/shutdown.log" >&2; exit 1; }
 cat "$scratch/shutdown.log"
 for needle in "test result: ok. 2 passed" \
-  "m606-shutdown matrix ok side=client cases=6" "m606-shutdown matrix ok side=relay cases=6" \
+  "m606-shutdown matrix ok side=client cases=8" "m606-shutdown matrix ok side=relay cases=8" \
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/shutdown.log"; then
     echo "m6-shutdown-phases-verify: FAILED: output lacks '$needle'" >&2
@@ -53,7 +54,7 @@ for needle in "test result: ok. 2 passed" \
   fi
 done
 for side in client relay; do
-  for phase in active preparing quiescing draining committing aborting; do
+  for phase in active preparing quiescing draining committing aborting retiring recovering; do
     if ! grep -q -- "m606-shutdown ok case=$side-$phase " "$scratch/shutdown.log"; then
       echo "m6-shutdown-phases-verify: FAILED: no ok line for $side-$phase" >&2
       exit 1

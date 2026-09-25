@@ -15,6 +15,15 @@
 //! can change a production connector's protocol behaviour. Every hold that
 //! fires prints one stderr line naming the kind, so a run can show it engaged.
 
+// M6-06 review: the hook must never reach a shipped build. Release builds
+// turn `debug_assertions` off, so a release build with the feature is refused
+// at compile time; `scripts/m6-release-artifact.py`'s `cli` check also scans
+// every bundled binary for the variable's name.
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!(
+    "the `test-hooks` feature is for debug test builds only; never build a release with it"
+);
+
 #[cfg(feature = "test-hooks")]
 mod enabled {
     use std::{

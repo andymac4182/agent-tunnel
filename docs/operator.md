@@ -1120,9 +1120,10 @@ Every setting follows from how the binaries stop and reconnect
   retries relay restarts and network loss inside the process, with backoff
   (section 3.1), so the unit restarts it only for what the process cannot
   handle: a crash, an internal failure (exit `1`), `OWNER_BUSY` (exit `7`), or
-  an attempt limit you set (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3`**
+  an attempt limit you set (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3 9`**
   keeps a configuration or credential error (a certificate refused on either
-  side) from restarting in a loop: the unit stays failed and
+  side), or a second `connect` on a profile another one already holds (exit
+  `9`, M6-06), from restarting in a loop: the unit stays failed and
   `journalctl -u tunnel-client` shows the error. If your supervisor should own
   every restart instead, add `--no-reconnect` to `ExecStart`. The relay does
   not retry its own startup (an unreachable Redis exits `1`), so its unit
@@ -1450,7 +1451,9 @@ counters, certificate expiry, export names. It only reads; it starts nothing.
 With no `connect` running for the profile it exits `8`
 (`SUPERVISOR_ABSENT`); a socket other users could reach is refused with `3`
 (`IPC_UNAUTHORIZED`); and a second `connect` on a profile whose supervisor is
-running exits `7` (`SUPERVISOR_RUNNING`). [runtime.md](runtime.md#supervisor-status-ipc)
+running exits `9` (`SUPERVISOR_RUNNING`): the profile lock is an exclusive
+`flock` on `supervisor.lock` beside the socket, and a `connect` that cannot
+take it does not start. [runtime.md](runtime.md#supervisor-status-ipc)
 has the fields and the authorization. `doctor --network` is not implemented
 and is refused rather than ignored:
 

@@ -3,7 +3,9 @@
 //! * **Local IPC authorization.** A running `connect` is the supervisor: it
 //!   binds `supervisor.sock` beside the client key, owner-only, and answers
 //!   `status` and `doctor`. These tests hold the socket's mode, the profile
-//!   lock a second `connect` meets (`SUPERVISOR_RUNNING`, exit `7`), the
+//!   lock a second `connect` meets (`SUPERVISOR_RUNNING`, exit `9`) -- also
+//!   when two start together, and failing closed when the lock cannot be
+//!   taken -- the
 //!   refusal of a socket other users could reach (`IPC_UNAUTHORIZED`, exit
 //!   `3`), the stale file a SIGKILLed supervisor leaves (`SUPERVISOR_ABSENT`,
 //!   exit `8`, then replaced by the next `connect`), and the socket's removal
@@ -389,10 +391,10 @@ fn a_live_supervisor_answers_status_and_doctor_and_holds_the_profile() {
         "SUPERVISOR_IPC_OK"
     );
 
-    // The bind is the profile lock: a second supervisor is refused before it
-    // reaches a relay, and the first keeps answering.
+    // The profile lock: a second supervisor is refused before it reaches a
+    // relay, with its own exit status, and the first keeps answering.
     let second = run_bounded(&["connect", "--config", &profile.config_arg(), "--json"]);
-    assert_eq!(second.status.code(), Some(7), "{}", text(&second));
+    assert_eq!(second.status.code(), Some(9), "{}", text(&second));
     assert_eq!(json(&second)["error"]["code"], "SUPERVISOR_RUNNING");
     assert!(
         run(&["status", "--config", &profile.config_arg()])
@@ -544,4 +546,83 @@ fn every_subcommand_exits_by_the_published_table() {
             text(&output)
         );
     }
+}
+
+/// The M6-06 review's race: two `connect`s started together must leave
+/// exactly one supervisor. Before the `flock`, both could find a stale
+/// socket, both unlink it and both bind. Ten rounds, each with a stale socket
+/// left by a SIGKILLed supervisor, so the unlink branch is the one raced.
+#[test]
+fn two_connects_started_together_leave_exactly_one_supervisor() {
+    let profile = Profile::new();
+    for round in 0..10 {
+        // A stale socket from a killed supervisor, every round.
+        let killed = Supervisor::start(&profile);
+        killed.signal("KILL");
+        let _ = killed.wait();
+        assert!(fs::symlink_metadata(profile.socket()).is_ok());
+
+        let spawn = || {
+            Command::new(client_binary())
+                .args(["connect", "--config", &profile.config_arg(), "--json"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn connect")
+        };
+        let (mut first, mut second) = (spawn(), spawn());
+        // The loser exits 9 at once; the winner stays in its reconnect loop.
+        let deadline = Instant::now() + STEP;
+        let (loser, winner) = loop {
+            let a = first.try_wait().expect("poll");
+            let b = second.try_wait().expect("poll");
+            match (a, b) {
+                (Some(status), None) => break (status, &mut second),
+                (None, Some(status)) => break (status, &mut first),
+                (Some(a), Some(b)) => panic!("round {round}: both exited: {a} {b}"),
+                (None, None) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: neither was refused"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(loser.code(), Some(9), "round {round}");
+        // Still exactly one: the other has not exited meanwhile, and it
+        // answers on the socket.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(winner.try_wait().expect("poll").is_none(), "round {round}");
+        let output = run(&["status", "--config", &profile.config_arg(), "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "round {round}: {}",
+            text(&output)
+        );
+        assert_eq!(json(&output)["result"]["pid"], winner.id(), "round {round}");
+        let _ = winner.kill();
+        let _ = winner.wait();
+        let _ = first.wait();
+        let _ = second.wait();
+    }
+}
+
+/// Fail closed (M6-06 review): a supervisor that cannot take the profile
+/// lock does not run unlocked.
+#[test]
+fn a_lock_that_cannot_be_trusted_stops_connect_before_it_starts() {
+    let profile = Profile::new();
+    let lock = profile.dir.join("supervisor.lock");
+    let elsewhere = profile.dir.join("elsewhere");
+    fs::write(&elsewhere, b"").expect("target");
+    std::os::unix::fs::symlink(&elsewhere, &lock).expect("symlink");
+    let output = run_bounded(&["connect", "--config", &profile.config_arg(), "--json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    assert_eq!(json(&output)["error"]["code"], "IPC_UNAUTHORIZED");
+    assert!(
+        fs::symlink_metadata(profile.socket()).is_err(),
+        "no socket may be bound without the lock"
+    );
 }

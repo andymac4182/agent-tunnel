@@ -22,9 +22,19 @@
 //! row M0-03 recorded (options (c) with (a)), applied by default pending owner
 //! confirmation (2026-09-25).
 //!
-//! **The bind is the profile lock.** A supervisor that finds a live listener
-//! on its path refuses to start (`SUPERVISOR_RUNNING`); a socket file nobody
-//! listens on is a stale leftover of a killed supervisor and is replaced.
+//! **The profile lock is an exclusive `flock` on `supervisor.lock`** (the
+//! socket path with its extension replaced by `lock`), opened `O_NOFOLLOW`,
+//! mode `0600`, owned by this user, and held for the supervisor's whole life
+//! ([`ProfileLock`]). The kernel releases it when the process ends, however
+//! it ends, so a SIGKILLed supervisor never leaves a stale lock. Probing,
+//! unlinking and binding the socket happen only while it is held, so two
+//! supervisors starting together cannot both decide a socket is stale and
+//! both bind (task row M6-C136, the M6-06 review). A second supervisor meets
+//! the lock and exits `9` `SUPERVISOR_RUNNING`; one that cannot take the lock
+//! for any other reason refuses to start too (fail closed). A socket file
+//! nobody listens on is a stale leftover of a killed supervisor and is
+//! replaced; one a live listener answers (a supervisor from before the lock)
+//! is `SUPERVISOR_RUNNING` as well.
 //!
 //! **Redaction is by construction.** [`SupervisorStatus`] holds identifiers,
 //! phases, counters, deadlines, a certificate expiry and export names and
@@ -73,6 +83,9 @@ pub enum IpcError {
     Malformed,
     /// A local I/O failure other than the above.
     Io(&'static str),
+    /// The profile lock could not be taken for a reason other than another
+    /// supervisor holding it (a missing directory, an I/O error).
+    LockFailed(&'static str),
     /// This platform has no supervisor IPC (not Unix).
     Unsupported,
 }
@@ -89,6 +102,7 @@ impl IpcError {
             Self::Timeout => "IPC_TIMEOUT",
             Self::Malformed => "IPC_MALFORMED",
             Self::Io(_) => "IPC_IO_ERROR",
+            Self::LockFailed(_) => "SUPERVISOR_LOCK_FAILED",
             Self::Unsupported => "IPC_UNSUPPORTED",
         }
     }
@@ -117,6 +131,12 @@ impl std::fmt::Display for IpcError {
             ),
             Self::Malformed => formatter.write_str("the supervisor's answer was malformed"),
             Self::Io(reason) => write!(formatter, "local supervisor IPC failed: {reason}"),
+            Self::LockFailed(reason) => {
+                write!(
+                    formatter,
+                    "the profile's supervisor lock could not be taken: {reason}"
+                )
+            }
             Self::Unsupported => {
                 formatter.write_str("supervisor IPC is not supported on this platform")
             }
@@ -328,6 +348,82 @@ mod unix {
         Ok(())
     }
 
+    /// The profile lock file for a supervisor socket path.
+    #[must_use]
+    pub fn lock_path(socket: &Path) -> PathBuf {
+        socket.with_extension("lock")
+    }
+
+    /// The exclusive profile lock, held for as long as this value lives.
+    ///
+    /// It is an open file description carrying a non-blocking exclusive
+    /// `flock`; dropping it, or the process ending in any way, releases it.
+    /// The lock file itself is never removed: unlinking a lock file lets a
+    /// third process lock a new inode while the second still holds the old
+    /// one.
+    #[derive(Debug)]
+    pub struct ProfileLock {
+        _file: std::os::fd::OwnedFd,
+        socket: PathBuf,
+    }
+
+    impl ProfileLock {
+        /// Take the lock for the supervisor socket at `socket`, or say why
+        /// not. Never blocks.
+        pub fn acquire(socket: &Path) -> Result<Self, IpcError> {
+            use rustix::fs::{FlockOperation, Mode, OFlags};
+            let uid = effective_uid();
+            check_directory(socket, uid).map_err(|error| match error {
+                IpcError::Io(reason) => IpcError::LockFailed(reason),
+                other => other,
+            })?;
+            let path = lock_path(socket);
+            let file = rustix::fs::open(
+                &path,
+                OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|error| match error {
+                rustix::io::Errno::LOOP => {
+                    IpcError::Unauthorized("the supervisor lock is a symbolic link")
+                }
+                rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => {
+                    IpcError::Unauthorized("the supervisor lock is not accessible to this user")
+                }
+                _ => IpcError::LockFailed("the supervisor lock file could not be opened"),
+            })?;
+            let stat = rustix::fs::fstat(&file)
+                .map_err(|_| IpcError::LockFailed("the supervisor lock file could not be read"))?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+            {
+                return Err(IpcError::Unauthorized(
+                    "the supervisor lock is not a regular file",
+                ));
+            }
+            if stat.st_uid != uid {
+                return Err(IpcError::Unauthorized(
+                    "the supervisor lock is owned by another user",
+                ));
+            }
+            if u32::from(stat.st_mode) & 0o077 != 0 {
+                return Err(IpcError::Unauthorized(
+                    "the supervisor lock is accessible to other users",
+                ));
+            }
+            match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => Ok(Self {
+                    _file: file,
+                    socket: socket.to_owned(),
+                }),
+                Err(rustix::io::Errno::WOULDBLOCK) => Err(IpcError::Busy),
+                Err(_) => Err(IpcError::LockFailed(
+                    "the supervisor lock could not be taken",
+                )),
+            }
+        }
+    }
+
     /// A bound supervisor socket. Dropping it removes the socket file, if
     /// the path still names the socket this process created.
     #[derive(Debug)]
@@ -339,15 +435,23 @@ mod unix {
     }
 
     impl SupervisorIpc {
-        /// Bind the profile's supervisor socket, taking the profile lock.
-        pub fn bind(path: &Path) -> Result<Self, IpcError> {
-            Self::bind_for_uid(path, effective_uid())
+        /// Bind the profile's supervisor socket. Only the holder of the
+        /// profile lock may probe, unlink and bind, so the lock is required.
+        pub fn bind(path: &Path, lock: &ProfileLock) -> Result<Self, IpcError> {
+            Self::bind_for_uid(path, effective_uid(), lock)
         }
 
         /// Bind, authorizing peers whose UID is `expected_uid`. Only tests
         /// pass anything but [`effective_uid`], to exercise the refusal.
         #[doc(hidden)]
-        pub fn bind_for_uid(path: &Path, expected_uid: u32) -> Result<Self, IpcError> {
+        pub fn bind_for_uid(
+            path: &Path,
+            expected_uid: u32,
+            lock: &ProfileLock,
+        ) -> Result<Self, IpcError> {
+            if lock.socket != path {
+                return Err(IpcError::Io("the profile lock is for another socket"));
+            }
             check_path_length(path)?;
             let own_uid = effective_uid();
             check_directory(path, own_uid)?;
@@ -358,8 +462,9 @@ mod unix {
                             "the supervisor socket path exists and is not a socket",
                         ));
                     }
-                    // A live listener is another supervisor; refused is a
-                    // stale file left by a killed one.
+                    // Under the lock no other supervisor of this version can
+                    // be binding. A live listener is one from before the lock
+                    // existed; refused is a stale file left by a killed one.
                     match std::os::unix::net::UnixStream::connect(path) {
                         Ok(_) => return Err(IpcError::Busy),
                         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -571,7 +676,9 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{SupervisorIpc, effective_uid, query_status, query_status_for_uid};
+pub use unix::{
+    ProfileLock, SupervisorIpc, effective_uid, lock_path, query_status, query_status_for_uid,
+};
 
 /// Read the supervisor's status; this platform has no supervisor IPC.
 #[cfg(not(unix))]
@@ -593,6 +700,13 @@ mod tests {
         dir
     }
 
+    /// Take the profile lock and bind, as `connect` does.
+    fn bind(path: &std::path::Path) -> Result<(ProfileLock, SupervisorIpc), IpcError> {
+        let lock = ProfileLock::acquire(path)?;
+        let ipc = SupervisorIpc::bind(path, &lock)?;
+        Ok((lock, ipc))
+    }
+
     fn snapshot() -> SupervisorStatus {
         SupervisorStatus {
             pid: 7,
@@ -606,7 +720,7 @@ mod tests {
     async fn a_same_user_reader_gets_the_snapshot_and_the_socket_is_owner_only() {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
-        let ipc = SupervisorIpc::bind(&path).expect("bind");
+        let (_lock, ipc) = bind(&path).expect("bind");
         let mode = std::fs::metadata(&path)
             .expect("socket")
             .permissions()
@@ -634,7 +748,8 @@ mod tests {
         // The server authorizes a UID that is not this process's, so this
         // process is, to it, another user: the real peer_cred path refuses.
         let other = effective_uid().wrapping_add(1);
-        let ipc = SupervisorIpc::bind_for_uid(&path, other).expect("bind");
+        let lock = ProfileLock::acquire(&path).expect("lock");
+        let ipc = SupervisorIpc::bind_for_uid(&path, other, &lock).expect("bind");
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
@@ -648,7 +763,7 @@ mod tests {
     async fn a_reader_refuses_a_supervisor_running_as_another_uid() {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
-        let ipc = SupervisorIpc::bind(&path).expect("bind");
+        let (_lock, ipc) = bind(&path).expect("bind");
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
@@ -670,7 +785,7 @@ mod tests {
     async fn a_socket_readable_by_others_is_refused_before_connecting() {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
-        let ipc = SupervisorIpc::bind(&path).expect("bind");
+        let (_lock, ipc) = bind(&path).expect("bind");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
@@ -689,7 +804,7 @@ mod tests {
         let dir = private_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770))
             .expect("chmod");
-        let error = SupervisorIpc::bind(&dir.path().join("s.sock")).expect_err("refused");
+        let error = bind(&dir.path().join("s.sock")).expect_err("refused");
         assert!(matches!(error, IpcError::Unauthorized(_)), "{error:?}");
     }
 
@@ -697,19 +812,81 @@ mod tests {
     async fn a_live_supervisor_holds_the_profile_and_a_stale_socket_is_replaced() {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
-        let first = SupervisorIpc::bind(&path).expect("bind");
-        assert_eq!(
-            SupervisorIpc::bind(&path).expect_err("busy"),
-            IpcError::Busy
-        );
-        // A killed supervisor leaves its file behind with nobody listening.
+        let first = bind(&path).expect("bind");
+        assert_eq!(bind(&path).expect_err("busy"), IpcError::Busy);
+        // A killed supervisor leaves its socket file behind, nobody
+        // listening; its lock went with its process.
         let stale = std::os::unix::net::UnixListener::bind(dir.path().join("t.sock"))
             .expect("stale listener");
         drop(stale);
-        let replaced = SupervisorIpc::bind(&dir.path().join("t.sock")).expect("stale replaced");
+        let replaced = bind(&dir.path().join("t.sock")).expect("stale replaced");
         drop(replaced);
         drop(first);
         assert!(!path.exists());
+    }
+
+    /// The M6-06 review's race: two supervisors starting together must not
+    /// both win. The lock is a non-blocking `flock` on an open file
+    /// description, so two acquisitions in one process conflict exactly as
+    /// two processes do; the process-level race is
+    /// `ops_gate_cli::two_connects_started_together_leave_exactly_one_supervisor`.
+    #[test]
+    fn concurrent_lock_attempts_admit_exactly_one() {
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        for _ in 0..50 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            // Spawn all eight before joining any: the barrier needs them all.
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (barrier, path) = (barrier.clone(), path.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        ProfileLock::acquire(&path)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().expect("join"))
+                .collect();
+            let won = results.iter().filter(|result| result.is_ok()).count();
+            let busy = results
+                .iter()
+                .filter(|result| matches!(result, Err(IpcError::Busy)))
+                .count();
+            assert_eq!((won, busy), (1, 7), "{results:?}");
+        }
+    }
+
+    #[test]
+    fn a_lock_that_is_a_symlink_or_open_to_others_is_refused() {
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"").expect("target");
+        std::os::unix::fs::symlink(&target, lock_path(&path)).expect("symlink");
+        assert_eq!(
+            ProfileLock::acquire(&path).expect_err("symlink"),
+            IpcError::Unauthorized("the supervisor lock is a symbolic link")
+        );
+        std::fs::remove_file(lock_path(&path)).expect("unlink");
+        std::fs::write(lock_path(&path), b"").expect("lock file");
+        std::fs::set_permissions(lock_path(&path), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+        assert_eq!(
+            ProfileLock::acquire(&path).expect_err("mode"),
+            IpcError::Unauthorized("the supervisor lock is accessible to other users")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_listener_without_the_lock_is_still_busy() {
+        // A supervisor from before the lock: listening, holding no lock.
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let _old = std::os::unix::net::UnixListener::bind(&path).expect("old supervisor");
+        assert_eq!(bind(&path).expect_err("busy"), IpcError::Busy);
     }
 
     #[tokio::test]
@@ -722,10 +899,7 @@ mod tests {
             IpcError::Absent
         );
         let long = dir.path().join("x".repeat(MAX_SOCKET_PATH_BYTES));
-        assert_eq!(
-            SupervisorIpc::bind(&long).expect_err("long"),
-            IpcError::PathTooLong
-        );
+        assert_eq!(bind(&long).expect_err("long"), IpcError::PathTooLong);
     }
 
     #[tokio::test]
@@ -733,7 +907,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = private_dir();
         let path = dir.path().join("s.sock");
-        let ipc = SupervisorIpc::bind(&path).expect("bind");
+        let (_lock, ipc) = bind(&path).expect("bind");
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));

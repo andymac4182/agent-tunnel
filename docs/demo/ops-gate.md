@@ -6,7 +6,7 @@ What this shows, end to end through a real local relay:
    socket. `tunnel-client status` and `doctor` read it; nothing else can.
 2. Every `tunnel-client` subcommand exits with the status
    [runtime.md](../runtime.md#client-exit-codes) publishes, including the new
-   `8` (`SUPERVISOR_ABSENT`) and `7` (`SUPERVISOR_RUNNING`).
+   `8` (`SUPERVISOR_ABSENT`) and `9` (`SUPERVISOR_RUNNING`).
 3. Neither `status` nor `doctor` prints a path, an endpoint, a key, a token,
    a canary or payload bytes.
 4. The client and the relay each stop in order on SIGTERM in every data
@@ -75,12 +75,12 @@ $ tunnel-client status --config client.toml --json
 The supervisor check in `doctor` is informational: `not_running` when no
 `connect` is up, and it never changes the exit status.
 
-The socket is the profile lock, and it is owner-only:
+The profile lock (an exclusive `flock` on `credentials/supervisor.lock`) refuses a second supervisor, and the socket is owner-only:
 
 ```console
 $ tunnel-client connect --config client.toml; echo "exit=$?"
 tunnel-client: another tunnel-client connect is already supervising this profile
-exit=7
+exit=9
 $ chmod 666 credentials/supervisor.sock
 $ tunnel-client status --config client.toml; echo "exit=$?"
 tunnel-client: local supervisor IPC refused: the supervisor socket is accessible to other users
@@ -143,7 +143,7 @@ rotation runs: `result.session.phase` moves through `preparing`, `quiescing`,
 * `status` exits `3` `IPC_UNAUTHORIZED`: the socket or its directory is
   reachable by other users, or owned by someone else. Find who changed it;
   restart `connect` to recreate it `0600`.
-* `connect` exits `7` `SUPERVISOR_RUNNING`: another `connect` holds the
+* `connect` exits `9` `SUPERVISOR_RUNNING`: another `connect` holds the
   profile. `tunnel-client status` names its pid.
 * The matrix script fails a case: the log names the case, both witnessed
   phases and the client's events. A gate failure while `uptime` shows a load

@@ -89,8 +89,10 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 /// nothing, while a missing member misclassifies a real exit.
 ///
 /// `8` is `status` finding no supervisor for the profile (`SUPERVISOR_ABSENT`,
-/// M6-06); `connect` never produces it.
-pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 130];
+/// M6-06); `connect` never produces it. `9` is `connect` refusing to start
+/// without the profile lock (`SUPERVISOR_RUNNING`, `SUPERVISOR_LOCK_FAILED`;
+/// the M6-06 review).
+pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 130];
 
 /// The M1 failure policy. A later caller can explicitly create a fresh
 /// session; the library never reconnects or replays an operation itself.

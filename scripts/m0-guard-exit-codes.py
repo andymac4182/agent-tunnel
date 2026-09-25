@@ -1194,18 +1194,45 @@ OPS_GATE_CASES: list[Case] = [
         ),
     ),
     Case(
-        # The profile lock: a second supervisor that ignores a live one would
-        # run its own reconnect loop on the same credential.  The fixture
-        # bounds that run, so the defeat reddens rather than hangs.
-        "a second supervisor on a held profile is noticed",
+        # The profile lock fails closed (M6-C136, the M6-06 review): a
+        # supervisor that cannot take the `flock` must not run unlocked.  The
+        # defeat runs it unlocked and without IPC instead -- the "fail open"
+        # the review found.  The fixtures bound the second supervisor's run,
+        # so the defeat reddens rather than hangs.
+        "a supervisor that cannot take the profile lock does not run",
         [
             (
                 MAIN,
-                "        Err(IpcError::Busy) => Err(CliError::from_ipc(IpcError::Busy)),",
-                "        Err(IpcError::Busy) => Ok(None),",
+                "        Err(error) => return Err(CliError::from_ipc(error)),",
+                "        Err(_) => return Ok((None, None)),",
+            ),
+        ],
+        frozenset(
+            {
+                "a_live_supervisor_answers_status_and_doctor_and_holds_the_profile",
+                "a_lock_that_cannot_be_trusted_stops_connect_before_it_starts",
+                "two_connects_started_together_leave_exactly_one_supervisor",
+            }
+        ),
+    ),
+    Case(
+        # The stale-socket branch (M6-06 review item 7): a socket nobody
+        # listens on is a SIGKILLed supervisor's and must be replaced.  The
+        # defeat reads it as a live supervisor, so no `connect` could ever
+        # start again after a crash.
+        "a crashed supervisor's stale socket is replaced, not read as busy",
+        [
+            (
+                SUPERVISOR_IPC,
+                "                        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {\n"
+                "                            std::fs::remove_file(path).map_err(|_| {",
+                "                        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {\n"
+                "                            return Err(IpcError::Busy);\n"
+                "                            #[allow(unreachable_code)]\n"
+                "                            std::fs::remove_file(path).map_err(|_| {",
             )
         ],
-        frozenset({"a_live_supervisor_answers_status_and_doctor_and_holds_the_profile"}),
+        frozenset({"a_killed_supervisors_stale_socket_is_absent_and_then_replaced"}),
     ),
     Case(
         "status with no supervisor is its own exit status",
