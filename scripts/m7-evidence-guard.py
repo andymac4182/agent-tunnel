@@ -313,29 +313,20 @@ def row_identifier(cells: "list[str]") -> str:
     return match.group(1) if match else (first[:24] or "?")
 
 
-# The one section where a run of table rows with no separator is NOT reported.
-#
-# docs/tasks.md's completion history is an append-only log that has been written
-# in TWO formats: 305 pipe-delimited rows and 39 markdown bullets, interleaved.
-# Each bullet ends the table above it, so most of that section's rows are
-# orphans.  It is a real defect and it is recorded as M4-41 -- it is exempted
-# here rather than swept because converting a bullet into a row means inventing
-# its Item and Event cells, and a guard that invented evidence would be a
-# stranger defect than the one it fixed.
-#
-# The exemption is one named section, it is COUNTED, and the count is printed on
-# every verbose run, because an exemption nobody measures is how a guard's scope
-# quietly becomes nothing.  scripts/test_table_shape.py pins the count so the
-# section cannot grow new orphans unnoticed.
-EXEMPT_SECTION = "Completion history"
+# There is NO exempt section (M4-41).  The `Completion history` log in
+# docs/tasks.md used to be exempted by name because it was written in two
+# formats at once -- pipe rows interleaved with 39 markdown bullets -- so 300 of
+# its rows were orphans no separator governed.  M4-41 converted the bullets to
+# rows (time, verbatim text, and Item/Event cells marked "not recorded" rather
+# than inferred) and joined the log into one table, and the exemption was then
+# deleted rather than left applying to nothing.  An orphan row in that section
+# is now the same hard failure it is everywhere else.
 
 
-def table_shape_findings(
-    rel: str, text: str
-) -> "tuple[list[str], int, int, int]":
+def table_shape_findings(rel: str, text: str) -> "tuple[list[str], int, int]":
     """Findings for rows whose cell count differs from their table's header.
 
-    Returns (findings, tables_seen, rows_checked, exempt_rows).
+    Returns (findings, tables_seen, rows_checked).
 
     The authority for a table's width is its OWN separator row (`|---|---|...`),
     which is what a markdown renderer uses and what the header therefore
@@ -351,7 +342,6 @@ def table_shape_findings(
     findings: "list[str]" = []
     tables_seen = 0
     rows_checked = 0
-    exempt_rows = 0
 
     # Work in BLOCKS of consecutive pipe-leading lines rather than streaming
     # line by line and carrying a `declared` width across gaps.
@@ -366,25 +356,19 @@ def table_shape_findings(
     # in docs/tasks.md hid 29 rows from it, and the only reason it was noticed
     # is that adding a row to that table did not move the scanned-row figure.
     # Rows no separator governs are now a finding, not a silence.
-    blocks: "list[tuple[str, list[tuple[int, str]]]]" = []
+    blocks: "list[list[tuple[int, str]]]" = []
     current: "list[tuple[int, str]]" = []
-    section = ""
-    block_section = ""
     for lineno, line in enumerate(text.splitlines(), start=1):
         if line.strip().startswith("|"):
-            if not current:
-                block_section = section
             current.append((lineno, line))
             continue
         if current:
-            blocks.append((block_section, current))
+            blocks.append(current)
             current = []
-        if line.startswith("#"):
-            section = line.lstrip("#").strip()
     if current:
-        blocks.append((block_section, current))
+        blocks.append(current)
 
-    for block_section, block in blocks:
+    for block in blocks:
         header_line, header = block[0]
         if len(block) >= 2 and is_separator(block[1][1]):
             declared = len(split_cells(block[1][1]))
@@ -403,10 +387,7 @@ def table_shape_findings(
         for lineno, line in body:
             cells = split_cells(line)
             rows_checked += 1
-            if declared is None and block_section == EXEMPT_SECTION:
-                # Counted, never silent, never fatal.  See EXEMPT_SECTION.
-                exempt_rows += 1
-            elif declared is None:
+            if declared is None:
                 findings.append(
                     f"{rel}:{lineno}: row '{row_identifier(cells)}' is not "
                     f"governed by any header/separator -- the run of table rows "
@@ -423,7 +404,7 @@ def table_shape_findings(
                     f"code span, where backticks do NOT protect it -- adds a column. "
                     f"Write it as '\\|'."
                 )
-    return findings, tables_seen, rows_checked, exempt_rows
+    return findings, tables_seen, rows_checked
 
 
 #: Status spellings that contain "verified" while claiming the opposite, or
@@ -458,6 +439,30 @@ NOT_A_VERIFIED_CLAIM = (
 )
 
 
+#: The header names that mark a table's verdict column (M4-40).  Matched
+#: exactly, lower-cased, against the table's OWN header row; a table naming
+#: none of them has no verdict column and contributes no row to the evidence
+#: rules.  `status` heads every task and edge-case table; `current state` is
+#: the milestone summary's verdict; `event` is the completion journal's.
+#:
+#: **The two non-`Status` verdicts keep the exact wording rule, not M6-C10's
+#: substring rule**, because that is the scope they had before M4-40: they
+#: entered only through the any-column exact match.  M4-40 changes WHICH cell
+#: is read, not which words admit it.  Widening the journal to the substring
+#: rule is a separate decision with a measured cost -- see
+#: `EXACT_VERDICT_HEADERS` and the M4-40 row.
+VERDICT_HEADERS = ("status", "current state", "event")
+#: Verdict columns matched only by exact equality with "verified" or
+#: "verified local".  Measured when M4-40 landed: widening both to the
+#: substring rule would admit 70 more rows and produce one finding, a
+#: 2026-09-23 M6-C73 entry naming the commit its diagnostic image was built
+#: from on a since-deleted branch -- a commit that resolves only in clones
+#: that still hold the object.  That is a decision about what a journal entry
+#: claims, and it is not taken silently inside a column fix.
+EXACT_VERDICT_HEADERS = ("current state", "event")
+EXACT_VERDICTS = ("verified", "verified local")
+
+
 def status_column(header: str) -> "int | None":
     """The index of a table's `Status` column, read from its own header.
 
@@ -478,17 +483,38 @@ def status_column(header: str) -> "int | None":
     measurement of its consequences: a table with no `Status` column has no
     status column, and the milestone and journal tables say so in their own
     headers (`Milestone | Current state | Gate statement | Completed at` and
-    `At | Item | Event | Evidence or scope`).  Rows in those tables are
-    matched only by the exact-equality rule, exactly as before this change.
+    `At | Item | Event | Evidence or scope`).
+
+    **Since M4-40 the header is the ONLY route into scope.**  The two tables
+    whose verdict is not headed `Status` name their verdict column in their
+    own header too -- `Current state` in the milestone summary, `Event` in the
+    completion journals -- so each is read positionally from its own header
+    (see `VERDICT_HEADERS`).  A table whose header names none of them has no
+    verdict column and none of its rows is in scope, whatever words its cells
+    contain.
     """
     cells = [cell.lower() for cell in split_cells(header)]
     for index, cell in enumerate(cells):
-        if cell == "status":
+        if cell in VERDICT_HEADERS:
             return index
     return None
 
 
-def row_is_verified(line: str, index: "int | None" = None) -> bool:
+def verdict_is_exact(header: str) -> bool:
+    """True when the header's verdict column admits only an exact match.
+
+    See `EXACT_VERDICT_HEADERS`.  False for a `Status` column and for a table
+    with no verdict column at all (whose rows `row_is_verified` rejects).
+    """
+    index = status_column(header)
+    if index is None:
+        return False
+    return split_cells(header)[index].lower() in EXACT_VERDICT_HEADERS
+
+
+def row_is_verified(
+    line: str, index: "int | None" = None, exact: bool = False
+) -> bool:
     """A row is verified when its status column claims it.
 
     In docs/tasks.md the `[x]` checkbox only means the task item is checked;
@@ -503,19 +529,26 @@ def row_is_verified(line: str, index: "int | None" = None) -> bool:
     checked, and the guard reported a clean pass over 252 rows without ever
     saying which ones it had not looked at.
 
-    A row is verified if the old exact match holds **or** its `Status` cell
-    claims verification in words that are not an awaiting/pending/negated
-    form.  The `or` is deliberate and makes the change a strict widening:
-    no row the old rule caught can leave scope, including the milestone-table
-    rows whose tables have no `Status` column at all.
+    **M4-40: the verdict column is the ONLY cell read.**  Until M4-40 this
+    also accepted a cell anywhere in the row equal to "verified" or "verified
+    local" -- an `or` kept so M6-C10's widening could not drop a row from
+    scope.  That fallback meant a row's scope was set by wording in *any*
+    column: an `Owner` or `Evidence` cell reading exactly `verified` put a
+    `planned` row under the gate and ancestry rules, and a row whose status
+    was `open` could be promoted into scope by a stray cell.  It is gone.
+    The rows it alone admitted were measured when it was removed: the two
+    milestone rows (M1, M2) whose `Current state` reads `verified local`, and
+    seven completion-journal rows whose `Event` reads `verified local` -- all
+    nine are now admitted through their own table's verdict column
+    (`VERDICT_HEADERS`, exact wording -- `exact=True`), so the removal
+    narrowed scope by **zero** rows while ending the any-column route.
     """
     cells = split_cells(line)
-    for cell in cells:
-        if cell.lower() in ("verified", "verified local"):
-            return True
     if index is None or len(cells) <= index:
         return False
     status = cells[index].lower()
+    if exact:
+        return status in EXACT_VERDICTS
     return "verified" in status and not any(no in status for no in NOT_A_VERIFIED_CLAIM)
 
 
@@ -592,32 +625,33 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
     tables_seen = 0
     shape_rows = 0
     shape_findings = 0
-    exempt_rows = 0
     for path in DOCS:
         rel = os.path.relpath(path, REPO_ROOT)
         text = read_text(path)
-        shape, tables_n, shape_n, exempt_n = table_shape_findings(rel, text)
+        shape, tables_n, shape_n = table_shape_findings(rel, text)
         findings.extend(shape)
         shape_findings += len(shape)
         tables_seen += tables_n
         shape_rows += shape_n
-        exempt_rows += exempt_n
         lines = text.splitlines()
         # The `Status` column index of the table currently being walked.  A
         # header is a table row whose next line is the separator; anything
         # that is not a table row ends the table, so a `Status` index can
         # never leak from one table into the next.
         index: "int | None" = None
+        exact = False
         for lineno, line in enumerate(lines, start=1):
             if not is_table_row(line):
                 index = None
+                exact = False
                 continue
             if is_separator(line):
                 continue
             if lineno < len(lines) and is_separator(lines[lineno]):
                 index = status_column(line)
+                exact = verdict_is_exact(line)
                 continue
-            if not row_is_verified(line, index):
+            if not row_is_verified(line, index, exact):
                 continue
             rows_scanned += 1
             row, gate_n, hash_n, pin_n = row_findings(
@@ -651,8 +685,8 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
             f"citations, {pin_citations} upstream-pin citations; "
             f"{len(gates)} known gates, {len(pins)} recorded upstream pins; "
             f"table shape: {shape_rows} rows in {tables_seen} tables checked, "
-            f"{shape_findings} findings, {exempt_rows} rows exempt "
-            f"(the '{EXEMPT_SECTION}' log, M4-41)\n"
+            f"{shape_findings} findings, 0 rows exempt (M4-41 removed the "
+            f"exemption)\n"
         )
     return findings
 

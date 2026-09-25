@@ -2248,22 +2248,125 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: The test(s) each case's deleted guard must make redden, keyed by
 #: `(suite, case)`.
 #:
-#: **Empty for suites `m5c2`..`m5c8`, and deliberately so (task row M4-23);
-#: `m5c9` is written with its witnesses from the start.**  A witness is a
-#: measurement -- the test that actually reddens when *this* guard is deleted,
-#: one `cargo test` per case -- and it cannot be read off the case's text.
-#: Filling this in by writing a plausible test name beside each case would
-#: produce a harness that checks 100 guesses and reports them as attribution,
-#: which is the defect this mechanism exists to remove, with the added harm
-#: that the run would now *claim* to have been attributed.
+#: **Measured, not read off the case text (task row M4-42).**  Every entry
+#: below was taken from a run of this harness in which the case's guard was
+#: deleted: of the tests that reddened, the entry names those whose path names
+#: the mutated file's module (its stem as a `::` segment, or as the test
+#: binary), and every reddened test when none does.  Suites m5c2-m5c8 (all seven) were
+#: measured by run `m5disc-7f3a` and then re-run in full with these entries in
+#: force by run `m5ver-4c1d`, in which every case was classified plain `RED` --
+#: its witness reddened again -- and none `RED (wrong witness)`.  A case whose
+#: entry is wrong fails the next run closed, which is the point: an entry is a
+#: claim the harness re-checks every time, not a label.
 #:
-#: So every case here is named in `scripts/guard_witness_debt.json` instead,
-#: keeps the old unattributed classification, and is reported as owing a
-#: witness.  Moving a case out of that ledger and into this table is the unit
-#: of progress; the ledger can only shrink, and a case may not appear in both.
+#: A case not listed here is still owed a witness and is named in
+#: `scripts/guard_witness_debt.json`; the ledger can only shrink, and a case may
+#: not appear in both.
 WITNESSES: dict[tuple[str, str], frozenset[str]] = {
-    # `m5c9` is the first suite in this harness written with its witnesses,
-    # each measured by running the case and reading which test reddened.
+    ('m5c2', 'a 503 is deliberate unavailability rather than a dispatched unknown'): frozenset({'outcome::tests::a_five_oh_three_is_deliberate_unavailability_and_not_a_dispatch'}),
+    ('m5c2', 'a capture is verified per marker rather than by length alone'): frozenset({'marker::tests::a_byte_count_cannot_tell_two_captures_apart_and_the_markers_can', 'marker::tests::one_corrupted_marker_is_located'}),
+    ('m5c2', 'a capture without the synthetic magic is refused'): frozenset({'marker::tests::a_real_capture_is_refused_at_the_magic'}),
+    ('m5c2', 'a deferred operation is refused rather than treated as unknown-but-allowed'): frozenset({'operation::tests::every_operation_in_the_documented_table_is_carried_or_deferred', 'operation::tests::no_deferred_operation_parses_and_a_typo_is_refused_differently'}),
+    ('m5c2', 'a duplicated member name is refused rather than resolved'): frozenset({'json::tests::a_duplicate_member_is_refused_at_the_top_level_and_nested'}),
+    ('m5c2', 'a failure after the request was written is unknown, not not-dispatched'): frozenset({'a_deadline_that_expires_after_the_write_is_unknown_and_the_ledger_shows_why', 'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice', 'a_rotation_leaves_the_lease_held_and_never_repeats_a_click', 'an_in_process_backend_that_hangs_is_dispatched_and_unknown', 'an_unknown_outcome_refuses_a_retry_and_a_not_dispatched_one_permits_it', 'the_fault_table_agrees_with_the_ledger_row_by_row', 'the_same_restart_is_only_named_a_restart_by_a_dispatcher_that_watches'}),
+    ('m5c2', "a framed payload's success member decides, not the HTTP status"): frozenset({'outcome::tests::a_handler_result_that_overrides_the_envelopes_success_key_is_believed', 'outcome::tests::a_permission_denial_and_an_unsupported_command_are_distinguished_from_a_plain_failure', 'outcome::tests::a_two_hundred_carrying_success_false_is_a_dispatched_failure'}),
+    ('m5c2', 'a locally-answered operation is planned as a local answer, never as a command'): frozenset({'plan::tests::describe_plans_a_local_answer_and_never_a_command'}),
+    ('m5c2', 'a locally-answered operation renders as its own wire outcome'): frozenset({'schema::tests::a_locally_answered_operation_renders_as_its_own_outcome'}),
+    ('m5c2', 'a pre-dispatch 400 or 401 is classified as not dispatched'): frozenset({'outcome::tests::a_pre_dispatch_four_hundred_or_four_oh_one_is_not_dispatched_and_carries_no_framing'}),
+    ('m5c2', 'a pre-dispatch refusal renders as its own wire outcome, not as failed'): frozenset({'schema::tests::a_pre_dispatch_refusal_is_distinguishable_from_a_dispatched_failure_on_the_wire'}),
+    ('m5c2', 'a truncated framing is distinguished from an absent one'): frozenset({'outcome::tests::a_truncated_or_unframed_two_hundred_is_dispatched_and_unknown', 'outcome::tests::the_framing_this_parser_expects_is_the_pinned_framing'}),
+    ('m5c2', 'a version reading that did not happen is unknown rather than a denial'): frozenset({'capability::tests::capture_authority_is_read_from_a_version_reading_and_not_from_a_probe'}),
+    ('m5c2', 'an IPv4-mapped IPv6 address is canonicalized before the loopback check'): frozenset({'endpoint::tests::loopback_addresses_with_a_bound_port_are_accepted'}),
+    ('m5c2', 'an absent desktop_capture_authorized is unknown, not denied'): frozenset({'capability::tests::an_absent_capture_authority_is_unknown_and_unknown_permits_an_attempt', 'capability::tests::capture_authority_is_read_from_a_version_reading_and_not_from_a_probe'}),
+    ('m5c2', 'an absent success member is unknown rather than a success'): frozenset({'outcome::tests::a_payload_with_no_success_member_is_unknown_rather_than_a_success'}),
+    ('m5c2', 'an operation answered from device-side state is not reported as a dispatch'): frozenset({'a_describe_can_never_report_a_running_backend_as_working', 'describe_reports_the_negotiated_set_rather_than_the_configuration', 'each_read_only_operation_dispatches_exactly_the_command_the_table_names', 'the_fault_table_agrees_with_the_ledger_row_by_row'}),
+    ('m5c2', 'an unknown capture authority still permits an attempt'): frozenset({'capability::tests::a_denied_capture_authority_removes_capture_and_an_absent_one_does_not', 'capability::tests::an_absent_capture_authority_is_unknown_and_unknown_permits_an_attempt', 'capability::tests::an_operation_whose_command_the_backend_does_not_advertise_is_not_negotiated', 'capability::tests::the_negotiated_set_is_the_intersection_of_all_three_inputs'}),
+    ('m5c2', 'an unknown operation name does not parse'): frozenset({'operation::tests::an_unknown_name_is_refused_with_no_folding_trimming_or_prefixing', 'operation::tests::every_operation_in_the_documented_table_is_carried_or_deferred', 'operation::tests::no_deferred_operation_parses_and_a_typo_is_refused_differently'}),
+    ('m5c2', 'an unknown outcome is never retryable'): frozenset({'outcome::tests::a_truncated_or_unframed_two_hundred_is_dispatched_and_unknown', 'outcome::tests::an_unreasoned_status_fails_towards_unknown_and_is_not_retryable', 'outcome::tests::retry_is_safe_exactly_for_not_dispatched_and_for_a_reported_failure'}),
+    ('m5c2', 'an unknown params member is refused rather than ignored'): frozenset({'schema::tests::unknown_members_are_refused_at_the_top_level_and_inside_params'}),
+    ('m5c2', 'an unknown top-level member is refused rather than ignored'): frozenset({'schema::tests::unknown_members_are_refused_at_the_top_level_and_inside_params'}),
+    ('m5c2', 'an unreasoned status fails towards unknown rather than not-dispatched'): frozenset({'outcome::tests::an_unreasoned_status_fails_towards_unknown_and_is_not_retryable'}),
+    ('m5c2', 'capture authority is read from a dispatched version reading'): frozenset({'capability::tests::a_denied_capture_authority_removes_capture_and_an_absent_one_does_not', 'capability::tests::capture_authority_is_read_from_a_version_reading_and_not_from_a_probe'}),
+    ('m5c2', 'describe and capture cannot stand in for the probe'): frozenset({'capability::tests::describe_and_capture_are_refused_as_probes'}),
+    ('m5c2', 'describe maps to no upstream command'): frozenset({'operation::tests::upstream_commands_are_allowlisted_by_the_pin_and_describe_is_not_a_command'}),
+    ('m5c2', 'every resolved address must be loopback, not merely one of them'): frozenset({'endpoint::tests::a_resolution_is_accepted_only_when_every_address_is_loopback'}),
+    ('m5c2', 'probe evidence requires a dispatched, succeeded probe'): frozenset({'capability::tests::only_a_dispatched_succeeded_probe_is_evidence'}),
+    ('m5c2', 'the backend endpoint must be a loopback address'): frozenset({'endpoint::tests::a_resolution_is_accepted_only_when_every_address_is_loopback', 'endpoint::tests::non_loopback_targets_are_refused'}),
+    ('m5c2', 'the capability check runs before anything is planned for dispatch'): frozenset({'plan::tests::the_checks_run_in_order_schema_then_capability_then_lease_then_capture'}),
+    ('m5c2', 'the discovery entry point admits only the commands describe reads'): frozenset({'plan::tests::discovery_admits_only_the_commands_describe_reads'}),
+    ('m5c2', 'the display index is bounded'): frozenset({'schema::tests::the_display_parameter_defaults_and_is_bounded'}),
+    ('m5c2', 'the negotiated set is the intersection of all three inputs'): frozenset({'capability::tests::an_operation_whose_command_the_backend_does_not_advertise_is_not_negotiated', 'capability::tests::describe_survives_a_narrowed_registry_because_it_is_not_a_command', 'capability::tests::the_default_local_configuration_and_grant_are_empty', 'capability::tests::the_negotiated_set_is_the_intersection_of_all_three_inputs'}),
+    ('m5c2', 'the request body limit is checked before the body is parsed'): frozenset({'schema::tests::an_oversized_body_is_refused_by_length_before_it_is_parsed'}),
+    ('m5c2', 'the request body must be a JSON object'): frozenset({'json::tests::everything_that_is_not_one_object_is_refused'}),
+    ('m5c2', 'the schema version is compared exactly'): frozenset({'schema::tests::the_version_is_compared_exactly'}),
+    ('m5c2', 'the unspecified address is refused'): frozenset({'endpoint::tests::the_unspecified_address_and_a_zero_port_are_refused_by_name'}),
+    ('m5c3', 'a capture belonging to another target session is refused'): frozenset({'capture::tests::a_capture_from_another_target_is_a_mismatch_before_it_is_stale'}),
+    ('m5c3', 'a capture dimension is bounded where the capture is recorded'): frozenset({'capture::tests::impossible_capture_geometry_is_refused_rather_than_recorded'}),
+    ('m5c3', 'a capture pixel is converted through the display scale'): frozenset({'capture::tests::a_scaled_capture_converts_pixels_into_backend_points', 'capture::tests::impossible_capture_geometry_is_refused_rather_than_recorded'}),
+    ('m5c3', 'a drag is bounds-checked at both ends'): frozenset({'plan::tests::a_drag_that_ends_outside_the_capture_is_refused'}),
+    ('m5c3', 'a failed input operation renders as non-retryable on the wire'): frozenset({'an_input_operation_that_reached_the_backend_is_never_retryable'}),
+    ('m5c3', 'a key name is restricted to a conservative character set'): frozenset({'schema::tests::keystroke_and_coordinate_parameters_are_bounded_and_fail_closed'}),
+    ('m5c3', 'a not-dispatched refusal of a known operation derives its retryability'): frozenset({'the_wire_derives_retryability_from_the_refusal_and_the_operation'}),
+    ('m5c3', 'a peer-unavailable refusal is never auto-retried for an input operation'): frozenset({'a_peer_unavailable_refusal_is_not_auto_retried_for_an_input_operation', 'the_wire_derives_retryability_from_the_refusal_and_the_operation'}),
+    ('m5c3', 'a planned dispatch never renders its payload, because the payload can be keystrokes'): frozenset({'crates/tunnel-cua/src/plan.rs - plan::Planned (line 217)'}),
+    ('m5c3', 'a release must name the current holding and not merely the target'): frozenset({'lease::tests::releasing_a_superseded_holding_of_your_own_does_not_drop_the_current_one'}),
+    ('m5c3', 'a revoked holder cannot re-acquire its own lease to clear the refusal'): frozenset({'lease::tests::a_revoked_holder_cannot_re_acquire_its_own_lease_to_clear_the_refusal', 'lease::tests::a_superseded_grant_revision_refuses_the_holder_at_the_point_of_use'}),
+    ('m5c3', 'a superseded capture is refused rather than acted on'): frozenset({'capture::tests::a_capture_from_another_target_is_a_mismatch_before_it_is_stale', 'capture::tests::a_superseded_capture_is_refused_and_the_newest_one_is_not'}),
+    ('m5c3', 'a superseded grant revision refuses the lease holder'): frozenset({'lease::tests::a_revoked_holder_cannot_re_acquire_its_own_lease_to_clear_the_refusal', 'lease::tests::a_revoked_lease_still_blocks_another_session_until_it_is_reconciled', 'lease::tests::a_superseded_grant_revision_refuses_the_holder_at_the_point_of_use'}),
+    ('m5c3', 'an input operation is refused to a session that does not hold the lease'): frozenset({'lease::tests::a_second_session_is_refused_only_while_the_first_genuinely_holds_the_lease'}),
+    ('m5c3', 'an input operation that reached the backend is never retryable'): frozenset({'an_input_operation_that_reached_the_backend_is_never_retryable'}),
+    ('m5c3', 'an input operation with no lease at all is refused rather than admitted'): frozenset({'lease::tests::a_second_session_is_refused_only_while_the_first_genuinely_holds_the_lease'}),
+    ('m5c3', 'coordinates outside the capture are refused'): frozenset({'capture::tests::coordinates_outside_the_capture_are_refused_and_the_last_inside_pixel_is_not'}),
+    ('m5c3', 'impossible capture geometry is refused rather than recorded'): frozenset({'capture::tests::impossible_capture_geometry_is_refused_rather_than_recorded'}),
+    ('m5c3', 'reconciling a grant frees only leases whose revision is behind'): frozenset({'lease::tests::re_acquiring_at_a_stale_revision_is_accepted_and_changes_nothing', 'lease::tests::reconciling_an_unchanged_revision_frees_nothing'}),
+    ('m5c3', 'the button selects the upstream click command'): frozenset({'plan::tests::every_input_operation_plans_its_canonical_command_and_payload', 'plan::tests::every_payload_uses_only_pinned_parameter_names'}),
+    ('m5c3', 'the capture bound is half-open, so the pixel at the width is outside'): frozenset({'capture::tests::coordinates_outside_the_capture_are_refused_and_the_last_inside_pixel_is_not'}),
+    ('m5c3', 'the click counter counts effects, so a double click contributes two'): frozenset({'a_click_happens_once_and_the_double_click_control_reads_two', 'the_journal_records_the_same_effects_the_in_memory_ledger_does'}),
+    ('m5c3', 'the planner checks the input lease before it plans a dispatch'): frozenset({'plan::tests::a_second_session_may_read_but_may_not_act', 'plan::tests::a_superseded_grant_revision_refuses_an_input_operation', 'plan::tests::the_checks_run_in_order_schema_then_capability_then_lease_then_capture'}),
+    ('m5c3', 'the planner resolves the capture identity before it plans a dispatch'): frozenset({'plan::tests::a_drag_that_ends_outside_the_capture_is_refused', 'plan::tests::a_scaled_capture_is_converted_before_it_reaches_the_payload', 'plan::tests::a_superseded_capture_refuses_every_coordinate_operation', 'plan::tests::every_planner_refusal_is_not_dispatched', 'plan::tests::keyboard_operations_need_the_lease_and_no_capture', 'plan::tests::the_checks_run_in_order_schema_then_capability_then_lease_then_capture'}),
+    ('m5c3', 'the request payload carries the converted coordinate and not the raw pixel'): frozenset({'plan::tests::a_scaled_capture_is_converted_before_it_reaches_the_payload'}),
+    ('m5c3', 'typed text is redacted from every diagnostic'): frozenset({'crates/tunnel-cua/src/schema.rs - schema::Keystrokes (line 126)', 'plan::tests::the_validated_parameters_never_render_the_typed_text'}),
+    ('m5c4', "a bare end of file makes the sentinel kill the watched backend's group"): frozenset({'a_sigkilled_supervisor_still_kills_the_backends_group'}),
+    ('m5c4', 'a capture identity is never reissued after a restart'): frozenset({'a_capture_taken_after_a_restart_never_reuses_a_pre_restart_identity', 'supervision::tests::a_capture_issued_after_a_restart_never_reuses_a_pre_restart_identity'}),
+    ('m5c4', 'a lease id is never reissued after a restart'): frozenset({'supervision::tests::a_lease_taken_after_a_restart_never_reuses_a_pre_restart_lease_id'}),
+    ('m5c4', 'a probe cannot report a backend that is gone as working'): frozenset({'supervisor::tests::a_probe_cannot_report_a_backend_that_is_gone_as_working'}),
+    ('m5c4', 'a restart invalidates both registries, never one of them'): frozenset({'supervision::tests::a_capture_issued_after_a_restart_never_reuses_a_pre_restart_identity', 'supervision::tests::a_restart_drops_the_lease_and_forgets_every_capture', 'supervision::tests::a_restart_that_freed_nothing_still_declares_what_it_cannot_see'}),
+    ('m5c4', 'a supervised backend is started as the leader of its own process group'): frozenset({'child::tests::a_backend_is_started_as_the_leader_of_its_own_process_group'}),
+    ('m5c4', 'a supervised restart drops every input lease'): frozenset({'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice', 'a_supervised_restart_declares_what_it_cannot_observe_about_the_target', 'supervision::tests::a_lease_taken_after_a_restart_never_reuses_a_pre_restart_lease_id', 'supervision::tests::a_restart_drops_the_lease_and_forgets_every_capture', 'supervision::tests::a_restart_frees_every_session_not_merely_the_one_that_asked', 'supervision::tests::a_restart_that_freed_nothing_still_declares_what_it_cannot_see', 'supervisor::tests::a_restart_invalidates_the_lease_and_the_captures_before_the_new_backend_exists', 'supervisor::tests::a_restart_whose_new_backend_fails_has_still_invalidated', 'supervisor::tests::stopping_a_backend_that_already_died_still_invalidates'}),
+    ('m5c4', 'a supervised restart forgets every capture identity'): frozenset({'a_capture_identity_from_before_a_restart_is_unknown_afterwards', 'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice', 'a_supervised_restart_declares_what_it_cannot_observe_about_the_target', 'supervision::tests::a_capture_issued_after_a_restart_never_reuses_a_pre_restart_identity', 'supervision::tests::a_restart_drops_the_lease_and_forgets_every_capture', 'supervision::tests::a_restart_that_freed_nothing_still_declares_what_it_cannot_see', 'supervisor::tests::a_restart_invalidates_the_lease_and_the_captures_before_the_new_backend_exists'}),
+    ('m5c4', 'an operation in flight across a restart is unknown, never not-dispatched'): frozenset({'supervision::tests::a_disturbed_exchange_that_reached_the_backend_is_named_a_restart', 'supervision::tests::an_operation_that_reached_the_backend_is_unknown_and_never_retryable', 'supervision::tests::attribution_never_changes_what_a_retry_is_allowed_to_do', 'supervision::tests::the_two_stages_are_the_only_thing_that_separates_them'}),
+    ('m5c4', 'every supervised CUA backend is watched by a parent-death sentinel'): frozenset({'child::tests::an_orderly_kill_stands_the_sentinel_down_rather_than_firing_it'}),
+    ('m5c4', 'nothing but probe evidence permits an operation to be dispatched'): frozenset({'health::tests::nothing_but_working_permits_a_dispatch', 'health::tests::running_and_working_are_different_questions'}),
+    ('m5c4', 'only an OS-gated read-only operation may stand as a health probe'): frozenset({'health::tests::a_non_probe_that_was_never_dispatched_is_still_reported_as_not_a_probe'}),
+    ('m5c4', 'stopping a backend invalidates as much as restarting one'): frozenset({'supervisor::tests::a_restart_invalidates_the_lease_and_the_captures_before_the_new_backend_exists', 'supervisor::tests::a_restart_whose_new_backend_fails_has_still_invalidated', 'supervisor::tests::stopping_a_backend_that_already_died_still_invalidates'}),
+    ('m5c4', 'the address a backend publishes goes through the loopback check'): frozenset({'supervisor::tests::a_backend_that_publishes_a_routable_address_is_refused_and_killed', 'supervisor::tests::a_wildcard_bind_is_refused_by_name'}),
+    ('m5c4', "the detaching descendant really does leave the backend's process group"): frozenset({'a_setsid_descendant_of_the_backend_escapes_even_with_the_sentinel_armed'}),
+    ('m5c4', 'the effect journal records what the backend was asked to do'): frozenset({'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice', 'the_journal_records_the_same_effects_the_in_memory_ledger_does', 'the_same_restart_is_only_named_a_restart_by_a_dispatcher_that_watches'}),
+    ('m5c4', "the in-group helper really is in the supervised backend's group"): frozenset({'a_sigkilled_supervisor_still_kills_the_backends_group', 'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it', 'the_group_kill_reaches_the_backends_in_group_helper', 'without_a_sentinel_a_sigkilled_supervisor_leaks_the_backends_group'}),
+    ('m5c4', "the previous generation's address file is removed before every start"): frozenset({'supervisor::tests::a_stale_address_from_the_previous_generation_is_never_read_as_the_new_one'}),
+    ('m5c4', "the supervisor signals the backend's whole process group, not only its leader"): frozenset({'child::tests::dropping_the_handle_ends_the_backend'}),
+    ('m5c5', 'a definitive answer survives a restart that happened around it'): frozenset({'supervision::tests::a_disturbed_exchange_keeps_every_definitive_answer_it_was_given', 'supervision::tests::attribution_never_changes_what_a_retry_is_allowed_to_do'}),
+    ('m5c5', 'a dispatcher handed a lifecycle epoch actually keeps it'): frozenset({'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice'}),
+    ('m5c5', 'a restart reaches the consumer as a restart, not as a lost connection'): frozenset({'supervision::tests::a_disturbed_exchange_that_reached_the_backend_is_named_a_restart'}),
+    ('m5c5', "an exchange the supervisor never disturbed keeps the transport's own answer"): frozenset({'supervision::tests::an_undisturbed_exchange_keeps_the_transports_own_answer'}),
+    ('m5c5', 'attribution never widens what a retry is allowed to do'): frozenset({'supervision::tests::a_disturbed_exchange_that_reached_the_backend_is_named_a_restart', 'supervision::tests::attribution_never_changes_what_a_retry_is_allowed_to_do'}),
+    ('m5c5', 'the lifecycle epoch advances before the kill, not after it'): frozenset({'a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice'}),
+    ('m5c6', 'a held key and a held button stay different declarations'): frozenset({'supervision::tests::a_held_button_and_a_held_key_are_different_declarations', 'supervision::tests::a_restart_declares_every_kind_an_input_operation_can_leave'}),
+    ('m5c6', 'a restart declares what it could not observe about the target'): frozenset({'supervision::tests::a_restart_that_freed_nothing_still_declares_what_it_cannot_see', 'supervision::tests::restarting_an_idle_backend_frees_nothing_and_says_so'}),
+    ('m5c6', 'an interrupted drag declares the button it may have left down'): frozenset({'supervision::tests::a_held_button_and_a_held_key_are_different_declarations', 'supervision::tests::every_operation_declares_what_an_interruption_of_it_can_leave_unobserved'}),
+    ('m5c6', 'an operation that synthesises no input declares no residue'): frozenset({'supervision::tests::every_operation_declares_what_an_interruption_of_it_can_leave_unobserved', 'supervision::tests::the_residue_type_can_express_nothing_which_is_what_makes_the_rest_a_choice'}),
+    ('m5c6', 'the declaration does not narrow to what the device happened to hold'): frozenset({'supervision::tests::a_restart_that_freed_nothing_still_declares_what_it_cannot_see', 'supervision::tests::restarting_an_idle_backend_frees_nothing_and_says_so'}),
+    ('m5c7', 'a payload may name a parameter upstream discards'): frozenset({'plan::tests::every_input_operation_plans_its_canonical_command_and_payload', 'plan::tests::every_payload_uses_only_pinned_parameter_names', 'plan::tests::no_payload_carries_a_parameter_the_released_dispatcher_would_discard'}),
+    ('m5c7', 'the fixture may keep reading the old drag spelling'): frozenset({'a_drag_records_the_start_of_its_path_through_the_display_scale'}),
+    ('m5c7', 'the knowingly-discarded list may be widened to anything'): frozenset({'cua_pin::tests::the_two_discard_lists_are_disjoint_and_neither_is_empty'}),
+    ('m5c7', 'the parameter lookup may answer for no command at all'): frozenset({'cua_pin::tests::every_allowlisted_command_has_exactly_one_pinned_parameter_schema', 'cua_pin::tests::the_parameters_never_to_send_are_genuinely_absent_from_their_command'}),
+    ('m5c7', 'the pinned parameter table may disagree with the payload builder'): frozenset({'cua_pin::tests::the_parameters_never_to_send_are_genuinely_absent_from_their_command'}),
+    ('m5c7', 'the scroll deltas may be dropped for constants'): frozenset({'plan::tests::every_input_operation_plans_its_canonical_command_and_payload'}),
+    ('m5c8', 'a present sentinel helper cannot be reported as missing'): frozenset({'the_skip_cannot_hide_a_helper_that_is_on_disk'}),
+    # `m5c9` (#140, m5-code) was written with its witnesses from the start,
+    # each measured by running the case and reading which test reddened;
+    # they are m5-code's measurements, not M4-42's, and the merged run of
+    # this harness re-checks them like every entry above.
     (
         "m5c9",
         "M5-C05: learning a grant revision frees the lease it superseded in the same step",
@@ -2319,13 +2422,6 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
         "m5c9",
         "M5-C05: ending a session releases the leases it holds",
     ): frozenset({"ending_a_session_releases_its_lease_and_only_its_lease"}),
-    # The first `m5c7` case to earn a witness (M5-C13 review follow-up). Its
-    # defeat replaces the scroll deltas with constants, and the test that
-    # pins the payload's `x`/`y` to the consumer's deltas is what reddens.
-    (
-        "m5c7",
-        "the scroll deltas may be dropped for constants",
-    ): frozenset({"plan::tests::every_input_operation_plans_its_canonical_command_and_payload"}),
 }
 
 #: The pinned ledger, loaded once.
