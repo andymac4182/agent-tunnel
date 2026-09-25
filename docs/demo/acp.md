@@ -78,7 +78,8 @@ client's `reqwest` must stay out of the shared build graph, task row M8-C09),
 then runs the ignored test
 `m8_acp_demo_official_client_runs_a_session_through_the_relay`, which brings
 up the relay and the device and runs the client against them. A cold build
-takes several minutes; the session itself takes about 2.5 seconds.
+takes several minutes. The session itself took 583 to 788 ms in the three recorded runs
+(`elapsed_ms` in the summary line).
 
 ## Expected output
 
@@ -117,8 +118,13 @@ How to read it:
 - `cancel_at_agent=cancelled` is read from the marker file the agent wrote in
   its workspace, so the cancellation is confirmed by the agent, not just by
   the client.
-- Each update is printed before the result of the turn it belongs to. That
-  ordering is guaranteed by the export, not by luck (task row M8-C27).
+- Each update is printed before the answer to the turn it belongs to. The
+  export guarantees that order by construction, for a turn that succeeds and
+  for one it answers with an error: both travel the same ordered channel as
+  the turn's updates, and a deterministic test holds each (task row M8-C27).
+  The row is still awaiting its rate check, at least 50 runs of the
+  three-relay gate, so "guaranteed" here means the mechanism, not a measured
+  rate.
 
 The script exits `0` only when the transcript, the agent's marker and the
 test's own `m8-acp-demo ok` line all agree. Anything else exits `1` with the

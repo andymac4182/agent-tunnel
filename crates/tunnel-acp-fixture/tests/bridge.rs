@@ -713,6 +713,19 @@ async fn output_credit_stalls_are_bounded_and_the_event_is_never_skipped() {
 /// out of order every time, not one run in fifty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
+    turn_answer_is_behind_its_updates(false).await;
+}
+
+/// M8-C27's error path: a turn the export must answer with an **error**
+/// (here a result with no `stopReason`, which the v1 profile refuses) is
+/// held to the same order.  The error is the turn's answer as much as a
+/// result is, and it must not overtake the updates that preceded it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_error_is_never_delivered_ahead_of_its_own_updates() {
+    turn_answer_is_behind_its_updates(true).await;
+}
+
+async fn turn_answer_is_behind_its_updates(v2: bool) {
     let workspace = workspace();
     let export = acp_export(workspace.path());
     let profile = Arc::new(export.profile_policies().expect("profile"));
@@ -747,7 +760,7 @@ async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
             "jsonrpc": "2.0",
             "id": "prompt-ordered",
             "method": "session/prompt",
-            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": format!("updates:{updates}")}]},
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": if v2 { format!("updates:{updates}:v2") } else { format!("updates:{updates}") }}]},
         })))
         .expect("request");
     assert_eq!(
@@ -759,14 +772,18 @@ async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
     // way.  Then give it a generous moment to be queued wherever it goes.
     let mut diagnostics = export.diagnostics();
     for _ in 0..400 {
-        if diagnostics.terminals_succeeded == 1 {
+        if diagnostics.terminals_succeeded + diagnostics.terminals_unknown == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
         diagnostics = export.diagnostics();
     }
     assert_eq!(
-        diagnostics.terminals_succeeded, 1,
+        (
+            diagnostics.terminals_succeeded,
+            diagnostics.terminals_unknown
+        ),
+        if v2 { (0, 1) } else { (1, 0) },
         "the turn finished while its stream was parked: {diagnostics:?}"
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -796,16 +813,22 @@ async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
                                 value
                                     .pointer("/result/stopReason")
                                     .and_then(Value::as_str)
-                                    .map_or_else(
-                                        || "<other>".to_owned(),
-                                        |stop| format!("result:{stop}"),
-                                    )
+                                    .map(|stop| format!("result:{stop}"))
+                                    .or_else(|| {
+                                        value
+                                            .pointer("/error/code")
+                                            .map(|code| format!("error:{code}"))
+                                    })
+                                    .unwrap_or_else(|| "<other>".to_owned())
                             },
                             ToOwned::to_owned,
                         )
                 })
                 .collect();
-            if order.iter().any(|entry| entry.starts_with("result:")) {
+            if order
+                .iter()
+                .any(|entry| entry.starts_with("result:") || entry.starts_with("error:"))
+            {
                 return order;
             }
         }
@@ -814,7 +837,11 @@ async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
 
     let expected: Vec<String> = (0..updates)
         .map(|index| format!("chunk-{index}"))
-        .chain(std::iter::once("result:end_turn".to_owned()))
+        .chain(std::iter::once(if v2 {
+            "error:-32603".to_owned()
+        } else {
+            "result:end_turn".to_owned()
+        }))
         .collect();
     assert_eq!(
         order, expected,

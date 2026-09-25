@@ -1016,6 +1016,7 @@ impl AcpExport {
         // own sender, so the upgrade succeeds for every prompt that could
         // still be answered (M8-C27).
         let ordered = connection.outbound.upgrade();
+        let stall_deadline = self.inner.validated.output_stall_deadline;
         tokio::spawn(async move {
             let Some(target) = connection.session_target(&session) else {
                 return;
@@ -1028,35 +1029,11 @@ impl AcpExport {
                     // The export classifies the turn it just finished, through
                     // the one rule that decides terminals.
                     record_terminal(&connection.counters, terminal);
-                    let body = serde_json::to_vec(&json!({
+                    serde_json::to_vec(&json!({
                         "jsonrpc": "2.0",
                         "id": host_id,
                         "result": {"stopReason": stop},
                     }))
-                    .unwrap_or_default();
-                    // **Behind the turn's own updates** (M8-C27): the reader
-                    // queued every earlier agent message on this channel
-                    // before it resolved the waiter this task just woke from,
-                    // so the dispatcher delivers them first and applies the
-                    // same stall and loss rules to the result.  Only when the
-                    // dispatcher is already gone — the connection closed — is
-                    // the result handed to the target directly, which is what
-                    // the target's own closed state then decides.
-                    let body = match ordered {
-                        Some(ordered) => match ordered
-                            .send(OutboundMessage {
-                                session: Some(session.clone()),
-                                kind: MessageKind::Response,
-                                compact: body,
-                            })
-                            .await
-                        {
-                            Ok(()) => return,
-                            Err(mpsc::error::SendError(unsent)) => unsent.compact,
-                        },
-                        None => body,
-                    };
-                    Ok(body)
                 }
                 Err(error) => {
                     // The child is gone, or its answer was refused, with the
@@ -1074,7 +1051,29 @@ impl AcpExport {
                 }
             }
             .unwrap_or_default();
-            let _ = target.tx.send(Bytes::from(body)).await;
+            // **Behind the turn's own updates** (M8-C27), on both paths: the
+            // reader queued every earlier agent message on this channel before
+            // it resolved the waiter this task just woke from, so the
+            // dispatcher delivers them first and applies the same stall and
+            // loss rules to the result or the error.  Only when the dispatcher
+            // is already gone -- the connection closed -- is the body handed
+            // to the target directly, still bounded by the stall deadline, and
+            // the target's own closed state then decides.
+            let body = match ordered {
+                Some(ordered) => match ordered
+                    .send(OutboundMessage {
+                        session: Some(session.clone()),
+                        kind: MessageKind::Response,
+                        compact: body,
+                    })
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(mpsc::error::SendError(unsent)) => unsent.compact,
+                },
+                None => body,
+            };
+            let _ = tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(body))).await;
         });
         no_body(StatusCode::ACCEPTED)
     }

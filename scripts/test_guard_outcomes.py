@@ -292,8 +292,11 @@ EXPECTED_GUARD_ANCHORS = {
     "fs-guard-deletion.py": 485,
     # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
     # `availability()`. Re-measured, not incremented: 150 first, which fails
-    # naming acp ("found 149"), then 149.
-    "acp-guard-deletion.py": 149,
+    # naming acp ("found 149"), then 149.  **151** after feat-acp-demo added
+    # the M8-C27 case and gave the lying-202 prompt case a second edit for
+    # the ordered path; measured the same way: 152 first, which fails naming
+    # acp ("found 151"), then 151.
+    "acp-guard-deletion.py": 151,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
