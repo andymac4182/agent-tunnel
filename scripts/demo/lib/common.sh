@@ -11,7 +11,15 @@
 
 DEMO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO_ROOT=$(cd "$DEMO_DIR/../.." && pwd)
-DEMO_STATE=${DEMO_STATE:-$DEMO_DIR/.state}
+# The state directory is fixed: down.sh deletes it recursively, so it must
+# never be redirected somewhere else. up.sh writes $DEMO_STATE_MARKER into it
+# first, and down.sh deletes nothing that lacks the marker.
+if [ -n "${DEMO_STATE:-}" ] && [ "$DEMO_STATE" != "$DEMO_DIR/.state" ]; then
+  printf 'demo: refusing DEMO_STATE=%s; the state directory is always %s\n' "$DEMO_STATE" "$DEMO_DIR/.state" >&2
+  exit 1
+fi
+DEMO_STATE=$DEMO_DIR/.state
+DEMO_STATE_MARKER=$DEMO_STATE/.agentuplink-demo-state
 DEMO_LOGS=$DEMO_STATE/logs
 DEMO_PIDS=$DEMO_STATE/pids
 DEMO_PKI=$DEMO_STATE/pki
@@ -23,6 +31,8 @@ DEMO_DEVICE_PORT=${DEMO_DEVICE_PORT:-19443}
 DEMO_REDIS_PORT=${DEMO_REDIS_PORT:-16380}
 DEMO_WEB_PORT=${DEMO_WEB_PORT:-18931}
 DEMO_REDIS_CONTAINER=${DEMO_REDIS_CONTAINER:-agentuplink-demo-redis}
+DEMO_LABEL=agentuplink.demo=1
+DEMO_DOCKER_TIMEOUT=${DEMO_DOCKER_TIMEOUT:-10}
 DEMO_REDIS_IMAGE=${DEMO_REDIS_IMAGE:-redis:8.4.0-alpine}
 DEMO_NAMESPACE=agentuplink-demo
 DEMO_INCARNATION=demo-local
@@ -35,6 +45,7 @@ DEMO_CONSUMER_URL=https://localhost:$DEMO_CONSUMER_PORT
 # The container the rest of the project's tests share. The demo must never
 # touch it; demo_guard_container refuses it by name.
 SHARED_REDIS_CONTAINER=agent-tunnel-m7-isolated-20260911
+SHARED_REDIS_PORT=63790
 
 # Remote mode (opt-in, read-only): the live Fly relay and the operator
 # material in ~/agentuplink-fly. Only read, never written.
@@ -56,9 +67,9 @@ DEMO_MODE=${DEMO_MODE:-local}
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_B=$(printf '\033[1m'); C_G=$(printf '\033[32m'); C_R=$(printf '\033[31m')
-  C_Y=$(printf '\033[33m'); C_D=$(printf '\033[2m'); C_0=$(printf '\033[0m')
+  C_Y=$(printf '\033[33m'); C_0=$(printf '\033[0m')
 else
-  C_B=; C_G=; C_R=; C_Y=; C_D=; C_0=
+  C_B=; C_G=; C_R=; C_Y=; C_0=
 fi
 
 demo_say() { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
@@ -75,8 +86,12 @@ demo_redact() {
   sed -E \
     -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/[redacted-token]/g' \
     -e 's/(Bearer )[A-Za-z0-9._~+\/=-]+/\1[redacted]/g' \
-    -e 's/-----BEGIN [A-Z ]*-----.*/[redacted-pem]/'
+    -e '/-----BEGIN/,/-----END/{/-----END/!d;s/.*/[redacted-pem]/;}'
 }
+
+# The shapes demo_redact removes, for scanners (selftest.sh): a JWT, or the
+# start of a PEM block.
+DEMO_SECRET_PATTERN='eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.|-----BEGIN'
 
 # ---------------------------------------------------------------- state
 
@@ -115,38 +130,85 @@ demo_now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 # ---------------------------------------------------------------- processes
 
-# demo_spawn NAME LOGFILE CMD... : start CMD in the background, record its
-# pid in $DEMO_PIDS/NAME.pid. Survives this shell; down.sh stops it.
+# A process identity: its start time and command line. A pid alone can be
+# reused by an unrelated process after ours exits; the pair cannot.
+demo_identity() { ps -o lstart=,command= -p "$1" 2>/dev/null; }
+
+# demo_spawn NAME LOGFILE CMD... : start CMD in the background and record its
+# pid and identity in $DEMO_PIDS/NAME.pid. Survives this shell; down.sh
+# stops it. The identity is sampled once the command line has settled: a
+# fork shows the parent shell's command line until exec, and macOS's python3
+# re-executes itself.
 demo_spawn() {
-  local name=$1 log=$2
+  local name=$1 log=$2 pid id prev='' i=0
   shift 2
   mkdir -p "$DEMO_PIDS"
   "$@" >"$log" 2>&1 </dev/null &
-  printf '%s\n' "$!" >"$DEMO_PIDS/$name.pid"
+  pid=$!
+  while [ "$i" -lt 30 ]; do
+    id=$(demo_identity "$pid")
+    [ -n "$id" ] || break
+    case $id in *"$(basename "$1")"*) [ "$id" = "$prev" ] && break ;; esac
+    prev=$id
+    sleep 0.1
+    i=$((i + 1))
+  done
+  printf '%s\n%s\n' "$pid" "$(demo_identity "$pid")" >"$DEMO_PIDS/$name.pid"
 }
+
+# demo_same_process PID IDENTITY : the pid still runs the recorded process.
+demo_same_process() {
+  [ -n "$1" ] && [ -n "$2" ] && [ "$(demo_identity "$1")" = "$2" ]
+}
+
+demo_recorded_pid() { sed -n 1p "$DEMO_PIDS/$1.pid" 2>/dev/null; }
 
 demo_pid_alive() {
-  local f="$DEMO_PIDS/$1.pid" pid
+  local f="$DEMO_PIDS/$1.pid"
   [ -f "$f" ] || return 1
-  pid=$(cat "$f")
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  demo_same_process "$(sed -n 1p "$f")" "$(sed -n 2p "$f")"
 }
 
-# Stop one recorded process: SIGTERM, wait up to 10 s, then SIGKILL.
+# demo_signal_verified PID IDENTITY SIGNAL : signal only the recorded process.
+demo_signal_verified() {
+  demo_same_process "$1" "$2" && kill "-$3" "$1" 2>/dev/null
+}
+
+# Stop one recorded process and its direct children: SIGTERM, wait up to
+# 10 s, then SIGKILL. Every signal is sent only after the recorded identity
+# is compared, so a reused pid is never signalled. The children are the
+# `pgrep -P` of the recorded pid, identified before the parent is signalled
+# (the device's stdio MCP servers, for example).
 demo_stop_pid() {
-  local name=$1 f="$DEMO_PIDS/$1.pid" pid i
+  local name=$1 f="$DEMO_PIDS/$1.pid" pid id i kid kid_id kids=
   [ -f "$f" ] || return 0
-  pid=$(cat "$f")
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
+  pid=$(sed -n 1p "$f"); id=$(sed -n 2p "$f")
+  if demo_same_process "$pid" "$id"; then
+    mkdir -p "$DEMO_PIDS"
+    : >"$DEMO_PIDS/.children"
+    for kid in $(pgrep -P "$pid" 2>/dev/null); do
+      printf '%s\n%s\n' "$kid" "$(demo_identity "$kid")" >>"$DEMO_PIDS/.children"
+    done
+    kids=$(cat "$DEMO_PIDS/.children"); rm -f "$DEMO_PIDS/.children"
+    demo_signal_verified "$pid" "$id" TERM
     i=0
-    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
+    while demo_same_process "$pid" "$id" && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    if demo_signal_verified "$pid" "$id" KILL; then
       demo_info "stopped $name (pid $pid) with SIGKILL after 10 s"
     else
       demo_info "stopped $name (pid $pid)"
     fi
+    while [ -n "$kids" ]; do
+      kid=$(printf '%s\n' "$kids" | sed -n 1p); kid_id=$(printf '%s\n' "$kids" | sed -n 2p)
+      kids=$(printf '%s\n' "$kids" | sed '1,2d')
+      demo_same_process "$kid" "$kid_id" || continue
+      demo_signal_verified "$kid" "$kid_id" TERM
+      sleep 1
+      demo_signal_verified "$kid" "$kid_id" KILL
+      demo_info "stopped a leftover child of $name (pid $kid)"
+    done
+  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    demo_warn "pid $pid recorded for $name now belongs to another process; not signalled"
   fi
   rm -f "$f"
 }
@@ -195,6 +257,32 @@ demo_port_free() {
 demo_guard_container() {
   [ "$DEMO_REDIS_CONTAINER" != "$SHARED_REDIS_CONTAINER" ] ||
     demo_die "refusing to use the shared test Redis container $SHARED_REDIS_CONTAINER"
+  [ "$DEMO_REDIS_PORT" != "$SHARED_REDIS_PORT" ] ||
+    demo_die "refusing DEMO_REDIS_PORT=$SHARED_REDIS_PORT: that port is the shared test Redis"
+}
+
+# demo_docker ARGS... : docker, bounded at $DEMO_DOCKER_TIMEOUT seconds (10 by
+# default). On a timeout it says Docker is not answering and returns 124.
+# Docker Desktop under load has left single calls hanging for over 20 minutes.
+# `docker run` and `docker rm` use longer explicit bounds (up.sh, down.sh).
+demo_docker() {
+  local rc=0
+  demo_timeout "$DEMO_DOCKER_TIMEOUT" docker "$@" || rc=$?
+  if [ "$rc" = 124 ]; then
+    printf '%sdemo: Docker not answering: "docker %s" gave no answer in %s s (Docker Desktop overloaded or stuck)%s\n' \
+      "$C_R" "$1" "$DEMO_DOCKER_TIMEOUT" "$C_0" >&2
+  fi
+  return "$rc"
+}
+
+# Print the demo container's name if it exists AND carries the demo label.
+demo_labelled_container() {
+  demo_docker ps -a --filter "label=$DEMO_LABEL" --filter "name=^/${DEMO_REDIS_CONTAINER}\$" --format '{{.Names}}'
+}
+
+# Print the name of any container with the demo's name, labelled or not.
+demo_named_container() {
+  demo_docker ps -a --filter "name=^/${DEMO_REDIS_CONTAINER}\$" --format '{{.Names}}'
 }
 
 # ---------------------------------------------------------------- tokens
@@ -325,7 +413,7 @@ demo_header() {
 # ---------------------------------------------------------------- features
 
 # Feature plug-ins live in features/NN-name.sh and are sourced in a subshell
-# (see features/README-plugin.txt for the contract).
+# (see features/_template.sh for the contract).
 demo_feature_files() { ls "$DEMO_DIR"/features/[0-9][0-9]-*.sh 2>/dev/null; }
 
 demo_feature_file() {
@@ -348,6 +436,7 @@ demo_load_feature() {
   feature_service() { :; }
   feature_grant_operations() { :; }
   feature_relay_profile() { :; }
+  feature_relay_toml() { :; }
   feature_export() { :; }
   feature_start() { :; }
   feature_show() { demo_warn "no demo steps defined"; }

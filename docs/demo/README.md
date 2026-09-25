@@ -4,9 +4,10 @@ Status: written for task rows M6-C127 to M6-C130 on 2026-09-26. Every command
 on this page was run on a Mac (Apple silicon, macOS, Docker Desktop) against
 `origin/main` at `6830ba7` plus this branch. The whole sequence (`up`, `show`
 for every ready feature, `down`) passed three rounds from clean with
-`scripts/demo/selftest.sh 3` at `f6eef6f`. A later change bounds the Docker
-calls and must be re-run the same way before the demo (task rows M6-C127,
-M6-C128 and M6-C130 stay open until then).
+`scripts/demo/selftest.sh 3` at `f6eef6f`. Later changes (bounded Docker
+calls, identity-checked process stops, a cleanup trap in `up.sh`) must be
+re-run the same way before the demo; task rows M6-C127, M6-C128 and M6-C130
+stay open until then.
 
 One command brings up a complete **local** demo on this Mac: a real
 `tunnel-relay`, a real `tunnel-client` device and a throwaway Redis, wired
@@ -63,11 +64,22 @@ reachable through the relay and nowhere else.
 5. **Rehearse:** `scripts/demo/selftest.sh 1`. It must end with
    `demo-selftest ok rounds=1`.
 
-Run everything from the repository root. The demo writes only to
-`scripts/demo/.state/` (gitignored) and its own container
-`agentuplink-demo-redis`. It never touches the shared test Redis
-(`agent-tunnel-m7-isolated-20260911`; the scripts refuse that name), the Fly
-deployment or `~/agentuplink-fly`.
+Run everything from the repository root. The local demo writes only to
+`scripts/demo/.state/` (gitignored; the location cannot be overridden) and
+its own container `agentuplink-demo-redis`, which carries the label
+`agentuplink.demo=1`. `down.sh` removes only a container with that label,
+deletes the state directory only while it holds the marker file `up.sh`
+writes, and signals a process only while its recorded start time and command
+line still match. It never touches the shared test Redis: the scripts refuse
+the container name `agent-tunnel-m7-isolated-20260911` and the port `63790`.
+It never touches the Fly deployment. It reads `~/agentuplink-fly` only in
+`--remote` mode, and never writes there.
+
+Every Docker call is bounded: queries (`docker info`, `ps`, `inspect`) at
+10 s (`DEMO_DOCKER_TIMEOUT`), `docker run` at 120 s and `docker rm` at 60 s.
+A call that does not answer ends with "Docker not answering" instead of
+hanging. If `up.sh` fails or is interrupted (Ctrl-C) part-way, it runs
+`down.sh --keep-logs` itself.
 
 ## One-minute pre-flight (the morning of)
 
@@ -80,7 +92,7 @@ scripts/demo/show.sh echo     # must end "echo: all steps as expected"
 `up.sh` ends with `local demo is up in N s` and a status table in which every
 line is `OK`. Measured: 22 to 67 s with binaries already built, on a machine
 running several other builds; most of it is starting the Redis container and
-the four catalog writes. Leave it up; `show.sh` can be run as often as you
+the six catalog writes (activation, provisioning, and `add-service` plus `set-grant` for each further feature). Leave it up; `show.sh` can be run as often as you
 like.
 
 If a step is not `OK`, run `scripts/demo/down.sh --keep-logs`, look in
@@ -180,10 +192,11 @@ Remote mode is therefore not proven green end to end (task row M6-C129).
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `docker is not running` | Docker Desktop is stopped | Start it; wait for `docker info` |
+| `Docker is not running or not answering` | Docker Desktop is stopped, or did not answer `docker info` in 10 s | Start it; wait until `docker info` answers promptly |
 | `port N is in use` | Another process holds a demo port | Stop it, or set the matching `DEMO_*_PORT` |
 | `cargo build failed` | Toolchain or network | Read `scripts/demo/.build.log`; `cargo build --locked` needs crates.io once |
-| `docker run did not start agentuplink-demo-redis (status 124 ...)` | Docker Desktop did not answer in 120 s. Seen while the machine ran several other agents' container builds (load average about 150): `docker run -d` hung for over 20 minutes | Restart Docker Desktop, then `down.sh` and `up.sh` |
+| `Docker not answering: docker run did not start agentuplink-demo-redis (status 124 ...)` | Docker Desktop did not answer in 120 s. Seen while the machine ran several other agents' container builds (load average about 150): `docker run -d` hung for over 20 minutes | Wait until `docker run --rm alpine:3 true` answers in seconds, then `up.sh`. On the presenter's own Mac, restarting Docker Desktop also works; on a shared machine it restarts everyone's containers |
+| `a container named agentuplink-demo-redis exists without the agentuplink.demo=1 label` | Something else took the demo's name | `down.sh` will not remove it; rename or remove it yourself, or set `DEMO_REDIS_CONTAINER` |
 | `Redis did not answer PING over TLS` | Image missing and no network, or Docker slow | `docker pull redis:8.4.0-alpine`, then `up.sh` again |
 | `down.sh`: `container ... is still present after 60 s`, exit 1 | Docker Desktop is stuck removing it | Everything else is already stopped and deleted; run `down.sh` again once Docker answers |
 | `relay exited during startup` | Configuration or Redis | `down.sh --keep-logs`; read `scripts/demo/.state/logs/relay.log` |
@@ -201,7 +214,12 @@ in and set `FEATURE_READY=1`. Nothing else changes: `up.sh` builds the
 feature's cargo packages, adds its service and grant to the catalog
 (`add-service` and `set-grant`), its export to the device profile and its
 profile to the relay's `[http_forward]` table, and starts its backend;
-`show.sh` runs its steps; `down.sh` stops what it started. The stubs
+`show.sh` runs its steps; `down.sh` stops what it started. A feature whose
+`feature_service` prints nothing (the adapters demo, which only calls the
+others) gets no catalog records and no export; `feature_relay_toml` adds
+relay configuration tables. The stubs
 `40-fs.sh`, `50-acp.sh`, `60-cua.sh` and `70-adapters.sh` are marked
-`TODO(<feature> feature PR)`. After filling one in, run
+`TODO(<feature> feature PR)`, and each feature branch adds its own recipe
+page here: [filesystem.md](filesystem.md), [acp.md](acp.md), [cua.md](cua.md)
+and [adapters.md](adapters.md). After filling one in, run
 `scripts/demo/selftest.sh 3`; it runs every ready feature.

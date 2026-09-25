@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Feature plug-in: Filesystem: the device's export directory, read through the relay
 # TODO(fs feature PR): fill this in per scripts/demo/features/_template.sh,
-# set FEATURE_READY=1, and add docs/demo/fs.md. Until then show.sh lists it
+# set FEATURE_READY=1, and add docs/demo/filesystem.md. Until then show.sh lists it
 # as not available and up.sh skips it.
 FEATURE_NAME=fs
 FEATURE_TITLE="Filesystem: the device's export directory, read through the relay"

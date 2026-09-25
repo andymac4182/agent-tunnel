@@ -47,17 +47,24 @@ if [ ! -f "$DEMO_STATE/ids.env" ]; then
 fi
 demo_load_ids
 
-state=$(docker inspect -f '{{.State.Status}}' "$DEMO_REDIS_CONTAINER" 2>/dev/null || echo absent)
-[ "$state" = running ] && demo_ok "redis container $DEMO_REDIS_CONTAINER running (127.0.0.1:$DEMO_REDIS_PORT, TLS)" || fail "redis container $DEMO_REDIS_CONTAINER: $state"
+rc=0
+state=$(demo_docker inspect -f '{{.State.Status}}' "$DEMO_REDIS_CONTAINER" 2>/dev/null) || rc=$?
+if [ "$rc" = 124 ]; then
+  fail "Docker not answering (no reply in $DEMO_DOCKER_TIMEOUT s); cannot check $DEMO_REDIS_CONTAINER"
+elif [ "$state" = running ]; then
+  demo_ok "redis container $DEMO_REDIS_CONTAINER running (127.0.0.1:$DEMO_REDIS_PORT, TLS)"
+else
+  fail "redis container $DEMO_REDIS_CONTAINER: ${state:-absent}"
+fi
 
 for p in relay device; do
-  demo_pid_alive "$p" && demo_ok "$p process running (pid $(cat "$DEMO_PIDS/$p.pid"))" || fail "$p process not running (log: $DEMO_LOGS/$p.log)"
+  demo_pid_alive "$p" && demo_ok "$p process running (pid $(demo_recorded_pid "$p"))" || fail "$p process not running (log: $DEMO_LOGS/$p.log)"
 done
 for f in "$DEMO_PIDS"/*.pid; do
   [ -e "$f" ] || continue
   name=$(basename "$f" .pid)
   case $name in relay|device) continue ;; esac
-  demo_pid_alive "$name" && demo_ok "backend $name running (pid $(cat "$f"))" || fail "backend $name not running (log: $DEMO_LOGS/$name.log)"
+  demo_pid_alive "$name" && demo_ok "backend $name running (pid $(demo_recorded_pid "$name"))" || fail "backend $name not running (log: $DEMO_LOGS/$name.log)"
 done
 
 for ep in /livez /readyz; do

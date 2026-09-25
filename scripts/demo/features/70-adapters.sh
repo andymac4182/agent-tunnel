@@ -8,3 +8,5 @@ FEATURE_TITLE="Adapters: the TypeScript client and native adapters calling the d
 FEATURE_READY=0
 FEATURE_TODO='TODO(adapters feature PR): TypeScript client/adapters using TOKEN=$(scripts/demo/token.sh SCOPE)'
 FEATURE_REMOTE=0
+# It has no catalog service of its own: leave feature_service empty (see the
+# template) and call the other features with TOKEN=$(scripts/demo/token.sh SCOPE).

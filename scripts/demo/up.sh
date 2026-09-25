@@ -50,18 +50,20 @@ if [ -f "$DEMO_STATE/ids.env" ] && "$DEMO_DIR/status.sh" --quiet >/dev/null 2>&1
   "$DEMO_DIR/status.sh"
   exit 0
 fi
-if [ -d "$DEMO_STATE" ] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$DEMO_REDIS_CONTAINER"; then
+command -v docker >/dev/null 2>&1 || demo_die "missing required command: docker"
+demo_docker info >/dev/null 2>&1 || demo_die "Docker is not running or not answering (start Docker Desktop and wait for 'docker info')"
+demo_guard_container
+stale=$(demo_named_container) || demo_die "Docker is not answering"
+if [ -d "$DEMO_STATE" ] || [ -n "$stale" ]; then
   demo_say "found a partial or stale demo; tearing it down first"
-  "$DEMO_DIR/down.sh"
+  "$DEMO_DIR/down.sh" || demo_die "down.sh could not clean up the previous demo (see above)"
 fi
 
 # ------------------------------------------------------------------ preflight
 demo_say "pre-flight"
-for cmd in docker openssl python3 curl nc uuidgen; do
+for cmd in openssl python3 curl nc uuidgen; do
   command -v "$cmd" >/dev/null 2>&1 || demo_die "missing required command: $cmd"
 done
-docker info >/dev/null 2>&1 || demo_die "docker is not running (start Docker Desktop)"
-demo_guard_container
 for port in "$DEMO_CONSUMER_PORT" "$DEMO_DEVICE_PORT" "$DEMO_REDIS_PORT" "$DEMO_WEB_PORT"; do
   demo_port_free "$port" || demo_die "port $port is in use; stop what holds it or set DEMO_*_PORT"
 done
@@ -103,8 +105,25 @@ CLIENT=$(demo_bin tunnel-client)
 demo_ok "binaries: $(dirname "$RELAY")"
 
 # ------------------------------------------------------------------ state + PKI
+# From here on, any failure or interrupt tears down what was started and
+# keeps the logs.
+UP_DONE=0
+on_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [ "$UP_DONE" != 1 ]; then
+    printf '%sdemo: up.sh did not finish (status %s); cleaning up, logs kept in %s%s\n' "$C_R" "$rc" "$DEMO_LOGS" "$C_0" >&2
+    "$DEMO_DIR/down.sh" --keep-logs >&2 || true
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
-mkdir -p "$DEMO_STATE" "$DEMO_LOGS" "$DEMO_PIDS" "$DEMO_PKI" "$DEMO_STATE/device" "$DEMO_STATE/catalog"
+mkdir -p "$DEMO_STATE"
+printf 'created by scripts/demo/up.sh; down.sh deletes this directory only while this file exists\n' >"$DEMO_STATE_MARKER"
+mkdir -p "$DEMO_LOGS" "$DEMO_PIDS" "$DEMO_PKI" "$DEMO_STATE/device" "$DEMO_STATE/catalog"
 demo_say "generating synthetic PKI and issuer in $DEMO_STATE (gitignored)"
 (
   cd "$DEMO_PKI"
@@ -140,13 +159,13 @@ demo_ok "server CA, device CA, relay and Redis certificates, token issuer"
 # ------------------------------------------------------------------ Redis
 demo_say "starting throwaway Redis container $DEMO_REDIS_CONTAINER (TLS, 127.0.0.1:$DEMO_REDIS_PORT)"
 rc=0
-demo_timeout 120 docker run -d --name "$DEMO_REDIS_CONTAINER" --label agentuplink.demo=1 \
+demo_timeout 120 docker run -d --name "$DEMO_REDIS_CONTAINER" --label "$DEMO_LABEL" \
   -p "127.0.0.1:$DEMO_REDIS_PORT:6379" -v "$DEMO_PKI/redis-tls:/tls:ro" \
   "$DEMO_REDIS_IMAGE" redis-server --port 0 --tls-port 6379 \
   --tls-cert-file /tls/redis.pem --tls-key-file /tls/redis-key.pem \
   --tls-ca-cert-file /tls/server-ca.pem --tls-auth-clients no \
   --appendonly yes --appendfsync always --no-appendfsync-on-rewrite no >/dev/null || rc=$?
-[ "$rc" = 0 ] || demo_die "docker run did not start $DEMO_REDIS_CONTAINER (status $rc; 124 = no answer in 120 s: Docker Desktop is overloaded or stuck, restart it), then run down.sh and up.sh"
+[ "$rc" = 0 ] || demo_die "Docker not answering: docker run did not start $DEMO_REDIS_CONTAINER (status $rc; 124 = no answer in 120 s). Wait until 'docker run --rm alpine:3 true' answers in seconds, then run up.sh again"
 i=0
 until demo_redis_ping; do
   i=$((i + 1)); [ "$i" -lt 60 ] || demo_die "Redis did not answer PING over TLS on 127.0.0.1:$DEMO_REDIS_PORT in 30 s"
@@ -202,6 +221,10 @@ EOF
 if [ -n "$profiles" ]; then
   printf '\n[http_forward]\nprofiles = [%s]\n' "$(printf '%s' "$profiles" | sed 's/^ //; s/,$//')" >>"$DEMO_STATE/relay.toml"
 fi
+for name in $ready_features; do
+  extra=$(demo_load_feature "$(demo_feature_file "$name")"; feature_relay_toml)
+  if [ -n "$extra" ]; then printf '\n# from feature %s\n%s\n' "$name" "$extra" >>"$DEMO_STATE/relay.toml"; fi
+done
 "$RELAY" check-serve-config --config "$DEMO_STATE/relay.toml" >"$DEMO_LOGS/check-serve-config.log" 2>&1 ||
   { cat "$DEMO_LOGS/check-serve-config.log" >&2; demo_die "relay configuration refused"; }
 demo_ok "relay configuration valid (profiles:${profiles:- none})"
@@ -233,6 +256,9 @@ handshake_timeout_seconds = 10
 overlap_seconds = 30
 EOF
   for name in $ready_features; do
+    # A feature without a catalog service (feature_service prints nothing)
+    # has no device export either: it only uses the others (adapters).
+    [ -n "$(demo_load_feature "$(demo_feature_file "$name")"; feature_service)" ] || continue
     printf '\n'
     (demo_load_feature "$(demo_feature_file "$name")"; feature_export "$(demo_service_id "$name")")
   done
@@ -259,6 +285,10 @@ for name in $ready_features; do
   file=$(demo_feature_file "$name")
   sid=$(demo_service_id "$name")
   service=$(demo_load_feature "$file"; feature_service)
+  if [ -z "$service" ]; then
+    demo_ok "feature $name has no catalog service (uses the others)"
+    continue
+  fi
   grant=$(demo_load_feature "$file"; feature_grant_operations)
   if [ "$first" = 1 ]; then
     cat >"$CAT/records.toml" <<EOF
@@ -298,6 +328,7 @@ EOF
   fi
   demo_ok "service $name = $sid (grant $grant)"
 done
+[ "$first" = 0 ] || demo_die "no ready feature provides a catalog service (provision-catalog needs one)"
 
 # ------------------------------------------------------------------ relay
 demo_say "starting tunnel-relay serve (consumer https://localhost:$DEMO_CONSUMER_PORT, device wss://localhost:$DEMO_DEVICE_PORT)"
@@ -325,6 +356,7 @@ done
 demo_ok "device session active"
 
 mv "$DEMO_STATE/ids.env.pending" "$DEMO_STATE/ids.env"
+UP_DONE=1
 elapsed=$(( $(demo_now_ms) - started ))
 demo_say "local demo is up in $((elapsed / 1000)).$(( (elapsed % 1000) / 100 )) s. Next: scripts/demo/show.sh list"
 "$DEMO_DIR/status.sh"

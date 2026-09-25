@@ -23,6 +23,9 @@ FEATURE_CARGO_PACKAGES=              # extra workspace packages to build, e.g. t
 FEATURE_REQUIRES=                    # extra commands that must be on PATH, e.g. node
 
 # The [service] table body, WITHOUT tenant/device/id (up.sh writes those).
+# Print NOTHING for a feature that has no service of its own and only calls
+# the others (the adapters demo): up.sh then skips its catalog records and
+# its device export, and still runs feature_start and its show steps.
 feature_service() {
   printf 'type = "echo"\ndisplay_name = "Example"\noperations = ["echo:invoke"]'
 }
@@ -31,6 +34,10 @@ feature_grant_operations() { printf '["echo:invoke"]'; }
 # An http-forward profile the relay must serve (mcp-2025-11-25,
 # mcp-2026-07-28, acp-http-v1), or nothing.
 feature_relay_profile() { :; }
+# Extra relay configuration TOML, appended to the generated relay.toml after
+# the [http_forward] table. Print whole tables only (a top-level key after a
+# table would land inside it). Paths should be absolute or under $DEMO_STATE.
+feature_relay_toml() { :; }
 # The device export tables. $1 is this feature's catalog service UUID.
 feature_export() {
   printf '[exports."%s"]\ntype = "echo"\ndevice_canary = "example:"\n' "$1"

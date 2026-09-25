@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Feature plug-in: authenticated echo through the relay (task row M6-C128).
 # Contract: scripts/demo/features/_template.sh.
-FEATURE_NAME=echo
+FEATURE_NAME="echo"
 FEATURE_TITLE="Authenticated echo: consumer -> relay -> device -> back"
 FEATURE_READY=1
 FEATURE_REMOTE=1
