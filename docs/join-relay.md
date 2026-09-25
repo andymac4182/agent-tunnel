@@ -50,7 +50,8 @@ shasum -a 256 -c agentuplink-*.tar.gz.sha256
 
 On Linux use `-p '*x86_64-unknown-linux-gnu*'` and `sha256sum -c`. Expect
 `agentuplink-<tag>-<target>.tar.gz: OK`. You can also download both files from
-the [releases page](https://github.com/andymac4182/agentuplink/releases).
+the releases page, `https://github.com/andymac4182/agentuplink/releases`, or
+through the [downloads page](https://agentuplink.dev/docs/downloads).
 
 **The checksum proves the download is intact, not who built it.** The
 `.sha256` file comes from the same release page as the archive. No release is

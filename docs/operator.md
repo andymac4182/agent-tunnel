@@ -91,8 +91,8 @@ while it runs (section 2.5). Anything larger is not supported yet:
 ## 1. Download and verify
 
 **There are two archive formats, and this section executes only one.** The
-archives most testers download are the CI archives on the
-[GitHub pre-releases](https://github.com/andymac4182/agentuplink/releases):
+archives most testers download are the CI archives on the GitHub
+pre-releases, `https://github.com/andymac4182/agentuplink/releases`:
 `agentuplink-<tag>-<target>.tar.gz` (`.zip` for Windows) with a `.sha256` file
 beside it. A CI archive unpacks **flat, with no top-level folder**, into
 `LICENSE`, `README.txt`, `bin/`, `examples/`, `notices/` and `release.json`
