@@ -982,10 +982,15 @@ RELEASE_CASES: list[Case] = [
     ),
 ]
 
-#: **M3-33: the cloud-client gate resends only the owner-not-ready refusal.**
-#: The gate's classifier used to accept any retryable `not_dispatched` 503,
-#: which M7-C83's empty-pin-set refusal also is, so a freeze could have
-#: masked that signature.  Narrowed as M3-30 narrowed the isolation gate's.
+#: **M3-33, then M3-15: the cloud-client gate resends only the relay's own
+#: rotation-freeze refusal.**  The gate's classifier used to accept any
+#: retryable `not_dispatched` 503, which M7-C83's empty-pin-set refusal also
+#: is, so a freeze could have masked that signature (M3-33 narrowed it to the
+#: owner-not-ready message and hint).  Since M3-15 the owner holds a request
+#: that lands in a freeze and names one that outlasts the hold
+#: `ROTATION_FREEZE`, so the owner-not-ready body is a fault refusal and the
+#: classifier requires the freeze code instead.  Defeating the code check lets
+#: the fault body through, and the unit test's owner-not-ready arm goes red.
 WIRE = HARNESS / "src" / "production_cluster" / "mcp_cloud_client" / "wire.rs"
 WIRE_TEST = [
     "cargo",
@@ -1000,19 +1005,170 @@ WIRE_TEST = [
 ]
 WIRE_CASES: list[Case] = [
     Case(
-        "the cloud-client gate resends only a refusal carrying the owner-not-ready message and hint",
+        "the cloud-client gate resends only a refusal carrying the rotation-freeze code",
         [
             (
                 WIRE,
-                '        && value["message"] == OWNER_NOT_READY_MESSAGE\n'
-                "        && (1..=MIN_RETRY_HINT_MS).contains(&hint))",
-                "        && hint > 0)",
+                '    (value["code"] == ROTATION_FREEZE_CODE\n'
+                '        && value["execution"] == "not_dispatched"',
+                '    (value["execution"] == "not_dispatched"',
             )
         ],
         frozenset(
             {
                 "production_cluster::mcp_cloud_client::wire::tests::"
-                "only_the_owner_not_ready_503_carries_a_retry_hint"
+                "only_the_rotation_freeze_503_carries_a_retry_hint"
+            }
+        ),
+    ),
+    Case(
+        "the cloud-client gate resends a rotation-freeze refusal only with the bounded hint",
+        [
+            (
+                WIRE,
+                "        && (1..=MIN_RETRY_HINT_MS).contains(&hint))\n"
+                "    .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))",
+                "        && hint > 0)\n"
+                "    .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))",
+            )
+        ],
+        frozenset(
+            {
+                "production_cluster::mcp_cloud_client::wire::tests::"
+                "only_the_rotation_freeze_503_carries_a_retry_hint"
+            }
+        ),
+    ),
+]
+
+#: **M3-15: the owner holds a new OPEN across a data-rotation freeze.**
+#: Owner decision, 2026-09-25: an OPEN landing between QUIESCE and COMMITTED
+#: is held, bounded in time and count, and admitted once the freeze ends; a
+#: freeze that outlasts the bound is refused with the distinct
+#: `ROTATION_FREEZE`, locally and through a forwarded hop.  The witnesses are
+#: the deterministic actor regressions in `actor_freeze_hold_tests.rs`, the
+#: HTTP mapping test in `http.rs` and the real HTTP/3 round trip in
+#: `peer_cleanup_h3_tests.rs`.  **Not a case, deliberately:** the shutdown
+#: release (`release_held_opens_at_shutdown`) is redundant with the
+#: session-loss release, because shutdown closes every session first, so
+#: defeating it leaves every test green; and the release hooks at the commit
+#: and abort handlers are duplicated by the actor's after-command service, so
+#: defeating one is only visible to a test that bypasses the actor loop.
+FREEZE_HOLD = RELAY / "src" / "actor_freeze_hold.rs"
+RELAY_HTTP = RELAY / "src" / "http.rs"
+FREEZE_HOLD_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "freeze",
+]
+HOLD = "actor::rotation_freeze_tests::freeze_hold_tests::"
+FREEZE_HOLD_CASES: list[Case] = [
+    Case(
+        # The whole decision.  Without the attempt-freeze condition every
+        # frozen OPEN is refused at once, exactly as before M3-15.
+        "an OPEN in a scheduled rotation freeze is held rather than refused",
+        [
+            (
+                ACTOR,
+                "            if !freeze_hold::attempt_frozen(session) {\n"
+                "                let _ = response.send(Err(RelayError::OwnerNotReady));",
+                "            {\n"
+                "                let _ = response.send(Err(RelayError::OwnerNotReady));",
+            )
+        ],
+        frozenset({HOLD + "an_open_during_a_freeze_is_admitted_after_commit"}),
+    ),
+    Case(
+        "a held OPEN is refused with ROTATION_FREEZE once the bound passes",
+        [
+            (
+                FREEZE_HOLD,
+                "                    if now >= held.deadline {\n"
+                "                        self.freeze_hold.record_wait(&held, now);\n"
+                "                        self.freeze_hold.counters.refused_after_bound += 1;\n"
+                "                        let _ = held.response.send(Err(RelayError::RotationFreeze));\n"
+                "                    } else {\n"
+                "                        keep.push_back(held);\n"
+                "                    }",
+                "                    keep.push_back(held);",
+            )
+        ],
+        frozenset({HOLD + "an_open_held_past_the_bound_is_refused_with_rotation_freeze"}),
+    ),
+    Case(
+        "the per-device hold cap refuses the OPEN over it",
+        [
+            (
+                FREEZE_HOLD,
+                "        if device_held >= per_device_cap || self.total >= MAX_HELD_TOTAL {",
+                "        if self.total >= MAX_HELD_TOTAL {",
+            )
+        ],
+        frozenset({HOLD + "the_hold_cap_is_enforced_per_device"}),
+    ),
+    Case(
+        "a held OPEN whose consumer went away is dropped, not dispatched",
+        [
+            (
+                FREEZE_HOLD,
+                "    pub(super) fn service_held_scope(&mut self, scope: &DeviceScope, now: Instant) {\n"
+                "        self.freeze_hold.sweep_cancelled(scope);\n",
+                "    pub(super) fn service_held_scope(&mut self, scope: &DeviceScope, now: Instant) {\n",
+            )
+        ],
+        frozenset({HOLD + "a_consumer_cancelling_during_the_hold_dispatches_nothing"}),
+    ),
+    Case(
+        "a session's end answers its held OPENs",
+        [
+            (
+                ACTOR,
+                "        // dispatched; answer them now rather than at their deadline.\n"
+                "        self.service_held_scope(&key.scope(), Instant::now());\n",
+                "        // dispatched; answer them now rather than at their deadline.\n",
+            )
+        ],
+        frozenset({HOLD + "session_loss_during_the_hold_releases_with_the_fault_refusal"}),
+    ),
+    Case(
+        "a local ROTATION_FREEZE refusal keeps its distinct consumer body",
+        [
+            (
+                RELAY_HTTP,
+                "        RelayError::RotationFreeze => {\n"
+                "            rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS)\n"
+                "        }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "http::tests::"
+                "rotation_freeze_refusal_is_distinct_from_the_owner_not_ready_fault_refusal"
+            }
+        ),
+    ),
+    Case(
+        "a forwarded ROTATION_FREEZE refusal reaches the ingress as its own error",
+        [
+            (
+                PEER_RUNTIME,
+                "            if let Some(retry_after_ms) = rotation_freeze_retry_after(&response) {\n"
+                "                return Err(PeerRuntimeError::RotationFreeze { retry_after_ms });\n"
+                "            }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "http::peer_cleanup_tests::peer_cleanup_h3_tests::"
+                "forwarded_rotation_freeze_refusal_keeps_its_distinct_reason"
             }
         ),
     ),
@@ -1095,7 +1251,8 @@ SUITES: list[Suite] = [
     ),
     Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
     Suite("m3c32-release-race", [BRIDGE], RELEASE_RACE_TEST, RELEASE_RACE_CASES),
-    Suite("m3c33-owner-not-ready-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
+    Suite("m3c33-m3c15-freeze-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
+    Suite("m3c15-freeze-hold", [RELAY], FREEZE_HOLD_TEST, FREEZE_HOLD_CASES),
     Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
 ]
 
