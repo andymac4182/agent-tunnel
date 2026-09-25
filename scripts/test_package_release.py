@@ -116,7 +116,7 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(
                     (unpacked / GUIDE).read_bytes(), (self.root / GUIDE).read_bytes()
                 )
-                runtime = (unpacked / "docs" / "runtime.md").read_text()
+                runtime = (unpacked / "docs" / "runtime.md").read_text(encoding="utf-8")
                 self.assertIn("](operator.md#1-download)", runtime)
                 self.assertIn(f"]({SOURCE_URL}/{self.sha}/docs/testing.md#gate)", runtime)
                 self.assertIn(f"]({SOURCE_URL}/{self.sha}/deploy/fly)", runtime)
@@ -147,7 +147,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual((staged / GUIDE).read_bytes(), (ROOT / GUIDE).read_bytes())
         self.assertEqual(unresolved_links(staged), [])
         for document in documents:
-            text = (staged / document).read_text()
+            text = (staged / document).read_text(encoding="utf-8")
             for url in package_release._LINK_RE.findall(text):
                 if url.startswith(SOURCE_URL):
                     target = url[len(SOURCE_URL) + 42:].partition("#")[0]
