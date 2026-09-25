@@ -1167,6 +1167,17 @@ async fn run_one_session(
             cause: Cause::ConfigError,
             message: error.to_string(),
             retryable: false,
+        })?
+        // M5 Lane B: refused unless this build has the `cua` feature and the
+        // device opted in through the environment.
+        .with_cua_exports(
+            config,
+            std::env::var(tunnel_client::CUA_OPT_IN_ENV).is_ok_and(|value| value == "1"),
+        )
+        .map_err(|error| CliError {
+            cause: Cause::ConfigError,
+            message: error.to_string(),
+            retryable: false,
         })?;
     // Kept across the move so the stop path can wait for supervised MCP
     // children to be reaped (M6-C29).

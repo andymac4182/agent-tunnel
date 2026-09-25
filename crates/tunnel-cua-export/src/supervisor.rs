@@ -336,7 +336,7 @@ impl Supervisor {
     /// backend that died on its own, and a supervisor that only invalidated
     /// on the paths it drove would leave exactly the crashed-backend case
     /// uncovered.
-    pub async fn stop(&mut self, authority: &dyn InputAuthority) -> Invalidation {
+    pub async fn stop(&mut self, authority: &(dyn InputAuthority + Sync)) -> Invalidation {
         // **Before the kill, and unconditionally.** Every exchange that could
         // see this backend's socket die must be guaranteed to read a changed
         // epoch afterwards, and an exchange racing us reads its "after" value
@@ -373,7 +373,7 @@ impl Supervisor {
     /// failed restart leaves *more* to invalidate rather than less.
     pub async fn restart(
         &mut self,
-        authority: &dyn InputAuthority,
+        authority: &(dyn InputAuthority + Sync),
     ) -> (Invalidation, Result<BackendEndpoint, StartError>) {
         let invalidation = self.stop(authority).await;
         let started = self.start().await;

@@ -11,6 +11,10 @@
 
 mod config;
 pub mod credentials;
+/// The device half of a `computer.v1` (CUA) export (M5 Lane B). Present only
+/// in a build with the non-default `cua` feature.
+#[cfg(feature = "cua")]
+pub mod cua_export;
 /// The device half of the filesystem endpoint (M4 gate 4).
 pub mod fs_export;
 pub mod http_forward;
@@ -58,6 +62,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub use config::{
+    CUA_OPT_IN_ENV, CUA_PROFILE_ID, CuaBackendSettings, CuaExportSettings,
     CredentialConfig, ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig,
     ReconnectConfig, RuntimeConfig as ConnectConfig, RuntimeConfigError,
 };

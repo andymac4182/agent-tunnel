@@ -813,6 +813,7 @@ async fn run(
             device_canary: None,
             mcp: None,
             acp: None,
+            cua: None,
             fs: Some(FsExportSettings {
                 root: directory.path().to_path_buf(),
                 capabilities: vec!["read".to_owned(), "write".to_owned(), "list".to_owned()],

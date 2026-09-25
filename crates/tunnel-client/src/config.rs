@@ -171,6 +171,19 @@ impl RuntimeConfig {
                 acp.validate()
                     .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
             }
+            if let Some(cua) = &export.cua {
+                if export.kind != ExportKind::HttpForward {
+                    return Err(RuntimeConfigError::Invalid(
+                        "a cua table is only valid on an http-forward export",
+                    ));
+                }
+                if export.mcp.is_some() || export.acp.is_some() {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an export carries one of an mcp, acp or cua table, never two",
+                    ));
+                }
+                cua.validate()?;
+            }
             match (export.kind, export.fs.as_ref()) {
                 (ExportKind::Fs, None) => {
                     return Err(RuntimeConfigError::Invalid(
@@ -339,6 +352,153 @@ pub struct ExportConfig {
     /// valid on an `fs` export, and required on one.  The root is operator
     /// configuration and is the one path this profile opens by name.
     pub fs: Option<FsExportSettings>,
+    /// A `computer.v1` (CUA) export served by the connector itself (M5
+    /// Lane B): only valid on an `http-forward` export, never alongside an
+    /// `mcp` or `acp` table. **Parsed and validated by every build, served
+    /// only by a build with the non-default `cua` feature, and then only
+    /// when `AGENT_TUNNEL_CUA_LANE_B=1` is set** (see
+    /// [`crate::http_forward::HttpHandlers::with_cua_exports`]).
+    pub cua: Option<CuaExportSettings>,
+}
+
+/// The pinned `computer.v1` profile identifier. Kept here, rather than read
+/// from `tunnel-cua`, so a build without the `cua` feature can still refuse a
+/// misspelt table at `config check`.
+pub const CUA_PROFILE_ID: &str = "computer-v1";
+
+/// The environment variable a device must set, to `1`, before a build with
+/// the `cua` feature will serve a CUA export (M5 Lane B's opt-in).
+pub const CUA_OPT_IN_ENV: &str = "AGENT_TUNNEL_CUA_LANE_B";
+
+/// Ceiling on a declared point-space dimension; matches
+/// `tunnel_cua::capture::MAX_CAPTURE_DIMENSION`.
+pub const MAX_CUA_POINT_DIMENSION: u32 = 65_535;
+
+/// Ceiling on the configured backend startup wait; matches
+/// `tunnel_cua_export::config::MAX_STARTUP`.
+pub const MAX_CUA_STARTUP_SECONDS: u64 = 120;
+
+/// The operator configuration of one CUA export (M5 Lane B).
+///
+/// **Only for a dedicated, disposable machine.** A CUA backend moves a real
+/// pointer and types on a real keyboard; `AGENTS.md` forbids exercising it
+/// against anyone's active desktop.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuaExportSettings {
+    /// `computer-v1`, the only pinned profile.
+    pub profile: String,
+    /// The target OS session name the input lease is taken on. Default
+    /// `primary`.
+    pub target: Option<String>,
+    /// The display's size in **input point space** (M5-C19 option (b),
+    /// applied by default pending owner confirmation, 2026-09-25). Both or
+    /// neither. With neither, every coordinate is refused
+    /// (`CaptureRefusal::ScaleUndeclared`); with both, each capture's scale is
+    /// derived from its own image, and the export refuses to declare a size
+    /// the backend's `get_screen_size` contradicts.
+    pub point_width: Option<u32>,
+    pub point_height: Option<u32>,
+    /// The `computer.v1` operations this device will serve **at most** (the
+    /// local-configuration term of the capability intersection). Default
+    /// deny: an empty list is refused.
+    pub operations: Vec<String>,
+    pub backend: CuaBackendSettings,
+}
+
+/// The supervised CUA backend process.
+///
+/// The backend publishes the loopback address it bound in `address_file`;
+/// the device reads it back and refuses anything that is not loopback. The
+/// address is never configured.
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuaBackendSettings {
+    /// Absolute path of the executable, run directly, never through a shell.
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    /// Absolute working directory.
+    pub workspace: PathBuf,
+    /// Absolute path the backend writes its bound loopback address to.
+    pub address_file: PathBuf,
+    /// Names copied from the connector's own environment when set.
+    pub inherit_env: Vec<String>,
+    /// Explicit environment values. The child environment is cleared first.
+    pub env: BTreeMap<String, String>,
+    /// How long to wait for the address, in seconds (default 20, at most 120).
+    pub startup_seconds: Option<u64>,
+}
+
+/// `Debug` prints no argument or environment value: those may carry operator
+/// secrets.
+impl std::fmt::Debug for CuaBackendSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CuaBackendSettings")
+            .field("args", &self.args.len())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("inherit_env", &self.inherit_env)
+            .field("startup_seconds", &self.startup_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CuaExportSettings {
+    /// Validate what can be validated without the `cua` feature.
+    ///
+    /// # Errors
+    /// The first rule violated.
+    pub fn validate(&self) -> Result<(), RuntimeConfigError> {
+        if self.profile != CUA_PROFILE_ID {
+            return Err(RuntimeConfigError::Invalid(
+                "a cua export's profile must be computer-v1",
+            ));
+        }
+        if let Some(target) = &self.target
+            && (target.is_empty() || target.len() > 128)
+        {
+            return Err(RuntimeConfigError::Invalid(
+                "a cua export's target must be 1 to 128 bytes",
+            ));
+        }
+        match (self.point_width, self.point_height) {
+            (None, None) => {}
+            (Some(width), Some(height))
+                if (1..=MAX_CUA_POINT_DIMENSION).contains(&width)
+                    && (1..=MAX_CUA_POINT_DIMENSION).contains(&height) => {}
+            _ => {
+                return Err(RuntimeConfigError::Invalid(
+                    "a cua export declares point_width and point_height together, each 1..=65535",
+                ));
+            }
+        }
+        if self.operations.is_empty() {
+            return Err(RuntimeConfigError::Invalid(
+                "a cua export must name at least one operation",
+            ));
+        }
+        let backend = &self.backend;
+        for path in [&backend.command, &backend.workspace, &backend.address_file] {
+            if !path.is_absolute() {
+                return Err(RuntimeConfigError::Invalid(
+                    "a cua backend's command, workspace and address_file must be absolute paths",
+                ));
+            }
+        }
+        if backend.address_file == backend.workspace {
+            return Err(RuntimeConfigError::Invalid(
+                "a cua backend's address_file must not be its workspace",
+            ));
+        }
+        if let Some(seconds) = backend.startup_seconds
+            && !(1..=MAX_CUA_STARTUP_SECONDS).contains(&seconds)
+        {
+            return Err(RuntimeConfigError::Invalid(
+                "a cua backend's startup_seconds must be 1..=120",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The operator configuration of one filesystem export.
@@ -383,6 +543,7 @@ impl Default for ExportConfig {
             mcp: None,
             acp: None,
             fs: None,
+            cua: None,
         }
     }
 }
@@ -988,5 +1149,71 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
             format!("{error}").contains("never both"),
             "refused for the wrong reason: {error}"
         );
+    }
+
+    const CUA_EXPORT: &str = "[exports.55555555-5555-4555-8555-555555555555]\ntype = \"http-forward\"\n\n[exports.55555555-5555-4555-8555-555555555555.cua]\nprofile = \"computer-v1\"\npoint_width = 1280\npoint_height = 800\noperations = [\"describe\", \"capture\", \"click\"]\n\n[exports.55555555-5555-4555-8555-555555555555.cua.backend]\ncommand = \"/opt/synthetic/cua-backend\"\nworkspace = \"/srv/synthetic-cua\"\naddress_file = \"/srv/synthetic-cua/backend.address\"\n";
+
+    fn with_cua(table: &str) -> String {
+        format!("{}\n{table}", valid_toml())
+    }
+
+    /// M5 Lane B: every build parses and validates a CUA table, so a
+    /// misconfiguration is a `config check` error whatever the build.
+    #[test]
+    fn a_cua_export_table_is_parsed_and_validated_by_every_build() {
+        let config = RuntimeConfig::parse(&with_cua(CUA_EXPORT)).expect("a valid cua export");
+        let export = &config.exports["55555555-5555-4555-8555-555555555555"];
+        let cua = export.cua.as_ref().expect("the cua table");
+        assert_eq!((cua.point_width, cua.point_height), (Some(1280), Some(800)));
+        for (broken, reason) in [
+            (CUA_EXPORT.replace("computer-v1", "computer-v2"), "profile"),
+            (CUA_EXPORT.replace("point_height = 800\n", ""), "point_width and point_height together"),
+            (CUA_EXPORT.replace("point_width = 1280", "point_width = 0"), "point_width and point_height together"),
+            (CUA_EXPORT.replace("[\"describe\", \"capture\", \"click\"]", "[]"), "at least one operation"),
+            (CUA_EXPORT.replace("\"/opt/synthetic/cua-backend\"", "\"cua-backend\""), "absolute"),
+            (CUA_EXPORT.replace("type = \"http-forward\"", "type = \"echo\""), "http-forward"),
+            (
+                format!("{CUA_EXPORT}\n[exports.55555555-5555-4555-8555-555555555555.acp]\nprofile = \"acp-http-v1\"\n\n[exports.55555555-5555-4555-8555-555555555555.acp.agent]\ncommand = \"/opt/a\"\nworkspace = \"/srv/a\"\n"),
+                "never two",
+            ),
+        ] {
+            let error = RuntimeConfig::parse(&with_cua(&broken)).expect_err(reason);
+            assert!(error.to_string().contains(reason), "{reason}: {error}");
+        }
+    }
+
+    /// **The first gate: a build without the `cua` feature refuses to serve
+    /// a CUA export, opted in or not.** A configuration without one is
+    /// unaffected.
+    #[cfg(not(feature = "cua"))]
+    #[test]
+    fn a_build_without_the_cua_feature_refuses_a_cua_export() {
+        let config = RuntimeConfig::parse(&with_cua(CUA_EXPORT)).expect("valid");
+        let error = crate::http_forward::HttpHandlers::new()
+            .with_cua_exports(&config, true)
+            .expect_err("no cua feature");
+        assert!(error.to_string().contains("without the `cua` feature"), "{error}");
+        let plain = RuntimeConfig::parse(valid_toml()).expect("valid");
+        assert!(
+            crate::http_forward::HttpHandlers::new()
+                .with_cua_exports(&plain, false)
+                .is_ok()
+        );
+    }
+
+    /// **The second gate: a build with the feature still refuses without the
+    /// environment opt-in**, and registers the export with it.
+    #[cfg(feature = "cua")]
+    #[test]
+    fn a_cua_build_refuses_a_cua_export_without_the_opt_in() {
+        let config = RuntimeConfig::parse(&with_cua(CUA_EXPORT)).expect("valid");
+        let error = crate::http_forward::HttpHandlers::new()
+            .with_cua_exports(&config, false)
+            .expect_err("not opted in");
+        assert!(error.to_string().contains(CUA_OPT_IN_ENV), "{error}");
+        let handlers = crate::http_forward::HttpHandlers::new()
+            .with_cua_exports(&config, true)
+            .expect("opted in");
+        assert!(handlers.contains("55555555-5555-4555-8555-555555555555"));
     }
 }
