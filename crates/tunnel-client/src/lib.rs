@@ -2210,7 +2210,7 @@ pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate valid
 
 /// `Transport` scope of a `STREAM_FORGET` whose terminal proof was still
 /// waiting for the relay's final data-channel ACK when its bounded
-/// revalidation window ended (task row M6-C103). The proof it holds is
+/// revalidation window ended (task row M6-C105). The proof it holds is
 /// consistent; only evidence is missing, and a missing ACK is what a lost or
 /// stalled data carrier produces -- a laptop asleep, a process stopped, a
 /// path gone -- so the session fails retryable and `connect` reconnects.

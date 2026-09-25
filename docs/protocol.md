@@ -201,7 +201,7 @@ produces (a laptop asleep, a process stopped, a data path gone), and the
 connector cannot distinguish it from a relay that never sent the ACK. It is a
 retryable transport failure, and the successor session starts with an empty
 journal, so nothing is replayed; the relay answers exchanges that were still
-in flight with an explicit unknown execution outcome (task row M6-C103).
+in flight with an explicit unknown execution outcome (task row M6-C105).
 Evidence that **contradicts** the proof -- a mismatched cursor, byte count,
 terminal or identity -- stays a non-retryable protocol error, before or after
 the window.

@@ -23,7 +23,7 @@
 #    socket holding the provisioned certificate, which the relay must close
 #    with 1002 PROTOCOL_UNSUPPORTED and log once (M6-C52); the identity case
 #    must also leave its payload-free relay refusal line; and
-#    (M6-C103) a session whose STREAM_FORGET proof is starved of the relay's
+#    (M6-C105) a session whose STREAM_FORGET proof is starved of the relay's
 #    final data-channel ACK by a proxy holding that direction, which must end
 #    retryable and reconnect, with the echo in flight answered as an explicit
 #    unknown outcome.
@@ -60,7 +60,7 @@ cat "$scratch/reconnect.log"
 for needle in "test result: ok. 9 passed" "m6c23-reconnect ok label=restart nonce=" \
   "m6c23-reconnect ok label=late-relay nonce=" "m6c23-reconnect ok label=not-yet-valid nonce=" \
   "m6c23-reconnect ok label=expired nonce=" "relay_tls_refusal_logged=true" "m6c23-reconnect ok label=identity nonce=" "relay_refusal_logged=true" "m6c38-protocol ok nonce=" "m6c23-reconnect ok label=issuer nonce=" \
-  "m6c68-liveness ok label=cut-path nonce=" "m6c103-held-ack ok label=held-ack nonce=" \
+  "m6c68-liveness ok label=cut-path nonce=" "m6c105-held-ack ok label=held-ack nonce=" \
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/reconnect.log"; then
     echo "m6-reconnect-verify: FAILED: output lacks '$needle'" >&2

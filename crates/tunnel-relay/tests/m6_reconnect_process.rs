@@ -53,12 +53,12 @@
 //!   (`DEVICE_CONTROL_IDLE_TIMEOUT` plus the disconnect hand-off), inside the
 //!   client's 60 s `OWNER_BUSY` window.
 //!
-//! * `m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting`
-//!   -- task row M6-C103: a proxy holds the relay-to-device direction of the
+//! * `m6c105_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting`
+//!   -- task row M6-C105: a proxy holds the relay-to-device direction of the
 //!   data socket from the device's answer to an echo onward, so the owner's
 //!   `STREAM_FORGET` arrives and its final ACK does not -- what a stalled or
 //!   lossy device produced live. The session must end `TRANSPORT_ERROR` and
-//!   reconnect (before M6-C103 the client exited `1` `PROTOCOL_ERROR`), and
+//!   reconnect (before M6-C105 the client exited `1` `PROTOCOL_ERROR`), and
 //!   an echo in flight meanwhile must be answered `503` with
 //!   `execution: unknown`.
 //!
@@ -1641,7 +1641,7 @@ async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconn
     );
 }
 
-/// Task row M6-C103: a TCP proxy that can **hold** the relay-to-device
+/// Task row M6-C105: a TCP proxy that can **hold** the relay-to-device
 /// direction of the data socket while everything else keeps flowing -- the
 /// deterministic form of what a stalled or lossy device produced live
 /// (SIGSTOP for 40 s with an echo in flight): the owner's `STREAM_FORGET`
@@ -1767,7 +1767,7 @@ const _: () = assert!(HELD_ACK_LOSS_BOUND.as_secs() < DEVICE_CONTROL_IDLE_TIMEOU
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
-async fn m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting() {
+async fn m6c105_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting() {
     let deployment = Deployment::provision("held-ack").await;
     let proxy = HeldAckProxy::start(deployment.device_listener).await;
     deployment.route_client_through(proxy.address);
@@ -1784,7 +1784,7 @@ async fn m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting(
     //    forwarded, so this echo really completed and its 200 is the truth.
     proxy.arm();
     let token = access_token(&deployment.issuer_key, &deployment.subject);
-    let payload = format!("m6c103-held-{}", deployment.nonce);
+    let payload = format!("m6c105-held-{}", deployment.nonce);
     let completed = consumer_post(
         deployment.consumer,
         &deployment.server_ca_pem,
@@ -1818,13 +1818,13 @@ async fn m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting(
             deployment.echo_path.clone(),
             token.clone(),
         );
-        let payload = format!("m6c103-in-flight-{}", deployment.nonce);
+        let payload = format!("m6c105-in-flight-{}", deployment.nonce);
         tokio::spawn(async move {
             consumer_post(consumer, &ca, &path, &token, payload.as_bytes()).await
         })
     };
 
-    // 3. The proof window runs out. Before M6-C103 this exited 1 with a
+    // 3. The proof window runs out. Before M6-C105 this exited 1 with a
     //    non-retryable PROTOCOL_ERROR; it must be a retryable end of session
     //    followed by a fresh one.
     let lost = client.wait_for_within(
@@ -1877,7 +1877,7 @@ async fn m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting(
     client.stop();
     drop(relay);
     println!(
-        "m6c103-held-ack ok label=held-ack nonce={} lost_after_hold_ms={} held_relay_bytes={held_bytes} \
+        "m6c105-held-ack ok label=held-ack nonce={} lost_after_hold_ms={} held_relay_bytes={held_bytes} \
          in_flight_status={status} in_flight_code={in_flight_code} in_flight_execution=unknown",
         deployment.nonce,
         lost_at.duration_since(held_at).as_millis(),

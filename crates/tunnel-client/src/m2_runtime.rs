@@ -5450,7 +5450,7 @@ impl M2Actor {
     }
 
     /// The error for a proof-pending `STREAM_FORGET` whose absolute deadline
-    /// has passed (task row M6-C103). Expiry is terminal for the proof -- a
+    /// has passed (task row M6-C105). Expiry is terminal for the proof -- a
     /// late ACK cannot rescue it -- but its class depends on what the
     /// connector holds now:
     ///
@@ -5577,7 +5577,7 @@ impl M2Actor {
                 }
                 // Still only missing evidence: once the window has closed that
                 // is the retryable expiry, never the validator's protocol
-                // error (task row M6-C103).
+                // error (task row M6-C105).
                 if proof_deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                     return Err(stream_forget_proof_expired());
                 }
@@ -11083,7 +11083,7 @@ mod tests {
         actor
             .handle_control(ControlMessage::StreamForget(
                 tunnel_protocol::rotation_control::StreamForget {
-                    message_id: format!("forget-m6c103-{stream_id}"),
+                    message_id: format!("forget-m6c105-{stream_id}"),
                     reply_to: String::new(),
                     session_id: "session".to_owned(),
                     epoch: 1,
@@ -11110,7 +11110,7 @@ mod tests {
         (actor, key, Frame::ack(1, 1, stream_id, 1))
     }
 
-    /// Task row M6-C103, the live defect: `tunnel-client connect` frozen for
+    /// Task row M6-C105, the live defect: `tunnel-client connect` frozen for
     /// 40 s (SIGSTOP) with an echo in flight exited 1 with a non-retryable
     /// `PROTOCOL_ERROR` "STREAM_FORGET terminal proof did not converge before
     /// its deadline". The owner's FORGET had been retained waiting for the
@@ -11122,7 +11122,7 @@ mod tests {
     /// was wrong: the expiry must be a retryable transport failure, so the
     /// reconnect loop starts a fresh session.
     #[tokio::test]
-    async fn m6c103_a_forget_proof_outlived_by_a_stall_expires_retryable() {
+    async fn m6c105_a_forget_proof_outlived_by_a_stall_expires_retryable() {
         let stream_id = 44;
         let (mut actor, key, held_ack) = retained_forget_awaiting_owner_ack(stream_id).await;
 
@@ -11163,12 +11163,12 @@ mod tests {
         assert_eq!(actor.forgotten_stream_through, 0);
     }
 
-    /// The other half of M6-C103: an expired proof that the connector's own
+    /// The other half of M6-C105: an expired proof that the connector's own
     /// evidence now **contradicts** is the peer's protocol violation, and
     /// stays the validator's non-retryable error rather than being laundered
     /// into a retryable expiry.
     #[tokio::test]
-    async fn m6c103_an_expired_forget_proof_contradicted_by_evidence_stays_a_protocol_error() {
+    async fn m6c105_an_expired_forget_proof_contradicted_by_evidence_stays_a_protocol_error() {
         let stream_id = 45;
         let (mut actor, _key, _held_ack) = retained_forget_awaiting_owner_ack(stream_id).await;
         let pending = actor
