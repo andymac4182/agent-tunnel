@@ -151,6 +151,42 @@ demo_stop_pid() {
   rm -f "$f"
 }
 
+# demo_timeout SECONDS CMD... : run CMD, killing it after SECONDS. Returns
+# CMD's status, or 124 on timeout. (macOS has no timeout(1).) Docker Desktop
+# under load has left `docker run` hanging for over 20 minutes.
+demo_timeout() {
+  local secs=$1 pid i=0
+  shift
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge $((secs * 10)) ]; then
+      kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$pid"
+}
+
+# PING the demo Redis over TLS from the host, through the published port,
+# verifying its certificate against the demo server CA. Exit 0 on PONG.
+demo_redis_ping() {
+  python3 - "$DEMO_REDIS_PORT" "$DEMO_PKI/server-ca.pem" <<'PY'
+import socket, ssl, sys
+ctx = ssl.create_default_context(cafile=sys.argv[2])
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            tls.sendall(b"PING\r\n")
+            sys.exit(0 if tls.recv(64).startswith(b"+PONG") else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 demo_port_free() {
   ! nc -z 127.0.0.1 "$1" >/dev/null 2>&1
 }

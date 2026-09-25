@@ -139,15 +139,17 @@ demo_ok "server CA, device CA, relay and Redis certificates, token issuer"
 
 # ------------------------------------------------------------------ Redis
 demo_say "starting throwaway Redis container $DEMO_REDIS_CONTAINER (TLS, 127.0.0.1:$DEMO_REDIS_PORT)"
-docker run -d --name "$DEMO_REDIS_CONTAINER" --label agentuplink.demo=1 \
+rc=0
+demo_timeout 120 docker run -d --name "$DEMO_REDIS_CONTAINER" --label agentuplink.demo=1 \
   -p "127.0.0.1:$DEMO_REDIS_PORT:6379" -v "$DEMO_PKI/redis-tls:/tls:ro" \
   "$DEMO_REDIS_IMAGE" redis-server --port 0 --tls-port 6379 \
   --tls-cert-file /tls/redis.pem --tls-key-file /tls/redis-key.pem \
   --tls-ca-cert-file /tls/server-ca.pem --tls-auth-clients no \
-  --appendonly yes --appendfsync always --no-appendfsync-on-rewrite no >/dev/null
+  --appendonly yes --appendfsync always --no-appendfsync-on-rewrite no >/dev/null || rc=$?
+[ "$rc" = 0 ] || demo_die "docker run did not start $DEMO_REDIS_CONTAINER (status $rc; 124 = no answer in 120 s: Docker Desktop is overloaded or stuck, restart it), then run down.sh and up.sh"
 i=0
-until docker exec "$DEMO_REDIS_CONTAINER" redis-cli --tls --cacert /tls/server-ca.pem -h localhost ping 2>/dev/null | grep -q PONG; do
-  i=$((i + 1)); [ "$i" -lt 60 ] || demo_die "Redis did not answer PING over TLS in 30 s"
+until demo_redis_ping; do
+  i=$((i + 1)); [ "$i" -lt 60 ] || demo_die "Redis did not answer PING over TLS on 127.0.0.1:$DEMO_REDIS_PORT in 30 s"
   sleep 0.5
 done
 demo_ok "Redis answers PING over TLS"

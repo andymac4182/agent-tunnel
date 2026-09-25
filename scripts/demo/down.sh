@@ -52,8 +52,19 @@ fi
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   if docker ps -a --format '{{.Names}}' | grep -qx "$DEMO_REDIS_CONTAINER"; then
-    docker rm -f -v "$DEMO_REDIS_CONTAINER" >/dev/null
-    demo_info "removed container $DEMO_REDIS_CONTAINER"
+    # A removal already in progress (a stuck Docker Desktop) is not an error
+    # here; wait for the container to disappear instead.
+    demo_timeout 60 docker rm -f -v "$DEMO_REDIS_CONTAINER" >/dev/null 2>&1 || true
+    i=0
+    while docker ps -a --format '{{.Names}}' | grep -qx "$DEMO_REDIS_CONTAINER" && [ "$i" -lt 60 ]; do
+      sleep 1; i=$((i + 1))
+    done
+    if docker ps -a --format '{{.Names}}' | grep -qx "$DEMO_REDIS_CONTAINER"; then
+      demo_warn "container $DEMO_REDIS_CONTAINER is still present after 60 s (Docker Desktop stuck?); run down.sh again later"
+      CONTAINER_LEFT=1
+    else
+      demo_info "removed container $DEMO_REDIS_CONTAINER"
+    fi
   fi
 else
   demo_warn "docker is not reachable; could not check for $DEMO_REDIS_CONTAINER"
@@ -67,5 +78,9 @@ if [ -d "$DEMO_STATE" ]; then
     rm -rf "$DEMO_STATE"
     demo_info "deleted $DEMO_STATE"
   fi
+fi
+if [ "${CONTAINER_LEFT:-0}" = 1 ]; then
+  demo_say "local demo is down except the Redis container (see above)"
+  exit 1
 fi
 demo_say "local demo is down"
