@@ -2455,6 +2455,37 @@ Actual computer-use tests run only in a dedicated disposable VM or isolated test
 
 The GUI fixture should display a known test window, unique screen markers, a text field, and a click counter. Check screenshot dimensions and markers, targeted input, expected field contents, one click per operation, cancellation, unsupported capabilities, and lost permissions. Use screenshots containing only fixture content as test artifacts. Record OS, display scale, keyboard layout, backend version, and granted permissions with each run. Do not infer Windows/macOS/Linux feature parity from the success of a single backend on one OS.
 
+### Disposable Linux CUA VM (Apple Silicon host)
+
+The owner approved on 2026-09-25 running CUA in a VM on the owner's Apple Silicon laptop, **never** against the laptop's own desktop. [`scripts/m5-cua-vm.sh`](../scripts/m5-cua-vm.sh) builds and drives that VM with [Tart](https://tart.run) (Apple Virtualization framework). It is the Linux half of the M5-03 proposal; macOS and Windows guests are not built yet.
+
+**Safety boundary.** Every screen capture and input event happens inside the guest. The script never starts `cua-computer-server`, a VNC server, a screenshot tool or a tunnel CUA export on the macOS host, and nothing requires granting the host Terminal or any host process Screen Recording or Accessibility. The server binds `127.0.0.1` inside the guest; the host reaches it only through an SSH forward over Tart's private NAT network (`192.168.64.0/24`), and [`probe.py`](../tests/cua-fixture/probe.py) refuses any base URL other than the host end of that forward. The probe sends no input. Screen content is the synthetic fixture only.
+
+**Golden image `cua-golden`.** Cloned from the official `ghcr.io/cirruslabs/ubuntu` image, pinned by digest in the script (Ubuntu 24.04.4 LTS, arm64); 4 vCPU, 4 GB RAM, the image's 20 GB disk (the owner cap is 4 vCPU, 4 GB and 25 GB). [`provision-guest.sh`](../tests/cua-fixture/provision-guest.sh) runs inside the guest and installs:
+
+- Xorg (modesetting on virtio-gpu, not Xvfb, per M5-03) at 1280x800, openbox, and getty autologin of an unprivileged, password-locked `cua` user straight into `startx`;
+- the fixture app [`fixture_app.py`](../tests/cua-fixture/fixture_app.py): a fullscreen Tk window titled `agentuplink-cua-fixture` with 40 px corner markers (red top-left, green top-right, blue bottom-left, magenta bottom-right), a yellow centre marker, a text field and a click counter. It writes what it actually received to `/tmp/cua-fixture/state.json`, so a test can check the application side effect rather than a transport acknowledgement;
+- `cua-computer-server==0.3.46` with the `driver` and `vnc` extras into `/opt/cua-server` by `pip install --require-hashes --no-deps` from [`requirements-linux-aarch64.lock`](../tests/cua-fixture/requirements-linux-aarch64.lock). The script refuses to build unless the lock's two `cua-computer-server` hashes are exactly `WHEEL_SHA256` and `SDIST_SHA256` from `crates/tunnel-http-forward/src/cua_pin.rs`. Every other dependency is hash-locked too; the lock was generated with `uv pip compile --generate-hashes --python-version 3.12 --python-platform aarch64-manylinux_2_39` (glibc 2.39 is Ubuntu 24.04's; `cua-driver` 0.22.2 ships only a `manylinux_2_31` aarch64 wheel, which the default `manylinux_2_28` target rejects);
+- `x11vnc` for the VNC backend, bound to guest loopback and started only by the launcher when that backend is selected. The launcher also sets `CUA_TELEMETRY_ENABLED=false`: `cua-core` 0.3.1 sends PostHog and OpenTelemetry events by default.
+
+**Commands.** Tart 2.38.0 was installed from the notarised GitHub release (the `cirruslabs/cli` Homebrew tap fails under Homebrew 7 and still carries 2.32.1); put `tart` on `PATH` or set `TART`. Every step checks `df` first and aborts if free space would drop below 20 GiB.
+
+```sh
+scripts/m5-cua-vm.sh golden            # build cua-golden once (~5 min; ~5 GiB on disk, shared with Tart's OCI cache)
+scripts/m5-cua-vm.sh cycle cua-run-1   # clone, boot, probe every backend, stop, delete
+scripts/m5-cua-vm.sh create NAME && scripts/m5-cua-vm.sh run NAME   # keep a clone up
+scripts/m5-cua-vm.sh probe NAME        # read-only probe; evidence under ~/.local/state/agentuplink-m5-cua-vm/runs/
+scripts/m5-cua-vm.sh destroy NAME
+scripts/m5-cua-vm.sh destroy-golden    # remove the golden image and the cached base image
+```
+
+Runs always use a clone (`tart clone` is an APFS copy-on-write clone, so a clone costs only the blocks the guest writes); the script refuses to run or probe `cua-golden` itself. `probe` records per variant: `/status`, `/commands` (names, aliases, parameters), and `/cmd` `version`, `get_screen_size`, `get_cursor_position` and `screenshot`, with the PNG's dimensions and the pixel colour at each marker, beside `xdpyinfo` and the manifest from [`guest-manifest.sh`](../tests/cua-fixture/guest-manifest.sh) (OS, kernel, display, DPI, keyboard layout, package versions, lock digest). The variants are `native`, `native` with the ignored `--width/--height` flags, `native` with `UNAVAILABLE_WITHOUT_CONTAINER_NAME=1`, `vnc`, and `cua-driver`.
+
+**A black root framebuffer is an environment failure.** On this image an X `GetImage` of the root window (PIL `ImageGrab`, which the native Linux backend uses, and ImageMagick `import`) returned an all-black frame until something forced an Expose of every window; `x11vnc` starting or `xrefresh` cleared it. The session therefore runs `xrefresh` once the fixture maps, and `run` does not report a guest up until a root capture inside the guest shows the red marker. Why the first paint is missing from the root image was not established.
+
+**Not covered yet.** No input is sent and the tunnel device does not run in the guest: there is no `aarch64-unknown-linux-gnu` release artifact and the CLI does not yet wire a CUA export (M5-03). No macOS or Windows guest exists, and the guest's display runs at identity scale, so it cannot answer M5-C19's non-identity question on its own.
+
+
 ## Soak, chaos, and load experiments
 
 The following are proposed experiment sizes and acceptance targets for the first working transport. They have not been measured and are not product guarantees. Record hardware, OS, commit, configuration, TLS settings, network conditions, and raw measurements; revise the targets through a documented decision after obtaining a baseline.

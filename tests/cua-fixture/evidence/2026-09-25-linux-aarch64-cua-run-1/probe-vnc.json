@@ -1,0 +1,110 @@
+{
+  "aliases": {
+    "click": "left_click",
+    "key": "press_key",
+    "tap": "left_click",
+    "type": "type_text"
+  },
+  "command_count": 21,
+  "commands": [
+    "double_click",
+    "drag",
+    "drag_to",
+    "get_cursor_position",
+    "get_screen_size",
+    "hotkey",
+    "key_down",
+    "key_up",
+    "left_click",
+    "mouse_down",
+    "mouse_up",
+    "move_cursor",
+    "press_key",
+    "right_click",
+    "screenshot",
+    "scroll",
+    "scroll_direction",
+    "scroll_down",
+    "scroll_up",
+    "type_text",
+    "version"
+  ],
+  "commands_http_status": 200,
+  "label": "vnc",
+  "param_names_mentioning_display": [],
+  "param_names_mentioning_scale": [],
+  "params": {
+    "get_cursor_position": [],
+    "get_screen_size": [],
+    "screenshot": [],
+    "version": []
+  },
+  "result_keys_mentioning_scale": [],
+  "results": {
+    "get_cursor_position": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "success": true
+      }
+    },
+    "get_screen_size": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "size": {
+          "height": 800,
+          "width": 1280
+        },
+        "success": true
+      }
+    },
+    "screenshot": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "image_data": "<8067 bytes elided>",
+        "success": true
+      }
+    },
+    "version": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "package": "0.3.46",
+        "protocol": 1,
+        "success": true
+      }
+    }
+  },
+  "screenshot_image": {
+    "pixels": {
+      "bottom_left": "#0000ff",
+      "bottom_right": "#ff00ff",
+      "centre": "#ffff00",
+      "top_left": "#ff0000",
+      "top_right": "#00ff00"
+    },
+    "png_bytes": 8067,
+    "png_height": 800,
+    "png_width": 1280
+  },
+  "status": {
+    "body": {
+      "features": [
+        "mcp"
+      ],
+      "os_type": "linux",
+      "status": "ok"
+    },
+    "http_status": 200
+  }
+}
