@@ -1631,7 +1631,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
+                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} delete_status={} delete_closed={} delete_failed_streams={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1641,6 +1641,9 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.session_id_from_connection_stream,
                         evidence.prompt_accepted_202,
                         evidence.conversation_stop_reason,
+                        evidence.delete_status,
+                        evidence.delete_closed_connection,
+                        evidence.delete_failed_held_streams,
                         evidence.permission_requested_on_wire,
                         evidence.offered_options,
                         evidence.allow_outcome_at_agent,

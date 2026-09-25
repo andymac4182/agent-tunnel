@@ -201,6 +201,17 @@ pub struct AcpRealPathEvidence {
     pub conversation_stop_reason: String,
     /// `session/prompt` was answered 202 and the result arrived separately.
     pub prompt_accepted_202: bool,
+    /// The consumer's DELETE over the real route: its status, and what it
+    /// did, read from the export and from the consumer's own held streams
+    /// rather than from the status (task row M8-02).
+    pub delete_status: u16,
+    /// The export closed exactly that connection while both of its streams
+    /// were still held by the consumer, so nothing but the DELETE ended it.
+    pub delete_closed_connection: bool,
+    /// Both of the consumer's held streams then **errored**: the teardown
+    /// crossed the device WebSocket, the owner and the peer hop back to the
+    /// consumer, and did not look like an orderly end.
+    pub delete_failed_held_streams: bool,
 
     // --- permissions ---
     /// The permission callback was observed on the session stream.
@@ -1158,7 +1169,48 @@ impl Gate<'_> {
         // What the **export** made of that turn, through the terminal rule.
         evidence.export_terminal_succeeded_delta =
             self.export().terminals_succeeded - before.terminals_succeeded;
-        self.close_conversation(conversation).await;
+
+        // **DELETE over the real route, observed rather than trusted.**  The
+        // streams are still held, so the only thing that can end this
+        // connection now is the DELETE itself; a 202 alone would prove only
+        // that the bridge accepted it.
+        let closed_before = self.export().connections_closed;
+        let headers = self.connection_headers(&conversation);
+        let request = acp_request(
+            "DELETE",
+            &self.base_uri,
+            &self.token,
+            &headers,
+            empty_stream(),
+        )?;
+        let response = conversation
+            .consumer
+            .sender
+            .clone()
+            .send_request(request)
+            .await
+            .map_err(|error| HarnessError::Http(format!("ACP DELETE: {error}")))?;
+        evidence.delete_status = response.status().as_u16();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let closed = self.export().connections_closed - closed_before == 1;
+            let failed = conversation.connection_stream.has_errored()
+                && conversation.session_stream.has_errored();
+            if closed && failed {
+                evidence.delete_closed_connection = true;
+                evidence.delete_failed_held_streams = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                evidence.delete_closed_connection = closed;
+                evidence.delete_failed_held_streams = failed;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        conversation.connection_stream.break_now();
+        conversation.session_stream.break_now();
+        conversation.consumer.shutdown();
         Ok(())
     }
 
@@ -1950,7 +2002,7 @@ fn m8c14_attribution(evidence: &AcpRealPathEvidence) -> String {
 
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
-    let checks: [(&str, bool); 32] = [
+    let checks: [(&str, bool); 35] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the device is owned by relay-a and the consumer entered at relay-c",
@@ -1986,6 +2038,18 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         (
             "the turn completed with end_turn, read off the wire",
             evidence.conversation_stop_reason == "end_turn",
+        ),
+        (
+            "DELETE over the real route was accepted 202",
+            evidence.delete_status == 202,
+        ),
+        (
+            "DELETE closed that connection at the export while its streams were still held",
+            evidence.delete_closed_connection,
+        ),
+        (
+            "DELETE failed both held streams at the consumer rather than ending them cleanly",
+            evidence.delete_failed_held_streams,
         ),
         // --- permissions ---
         (
