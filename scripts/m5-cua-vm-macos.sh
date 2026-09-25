@@ -92,11 +92,39 @@ is_golden() { [ "$1" = "${GOLDEN}" ] || [ "$1" = "${DENIED}" ]; }
 vm_exists() { "${TART}" list --quiet 2>/dev/null | grep -qx "$1"; }
 vm_running() { "${TART}" list --format json | python3 -c 'import json,sys; n=sys.argv[1]; sys.exit(0 if any(v["Name"]==n and v["Running"] for v in json.load(sys.stdin)) else 1)' "$1"; }
 base_cached() { "${TART}" list --format json | python3 -c 'import json,sys; n=sys.argv[1]; sys.exit(0 if any(v["Name"]==n for v in json.load(sys.stdin)) else 1)' "${BASE_IMAGE}"; }
+# `tart exec` runs as whoever is logged in to the guest's GUI: measured
+# 2026-09-26, the Tart Guest Agent serves exec from its per-session launchd
+# agent (`tart-guest-agent --run-agent`), not from its root daemon. So before
+# the golden image's first reboot it is the base image's `admin`, and from then
+# on it is the unprivileged `cua`, which has no sudo. gexec is therefore only
+# used for unprivileged reads; everything that needs root goes over SSH as
+# admin (groot), authenticated by the guest host key read over exec.
 gexec() { local vm="$1"; shift; "${TART}" exec "${vm}" "$@"; }
 gexec_in() { local vm="$1"; shift; "${TART}" exec -i "${vm}" "$@"; }
-# Run a command as root in the guest. The guest agent runs as the image's
-# admin user, which has passwordless sudo.
-groot() { local vm="$1"; shift; gexec "${vm}" sudo "$@"; }
+
+# known_hosts VM: refresh the per-VM known_hosts from the guest's own ed25519
+# host key, read over the hypervisor channel, for the guest's current address.
+known_hosts() {
+  local vm="$1" ip key kh="${STATE}/known_hosts.d/${1}"
+  mkdir -p "${STATE}/known_hosts.d"
+  ip="$("${TART}" ip "${vm}")"
+  case "${ip}" in 192.168.64.*) ;; *) die "unexpected guest address ${ip}; expected Tart's private NAT network";; esac
+  key="$(gexec "${vm}" cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')"
+  case "${key}" in "ssh-ed25519 "?*) ;; *) die "could not read the guest's ed25519 host key";; esac
+  echo "${ip} ${key}" >"${kh}"
+}
+gssh() {
+  local vm="$1" kh="${STATE}/known_hosts.d/${1}" ip; shift
+  [ -s "${kh}" ] || known_hosts "${vm}"
+  ip="$(awk '{print $1; exit}' "${kh}")"
+  ssh -i "${STATE}/id_ed25519" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${kh}" \
+    -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
+    "admin@${ip}" "$@"
+}
+# groot VM CMD...: run CMD as root in the guest (admin has passwordless sudo).
+groot() { local vm="$1"; shift; gssh "${vm}" "sudo $(printf '%q ' "$@")"; }
+# groot_in VM CMD...: as groot, with the host's stdin attached.
+groot_in() { groot "$@"; }
 cua_uid() { groot "$1" id -u cua; }
 
 ssh_key() {
@@ -123,7 +151,7 @@ boot() {
   for _ in $(seq 1 240); do
     if gexec "${vm}" true 2>/dev/null; then
       ok=$((ok + 1))
-      [ "${ok}" -ge 3 ] && { assert_guest "${vm}"; return 0; }
+      [ "${ok}" -ge 3 ] && { assert_guest "${vm}"; known_hosts "${vm}"; return 0; }
     else
       ok=0
     fi
@@ -213,7 +241,7 @@ copy_fixture() {
   local vm="$1"
   COPYFILE_DISABLE=1 tar -C "${FIXTURE}" -cf - fixture_app.py provision-guest-macos.sh guest-manifest-macos.sh \
       window-state-macos.py requirements-macos-arm64.lock \
-    | gexec_in "${vm}" sudo bash -c 'rm -rf /opt/cua-fixture && mkdir -p /opt/cua-fixture && tar -C /opt/cua-fixture -xf - && chown -R root:wheel /opt/cua-fixture && chmod -R a+rX /opt/cua-fixture'
+    | groot_in "${vm}" bash -c 'rm -rf /opt/cua-fixture && mkdir -p /opt/cua-fixture && tar -C /opt/cua-fixture -xf - && chown -R root:wheel /opt/cua-fixture && chmod -R a+rX /opt/cua-fixture'
 }
 
 check_lock_matches_pin() {
@@ -259,8 +287,11 @@ cmd_golden() {
     "${STATE}/logs/${GOLDEN}.provision.log" \
     || die "provisioning failed; see ${STATE}/logs/${GOLDEN}.provision.log"
   log "rebooting into cua's autologin session"
-  groot "${GOLDEN}" shutdown -r now >/dev/null 2>&1 || true
-  sleep 20
+  # The VM restarts in place (`tart run` keeps running), so wait for the
+  # agent to go away before waiting for it to come back.
+  groot "${GOLDEN}" /sbin/shutdown -r now >/dev/null 2>&1 || true
+  local _
+  for _ in $(seq 1 60); do gexec "${GOLDEN}" true 2>/dev/null || break; sleep 2; done
   boot "${GOLDEN}"
   wait_session "${GOLDEN}"
   groot "${GOLDEN}" bash /opt/cua-fixture/guest-manifest-macos.sh | tee "${STATE}/golden-manifest.json"
@@ -328,7 +359,7 @@ start_server() {
   {
     printf 'LABEL=%q\nBACKEND=%q\nARGS=%q\nPORT=%q\n' "${label}" "${backend}" "${sargs}" "${SERVER_PORT}"
     for e in ${envs}; do printf 'export %q\n' "${e}"; done
-  } | gexec_in "${vm}" sudo bash -c 'umask 022; cat >/etc/agentuplink-cua/server-run.sh && chown root:wheel /etc/agentuplink-cua/server-run.sh'
+  } | groot_in "${vm}" bash -c 'umask 022; cat >/etc/agentuplink-cua/server-run.sh && chown root:wheel /etc/agentuplink-cua/server-run.sh'
   groot "${vm}" launchctl kickstart -k "gui/${uid}/${AGENT_PREFIX}.cua-server"
   local _
   for _ in $(seq 1 60); do
