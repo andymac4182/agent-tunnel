@@ -72,9 +72,11 @@ fi
 # artifact whose digest is not in the lock, including cua-computer-server,
 # whose two hashes are the wheel and sdist digests in cua_pin.rs. Wheels only:
 # every one of the locked packages has a macOS arm64 or pure-Python wheel.
+# The lock includes the pyobjc frameworks listed in
+# requirements-macos-pyobjc-darwin24.in (see that file for why).
 rm -rf /opt/cua-server
 "${PY_FW}/bin/python3.13" -m venv /opt/cua-server
-/opt/cua-server/bin/pip install -q --require-hashes --no-deps --only-binary :all: \
+/opt/cua-server/bin/pip install -q --no-cache-dir --require-hashes --no-deps --only-binary :all: \
   -r "${SRC}/requirements-macos-arm64.lock"
 /opt/cua-server/bin/pip check
 
