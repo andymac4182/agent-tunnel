@@ -181,7 +181,17 @@ def forwarder_main(args: argparse.Namespace) -> None:
         await asyncio.gather(_pump(reader, up_writer), _pump(up_reader, writer))
 
     async def main():
-        server = await asyncio.start_server(handle, "127.0.0.1", args.port, ssl=context)
+        # The relay dials `localhost`, which may resolve to ::1 first; listen
+        # on both loopback families where the host has them.
+        hosts = ["127.0.0.1"]
+        if socket.has_ipv6:
+            try:
+                with socket.socket(socket.AF_INET6) as probe:
+                    probe.bind(("::1", 0))
+                hosts.append("::1")
+            except OSError:
+                pass
+        server = await asyncio.start_server(handle, hosts, args.port, ssl=context)
         print(f"forwarder listening port={args.port}", flush=True)
         async with server:
             await server.serve_forever()
@@ -366,6 +376,8 @@ class Stack:
             if completed.returncode == 0:
                 break
             stderr = completed.stderr.decode(errors="replace")
+            if attempt == 1:
+                self.event("activate-diagnostics", **self.redis_diagnostics())
             if "stage=connection_establishment" not in stderr or attempt == 5:
                 raise SystemExit(f"activate-first-incarnation failed: {stderr[-600:]}")
             self.event("activate-retry", attempt=attempt, stderr=stderr.strip()[-200:])
@@ -418,6 +430,24 @@ class Stack:
         self.devices[name] = {"id": device_id, "dir": d, "config": config, "proc": None,
                               "starts": 0, "exports": dict(exports)}
         return d
+
+    def redis_diagnostics(self) -> dict:
+        """Which hop refuses: the upstream Redis, or the forwarder per address family."""
+        out: dict[str, str] = {}
+        try:
+            out["upstream_ping"] = resp(self.redis[0], self.redis[1], ["PING"]).decode(errors="replace").strip()
+        except OSError as error:
+            out["upstream_ping"] = f"error {type(error).__name__}: {error}"
+        out["localhost_resolves"] = ",".join(sorted({a[4][0] for a in socket.getaddrinfo(
+            "localhost", self.forwarder_port, type=socket.SOCK_STREAM)}))
+        for host in ("127.0.0.1", "::1"):
+            try:
+                with socket.create_connection((host, self.forwarder_port), timeout=3):
+                    out[f"forwarder_{host}"] = "connect ok"
+            except OSError as error:
+                out[f"forwarder_{host}"] = f"error {type(error).__name__}"
+        out["forwarder_alive"] = str(self.forwarder.poll() is None)
+        return out
 
     def add_user(self, name: str) -> None:
         user_id, subject = str(uuid.uuid4()), f"m6-03-soak-user-{name}-{self.nonce}"
