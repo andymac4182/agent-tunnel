@@ -1,0 +1,229 @@
+{
+  "button_click": "ok",
+  "calls": [
+    {
+      "elapsed_ms": 10121,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "describe",
+      "outcome": "answered_locally",
+      "result": {
+        "endpoint_is_loopback": true,
+        "operations": [
+          "describe",
+          "capture",
+          "screen_info",
+          "cursor_position",
+          "click",
+          "double_click",
+          "move",
+          "drag",
+          "scroll",
+          "type_text",
+          "press_key",
+          "hotkey"
+        ]
+      }
+    },
+    {
+      "elapsed_ms": 469,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "screen_info",
+      "outcome": "ok",
+      "result": {
+        "size": {
+          "height": 800,
+          "width": 1280
+        }
+      }
+    },
+    {
+      "elapsed_ms": 236,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "cursor_position",
+      "outcome": "ok",
+      "result": {
+        "position": {
+          "x": 640,
+          "y": 400
+        }
+      }
+    },
+    {
+      "elapsed_ms": 366,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "capture",
+      "outcome": "ok",
+      "result": {
+        "capture": 1,
+        "display": 0,
+        "format": "png",
+        "image_bytes": 7077,
+        "image_sha256": "a32991e346f62616bea3534047893e036d7b4a131dae8f2e1b6c0e0d29d997cf"
+      }
+    },
+    {
+      "elapsed_ms": 281,
+      "error": {
+        "code": "lease_not_held",
+        "message": "no input lease is held for this target",
+        "retryable": true
+      },
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "click",
+      "outcome": "not_dispatched",
+      "params": {
+        "capture": 1,
+        "x": 1,
+        "y": 1
+      }
+    },
+    {
+      "elapsed_ms": 257,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "acquire_input_lease",
+      "outcome": "answered_locally",
+      "result": {
+        "held": true,
+        "lease": 1,
+        "target": "primary"
+      }
+    },
+    {
+      "elapsed_ms": 604,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "click",
+      "outcome": "ok",
+      "params": {
+        "capture": 1,
+        "x": 300,
+        "y": 116
+      },
+      "result": {}
+    },
+    {
+      "elapsed_ms": 581,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "type_text",
+      "outcome": "ok",
+      "result": {}
+    },
+    {
+      "elapsed_ms": 208,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "click",
+      "outcome": "ok",
+      "params": {
+        "capture": 1,
+        "x": 180,
+        "y": 180
+      },
+      "result": {}
+    },
+    {
+      "elapsed_ms": 443,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "capture",
+      "outcome": "ok",
+      "result": {
+        "capture": 2,
+        "display": 0,
+        "format": "png",
+        "image_bytes": 9994,
+        "image_sha256": "5bf9276172387741a6d9f52f5276d77185a36556e05241855ada6e7049d0da9a"
+      }
+    },
+    {
+      "elapsed_ms": 239,
+      "error": {
+        "code": "capture_superseded",
+        "message": "the capture has been superseded by a newer one",
+        "retryable": true
+      },
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "click",
+      "outcome": "not_dispatched",
+      "params": {
+        "capture": 1,
+        "x": 105,
+        "y": 165
+      }
+    },
+    {
+      "elapsed_ms": 408,
+      "error": null,
+      "http_status": "200",
+      "http_version": "2",
+      "operation": "release_input_lease",
+      "outcome": "answered_locally",
+      "result": {
+        "held": false,
+        "lease": null,
+        "target": "primary"
+      }
+    }
+  ],
+  "cursor_position": {
+    "position": {
+      "x": 640,
+      "y": 400
+    }
+  },
+  "focus_click": "ok",
+  "fresh_capture": "ok",
+  "lease": "answered_locally",
+  "markers": {
+    "bottom_left": "#0000ff",
+    "bottom_right": "#ff00ff",
+    "centre": "#ffff00",
+    "png_height": 800,
+    "png_width": 1280,
+    "top_left": "#ff0000",
+    "top_right": "#00ff00"
+  },
+  "markers_match_fixture": true,
+  "negotiated_operations": [
+    "describe",
+    "capture",
+    "screen_info",
+    "cursor_position",
+    "click",
+    "double_click",
+    "move",
+    "drag",
+    "scroll",
+    "type_text",
+    "press_key",
+    "hotkey"
+  ],
+  "release": "answered_locally",
+  "screen_info": {
+    "size": {
+      "height": 800,
+      "width": 1280
+    }
+  },
+  "stale_click": "capture_superseded",
+  "type_text": "ok",
+  "typed_characters": 16,
+  "unleased_click": "lease_not_held"
+}

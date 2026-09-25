@@ -1,0 +1,1 @@
+b'HTTP/1.1 200 OK\r\ndate: Fri, 25 Sep 2026 16:34:29 GMT\r\nserver: uvicorn\r\ncache-control: no-cache\r\nconnection: keep-alive\r\ncontent-type: text/plain; charset=utf-8\r\nvary: Origin\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n41\r\ndata: {"success": true, "size": {"width": 1280, "height": 800}}\n\n\r\n0\r\n\r\n'
