@@ -2230,7 +2230,8 @@ empty-pin-set refusal (M7-C83) shares the code and execution but has its own
 message and a 5000 ms hint, and is never resent. The owner-not-ready body
 outside a freeze reaches its case unchanged. Refusals and resends are printed with the evidence
 (M3-30: on a hosted runner the rotation-span case starts inside the first
-freeze). Everything else on the path is production: relay-c's public route, the
+freeze; since M3-34 that case anchors on a completed rotation instead of
+relying on this resend). Everything else on the path is production: relay-c's public route, the
 peer HTTP/3 hop, relay-a's owner actor, the rotating device data WebSocket and
 `tunnel-client`'s configured `[exports.<service>.mcp]` stdio exports.
 
@@ -2329,9 +2330,17 @@ boundaries at most every 15 s (defect M7-C80).
   `session_idle_seconds` (M3-16). The Streamable HTTP export has the same
   setting for its own session table, so an abandoned session there is
   forgotten rather than held for ever.
-* **rotation-span.** One call is held open until the owner has completed three
-  scheduled rotations, then released: it must answer 200 exactly once with the
-  fixture's exact text, on the same device session, with one dispatch. This
+* **rotation-span.** The case first waits for the owner to complete one
+  scheduled rotation and anchors on it: the owner starts the next one only a
+  whole interval later, so the session and the call are sent while no freeze
+  can begin, wherever the schedule stood when the case started (M3-34). One
+  call is then held open until the owner has completed three more scheduled
+  rotations, then released: it must answer 200 exactly once with the
+  fixture's exact text, on the same device session, with one dispatch. Once
+  its hold has started, the owner must still be `active` with the anchor's
+  completed count, so the call provably reached the device before any rotation
+  it is credited with began; a call refused into a freeze and resent until
+  after it fails that rule rather than being counted as spanning it. This
   case is also the validator's control for the revocation withdrawal above: an
   identical held call that is never revoked stays open far longer than the
   five-second withdrawal bound and is answered.
