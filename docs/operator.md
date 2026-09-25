@@ -458,12 +458,14 @@ one real request through the relay: an MCP `initialize` and a `tools/call`, an
 ACP `initialize`, and a 9P read of the file.
 
 Then, against your Redis, activate the relay's incarnation and write the
-records, in that order. **Do not start `serve` until `provision-catalog` has
-succeeded.** Provisioning refuses a namespace holding any key other than the
-incarnation binding, and nothing shipped removes a key a relay has written, so
-a relay started between the two commands can leave the namespace
-unprovisionable (M6-C34); if that happens, choose a new `redis_namespace` and
-start again. **Shape-only:** both write Redis, which this guide's
+records, in that order. `serve` refuses a namespace that has been activated
+but not provisioned: it exits `1` with `Redis catalog connection failed;
+stage=authority_identity class=unprovisioned` before it writes anything, so
+starting it too early costs nothing and you run `provision-catalog` next
+(M6-C34). A `tunnel-relay` built before M6-C34 does not refuse; do not start
+one of those until `provision-catalog` has succeeded, because provisioning
+refuses a namespace holding any key other than the incarnation binding.
+**Shape-only:** both write Redis, which this guide's
 check does not have. `scripts/m6-provisioning-verify.sh` runs them, `serve`,
 `connect` and an echo end to end with these binaries and the two examples
 against a real Redis:
@@ -478,17 +480,24 @@ first incarnation of namespace ...`. It refuses a namespace that holds any key
 at all, including one that already has an incarnation: changing an
 incarnation is recovery's job (section 4), and this command cannot be used to
 skip it. `provision-catalog` prints `Provisioned namespace ...` with the
-identifiers it wrote. It refuses a namespace without an active incarnation,
-and it runs **once** per namespace: a second run, or a run after a partial
-failure, is refused, and a namespace left partly written is discarded, not
-repaired. Choose a new `redis_namespace` and start again. No identifier it
-prints is secret; it prints no certificate, key or token.
+identifiers it wrote. It refuses a namespace without an active incarnation.
+It writes every record, and the reservation that makes it run once, in **one
+Redis script** (M6-C35): a refusal found part-way, such as a grant whose
+`expires_at` has already passed, or a Redis error part-way is rolled back in
+that script, so the namespace is either fully provisioned or exactly as
+activated. After a failure, fix the cause and run the same command again on
+the same namespace. Once it has succeeded, a second run is refused
+("namespace was already provisioned"). No identifier it prints is secret; it
+prints no certificate, key or token.
 
 Because an interrupted write cannot be undone, neither command stops part-way
 on the first SIGTERM or Ctrl-C: it says it received the signal, finishes (each
 Redis step is bounded), and prints and exits with its own outcome. A second
-signal abandons it at once with exit `130` and says the outcome is unknown;
-treat that namespace as partial. `initialize`, `recovery-initialize` and
+signal abandons it at once with exit `130` and says the outcome is unknown.
+Because each command is one Redis script, the namespace is then either
+written completely or untouched: run the command again, and "namespace
+already has a deployment incarnation" or "namespace was already provisioned"
+means the abandoned run completed. `initialize`, `recovery-initialize` and
 `recover` behave the same way (M6-C23).
 
 The activation also binds the namespace to the Redis server's run id, and
@@ -734,8 +743,9 @@ looks up the user and authorizes the grant, in Redis. So:
 **Not supported in this alpha:** a second tenant, changing or deactivating a
 user or a membership, changing a service's type or operations, and
 reactivating a revoked device or credential. Renewing a device certificate is
-M6-C56. A namespace left partly provisioned (M6-C35) can take these additions,
-but it is still not repaired.
+M6-C56. Since M6-C35 `provision-catalog` cannot leave a namespace partly
+provisioned; one left partly written by an earlier `tunnel-relay` can take
+these additions, but it is still not repaired.
 
 ## 3. Deployment
 

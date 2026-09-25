@@ -34,7 +34,7 @@ use tunnel_relay::{
         QuiescenceAcknowledgement, RecoverRequest, RecoveryApprovalVersionStore,
         RecoveryFenceIdentity, RecoveryWorkflowConfig,
     },
-    redis_connection::{self, RedisTlsMaterialPaths},
+    redis_connection::{self, RedisConnectionError, RedisConnectionStage, RedisTlsMaterialPaths},
     routing::{OwnerRouter, RelayIdentity},
 };
 use tunnel_transport::{
@@ -775,6 +775,22 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         &redis_tls_material,
     )
     .await?;
+    // M6-C34: refuse a namespace that was activated but never provisioned,
+    // before anything below (continuity token, cluster records, listeners)
+    // can write to it and make `provision-catalog` refuse it as occupied.
+    if let Err(error) = catalog.ensure_provisioned().await {
+        let failure = CatalogConnectionFailure::classify(&error);
+        let stage = match failure {
+            CatalogConnectionFailure::Unprovisioned => RedisConnectionStage::AuthorityIdentity,
+            _ => RedisConnectionStage::AuthorityConnection,
+        };
+        return Err(RedisConnectionError::CatalogConnectionFailed {
+            stage,
+            lane: None,
+            failure,
+        }
+        .into());
+    }
     // M6-C65: a single relay may adopt a restarted Redis run the namespace
     // allows; a cluster relay never does (recovery stays the cluster's path).
     if config.cluster.is_none() {

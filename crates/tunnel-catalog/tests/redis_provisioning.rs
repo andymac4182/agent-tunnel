@@ -387,6 +387,133 @@ async fn provisioning_requires_an_active_incarnation_valid_records_and_runs_once
     delete_namespace(&namespace).await;
 }
 
+/// Task row M6-C35: provisioning is one atomic write.  A refusal found
+/// part-way -- here a grant that has already expired, which record
+/// validation does not catch and the grant script does, after the tenant,
+/// device and credential writes -- leaves the namespace exactly as activated:
+/// no reservation, no records, so the operator fixes the records and runs
+/// `provision-catalog` again on the same namespace.  Before the fix the
+/// reservation, the records and the credential stayed behind and every rerun
+/// was refused `namespace was already provisioned`.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c35_a_provisioning_refused_part_way_writes_nothing_and_can_be_rerun() {
+    let namespace = fresh_namespace();
+    let catalog = RedisCatalog::connect_for_recovery(&url(), &namespace, INCARNATION)
+        .await
+        .expect("connect");
+    catalog
+        .activate_first_deployment_incarnation()
+        .await
+        .expect("first activation");
+    let activated = keys(&namespace).await;
+    assert_eq!(
+        activated.len(),
+        2,
+        "only the activation keys: {activated:?}"
+    );
+
+    let (records, ids) = records();
+    let mut expired = records.clone();
+    expired.grants[0].expires_at = Some(Utc::now() - Duration::hours(1));
+    match catalog.provision_initial_catalog(&expired).await {
+        Err(CatalogError::InvalidInput(message)) => assert_eq!(message, "grant expiry"),
+        other => panic!("expected the grant script's expiry refusal, got {other:?}"),
+    }
+    assert_eq!(
+        keys(&namespace).await,
+        activated,
+        "a provisioning refused part-way must leave only the activation keys"
+    );
+
+    catalog
+        .provision_initial_catalog(&records)
+        .await
+        .expect("the corrected records provision the same namespace");
+    let serving =
+        RedisCatalog::connect_with_deployment_incarnation(&url(), &namespace, INCARNATION)
+            .await
+            .expect("serve's catalog");
+    let device = serving
+        .resolve_device(&ids.fingerprint, Utc::now())
+        .await
+        .expect("resolve device")
+        .expect("the credential resolves");
+    assert_eq!(device.device_id, ids.device);
+    println!(
+        "m6c35-atomic ok namespace={namespace} refused_keys={} provisioned_keys={}",
+        activated.len(),
+        keys(&namespace).await.len()
+    );
+    delete_namespace(&namespace).await;
+}
+
+/// Task row M6-C35: a Redis *error* part-way through the write -- here an
+/// ACL user that may not run `SADD`, so the first index write fails after
+/// the first record hash was written -- is rolled back in the same script:
+/// nothing but the activation keys remains, and the reservation is not taken.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c35_a_redis_error_part_way_is_rolled_back_in_the_same_script() {
+    let namespace = fresh_namespace();
+    let admin = RedisCatalog::connect_for_recovery(&url(), &namespace, INCARNATION)
+        .await
+        .expect("connect");
+    admin
+        .activate_first_deployment_incarnation()
+        .await
+        .expect("first activation");
+    let activated = keys(&namespace).await;
+
+    let user = format!("m6c35-nosadd-{}", Uuid::new_v4().simple());
+    let password = format!("m6c35-{}", Uuid::new_v4().simple());
+    let client = redis::Client::open(url()).expect("open Redis client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis");
+    let _: () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&user)
+        .arg("on")
+        .arg(format!(">{password}"))
+        .arg("~*")
+        .arg("+@all")
+        .arg("-sadd")
+        .query_async(&mut connection)
+        .await
+        .expect("create the no-SADD ACL user");
+    let restricted_url = url().replacen("redis://", &format!("redis://{user}:{password}@"), 1);
+    let restricted =
+        RedisCatalog::connect_with_deployment_incarnation(&restricted_url, &namespace, INCARNATION)
+            .await;
+    let outcome = match restricted {
+        Ok(restricted) => restricted.provision_initial_catalog(&records().0).await,
+        Err(error) => Err(error),
+    };
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async(&mut connection)
+        .await
+        .expect("delete the ACL user");
+    assert!(
+        outcome.is_err(),
+        "provisioning without SADD must fail, got {outcome:?}"
+    );
+    assert_eq!(
+        keys(&namespace).await,
+        activated,
+        "a Redis error part-way must be rolled back to the activation keys"
+    );
+    admin
+        .provision_initial_catalog(&records().0)
+        .await
+        .expect("the same namespace provisions once the error is gone");
+    println!("m6c35-rollback ok namespace={namespace} error_rolled_back=true");
+    delete_namespace(&namespace).await;
+}
+
 async fn get(namespace: &str, key: &str) -> Option<String> {
     let client = redis::Client::open(url()).expect("open Redis client");
     let mut connection = client

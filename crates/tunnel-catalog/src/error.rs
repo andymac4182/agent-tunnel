@@ -94,6 +94,11 @@ pub enum CatalogConnectionFailure {
     /// The namespace is bound to an earlier Redis server run: Redis
     /// restarted and nothing re-attested the namespace (M6-C65).
     RunChanged,
+    /// The namespace is activated but `provision-catalog` has not run on it
+    /// (M6-C34): `serve` refuses it so that a relay started between the two
+    /// bootstrap commands cannot write anything that would make provisioning
+    /// refuse the namespace.
+    Unprovisioned,
     /// Redis restarted without the serving relay's last acknowledged
     /// continuity token: it came back from a copy older than that token (an
     /// earlier snapshot or backup, or a replica that had not received it), or
@@ -129,6 +134,7 @@ impl CatalogConnectionFailure {
             Self::RunIdConflict => "run_id_conflict",
             Self::Unbound => "unbound",
             Self::RunChanged => "run_changed",
+            Self::Unprovisioned => "unprovisioned",
             Self::Continuity => "continuity",
             Self::Persistence => "persistence",
             Self::Config => "config",
@@ -150,6 +156,9 @@ impl CatalogConnectionFailure {
             }
             CatalogError::Conflict(label) if *label == crate::redis::RUN_BINDING_CHANGED => {
                 Self::RunChanged
+            }
+            CatalogError::Conflict(label) if *label == crate::redis::NAMESPACE_UNPROVISIONED => {
+                Self::Unprovisioned
             }
             CatalogError::Conflict(label) if *label == crate::redis::CONTINUITY_MISMATCH => {
                 Self::Continuity

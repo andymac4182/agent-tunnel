@@ -483,13 +483,15 @@ exits `1` on failure. Read the message before running anything again:
 | 3 | "namespace is not empty" | No. Choose a new namespace. |
 | 4 | fails connecting to Redis, or at `stage=authority_identity` because step 3 has not succeeded | Yes. `provision-catalog` makes the same connection and incarnation check as `serve` before it writes anything (`crates/tunnel-relay/src/provisioning.rs`, `provision_catalog`). |
 | 4 | "invalid provisioning records" or "invalid device certificate" | Yes. These are checked before Redis is contacted. |
-| 4 | "namespace was already provisioned" | No. The one-shot reservation is taken before any record is written, so this means an earlier run got at least that far. If that run printed `Provisioned namespace`, you are done. If its outcome is unknown, or it failed part-way, the namespace may be partly written and nothing shipped repairs it (M6-C35): choose a new namespace. |
-| 4 | "namespace holds records other than its active incarnation" | No. Something wrote the namespace between steps 3 and 4, for example a relay started too early (M6-C34). Choose a new namespace. |
+| 4 | any other refusal, or a Redis error | Yes. The reservation and every record are written by one Redis script, and a refusal or error part-way is rolled back in it, so the namespace is exactly as step 3 left it (M6-C35). Fix the cause and run step 4 again. An image from before M6-C35 wrote in several steps and could leave the namespace partly written: with such an image, choose a new namespace. |
+| 4 | "namespace was already provisioned" | No. The reservation is written in the same script as the records, so an earlier run completed: you are done, even if that run's outcome was unknown. |
+| 4 | "namespace holds records other than its active incarnation" | No. Something wrote the namespace between steps 3 and 4. Since M6-C34 `serve` refuses an activated, unprovisioned namespace (`class=unprovisioned`) before writing anything, so only a relay image from before M6-C34, or another writer, can cause this. Choose a new namespace. |
 
 Stopping a step's machine part-way is also covered by the binary: a writing
 command finishes its current bounded Redis step on the first stop signal and
 exits with its own outcome; a second signal abandons it with exit `130`, and
-the namespace must then be treated as partial ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
+the outcome is unknown. Each step is one Redis script, so rerun the step: its
+own "already" refusal means the abandoned run completed ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
 
 #### 6.2.1 When step 3 or 4 cannot reach Redis
 
@@ -554,8 +556,8 @@ retry after the fix.
 
 `fly ssh console` is not an option at this point: there is no relay machine
 to connect to, because `serve` refuses to start on a namespace with no
-incarnation, and a relay started between steps 3 and 4 can leave the
-namespace unprovisionable (M6-C34).
+incarnation, and on an activated namespace that step 4 has not provisioned
+(`class=unprovisioned`, M6-C34).
 
 Three things here were not measured on Fly. That the one-off machines receive
 the app's secrets rests on Fly's documentation: "An app's secrets are

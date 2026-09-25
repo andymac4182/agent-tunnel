@@ -36,6 +36,11 @@ pub(crate) use lane::{
 };
 pub use recovery::DurableCatalogObservation;
 
+/// `serve`'s refusal of an activated namespace that `provision-catalog` has
+/// not run on (task row M6-C34).
+pub(crate) const NAMESPACE_UNPROVISIONED: &str =
+    "namespace is activated but not provisioned; run provision-catalog first";
+
 const MAX_SAFE_REDIS_TIME: i64 = 9_000_000_000_000_000;
 const MAX_FIXTURE_RECORDS: usize = 4_096;
 const MAX_CLEANUP_KEYS: usize = 100_000;
@@ -993,30 +998,46 @@ impl RedisCatalog {
     /// new marker would make every provisioned namespace unobservable by
     /// `recovery-observe`.
     ///
-    /// The reservation is taken before any record is written, so a second run
-    /// is refused even after a partial failure; a namespace left partial is
-    /// discarded, not repaired, exactly as the fixture seed's is.
+    /// The reservation and every record are written by one script (task row
+    /// M6-C35): a refusal or a Redis error part-way is rolled back inside
+    /// that script, so the namespace is either fully provisioned (and a
+    /// second run is refused) or left exactly as activated, and a rerun on
+    /// the same namespace is possible.
     pub async fn provision_initial_catalog(
         &self,
         records: &CatalogFixture,
     ) -> Result<(), CatalogError> {
         validate_fixture(records)?;
         self.ensure_active_incarnation().await?;
-        match self.reserve_empty_namespace().await? {
-            NamespaceReservation::Reserved => {}
+        match self.reserve_and_write_seed(records).await? {
+            NamespaceReservation::Reserved => Ok(()),
             NamespaceReservation::AlreadyReserved => {
-                return Err(CatalogError::Conflict("namespace was already provisioned"));
+                Err(CatalogError::Conflict("namespace was already provisioned"))
             }
-            NamespaceReservation::Occupied => {
-                return Err(CatalogError::Conflict(
-                    "namespace holds records other than its active incarnation",
-                ));
-            }
-            NamespaceReservation::ScanBound => {
-                return Err(CatalogError::Conflict("namespace scan bound"));
-            }
+            NamespaceReservation::Occupied => Err(CatalogError::Conflict(
+                "namespace holds records other than its active incarnation",
+            )),
+            NamespaceReservation::ScanBound => Err(CatalogError::Conflict("namespace scan bound")),
         }
-        self.write_seed_records(records).await
+    }
+
+    /// `serve`'s provisioning fence (task row M6-C34): refuse a namespace
+    /// whose incarnation is active but which `provision-catalog` (or the
+    /// fixture seed) has not reserved.  The reservation key is written only
+    /// by the atomic provisioning script, together with every record, and
+    /// nothing removes it, so its presence is exactly "provisioning
+    /// completed".  A relay started between `activate-first-incarnation` and
+    /// `provision-catalog` therefore stops before it can write any key --
+    /// owner leases, continuity tokens, cluster records -- that would make
+    /// provisioning refuse the namespace as occupied.
+    pub async fn ensure_provisioned(&self) -> Result<(), CatalogError> {
+        let mut command = redis::cmd("GET");
+        command.arg(self.fixture_seed_guard_key());
+        let reserved: Option<String> = self.connection.query(&command).await?;
+        match reserved.as_deref() {
+            Some("1") => Ok(()),
+            _ => Err(CatalogError::Conflict(NAMESPACE_UNPROVISIONED)),
+        }
     }
 
     /// Day-2 catalog change (task row M6-C31): add one user, bound to one
@@ -1223,25 +1244,64 @@ impl RedisCatalog {
 
     /// Take the one-shot seed reservation of a namespace holding nothing but
     /// its active incarnation, Redis run binding and, when a relay already
-    /// served it, that relay's continuity token (M6-C65).
-    async fn reserve_empty_namespace(&self) -> Result<NamespaceReservation, CatalogError> {
+    /// served it, that relay's continuity token (M6-C65), **and** write every
+    /// record of `fixture`, in one script (task row M6-C35).
+    ///
+    /// The script proves the namespace empty, applies the seed's writes in
+    /// order -- the record hashes and indexes, then each credential through
+    /// `SCRIPT_SEED_CREDENTIAL`'s body and each grant through
+    /// `SCRIPT_UPSERT_GRANT_BODY`'s, unchanged -- and sets the reservation
+    /// last.  A sub-script refusal or a Redis error raised part-way (caught
+    /// with `pcall`) deletes every key the namespace did not hold before the
+    /// script started, which is exactly what the script wrote: no other
+    /// client runs while it does.  So a namespace is either reserved with its
+    /// complete records or left as it was.
+    async fn reserve_and_write_seed(
+        &self,
+        fixture: &CatalogFixture,
+    ) -> Result<NamespaceReservation, CatalogError> {
+        let ops = self.seed_operations(fixture)?;
+        let mut args = vec![self.prefix.clone(), MAX_SEED_SCAN_KEYS.to_string()];
+        args.extend(ops);
         let reply: Vec<String> = self
             .eval(
-                SCRIPT_RESERVE_FIXTURE_NAMESPACE,
+                &format!(
+                    "{LUA_DECIMAL_HELPERS}\n\
+                     local function seed_credential(KEYS, ARGV)\n{SCRIPT_SEED_CREDENTIAL}\nend\n\
+                     local function upsert_grant(KEYS, ARGV)\n{SCRIPT_UPSERT_GRANT_BODY}\nend\n\
+                     {SCRIPT_RESERVE_AND_WRITE_SEED}"
+                ),
                 &[
                     self.fixture_seed_guard_key(),
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
                     self.continuity_key(),
+                    self.catalog_generation_key(),
                 ],
-                &[self.prefix.clone(), MAX_SEED_SCAN_KEYS.to_string()],
+                &args,
             )
             .await?;
-        match reply.first().map(String::as_str) {
-            Some("ok") => Ok(NamespaceReservation::Reserved),
-            Some("used") => Ok(NamespaceReservation::AlreadyReserved),
-            Some("occupied") => Ok(NamespaceReservation::Occupied),
-            Some("bound") => Ok(NamespaceReservation::ScanBound),
+        match reply.as_slice() {
+            [status] if status == "ok" => Ok(NamespaceReservation::Reserved),
+            [status] if status == "used" => Ok(NamespaceReservation::AlreadyReserved),
+            [status] if status == "occupied" => Ok(NamespaceReservation::Occupied),
+            [status] if status == "bound" => Ok(NamespaceReservation::ScanBound),
+            [status, step, refusal] if status == "refused" => {
+                Err(match (step.as_str(), refusal.as_str()) {
+                    ("credential", "conflict") => {
+                        CatalogError::Conflict("duplicate SPKI fingerprint")
+                    }
+                    ("grant", "none") => CatalogError::InvalidInput("grant tenant relationship"),
+                    ("grant", "expired") => CatalogError::InvalidInput("grant expiry"),
+                    (_, "overflow") => CatalogError::RevisionOverflow,
+                    _ => CatalogError::Serialization("invalid Redis seed step reply".into()),
+                })
+            }
+            // A Redis error part-way, already rolled back.  Its text is not
+            // returned: it can name keys.
+            [status] if status == "error" => Err(CatalogError::Conflict(
+                "Redis refused a seed write; nothing was written",
+            )),
             _ => Err(CatalogError::Serialization(
                 "invalid Redis fixture reservation reply".into(),
             )),
@@ -1545,158 +1605,149 @@ impl RedisCatalog {
         }
     }
 
-    /// Write every record of an already-validated seed into a namespace whose
-    /// one-shot reservation the caller has just taken.  Shared by the fixture
-    /// seed and the operator bootstrap so both write exactly one key layout.
-    async fn write_seed_records(&self, fixture: &CatalogFixture) -> Result<(), CatalogError> {
-        let mut pipeline = redis::pipe();
-        pipeline.atomic();
+    /// Every write of an already-validated seed, encoded for
+    /// `SCRIPT_RESERVE_AND_WRITE_SEED` (task row M6-C35).  Shared by the
+    /// fixture seed and the operator bootstrap so both write exactly one key
+    /// layout: the record hashes and indexes, one catalog generation step for
+    /// them, then each credential and each grant with exactly the keys and
+    /// arguments their stand-alone scripts take.
+    fn seed_operations(&self, fixture: &CatalogFixture) -> Result<Vec<String>, CatalogError> {
+        let mut ops = SeedOperations::default();
         for tenant in &fixture.tenants {
-            pipeline
-                .cmd("HSET")
-                .arg(self.tenant_key(tenant.tenant_id))
-                .arg("tenant_id")
-                .arg(tenant.tenant_id.to_string())
-                .arg("display_name")
-                .arg(&tenant.display_name)
-                .arg("active")
-                .arg(bool_string(tenant.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.tenants_index())
-                .arg(tenant.tenant_id.to_string());
+            ops.command(&[
+                "HSET",
+                &self.tenant_key(tenant.tenant_id),
+                "tenant_id",
+                &tenant.tenant_id.to_string(),
+                "display_name",
+                &tenant.display_name,
+                "active",
+                bool_string(tenant.active),
+            ]);
+            ops.command(&["SADD", &self.tenants_index(), &tenant.tenant_id.to_string()]);
         }
         for user in &fixture.users {
-            pipeline
-                .cmd("HSET")
-                .arg(self.user_key(user.user_id))
-                .arg("user_id")
-                .arg(user.user_id.to_string())
-                .arg("display_name")
-                .arg(&user.display_name);
-            pipeline
-                .cmd("SADD")
-                .arg(self.users_index())
-                .arg(user.user_id.to_string());
+            ops.command(&[
+                "HSET",
+                &self.user_key(user.user_id),
+                "user_id",
+                &user.user_id.to_string(),
+                "display_name",
+                &user.display_name,
+            ]);
+            ops.command(&["SADD", &self.users_index(), &user.user_id.to_string()]);
         }
         for identity in &fixture.identities {
-            pipeline
-                .cmd("HSET")
-                .arg(self.identity_key(&identity.issuer, &identity.subject))
-                .arg("issuer")
-                .arg(&identity.issuer)
-                .arg("subject")
-                .arg(&identity.subject)
-                .arg("user_id")
-                .arg(identity.user_id.to_string());
-            pipeline
-                .cmd("SADD")
-                .arg(self.identities_index())
-                .arg(self.identity_key(&identity.issuer, &identity.subject));
+            let key = self.identity_key(&identity.issuer, &identity.subject);
+            ops.command(&[
+                "HSET",
+                &key,
+                "issuer",
+                &identity.issuer,
+                "subject",
+                &identity.subject,
+                "user_id",
+                &identity.user_id.to_string(),
+            ]);
+            ops.command(&["SADD", &self.identities_index(), &key]);
         }
         for membership in &fixture.memberships {
-            pipeline
-                .cmd("HSET")
-                .arg(self.membership_key(membership.tenant_id, membership.user_id))
-                .arg("tenant_id")
-                .arg(membership.tenant_id.to_string())
-                .arg("user_id")
-                .arg(membership.user_id.to_string())
-                .arg("role")
-                .arg(membership.role.as_str())
-                .arg("active")
-                .arg(bool_string(membership.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.memberships_index(membership.tenant_id))
-                .arg(membership.user_id.to_string());
-            pipeline
-                .cmd("SADD")
-                .arg(self.user_tenants_index(membership.user_id))
-                .arg(membership.tenant_id.to_string());
+            ops.command(&[
+                "HSET",
+                &self.membership_key(membership.tenant_id, membership.user_id),
+                "tenant_id",
+                &membership.tenant_id.to_string(),
+                "user_id",
+                &membership.user_id.to_string(),
+                "role",
+                membership.role.as_str(),
+                "active",
+                bool_string(membership.active),
+            ]);
+            ops.command(&[
+                "SADD",
+                &self.memberships_index(membership.tenant_id),
+                &membership.user_id.to_string(),
+            ]);
+            ops.command(&[
+                "SADD",
+                &self.user_tenants_index(membership.user_id),
+                &membership.tenant_id.to_string(),
+            ]);
         }
         for device in &fixture.devices {
-            pipeline
-                .cmd("HSET")
-                .arg(self.device_key(device.tenant_id, device.device_id))
-                .arg("tenant_id")
-                .arg(device.tenant_id.to_string())
-                .arg("device_id")
-                .arg(device.device_id.to_string())
-                .arg("owner_user_id")
-                .arg(device.owner_user_id.to_string())
-                .arg("display_name")
-                .arg(&device.display_name)
-                .arg("active")
-                .arg(bool_string(device.active))
-                .arg("last_seen_at_us")
-                .arg(
-                    device
-                        .last_seen_at
-                        .map(datetime_micros)
-                        .transpose()?
-                        .map_or_else(String::new, |value| value.to_string()),
-                );
-            pipeline
-                .cmd("HSETNX")
-                .arg(self.device_key(device.tenant_id, device.device_id))
-                .arg("device_version")
-                .arg("1");
-            pipeline
-                .cmd("SETNX")
-                .arg(self.owner_epoch_key(device.tenant_id, device.device_id))
-                .arg("0")
-                .ignore();
-            pipeline
-                .cmd("SADD")
-                .arg(self.devices_index(device.tenant_id))
-                .arg(device.device_id.to_string());
+            let key = self.device_key(device.tenant_id, device.device_id);
+            let last_seen = device
+                .last_seen_at
+                .map(datetime_micros)
+                .transpose()?
+                .map_or_else(String::new, |value| value.to_string());
+            ops.command(&[
+                "HSET",
+                &key,
+                "tenant_id",
+                &device.tenant_id.to_string(),
+                "device_id",
+                &device.device_id.to_string(),
+                "owner_user_id",
+                &device.owner_user_id.to_string(),
+                "display_name",
+                &device.display_name,
+                "active",
+                bool_string(device.active),
+                "last_seen_at_us",
+                &last_seen,
+            ]);
+            ops.command(&["HSETNX", &key, "device_version", "1"]);
+            ops.command(&[
+                "SETNX",
+                &self.owner_epoch_key(device.tenant_id, device.device_id),
+                "0",
+            ]);
+            ops.command(&[
+                "SADD",
+                &self.devices_index(device.tenant_id),
+                &device.device_id.to_string(),
+            ]);
         }
         for service in &fixture.services {
-            pipeline
-                .cmd("HSET")
-                .arg(self.service_key(service.tenant_id, service.device_id, service.service_id))
-                .arg("tenant_id")
-                .arg(service.tenant_id.to_string())
-                .arg("device_id")
-                .arg(service.device_id.to_string())
-                .arg("service_id")
-                .arg(service.service_id.to_string())
-                .arg("service_type")
-                .arg(&service.service_type)
-                .arg("display_name")
-                .arg(&service.display_name)
-                .arg("capabilities")
-                .arg(serde_json::to_string(&service.capabilities)?)
-                .arg("version")
-                .arg(service.version.to_string())
-                .arg("active")
-                .arg(bool_string(service.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.services_index(service.tenant_id, service.device_id))
-                .arg(service.service_id.to_string());
+            ops.command(&[
+                "HSET",
+                &self.service_key(service.tenant_id, service.device_id, service.service_id),
+                "tenant_id",
+                &service.tenant_id.to_string(),
+                "device_id",
+                &service.device_id.to_string(),
+                "service_id",
+                &service.service_id.to_string(),
+                "service_type",
+                &service.service_type,
+                "display_name",
+                &service.display_name,
+                "capabilities",
+                &serde_json::to_string(&service.capabilities)?,
+                "version",
+                &service.version.to_string(),
+                "active",
+                bool_string(service.active),
+            ]);
+            ops.command(&[
+                "SADD",
+                &self.services_index(service.tenant_id, service.device_id),
+                &service.service_id.to_string(),
+            ]);
         }
-        pipeline
-            .cmd("EVAL")
-            .arg(format!(
-                "{LUA_DECIMAL_HELPERS}{SCRIPT_INCREMENT_CATALOG_GENERATION}"
-            ))
-            .arg(1_i64)
-            .arg(self.catalog_generation_key())
-            .ignore();
-        self.execute_seed_pipeline(pipeline).await?;
+        ops.push("gen", &[], &[]);
         for credential in &fixture.credentials {
-            self.seed_credential(credential).await?;
+            let (keys, args) = self.seed_credential_call(credential)?;
+            ops.push("credential", &keys, &args);
         }
+        let at_us = datetime_micros(Utc::now())?;
         for grant in &fixture.grants {
-            self.upsert_grant(grant).await?;
+            let (keys, args) = self.upsert_grant_call(grant, at_us)?;
+            ops.push("grant", &keys, &args);
         }
-        Ok(())
-    }
-
-    async fn execute_seed_pipeline(&self, pipeline: redis::Pipeline) -> Result<(), CatalogError> {
-        self.connection.query_pipeline::<()>(&pipeline).await
+        Ok(ops.0)
     }
 
     fn tenant_key(&self, tenant: Uuid) -> String {
@@ -1859,7 +1910,12 @@ impl RedisCatalog {
         format!("{}idx:fingerprint:{fingerprint}", self.prefix)
     }
 
-    async fn seed_credential(&self, credential: &CredentialRecord) -> Result<(), CatalogError> {
+    /// The keys and arguments of `SCRIPT_SEED_CREDENTIAL` for one credential,
+    /// run inside the seed script (task row M6-C35).
+    fn seed_credential_call(
+        &self,
+        credential: &CredentialRecord,
+    ) -> Result<(Vec<String>, Vec<String>), CatalogError> {
         let not_before = datetime_micros(credential.not_before)?;
         let expires = datetime_micros(credential.expires_at)?;
         let revoked = credential
@@ -1867,40 +1923,91 @@ impl RedisCatalog {
             .map(datetime_micros)
             .transpose()?
             .map_or_else(String::new, |value| value.to_string());
-        let reply: Vec<String> = self
-            .eval(
-                &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_SEED_CREDENTIAL}"),
-                &[
-                    self.credential_key(
-                        credential.tenant_id,
-                        credential.device_id,
-                        credential.credential_id,
-                    ),
-                    self.fingerprint_index(&credential.spki_fingerprint),
-                    self.credentials_index(credential.tenant_id, credential.device_id),
-                    self.catalog_generation_key(),
-                ],
-                &[
-                    credential.tenant_id.to_string(),
-                    credential.device_id.to_string(),
-                    credential.credential_id.to_string(),
-                    credential.spki_fingerprint.clone(),
-                    credential.serial.clone().unwrap_or_default(),
-                    not_before.to_string(),
-                    expires.to_string(),
-                    revoked,
-                    bool_string(credential.active).into(),
-                    self.prefix.clone(),
-                ],
-            )
-            .await?;
-        match reply.first().map(String::as_str) {
-            Some("ok") => Ok(()),
-            Some("conflict") => Err(CatalogError::Conflict("duplicate SPKI fingerprint")),
-            _ => Err(CatalogError::Serialization(
-                "invalid Redis credential reply".into(),
-            )),
-        }
+        Ok((
+            vec![
+                self.credential_key(
+                    credential.tenant_id,
+                    credential.device_id,
+                    credential.credential_id,
+                ),
+                self.fingerprint_index(&credential.spki_fingerprint),
+                self.credentials_index(credential.tenant_id, credential.device_id),
+                self.catalog_generation_key(),
+            ],
+            vec![
+                credential.tenant_id.to_string(),
+                credential.device_id.to_string(),
+                credential.credential_id.to_string(),
+                credential.spki_fingerprint.clone(),
+                credential.serial.clone().unwrap_or_default(),
+                not_before.to_string(),
+                expires.to_string(),
+                revoked,
+                bool_string(credential.active).into(),
+                self.prefix.clone(),
+            ],
+        ))
+    }
+
+    /// The keys and arguments of `SCRIPT_UPSERT_GRANT_BODY` for one grant at
+    /// `at_us`, shared by [`Catalog::upsert_grant`] and the seed script.
+    fn upsert_grant_call(
+        &self,
+        spec: &GrantSpec,
+        at_us: i64,
+    ) -> Result<(Vec<String>, Vec<String>), CatalogError> {
+        let permissions = serde_json::to_string(&spec.permissions)?;
+        let constraints = serde_json::to_string(&spec.constraints)?;
+        let expires = spec
+            .expires_at
+            .map(datetime_micros)
+            .transpose()?
+            .map_or_else(String::new, |value| value.to_string());
+        Ok((
+            vec![
+                self.grant_key(
+                    spec.tenant_id,
+                    spec.principal_id,
+                    spec.device_id,
+                    spec.service_id,
+                ),
+                self.membership_key(spec.tenant_id, spec.principal_id),
+                self.tenant_key(spec.tenant_id),
+                self.device_key(spec.tenant_id, spec.device_id),
+                self.service_key(spec.tenant_id, spec.device_id, spec.service_id),
+                self.grants_device_index(spec.tenant_id, spec.device_id),
+                self.catalog_generation_key(),
+            ],
+            vec![
+                at_us.to_string(),
+                permissions,
+                constraints,
+                expires,
+                bool_string(spec.active).into(),
+            ],
+        ))
+    }
+}
+
+/// The operation list of the seed script (task row M6-C35): each entry is
+/// its kind, its key count, its argument count, the keys, then the
+/// arguments, flattened into the script's `ARGV`.
+#[derive(Default)]
+struct SeedOperations(Vec<String>);
+
+impl SeedOperations {
+    /// One plain Redis command; its first argument is the command name.
+    fn command(&mut self, command: &[&str]) {
+        let args: Vec<String> = command.iter().map(|part| (*part).to_owned()).collect();
+        self.push("cmd", &[], &args);
+    }
+
+    fn push(&mut self, kind: &str, keys: &[String], args: &[String]) {
+        self.0.push(kind.to_owned());
+        self.0.push(keys.len().to_string());
+        self.0.push(args.len().to_string());
+        self.0.extend(keys.iter().cloned());
+        self.0.extend(args.iter().cloned());
     }
 }
 
@@ -2078,38 +2185,12 @@ impl Catalog for RedisCatalog {
 
     async fn upsert_grant(&self, spec: &GrantSpec) -> Result<GrantSnapshot, CatalogError> {
         let now = Utc::now();
-        let at_us = datetime_micros(now)?;
-        let permissions = serde_json::to_string(&spec.permissions)?;
-        let constraints = serde_json::to_string(&spec.constraints)?;
-        let expires = spec
-            .expires_at
-            .map(datetime_micros)
-            .transpose()?
-            .map_or_else(String::new, |value| value.to_string());
+        let (keys, args) = self.upsert_grant_call(spec, datetime_micros(now)?)?;
         let reply: Vec<String> = self
             .eval(
                 &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_UPSERT_GRANT_BODY}"),
-                &[
-                    self.grant_key(
-                        spec.tenant_id,
-                        spec.principal_id,
-                        spec.device_id,
-                        spec.service_id,
-                    ),
-                    self.membership_key(spec.tenant_id, spec.principal_id),
-                    self.tenant_key(spec.tenant_id),
-                    self.device_key(spec.tenant_id, spec.device_id),
-                    self.service_key(spec.tenant_id, spec.device_id, spec.service_id),
-                    self.grants_device_index(spec.tenant_id, spec.device_id),
-                    self.catalog_generation_key(),
-                ],
-                &[
-                    at_us.to_string(),
-                    permissions,
-                    constraints,
-                    expires,
-                    bool_string(spec.active).into(),
-                ],
+                &keys,
+                &args,
             )
             .await?;
         match reply.first().map(String::as_str) {
@@ -2239,19 +2320,18 @@ impl Catalog for RedisCatalog {
             return Err(CatalogError::InvalidInput("fixture namespace"));
         }
         validate_fixture(fixture)?;
-        match self.reserve_empty_namespace().await? {
-            NamespaceReservation::Reserved => {}
+        match self.reserve_and_write_seed(fixture).await? {
+            NamespaceReservation::Reserved => Ok(()),
             NamespaceReservation::AlreadyReserved => {
-                return Err(CatalogError::Conflict("fixture namespace already seeded"));
+                Err(CatalogError::Conflict("fixture namespace already seeded"))
             }
             NamespaceReservation::Occupied => {
-                return Err(CatalogError::Conflict("fixture namespace is not empty"));
+                Err(CatalogError::Conflict("fixture namespace is not empty"))
             }
             NamespaceReservation::ScanBound => {
-                return Err(CatalogError::Conflict("fixture namespace scan bound"));
+                Err(CatalogError::Conflict("fixture namespace scan bound"))
             }
         }
-        self.write_seed_records(fixture).await
     }
 
     async fn claim_owner(&self, request: &OwnerClaimRequest) -> Result<OwnerClaim, CatalogError> {
@@ -3072,24 +3152,88 @@ pub(crate) fn validate_fixture(fixture: &CatalogFixture) -> Result<(), CatalogEr
     Ok(())
 }
 
-const SCRIPT_RESERVE_FIXTURE_NAMESPACE: &str = r#"
+/// The one-shot seed (task rows M6-C21, M6-C35).  `KEYS`: the reservation,
+/// the active incarnation, the Redis run binding, the continuity token and the
+/// catalog generation.  `ARGV[1]` is the namespace prefix, `ARGV[2]` the scan
+/// bound, and the rest the operation list `SeedOperations` builds.  It is
+/// appended to the decimal helpers and to `seed_credential` and
+/// `upsert_grant`, which wrap `SCRIPT_SEED_CREDENTIAL` and
+/// `SCRIPT_UPSERT_GRANT_BODY` unchanged.
+///
+/// The namespace must hold nothing but the incarnation, run and continuity
+/// keys.  Every operation then runs inside `pcall`; the first refusal or
+/// Redis error deletes every other key under the prefix -- all written by
+/// this script, since the namespace held none of them when it started and no
+/// other client runs meanwhile -- and the reservation is never set.
+const SCRIPT_RESERVE_AND_WRITE_SEED: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 1 then return {'used'} end
-local cursor = '0'
-local examined = 0
-local limit = tonumber(ARGV[2])
-repeat
-  local result = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. '*', 'COUNT', 256)
-  cursor = result[1]
-  for _, key in ipairs(result[2]) do
-    examined = examined + 1
-    if examined > limit then return {'bound'} end
-    if key ~= KEYS[1] and key ~= KEYS[2] and key ~= KEYS[3] and key ~= KEYS[4] then
-      return {'occupied'}
+local function scan_namespace(visit)
+  local cursor = '0'
+  local examined = 0
+  local limit = tonumber(ARGV[2])
+  repeat
+    local result = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. '*', 'COUNT', 256)
+    cursor = result[1]
+    for _, key in ipairs(result[2]) do
+      examined = examined + 1
+      if examined > limit then return 'bound' end
+      if key ~= KEYS[2] and key ~= KEYS[3] and key ~= KEYS[4] then
+        local outcome = visit(key)
+        if outcome then return outcome end
+      end
+    end
+  until cursor == '0'
+  return nil
+end
+local occupied = scan_namespace(function(key)
+  if key ~= KEYS[1] then return 'occupied' end
+  return nil
+end)
+if occupied then return {occupied} end
+local refusal = nil
+local ok, err = pcall(function()
+  local i = 3
+  while i <= #ARGV do
+    local kind = ARGV[i]
+    local key_count = tonumber(ARGV[i + 1])
+    local arg_count = tonumber(ARGV[i + 2])
+    i = i + 3
+    local keys = {}
+    for j = 1, key_count do keys[j] = ARGV[i]; i = i + 1 end
+    local args = {}
+    for j = 1, arg_count do args[j] = ARGV[i]; i = i + 1 end
+    if kind == 'cmd' then
+      redis.call(unpack(args))
+    elseif kind == 'gen' then
+      local next_generation = decimal_increment(redis.call('GET', KEYS[5]))
+      if not next_generation then refusal = {'refused', 'generation', 'overflow'}; return end
+      redis.call('SET', KEYS[5], next_generation)
+    elseif kind == 'credential' then
+      local reply = seed_credential(keys, args)
+      if reply[1] ~= 'ok' then refusal = {'refused', 'credential', reply[1]}; return end
+    elseif kind == 'grant' then
+      local reply = upsert_grant(keys, args)
+      if reply[1] ~= 'ok' then refusal = {'refused', 'grant', reply[1]}; return end
+    else
+      refusal = {'refused', 'operation', kind}
+      return
     end
   end
-until cursor == '0'
-redis.call('SET', KEYS[1], '1')
-return {'ok'}
+end)
+if ok and not refusal then
+  redis.call('SET', KEYS[1], '1')
+  return {'ok'}
+end
+-- Roll back: every key but the incarnation, run and continuity keys was
+-- written by this script.  Bounded by the same scan limit; a rollback that
+-- reaches it is reported, not hidden.
+local rollback = scan_namespace(function(key)
+  redis.call('DEL', key)
+  return nil
+end)
+if rollback then return {'error'} end
+if not ok then return {'error'} end
+return refusal
 "#;
 
 const SCRIPT_ENSURE_INCARNATION: &str = r#"
@@ -3367,13 +3511,6 @@ local function decimal_increment(value)
   if carry == 1 then table.insert(chars, 1, '1') end
   return table.concat(chars)
 end
-"#;
-
-const SCRIPT_INCREMENT_CATALOG_GENERATION: &str = r#"
-local next_generation = decimal_increment(redis.call('GET', KEYS[1]))
-if not next_generation then return redis.error_reply('catalog generation overflow') end
-redis.call('SET', KEYS[1], next_generation)
-return next_generation
 "#;
 
 const SCRIPT_UPSERT_GRANT_BODY: &str = r#"

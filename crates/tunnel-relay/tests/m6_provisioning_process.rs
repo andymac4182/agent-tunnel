@@ -255,6 +255,82 @@ fn delete_namespace(upstream: SocketAddr, database: u32, namespace: &str) -> usi
     keys.len()
 }
 
+/// Every key of `namespace`, sorted, with the namespace prefix removed.
+fn namespace_keys(upstream: SocketAddr, database: u32, namespace: &str) -> Vec<String> {
+    let prefix = format!("tunnel-catalog:{namespace}:");
+    let reply = redis_command(upstream, database, &["KEYS", &format!("{prefix}*")]);
+    let mut keys: Vec<String> = String::from_utf8_lossy(&reply)
+        .split("\r\n")
+        .filter_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Task row M6-C34: `serve` started between `activate-first-incarnation` and
+/// `provision-catalog` must refuse the namespace **and write nothing**, so
+/// provisioning still succeeds afterwards.  Before the fix `serve` accepted an
+/// activated, unprovisioned namespace and kept serving; this step then lists
+/// what it wrote (the measurement the row asked for) and fails.
+fn serve_between_activation_and_provisioning(
+    relay_bin: &Path,
+    relay_config: &Path,
+    upstream: SocketAddr,
+    database: u32,
+    namespace: &str,
+) {
+    let mut early = Running(
+        Command::new(relay_bin)
+            .args(["serve", "--config"])
+            .arg(relay_config)
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve before provisioning"),
+    );
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let status = loop {
+        if let Some(status) = early.0.try_wait().expect("poll serve") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        let keys = namespace_keys(upstream, database, namespace);
+        let _ = early.0.kill();
+        let _ = early.0.wait();
+        panic!(
+            "step serve-before-provisioning: serve accepted an activated, unprovisioned \
+             namespace and was still running after {STEP_DEADLINE:?}; namespace keys: {keys:?}"
+        );
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = early.0.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let expected = "Redis catalog connection failed; stage=authority_identity class=unprovisioned";
+    assert!(
+        status.code() == Some(1) && stderr.contains(expected),
+        "step serve-before-provisioning: expected `{expected}`, got {:?}: {stderr}",
+        status.code()
+    );
+    let keys = namespace_keys(upstream, database, namespace);
+    assert_eq!(
+        keys,
+        ["meta:active_incarnation", "meta:redis_run_id"],
+        "step serve-before-provisioning: the refused serve wrote to the namespace"
+    );
+    println!(
+        "m6c34-serve-before-provisioning ok exit=1 class=unprovisioned keys={}",
+        keys.len()
+    );
+}
+
 /// Removes this run's ACL user however the test ends.
 struct AclUserGuard {
     upstream: SocketAddr,
@@ -1192,6 +1268,13 @@ async fn provision_and_serve_with(
             .arg(&relay_config),
     ));
     assert!(activated.contains(&incarnation), "{activated}");
+    serve_between_activation_and_provisioning(
+        &relay_bin,
+        &relay_config,
+        upstream,
+        database,
+        &namespace,
+    );
     let provisioned = stdout(&step(
         "catalog records (tunnel-relay provision-catalog)",
         Command::new(&relay_bin)
