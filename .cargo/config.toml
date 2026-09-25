@@ -1,0 +1,22 @@
+# Link the Microsoft C runtime statically into Windows binaries.
+#
+# Without this, every `x86_64-pc-windows-msvc` binary imports
+# `VCRUNTIME140.dll`, which belongs to the Visual C++ Redistributable and is
+# absent from a clean Windows install: the release archive ran on the hosted
+# runner (which has the redistributable) and would fail to start on a
+# tester's machine.  Found by `scripts/verify_release_archive.py`'s
+# portability check on the unpacked Windows archive, release run
+# 36144014503 (docs/tasks.md M6-C116).  The Universal CRT (`api-ms-win-crt-*`
+# -> `ucrtbase.dll`) is part of Windows 10 and later and is linked
+# statically too with this flag.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+#
+# Two consequences, both deliberate:
+# - This applies to every build of the target, so Windows host tests in CI
+#   (`ci.yml`'s Windows job) also link the C runtime statically. Accepted:
+#   tests then exercise the same runtime linkage that ships.
+# - Any of RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS or CARGO_BUILD_RUSTFLAGS
+#   REPLACES this list instead of adding to it, which would silently drop
+#   `+crt-static`. They must stay unset for release builds;
+#   `.github/workflows/release.yml`'s build step fails if any is set.

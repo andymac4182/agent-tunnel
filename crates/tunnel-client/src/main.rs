@@ -1643,6 +1643,16 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
     match command {
         "--help" | "-h" => Ok(Command::Help),
         "--version" | "-V" => Ok(Command::Version),
+        // `--help`/`-h` after a subcommand is a request for help, not an
+        // invalid invocation (demo-readiness defect D6: `connect --help`
+        // exited 2). It prints the one usage text every subcommand shares
+        // and exits 0, wherever the flag sits among the subcommand's
+        // arguments -- except as the value of a flag that takes a PATH.
+        "check-config" | "config" | "connect" | "credentials" | "doctor"
+            if asks_for_help(&args[1..]) =>
+        {
+            Ok(Command::Help)
+        }
         "check-config" => {
             if args.len() > 2 {
                 return Err(CliError::usage("check-config accepts at most one PATH"));
@@ -1658,6 +1668,23 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         }
         _ => Err(CliError::usage("unknown command")),
     }
+}
+
+/// Flags whose next argument is a value, so a `--help` there is a PATH.
+const VALUE_FLAGS: [&str; 4] = ["--config", "--csr-out", "--certificate", "--server-ca"];
+
+/// Whether a subcommand's arguments ask for help: a `--help` or `-h` in a
+/// flag position (not the value of one of [`VALUE_FLAGS`]).
+fn asks_for_help(args: &[OsString]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--help" | "-h") => return true,
+            Some(flag) if VALUE_FLAGS.contains(&flag) => index += 2,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn parse_config_command(args: &[OsString]) -> Result<Command, CliError> {
@@ -1707,7 +1734,12 @@ fn parse_path_and_json(args: &[OsString], command: &str) -> Result<(PathBuf, boo
             Some("--json") => json = true,
             _ => {
                 return Err(CliError::usage(format!(
-                    "usage: tunnel-client {command} --config PATH"
+                    "usage: tunnel-client {command} --config PATH [--json]{}",
+                    if command == "connect" {
+                        " [--no-reconnect]"
+                    } else {
+                        ""
+                    }
                 )));
             }
         }
