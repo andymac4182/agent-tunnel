@@ -86,6 +86,19 @@ def summarise(record: dict) -> dict:
     return out
 
 
+def numbers_only(value):
+    """Keep only numbers, booleans and the dict/list structure around them."""
+    if isinstance(value, dict):
+        kept = {k: numbers_only(v) for k, v in value.items()}
+        return {k: v for k, v in kept.items() if v not in (None, {}, [])}
+    if isinstance(value, list):
+        kept = [numbers_only(v) for v in value]
+        return [v for v in kept if v not in (None, {}, [])]
+    if isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
 def find_keys(value, needle: str, path: str = "") -> list[str]:
     """Every key path whose name contains needle (case-insensitive)."""
     hits = []
@@ -243,7 +256,14 @@ def main() -> int:
             info["pixels"] = pixels
         ev["screenshot_image"] = info
         if not info["fixture_markers_verified"]:
+            # The state queries still answer M5-C19's scale question, so
+            # record their numbers and flags only: no strings, so no window
+            # or element names from a screen not known to be the fixture.
+            for name in OPTIONAL_READ_ONLY:
+                if name in cmds:
+                    results[name] = numbers_only(cmd(base, name))
             ev["results"] = {k: v for k, v in results.items()}
+            ev["result_keys_mentioning_scale"] = find_keys(results, "scale")
             print(json.dumps(ev, indent=2, sort_keys=True))
             print("probe.py: screenshot corners are not the fixture markers; "
                   "refusing to keep the image or its pixels", file=sys.stderr)

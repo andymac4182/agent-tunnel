@@ -36,11 +36,13 @@ STATE_PATH = os.environ.get("CUA_FIXTURE_STATE", "/tmp/cua-fixture/state.json")
 def activate_on_macos(root: tk.Tk) -> None:
     """Bring the fixture in front of Finder's desktop in the macOS guest.
 
-    launchd starts the fixture in the background, and an inactive Tk app's
-    fullscreen window leaves the menu bar drawn over its top edge, where two
-    of the corner markers are. Activating the app hides the menu bar. PyObjC
-    is present in the guest's server venv, which is what runs the fixture on
-    macOS; elsewhere this is never called.
+    launchd starts the fixture in the background, and a fullscreen window of
+    an app that is not active may sit behind Finder or under the menu bar,
+    where two of the corner markers are. Activating the app is meant to
+    prevent that; whether it is needed was not isolated. Measured 2026-09-26
+    with it: the fixture's window is the only on-screen window, at layer 19,
+    covering the whole screen. PyObjC is present in the guest's server venv,
+    which runs the fixture on macOS; elsewhere this is never called.
     """
     root.attributes("-topmost", True)
     root.lift()
