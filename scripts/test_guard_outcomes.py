@@ -1164,7 +1164,11 @@ def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
     #: be dropped for constants` (renamed from "...for the cursor point"
     #: after M5-C13) with a measured witness; M4-42 had already witnessed
     #: it under the old name, so the merged figure stays 3.
-    PINNED_WITNESS_DEBT = 3
+    #: The last 3 acp cases were then witnessed, each after a test was made
+    #: able to see its guard (two strengthened, one bounded, one added; see
+    #: M4-42 and the note above acp-guard-deletion's `WITNESSES`) -> 0.
+    #: Every drop is a `WITNESSES` entry; none is a reclassification.
+    PINNED_WITNESS_DEBT = 0
 
     directory = Path(__file__).resolve().parent
     ledger = json.loads(WITNESS_DEBT_FILE.read_text())

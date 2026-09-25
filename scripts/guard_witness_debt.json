@@ -1,18 +1,5 @@
 {
   "fs-guard-deletion": [],
   "m5-guard-deletion": [],
-  "acp-guard-deletion": [
-    [
-      "m8c2",
-      "only a permission expires on a permission deadline"
-    ],
-    [
-      "m8c2",
-      "the child handle kills the group synchronously, not only from a task"
-    ],
-    [
-      "m8c4",
-      "a stalled event is never dropped and continued past"
-    ]
-  ]
+  "acp-guard-deletion": []
 }
