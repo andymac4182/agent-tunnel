@@ -28,6 +28,12 @@ READ_ONLY_COMMANDS = ("version", "get_screen_size", "get_cursor_position", "scre
 # State queries only some backends register (the Cua Driver backend does).
 # Both are captures/reads, never input; probed only when advertised.
 OPTIONAL_READ_ONLY = ("get_desktop_state", "get_capture_scope_state")
+# With --permission-reads (the macOS guest): reads whose outcome is expected to
+# depend on a TCC grant. Measured 2026-09-26 (M5-C32): without Accessibility the
+# native AX tree still answers success, so this records the outcome for
+# comparison with a granted run; it is not a permission check. Recorded as
+# outcome and shape only, never the tree itself.
+PERMISSION_READS = ("get_accessibility_tree",)
 
 
 def http(method: str, url: str, body: dict | None = None, timeout: float = 60.0):
@@ -64,6 +70,35 @@ def elide(value, limit: int = 256):
     if isinstance(value, list):
         return [elide(v, limit) for v in value]
     return value
+
+
+def summarise(record: dict) -> dict:
+    """Outcome and shape of a /cmd result: status, success, error text, keys.
+
+    Drops every value except a bounded error string, so an accessibility tree
+    (window and element names) never reaches the evidence.
+    """
+    out = {k: record[k] for k in ("http_status", "framing") if k in record}
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        out["success"] = payload.get("success")
+        if payload.get("error") is not None:
+            out["error"] = str(payload["error"])[:300]
+        out["payload_keys"] = sorted(payload)
+    return out
+
+
+def numbers_only(value):
+    """Keep only numbers, booleans and the dict/list structure around them."""
+    if isinstance(value, dict):
+        kept = {k: numbers_only(v) for k, v in value.items()}
+        return {k: v for k, v in kept.items() if v not in (None, {}, [])}
+    if isinstance(value, list):
+        kept = [numbers_only(v) for v in value]
+        return [v for v in kept if v not in (None, {}, [])]
+    if isinstance(value, (bool, int, float)):
+        return value
+    return None
 
 
 def find_keys(value, needle: str, path: str = "") -> list[str]:
@@ -149,6 +184,8 @@ def main() -> int:
     ap.add_argument("--label", required=True, help="backend/variant label for the record")
     ap.add_argument("--out-dir")
     ap.add_argument("--marker-size", type=int, default=40)
+    ap.add_argument("--permission-reads", action="store_true",
+                    help="also record the outcome (not the content) of PERMISSION_READS")
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
     if not base.startswith("http://127.0.0.1:"):
@@ -184,6 +221,12 @@ def main() -> int:
             results[name] = {"advertised": False}
             continue
         results[name] = cmd(base, name)
+    if args.permission_reads:
+        # Before the fixture-marker gate, so a denied run still records them.
+        ev["permission_reads"] = {
+            name: summarise(cmd(base, name)) if name in cmds else {"advertised": False}
+            for name in PERMISSION_READS
+        }
     shot = results.get("screenshot", {})
     payload = shot.get("payload", {})
     if payload.get("success") and payload.get("image_data"):
@@ -215,7 +258,14 @@ def main() -> int:
             info["pixels"] = pixels
         ev["screenshot_image"] = info
         if not info["fixture_markers_verified"]:
+            # The state queries still answer M5-C19's scale question, so
+            # record their numbers and flags only: no strings, so no window
+            # or element names from a screen not known to be the fixture.
+            for name in OPTIONAL_READ_ONLY:
+                if name in cmds:
+                    results[name] = numbers_only(cmd(base, name))
             ev["results"] = {k: v for k, v in results.items()}
+            ev["result_keys_mentioning_scale"] = find_keys(results, "scale")
             print(json.dumps(ev, indent=2, sort_keys=True))
             print("probe.py: screenshot corners are not the fixture markers; "
                   "refusing to keep the image or its pixels", file=sys.stderr)

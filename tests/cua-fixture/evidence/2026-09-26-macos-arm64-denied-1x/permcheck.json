@@ -1,0 +1,6 @@
+{
+    "accessibility_trusted": false,
+    "process_image": "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+    "screen_recording_preflight": false,
+    "sys_executable": "/opt/cua-server/bin/python"
+}
