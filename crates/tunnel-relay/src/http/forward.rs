@@ -48,10 +48,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_bridge::{
     BridgeConfig, CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, ExchangeReport,
-    Execution, HANDOFF_CAPACITY, OutboundEnd, Outcome, PauseController, PauseSignal, Profile,
-    QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset, begin_paused, channel,
-    detail_from_reason, detail_from_status, pump_inbound, pump_outbound, rejection_response,
-    reset_reason_for, reset_signal_pair,
+    Execution, FrameSender, HANDOFF_CAPACITY, InboundEnd, OutboundEnd, Outcome, PauseController,
+    PauseSignal, Profile, QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset,
+    begin_paused, channel, detail_from_reason, detail_from_status, pump_inbound, pump_outbound,
+    rejection_response, reset_reason_for, reset_signal_pair,
 };
 use tunnel_http_forward::HttpErrorCode;
 use tunnel_protocol::{ResultDetail, reset_reason};
@@ -302,6 +302,10 @@ pub(crate) struct ActorReader {
     stream_id: u64,
     operation_id: String,
     status: watch::Receiver<Option<ResultDetail>>,
+    /// The actor's record of the connector RESET.  A read that finds the
+    /// stream already released consults it, so an accepted RESET is never
+    /// reported as a carrier loss (task row M8-C14).
+    peer_reset: watch::Receiver<Option<HttpPeerReset>>,
     signal: ResetSignal,
     pending: Option<tokio::sync::oneshot::Receiver<HttpRead>>,
     pending_reset: Option<u16>,
@@ -322,6 +326,33 @@ impl ActorReader {
     pub(crate) const fn last_reset_reason(&self) -> Option<u16> {
         self.last_reset_reason
     }
+}
+
+/// The RESET reason a read must report instead of a carrier loss.
+///
+/// The actor accepts a connector RESET into the stream's state, publishes it
+/// on `peer_reset`, and may then release the stream (terminal bookkeeping,
+/// FORGET) before this relay's reader or signal task has observed it.  A
+/// read of a released stream answers `Closed`, so without this check the
+/// RESET the device sent is lost and the exchange ends as a carrier failure
+/// (task row M8-C14).
+fn reset_behind_close(peer_reset: &watch::Receiver<Option<HttpPeerReset>>) -> Option<u16> {
+    peer_reset.borrow().map(|peer| peer.reason)
+}
+
+/// Wait for the connector RESET the actor accepted, or for the stream to be
+/// released without one.  A RESET published before the release is always
+/// reported, however the two wakeups are ordered (task row M8-C14).
+async fn accepted_peer_reset(
+    closed: CancellationToken,
+    mut peer_reset: watch::Receiver<Option<HttpPeerReset>>,
+) -> Option<HttpPeerReset> {
+    let observed = tokio::select! {
+        biased;
+        observed = peer_reset.wait_for(Option::is_some) => observed.ok().and_then(|value| *value),
+        () = closed.cancelled() => None,
+    };
+    observed.or_else(|| *peer_reset.borrow())
 }
 
 async fn detail_with_status(
@@ -368,7 +399,13 @@ impl CarrierReader for ActorReader {
                         .await
                     {
                         Some(receiver) => self.pending = Some(receiver),
-                        None => return CarrierEvent::Closed,
+                        None => match reset_behind_close(&self.peer_reset) {
+                            Some(reason) => {
+                                self.pending_reset = Some(reason);
+                                continue;
+                            }
+                            None => return CarrierEvent::Closed,
+                        },
                     }
                 }
                 let Some(receiver) = self.pending.as_mut() else {
@@ -382,7 +419,10 @@ impl CarrierReader for ActorReader {
                     HttpRead::Data(data) => return CarrierEvent::Data(Bytes::from(data)),
                     HttpRead::Fin => return CarrierEvent::Fin,
                     HttpRead::Reset(reason) => self.pending_reset = Some(reason),
-                    HttpRead::Closed => return CarrierEvent::Closed,
+                    HttpRead::Closed => match reset_behind_close(&self.peer_reset) {
+                        Some(reason) => self.pending_reset = Some(reason),
+                        None => return CarrierEvent::Closed,
+                    },
                 }
             }
         }
@@ -401,7 +441,7 @@ pub(crate) fn actor_carriers(
 ) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
     let HttpStreamRegistration {
         base,
-        mut peer_reset,
+        peer_reset,
         // http-forward states its own terminal reasons through RESET and
         // RESULT_STATUS; it has no close code to derive from a teardown cause.
         terminal: _,
@@ -411,16 +451,10 @@ pub(crate) fn actor_carriers(
     let (notifier, signal) = reset_signal_pair();
     let closed = base.closed.clone();
     let mut status = result_status.clone();
+    let reader_peer_reset = peer_reset.clone();
     let task = tokio::spawn(async move {
-        let peer: HttpPeerReset = tokio::select! {
-            () = closed.cancelled() => return,
-            observed = peer_reset.wait_for(Option::is_some) => match observed {
-                Ok(value) => match *value {
-                    Some(peer) => peer,
-                    None => return,
-                },
-                Err(_) => return,
-            },
+        let Some(peer) = accepted_peer_reset(closed, peer_reset).await else {
+            return;
         };
         let detail = detail_with_status(peer.reason, &mut status).await;
         notifier.notify(SignaledReset {
@@ -441,6 +475,7 @@ pub(crate) fn actor_carriers(
             stream_id: base.stream_id,
             operation_id: base.operation_id,
             status: result_status,
+            peer_reset: reader_peer_reset,
             signal,
             pending: None,
             pending_reset: None,
@@ -1966,6 +2001,27 @@ async fn both_finished(mut up: watch::Receiver<bool>, mut down: watch::Receiver<
     let _ = down.wait_for(|finished| *finished).await;
 }
 
+/// [`pump_inbound`] for a direction whose sender is shared.
+///
+/// `pump_inbound` reports a carrier that ended without FIN or RESET by
+/// dropping its sender, which the bridge sees as the direction's end only
+/// when that sender was the last one.  On the owner relay it is not: each
+/// owner writer keeps a clone of the *other* direction's sender so a
+/// validation failure can reset both, so a lost carrier left the direction
+/// open, both outbound pumps waiting on each other, and the exchange held
+/// until the peer admission was invalidated (task row M8-C14).  The loss is
+/// therefore stated as an explicit RESET.
+async fn pump_inbound_shared<R: CarrierReader>(reader: R, to_bridge: FrameSender) -> InboundEnd {
+    let end = pump_inbound(reader, to_bridge.clone()).await;
+    if end == InboundEnd::CarrierClosed {
+        to_bridge.reset(ResetDetail {
+            code: HttpErrorCode::StreamInterrupted,
+            execution: Execution::Unknown,
+        });
+    }
+    end
+}
+
 /// Relay one forwarded HTTP exchange between the peer hop and the owner
 /// actor.  The owner admits the stream itself (after re-authenticating the
 /// forwarded token and re-authorizing the grant), remains the only authority
@@ -2108,7 +2164,7 @@ pub(crate) async fn handle_peer_http_stream(
         Arc::clone(&verdict),
         up_tx.clone(),
     );
-    let up_in = tokio::spawn(pump_inbound(hop_reader, up_tx));
+    let up_in = tokio::spawn(pump_inbound_shared(hop_reader, up_tx));
     let up_out = tokio::spawn(pump_outbound(
         up_rx,
         FinObserved {
@@ -2116,7 +2172,7 @@ pub(crate) async fn handle_peer_http_stream(
             finished: up_finished_tx,
         },
     ));
-    let down_in = tokio::spawn(pump_inbound(actor_reader, down_tx));
+    let down_in = tokio::spawn(pump_inbound_shared(actor_reader, down_tx));
     let down_out = tokio::spawn(pump_outbound(
         down_rx,
         FinObserved {
@@ -2767,5 +2823,77 @@ mod tests {
         // Left for the codec to reject rather than silently laundered.
         assert!(headers.contains_key("proxy-authorization"));
         assert!(headers.contains_key("content-type"));
+    }
+
+    /// A carrier whose only event is an end without FIN or RESET.
+    struct LostCarrier;
+
+    impl CarrierReader for LostCarrier {
+        fn next(&mut self) -> impl Future<Output = CarrierEvent> + Send {
+            std::future::ready(CarrierEvent::Closed)
+        }
+
+        fn reset_signal(&self) -> ResetSignal {
+            reset_signal_pair().1
+        }
+    }
+
+    /// M8-C14.  On the owner relay each writer holds a clone of the other
+    /// direction's sender, so a carrier that ends without FIN or RESET must
+    /// end its direction explicitly.  Dropping the pump's own sender is not
+    /// enough while the clone lives: the direction stayed open, and the
+    /// exchange held until membership expiry invalidated the peer admission
+    /// (~58.7 s in `verify-m8-acp-real-path`).
+    #[tokio::test]
+    async fn a_lost_carrier_ends_a_direction_whose_sender_is_shared() {
+        let (to_bridge, mut from_carrier, _) = channel(HANDOFF_CAPACITY);
+        // The other writer's clone, alive for the whole exchange.
+        let _held_by_other_writer = to_bridge.clone();
+        let end = pump_inbound_shared(LostCarrier, to_bridge).await;
+        assert_eq!(end, InboundEnd::CarrierClosed);
+        let frame = tokio::time::timeout(Duration::from_secs(2), from_carrier.recv())
+            .await
+            .expect("the direction must end, not wait for another sender to drop");
+        assert_eq!(
+            frame,
+            Some(tunnel_http_bridge::Frame::Reset(ResetDetail {
+                code: HttpErrorCode::StreamInterrupted,
+                execution: Execution::Unknown,
+            }))
+        );
+    }
+
+    /// M8-C14.  The actor publishes the connector RESET and may release the
+    /// stream before this relay's signal task runs; both wakeups are then
+    /// ready at once.  The RESET must win every time, and a read of the
+    /// released stream must report it rather than a carrier loss.
+    #[tokio::test]
+    async fn a_reset_published_before_the_release_is_never_lost() {
+        let peer = HttpPeerReset {
+            reason: reset_reason::ADAPTER_FAILURE,
+            after_fin: false,
+        };
+        // `tokio::select!` without `biased` starts at a random branch, so a
+        // single trial could pass by luck; 64 make that negligible.
+        for _ in 0..64 {
+            let (reset_tx, reset_rx) = watch::channel(None);
+            let closed = CancellationToken::new();
+            reset_tx.send_replace(Some(peer));
+            closed.cancel();
+            assert_eq!(
+                accepted_peer_reset(closed, reset_rx.clone()).await,
+                Some(peer)
+            );
+            assert_eq!(
+                reset_behind_close(&reset_rx),
+                Some(reset_reason::ADAPTER_FAILURE)
+            );
+        }
+        // Released with no RESET: the carrier really was lost.
+        let (_reset_tx, reset_rx) = watch::channel(None);
+        let closed = CancellationToken::new();
+        closed.cancel();
+        assert_eq!(accepted_peer_reset(closed, reset_rx.clone()).await, None);
+        assert_eq!(reset_behind_close(&reset_rx), None);
     }
 }
