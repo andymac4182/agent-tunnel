@@ -109,7 +109,9 @@ cleanup() {
     say "exit $status; work directory kept: $work"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# An interrupt must still exit (and so run the EXIT cleanup once).
+trap 'exit 130' INT TERM
 
 for tool in cargo node npm openssl curl python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing prerequisite: $tool"
@@ -482,6 +484,9 @@ echo "$summary" >> "$log"
 say "$summary"
 if [ -n "${M3SC_LOG_COPY:-}" ]; then cp "$log" "$M3SC_LOG_COPY"; fi
 # A run that reported nothing is not a pass.
+# M3-48 may be reported as `result=known` at most once per Python mode;
+# more means something else is being excused.
+[ "$sdk_known" -le 2 ] || { say "$sdk_known known results; at most 2 (M3-48, once per Python mode)"; failed=1; }
 [ "$sdk_pass" -ge 70 ] || { say "only $sdk_pass SDK cases passed; expected at least 70"; failed=1; }
 [ "$failed" = 0 ] || fail "see $work/logs"
 say "ok: the pinned TypeScript and Python MCP SDKs and the conformance suite work through the relay"
