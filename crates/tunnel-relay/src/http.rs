@@ -1245,7 +1245,7 @@ async fn echo(
             bytes,
         )
             .into_response(),
-        Ok(Ok(EchoOutcome::Failure { code, execution })) => failure_outcome(code, execution),
+        Ok(Ok(EchoOutcome::Failure { code, execution })) => echo_failure_response(code, execution),
         Ok(Err(_)) => failure_outcome("REVERSE_CHANNEL_UNAVAILABLE", "not_dispatched"),
         Err(_) => failure_outcome("REVERSE_CHANNEL_INTERRUPTED", "unknown"),
     }
@@ -4450,6 +4450,17 @@ fn catalog_error(error: tunnel_catalog::CatalogError) -> Response {
     )
 }
 
+/// The unary echo route's answer for an actor failure.  A unary echo held
+/// across a rotation freeze past its bound, or refused because the hold was
+/// full (task row M3-15), answers the same distinct body as a held stream
+/// OPEN; every other failure keeps [`failure_outcome`].
+fn echo_failure_response(code: &'static str, execution: &'static str) -> Response {
+    if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
+        return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
+    }
+    failure_outcome(code, execution)
+}
+
 fn failure_outcome(code: &'static str, execution: &'static str) -> Response {
     let status = if execution == "not_dispatched" && code == "FORBIDDEN" {
         StatusCode::FORBIDDEN
@@ -4794,8 +4805,8 @@ mod tests {
     use super::{
         ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
         PeerAdmissionBarrierError, PeerAdmissionScope, ROTATION_FREEZE_CODE, control_refusal_close,
-        forwarded_bearer_token, forwarded_control_refusal_status, is_no_live_owner,
-        local_consumer_admission_response, method_not_allowed, owner_busy_close,
+        echo_failure_response, forwarded_bearer_token, forwarded_control_refusal_status,
+        is_no_live_owner, local_consumer_admission_response, method_not_allowed, owner_busy_close,
         peer_consumer_diagnostic_outcome, peer_failure_response, remote_control_refusal_close,
         service_resolution_response, stream_limit_response,
     };
@@ -5177,11 +5188,16 @@ mod tests {
         }
 
         // The scheduled freeze: same status, same hint and Retry-After, and a
-        // distinct code, from the local owner and through a forwarded hop.
+        // distinct code, from the local owner, the unary echo route and
+        // through a forwarded hop.
         for (label, freeze) in [
             (
                 "local",
                 local_consumer_admission_response(RelayError::RotationFreeze),
+            ),
+            (
+                "unary echo",
+                echo_failure_response(crate::actor::ROTATION_FREEZE_ECHO_CODE, "not_dispatched"),
             ),
             (
                 "forwarded",

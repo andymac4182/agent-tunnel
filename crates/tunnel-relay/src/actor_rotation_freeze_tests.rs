@@ -1115,17 +1115,18 @@ async fn finite_echo_dispatch_pauses_during_quiesce() {
             response,
         })
         .await;
-    match receiver.try_recv() {
-        Ok(EchoOutcome::Failure { code, execution }) => {
-            assert_eq!(code, "RESOURCE_EXHAUSTED");
-            assert_eq!(execution, "not_dispatched");
-        }
-        Ok(EchoOutcome::Success(_)) => panic!("finite echo must not complete during quiesce"),
-        Err(_) => panic!("finite echo admission must answer synchronously"),
-    }
+    // M3-15: the finite echo is held (not answered) and stays out of the
+    // frozen roster; `freeze_hold_tests` follows it to its outcome.
+    assert!(
+        matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "a finite echo in a freeze is held, not refused"
+    );
     assert!(
         fixture.session().pending.is_empty(),
-        "a refused finite echo must not join the frozen roster"
+        "a held finite echo must not join the frozen roster"
     );
     assert!(
         fixture

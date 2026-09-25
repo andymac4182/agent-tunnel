@@ -74,6 +74,7 @@ describe('the descriptor', () => {
       [429, 'RESOURCE_EXHAUSTED', 'RESOURCE_EXHAUSTED'],
       [503, 'DEVICE_OFFLINE', 'DEVICE_OFFLINE'],
       [503, 'BACKEND_UNAVAILABLE', 'BACKEND_UNAVAILABLE'],
+      [503, 'ROTATION_FREEZE', 'ROTATION_FREEZE'],
     ];
     for (const [status, code, expected] of cases) {
       it(`${status} ${code}`, async () => {

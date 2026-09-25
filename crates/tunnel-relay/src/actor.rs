@@ -75,8 +75,8 @@ use crate::{
 
 #[path = "actor_freeze_hold.rs"]
 mod freeze_hold;
-pub(crate) use freeze_hold::ROTATION_FREEZE_RETRY_AFTER_MS;
 use freeze_hold::sleep_until_hold_deadline;
+pub(crate) use freeze_hold::{ROTATION_FREEZE_ECHO_CODE, ROTATION_FREEZE_RETRY_AFTER_MS};
 
 #[path = "actor_http_stream.rs"]
 mod http_stream;
@@ -3079,7 +3079,7 @@ impl RelayActor {
                         self.after_command_http_maintenance(scope).await;
                         // A command can end a freeze, end a session or pass a
                         // hold deadline; settle held OPENs against it.
-                        self.service_held_opens(Instant::now());
+                        self.service_held_opens(tokio::time::Instant::now());
                     }
                     if shutdown || self.shutting_down {
                         break;
@@ -3088,7 +3088,7 @@ impl RelayActor {
                 () = sleep_until_hold_deadline(self.freeze_hold.next_deadline()),
                     if !self.freeze_hold.is_empty() =>
                 {
-                    self.service_held_opens(Instant::now());
+                    self.service_held_opens(tokio::time::Instant::now());
                 }
             }
             if self.shutting_down {
@@ -4662,6 +4662,13 @@ impl RelayActor {
     }
 
     async fn dispatch_echo(&mut self, request: DispatchRequest) {
+        let _ = self.admit_unary_echo(request, true);
+    }
+
+    /// Dispatch one finite unary echo, holding it across a scheduled rotation
+    /// freeze when `hold` is set (task row M3-15).  `hold` is false only when
+    /// a held echo is re-dispatched after its freeze ended.
+    fn admit_unary_echo(&mut self, request: DispatchRequest, hold: bool) -> freeze_hold::Admission {
         let DispatchRequest {
             consumer,
             device_id,
@@ -4672,14 +4679,14 @@ impl RelayActor {
             response,
         } = request;
         if response.is_closed() {
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if body.len() > self.options.limits.max_body_bytes {
             let _ = response.send(EchoOutcome::Failure {
                 code: "BODY_LIMIT",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if grant.tenant_id != consumer.tenant_id
             || grant.principal_id != consumer.principal_id
@@ -4691,7 +4698,7 @@ impl RelayActor {
                 code: "FORBIDDEN",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         let scope = DeviceScope::new(consumer.tenant_id, device_id);
         let Some(session) = self.sessions.get_mut(&scope) else {
@@ -4699,21 +4706,21 @@ impl RelayActor {
                 code: "DEVICE_OFFLINE",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         };
         if session.identity.tenant_id != consumer.tenant_id || session.data_tx.is_none() {
             let _ = response.send(EchoOutcome::Failure {
                 code: "DEVICE_OFFLINE",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if session.cluster_profile && !session.owner_fenced {
             let _ = response.send(EchoOutcome::Failure {
                 code: "OWNER_FENCING_REQUIRED",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if session.owner_write_unknown.is_some() {
             // The last lease renewal may or may not have committed.  Until
@@ -4723,19 +4730,50 @@ impl RelayActor {
                 code: "OWNER_AUTHORITY_UNKNOWN",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if Self::rotation_frozen(session) {
             // The finite echo also enters `session.pending`, which is part of
-            // the immutable QUIESCE roster.  Pause its admission during a
-            // rotation/recovery freeze with the retryable overload the protocol
-            // permits (docs/protocol.md "Quiesce admission") so a late pending
-            // entry cannot drift the roster.
-            let _ = response.send(EchoOutcome::Failure {
-                code: "RESOURCE_EXHAUSTED",
-                execution: "not_dispatched",
-            });
-            return;
+            // the immutable QUIESCE roster, so it may not be admitted during a
+            // freeze.  A scheduled attempt's freeze holds it, bounded, and
+            // dispatches it once the freeze ends (task row M3-15); past the
+            // bound or with the hold full it is refused `ROTATION_FREEZE`.
+            // Recovery is a fault state and keeps the retryable overload the
+            // protocol permits (docs/protocol.md "Quiesce admission").
+            if !freeze_hold::attempt_frozen(session) {
+                let _ = response.send(EchoOutcome::Failure {
+                    code: "RESOURCE_EXHAUSTED",
+                    execution: "not_dispatched",
+                });
+                return freeze_hold::Admission::Refused;
+            }
+            if !hold {
+                let _ = response.send(EchoOutcome::Failure {
+                    code: freeze_hold::ROTATION_FREEZE_ECHO_CODE,
+                    execution: "not_dispatched",
+                });
+                return freeze_hold::Admission::Refused;
+            }
+            let session_key = session.key.clone();
+            let handshake_timeout_ms = session
+                .rotation
+                .as_ref()
+                .map_or(0, |rotation| rotation.state.config().handshake_timeout_ms);
+            return self.hold_request(
+                scope,
+                session_key,
+                handshake_timeout_ms,
+                freeze_hold::HeldKind::Echo(DispatchRequest {
+                    consumer,
+                    device_id,
+                    service_id,
+                    grant,
+                    body,
+                    consumer_expires_at,
+                    response,
+                }),
+                None,
+            );
         }
         // Finished unary echoes still awaiting their owner STREAM_FORGET
         // hold a connector retention slot each; together with the live ones
@@ -4760,14 +4798,14 @@ impl RelayActor {
                 code: "RESOURCE_EXHAUSTED",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if session.queued_bytes.saturating_add(body.len()) > self.options.limits.max_queue_bytes {
             let _ = response.send(EchoOutcome::Failure {
                 code: "RESOURCE_EXHAUSTED",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         let sequence = UNARY_ECHO_DATA_SEQUENCE;
         let Some(stream_id) = allocate_stream_id(&mut session.next_stream_id) else {
@@ -4775,7 +4813,7 @@ impl RelayActor {
                 code: "STREAM_LIMIT",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         };
         let operation_id = Uuid::new_v4().to_string();
         let queued_len = body.len();
@@ -4811,7 +4849,7 @@ impl RelayActor {
                     code: "CONTROL_LIMIT",
                     execution: "not_dispatched",
                 });
-                return;
+                return freeze_hold::Admission::Refused;
             }
         };
         if !session.queue_budget.reserve_data(queued_len) {
@@ -4819,7 +4857,7 @@ impl RelayActor {
                 code: "RESOURCE_EXHAUSTED",
                 execution: "not_dispatched",
             });
-            return;
+            return freeze_hold::Admission::Refused;
         }
         session.pending.insert(
             stream_id,
@@ -4851,7 +4889,7 @@ impl RelayActor {
                     execution: "not_dispatched",
                 });
             }
-            return;
+            return freeze_hold::Admission::Refused;
         }
         tracing::debug!(
             tenant_id = %session.identity.tenant_id,
@@ -4864,6 +4902,7 @@ impl RelayActor {
             bytes = queued_len,
             phase = "stream_admitted",
         );
+        freeze_hold::Admission::Admitted
     }
 
     /// Admit one long-lived M2 echo stream.  The HTTP layer has already
@@ -5022,38 +5061,31 @@ impl RelayActor {
                 let _ = response.send(Err(RelayError::RotationFreeze));
                 return freeze_hold::Admission::Refused;
             }
-            let now = Instant::now();
-            let bound = freeze_hold::hold_bound(
-                session
-                    .rotation
-                    .as_ref()
-                    .map_or(0, |rotation| rotation.state.config().handshake_timeout_ms),
-                self.options.limits.operation_timeout,
-                self.options
-                    .cluster
-                    .as_ref()
-                    .map(|cluster| Duration::from_secs(cluster.peer_idle_timeout_seconds)),
+            let session_key = session.key.clone();
+            let handshake_timeout_ms = session
+                .rotation
+                .as_ref()
+                .map_or(0, |rotation| rotation.state.config().handshake_timeout_ms);
+            // A filesystem upgrade is also waited on by the client's own
+            // handshake budget, the descriptor's `requestTimeoutSeconds`.
+            let fs_handshake = fs.then(|| {
+                Duration::from_secs(tunnel_fs_provider::default_limits().request_timeout_seconds())
+            });
+            return self.hold_request(
+                scope,
+                session_key,
+                handshake_timeout_ms,
+                freeze_hold::HeldKind::Stream {
+                    consumer,
+                    device_id,
+                    service_id,
+                    grant,
+                    consumer_expires_at,
+                    request_id,
+                    response,
+                },
+                fs_handshake,
             );
-            let held = freeze_hold::HeldOpen {
-                key: session.key.clone(),
-                consumer,
-                device_id,
-                service_id,
-                grant,
-                consumer_expires_at,
-                request_id,
-                response,
-                held_at: now,
-                deadline: now + bound,
-            };
-            let cap = freeze_hold::per_device_cap(self.options.limits.max_streams_per_device);
-            return match self.freeze_hold.try_hold(scope, held, cap) {
-                None => freeze_hold::Admission::Held,
-                Some(refused) => {
-                    let _ = refused.response.send(Err(RelayError::RotationFreeze));
-                    freeze_hold::Admission::Refused
-                }
-            };
         }
         let active_streams = session
             .streams
@@ -8692,7 +8724,7 @@ impl RelayActor {
         // held while the writer was frozen, each with the continuing sequence.
         self.flush_frozen_writes(key);
         // Then admit the OPENs held across the freeze, in arrival order.
-        self.service_held_scope(&key.scope(), Instant::now());
+        self.service_held_scope(&key.scope(), tokio::time::Instant::now());
     }
 
     async fn handle_rotate_retired(
@@ -9464,7 +9496,7 @@ impl RelayActor {
             // back onto it with the continuing sequence (no gap).  A no-op
             // while the bilateral abort is still completing.
             self.flush_frozen_writes(key);
-            self.service_held_scope(&key.scope(), Instant::now());
+            self.service_held_scope(&key.scope(), tokio::time::Instant::now());
         }
     }
 
@@ -13651,7 +13683,7 @@ impl RelayActor {
         // is back to Active with a live carrier (e.g. active-loss recovery
         // leaves data_tx cleared and is handled by the recovery path instead).
         self.flush_frozen_writes(&key);
-        self.service_held_scope(&key.scope(), Instant::now());
+        self.service_held_scope(&key.scope(), tokio::time::Instant::now());
         if old_closed {
             self.finish_rotation_if_ready(&key);
         }
@@ -13739,7 +13771,7 @@ impl RelayActor {
         self.owner_forgets.remove(key);
         // OPENs held across a rotation freeze of this session were never
         // dispatched; answer them now rather than at their deadline.
-        self.service_held_scope(&key.scope(), Instant::now());
+        self.service_held_scope(&key.scope(), tokio::time::Instant::now());
         if session.closed {
             return;
         }

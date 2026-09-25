@@ -1056,6 +1056,7 @@ WIRE_CASES: list[Case] = [
 #: defeating one is only visible to a test that bypasses the actor loop.
 FREEZE_HOLD = RELAY / "src" / "actor_freeze_hold.rs"
 RELAY_HTTP = RELAY / "src" / "http.rs"
+RELAY_FS = RELAY / "src" / "http" / "fs.rs"
 FREEZE_HOLD_TEST = [
     "cargo",
     "test",
@@ -1092,7 +1093,7 @@ FREEZE_HOLD_CASES: list[Case] = [
                 "                    if now >= held.deadline {\n"
                 "                        self.freeze_hold.record_wait(&held, now);\n"
                 "                        self.freeze_hold.counters.refused_after_bound += 1;\n"
-                "                        let _ = held.response.send(Err(RelayError::RotationFreeze));\n"
+                "                        held.refuse(HoldRefusal::RotationFreeze);\n"
                 "                    } else {\n"
                 "                        keep.push_back(held);\n"
                 "                    }",
@@ -1106,8 +1107,9 @@ FREEZE_HOLD_CASES: list[Case] = [
         [
             (
                 FREEZE_HOLD,
-                "        if device_held >= per_device_cap || self.total >= MAX_HELD_TOTAL {",
-                "        if self.total >= MAX_HELD_TOTAL {",
+                "        if device_held >= per_device_cap\n"
+                "            || tenant_held >= MAX_HELD_PER_TENANT",
+                "        if tenant_held >= MAX_HELD_PER_TENANT",
             )
         ],
         frozenset({HOLD + "the_hold_cap_is_enforced_per_device"}),
@@ -1130,7 +1132,7 @@ FREEZE_HOLD_CASES: list[Case] = [
             (
                 ACTOR,
                 "        // dispatched; answer them now rather than at their deadline.\n"
-                "        self.service_held_scope(&key.scope(), Instant::now());\n",
+                "        self.service_held_scope(&key.scope(), tokio::time::Instant::now());\n",
                 "        // dispatched; answer them now rather than at their deadline.\n",
             )
         ],
@@ -1171,6 +1173,111 @@ FREEZE_HOLD_CASES: list[Case] = [
                 "forwarded_rotation_freeze_refusal_keeps_its_distinct_reason"
             }
         ),
+    ),
+    Case(
+        "a unary echo in a scheduled rotation freeze is held rather than refused",
+        [
+            (
+                ACTOR,
+                "            if !freeze_hold::attempt_frozen(session) {\n"
+                "                let _ = response.send(EchoOutcome::Failure {",
+                "            {\n"
+                "                let _ = response.send(EchoOutcome::Failure {",
+            )
+        ],
+        frozenset({HOLD + "a_unary_echo_during_a_freeze_is_held_then_dispatched_after_commit"}),
+    ),
+    Case(
+        "the unary echo route answers a held echo's bound refusal as ROTATION_FREEZE",
+        [
+            (
+                RELAY_HTTP,
+                "    if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {\n"
+                "        return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);\n"
+                "    }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "http::tests::"
+                "rotation_freeze_refusal_is_distinct_from_the_owner_not_ready_fault_refusal"
+            }
+        ),
+    ),
+    Case(
+        "the filesystem upgrade answers a freeze past the bound as ROTATION_FREEZE",
+        [
+            (
+                RELAY_FS,
+                "    if matches!(error, crate::actor::RelayError::RotationFreeze) {\n"
+                "        return rotation_freeze_fs_error();\n"
+                "    }\n",
+                "",
+            )
+        ],
+        frozenset({"http::fs::tests::a_rotation_freeze_answers_its_own_filesystem_code"}),
+    ),
+    Case(
+        "a held request belongs to its session, not to a successor",
+        [
+            (
+                FREEZE_HOLD,
+                "                .get(scope)\n"
+                "                .filter(|session| session.key == held.key);",
+                "                .get(scope);",
+            )
+        ],
+        frozenset({HOLD + "a_successor_session_never_inherits_a_held_open"}),
+    ),
+    Case(
+        "the per-tenant hold cap refuses the request over it",
+        [
+            (
+                FREEZE_HOLD,
+                "            || tenant_held >= MAX_HELD_PER_TENANT\n",
+                "",
+            )
+        ],
+        frozenset({HOLD + "the_hold_cap_is_enforced_per_tenant"}),
+    ),
+    Case(
+        "the relay-wide hold cap refuses the request over it",
+        [
+            (
+                FREEZE_HOLD,
+                "            || self.total >= MAX_HELD_TOTAL\n",
+                "",
+            )
+        ],
+        frozenset({HOLD + "the_hold_cap_is_enforced_per_relay"}),
+    ),
+    Case(
+        "the actor loop wakes at the earliest hold deadline with no command",
+        [
+            (
+                ACTOR,
+                "                () = sleep_until_hold_deadline(self.freeze_hold.next_deadline()),\n"
+                "                    if !self.freeze_hold.is_empty() =>\n"
+                "                {\n"
+                "                    self.service_held_opens(tokio::time::Instant::now());\n"
+                "                }\n",
+                "",
+            )
+        ],
+        frozenset({HOLD + "the_run_loop_refuses_a_held_open_at_its_deadline_without_a_command"}),
+    ),
+    Case(
+        "a commit flushes the frozen writes before it admits the held requests",
+        [
+            (
+                ACTOR,
+                "        self.flush_frozen_writes(key);\n"
+                "        // Then admit the OPENs held across the freeze, in arrival order.\n",
+                "        // Then admit the OPENs held across the freeze, in arrival order.\n",
+            )
+        ],
+        frozenset({HOLD + "an_open_during_a_freeze_is_admitted_after_commit"}),
     ),
 ]
 

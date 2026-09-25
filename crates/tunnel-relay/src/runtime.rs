@@ -599,7 +599,8 @@ pub struct RelaySnapshot {
 /// exactly once, through one of the `released_*`, `refused_after_bound` or
 /// `cancelled` counters, so
 /// `held == currently_held + released_on_commit + released_on_abort +
-/// refused_after_bound + cancelled + released_on_session_loss`.
+/// released_on_recovery + refused_after_bound + cancelled +
+/// released_on_session_loss`.
 /// `refused_hold_full` counts OPENs that were never held because the cap was
 /// full. Every field is a count or a duration: no identity, route or payload.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -612,11 +613,17 @@ pub struct RotationFreezeHoldSnapshot {
     pub admitted_after_hold: u64,
     /// Held OPENs released because the attempt committed.
     pub released_on_commit: u64,
-    /// Held OPENs released because the attempt ended without a commit: a
-    /// coordinated abort, or recovery. Each was then answered by ordinary
-    /// admission, so an abort that resumed the old carrier admits it and one
-    /// that entered recovery gives the existing owner-not-ready refusal.
+    /// Held requests released because a coordinated abort completed and the
+    /// old carrier resumed. Each then ran ordinary admission on it.
     pub released_on_abort: u64,
+    /// Held requests released because the attempt entered recovery. Each then
+    /// ran ordinary admission, which gives the existing fault refusal.
+    pub released_on_recovery: u64,
+    /// Releases (commit or abort) that found deferred writes still queued on
+    /// the session, frozen or credit-parked. The hold is settled after the
+    /// frozen writes are flushed, so a frozen write left here means a
+    /// transiently full writer queue; zero in the deterministic tests.
+    pub released_with_deferred_writes: u64,
     /// Held OPENs refused with `ROTATION_FREEZE` because the freeze outlasted
     /// the hold bound.
     pub refused_after_bound: u64,
