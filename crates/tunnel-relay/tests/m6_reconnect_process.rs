@@ -1704,10 +1704,7 @@ impl HeldAckProxy {
                     let upstream_holding = Arc::clone(&holding);
                     let to_relay = async move {
                         let mut buffer = vec![0_u8; 16 * 1024];
-                        loop {
-                            let Ok(read) = device_read.read(&mut buffer).await else {
-                                break;
-                            };
+                        while let Ok(read) = device_read.read(&mut buffer).await {
                             if read == 0 {
                                 break;
                             }
@@ -1722,10 +1719,7 @@ impl HeldAckProxy {
                     };
                     let to_device = async move {
                         let mut buffer = vec![0_u8; 16 * 1024];
-                        loop {
-                            let Ok(read) = relay_read.read(&mut buffer).await else {
-                                break;
-                            };
+                        while let Ok(read) = relay_read.read(&mut buffer).await {
                             if read == 0 {
                                 break;
                             }
