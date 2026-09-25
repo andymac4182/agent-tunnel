@@ -3067,11 +3067,12 @@ async fn handle_peer_ingress_inner(
     {
         Ok(Some(owner)) => owner,
         Ok(None) => {
-            // The owner the request named no longer holds the device.
+            // The owner the request named no longer holds the device.  The
+            // owner-side fault keeps its `membership` classification.
             let _ = request.reject_owner_changed().await;
-            return Err(PeerRuntimeError::OwnerChanged {
-                retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,
-            });
+            return Err(PeerRuntimeError::Membership(
+                "owner is unavailable".to_owned(),
+            ));
         }
         Err(_) => {
             let _ = request.reject_owner_not_ready().await;
@@ -3090,9 +3091,9 @@ async fn handle_peer_ingress_inner(
         // ingress's HTTP/3 client raises as a connection error, taking down
         // every other request multiplexed on that peer connection.
         let _ = request.reject_owner_changed().await;
-        return Err(PeerRuntimeError::OwnerChanged {
-            retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,
-        });
+        return Err(PeerRuntimeError::Membership(
+            "peer request is not for this owner".to_owned(),
+        ));
     }
     if owner.lease_expires_at <= now {
         // The claim is this relay's, but its Redis lease has lapsed: a
@@ -4711,13 +4712,17 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
 /// holds the owner token this relay resolved (task row M7-C110).  Nothing was
 /// dispatched and this relay has dropped its cached route, so a consumer
 /// retry performs a fresh authoritative owner lookup (docs/cluster.md: the
-/// relay never reselects an owner itself).
+/// relay never reselects an owner itself).  `OWNER_CHANGED` is the internal
+/// peer outcome; the public answer keeps the consumer vocabulary's existing
+/// retryable `PEER_UNAVAILABLE` / `not_dispatched`, as for an owner that is
+/// not ready, so every consumer and gate that already retries that class
+/// keeps doing so.  The owner fault record names `owner_changed`.
 fn owner_changed_response(retry_after_ms: u64) -> Response {
     let retry_after_ms = retry_after_ms.clamp(1, OWNER_NOT_READY_RETRY_AFTER_MS.max(1));
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorBody {
-            code: "OWNER_CHANGED",
+            code: "PEER_UNAVAILABLE",
             execution: "not_dispatched",
             message: "the device's owner relay changed; retry after the bounded hint",
             retryable: Some(true),

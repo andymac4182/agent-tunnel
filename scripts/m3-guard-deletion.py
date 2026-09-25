@@ -1407,15 +1407,15 @@ M7_CONNECTOR_RELAY_CASES: list[Case] = [
             (
                 RELAY_HTTP,
                 "        let _ = request.reject_owner_changed().await;\n"
-                "        return Err(PeerRuntimeError::OwnerChanged {\n"
-                "            retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,\n"
-                "        });\n"
+                "        return Err(PeerRuntimeError::Membership(\n"
+                "            \"peer request is not for this owner\".to_owned(),\n"
+                "        ));\n"
                 "    }\n"
                 "    if owner.lease_expires_at",
                 "        drop(request);\n"
-                "        return Err(PeerRuntimeError::OwnerChanged {\n"
-                "            retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,\n"
-                "        });\n"
+                "        return Err(PeerRuntimeError::Membership(\n"
+                "            \"peer request is not for this owner\".to_owned(),\n"
+                "        ));\n"
                 "    }\n"
                 "    if owner.lease_expires_at",
             )

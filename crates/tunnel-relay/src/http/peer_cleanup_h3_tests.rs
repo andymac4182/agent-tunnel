@@ -3711,7 +3711,11 @@ async fn the_ingress_drops_a_stale_route_on_owner_changed_and_answers_typed() {
         .await
         .expect("bounded refusal body");
     let body: serde_json::Value = serde_json::from_slice(&body).expect("refusal JSON");
-    assert_eq!(body["code"], "OWNER_CHANGED");
+    assert_eq!(body["code"], "PEER_UNAVAILABLE");
+    assert_eq!(
+        body["message"],
+        "the device's owner relay changed; retry after the bounded hint"
+    );
     assert_eq!(body["execution"], "not_dispatched");
     assert_eq!(body["retryable"], true);
 
