@@ -3678,30 +3678,38 @@ async fn a_unary_echo_past_its_operation_timeout_is_still_forgotten() {
 
 /// M7-C94: an abandoned exchange is retained only while its proofs can still
 /// arrive.  One whose connector never answers is not kept forever: once it
-/// has waited past `UNARY_ABANDON_TIMEOUT` the tick closes the session with
-/// that typed reason.
+/// has waited past `unary_abandon_bound` the tick closes the session with the
+/// typed reason `UNARY_ABANDON_TIMEOUT`.  The bound is derived from the
+/// operation timeout (review of PR #171): with a 120 s operation timeout an
+/// exchange abandoned 90 s ago, past the former fixed 60 s, is still retained.
 #[tokio::test]
 async fn an_abandoned_unary_echo_that_never_ends_closes_the_session_after_its_bound() {
     let mut fixture = FreezeFixture::new("unary-abandon-bound", false);
+    fixture.actor.options.limits.operation_timeout = StdDuration::from_secs(120);
     let (stream_id, _, _, receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
     fixture.authorize_unary_echo(stream_id);
     drop(receiver);
     let key = fixture.key.clone();
     fixture.actor.expire_pending_echoes(&key);
+    let set_abandoned_ago = |fixture: &mut FreezeFixture, ago: StdDuration| {
+        if let Some(pending) = fixture
+            .actor
+            .sessions
+            .get_mut(&key.scope())
+            .and_then(|session| session.pending.get_mut(&stream_id))
+        {
+            pending.abandon.abandoned_at = Some(Instant::now() - ago);
+        }
+    };
+    set_abandoned_ago(&mut fixture, StdDuration::from_secs(90));
     fixture.actor.tick().await;
     assert!(
         fixture.session_alive(),
-        "within its bound the abandoned exchange is simply retained"
+        "within a 120 s operation timeout the abandoned exchange is simply retained"
     );
-    if let Some(pending) = fixture
-        .actor
-        .sessions
-        .get_mut(&key.scope())
-        .and_then(|session| session.pending.get_mut(&stream_id))
-    {
-        pending.abandon.abandoned_at =
-            Some(Instant::now() - super::UNARY_ABANDON_TIMEOUT - StdDuration::from_secs(1));
-    }
+    let bound = fixture.actor.unary_abandon_bound(fixture.session());
+    assert!(bound > StdDuration::from_secs(120), "{bound:?}");
+    set_abandoned_ago(&mut fixture, bound + StdDuration::from_secs(1));
     fixture.actor.tick().await;
     assert!(
         !fixture.session_alive(),

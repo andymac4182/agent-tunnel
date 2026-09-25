@@ -3125,7 +3125,16 @@ async fn handle_peer_ingress_inner(
                 .await
             {
                 Ok(access) => Some(access),
-                Err(_) => {
+                Err(error) => {
+                    // A catalog the owner could not read never evaluated the
+                    // credential: retryable, as for the public boundary
+                    // (2aefebca).  Only a rejected credential is a 401.
+                    if matches!(error, tunnel_catalog::OidcError::Catalog(_)) {
+                        let _ = request.reject_owner_not_ready().await;
+                        return Err(PeerRuntimeError::Membership(
+                            OWNER_AUTHORIZATION_UNAVAILABLE.to_owned(),
+                        ));
+                    }
                     let _ = request.reject_refused(StatusCode::UNAUTHORIZED).await;
                     return Err(PeerRuntimeError::Membership(
                         "consumer authentication failed".to_owned(),
@@ -3151,7 +3160,7 @@ async fn handle_peer_ingress_inner(
                 match resolve_peer_device(&catalog, &request_body.authentication, now).await {
                     Ok(device) => device,
                     Err(error) => {
-                        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                        refuse_peer_admission(request, &error).await;
                         return Err(error);
                     }
                 };
@@ -3162,7 +3171,7 @@ async fn handle_peer_ingress_inner(
                 match resolve_peer_device(&catalog, &request_body.authentication, now).await {
                     Ok(device) => device,
                     Err(error) => {
-                        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                        refuse_peer_admission(request, &error).await;
                         return Err(error);
                     }
                 };
@@ -3190,7 +3199,7 @@ async fn handle_peer_ingress_inner(
             {
                 Ok(granted) => granted,
                 Err(error) => {
-                    let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                    refuse_peer_admission(request, &error).await;
                     return Err(error);
                 }
             };
@@ -3227,7 +3236,7 @@ async fn handle_peer_ingress_inner(
             {
                 Ok(grant) => grant,
                 Err(error) => {
-                    let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                    refuse_peer_admission(request, &error).await;
                     return Err(error);
                 }
             };
@@ -3252,6 +3261,33 @@ async fn handle_peer_ingress_inner(
     }
 }
 
+/// The owner-side refusals that mean "the owner could not read its
+/// catalog", not "the request was denied" (review of PR #171, the 2aefebca
+/// class): each is answered owner-not-ready (`503`, `not_dispatched`,
+/// retryable) rather than a non-retryable `403`.
+const OWNER_DEVICE_CATALOG_UNAVAILABLE: &str = "device catalog unavailable";
+const OWNER_AUTHORIZATION_UNAVAILABLE: &str = "authorization unavailable";
+
+fn is_transient_owner_refusal(error: &PeerRuntimeError) -> bool {
+    matches!(
+        error,
+        PeerRuntimeError::Membership(reason)
+            if reason == OWNER_DEVICE_CATALOG_UNAVAILABLE
+                || reason == OWNER_AUTHORIZATION_UNAVAILABLE
+    )
+}
+
+/// Answer a device or grant refusal on the request's own stream (task row
+/// M7-C110): a transient catalog failure as owner-not-ready, a real denial
+/// as `403`.
+async fn refuse_peer_admission(request: InboundPeerRequest, error: &PeerRuntimeError) {
+    if is_transient_owner_refusal(error) {
+        let _ = request.reject_owner_not_ready().await;
+    } else {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+    }
+}
+
 async fn resolve_peer_device(
     catalog: &SharedCatalog,
     authentication: &tunnel_cluster::envelope::DeviceAuthenticationContext,
@@ -3261,7 +3297,7 @@ async fn resolve_peer_device(
     let device = catalog
         .resolve_device(&certificate.spki_fingerprint, now)
         .await
-        .map_err(|_| PeerRuntimeError::Membership("device catalog unavailable".to_owned()))?
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_DEVICE_CATALOG_UNAVAILABLE.to_owned()))?
         .ok_or_else(|| {
             PeerRuntimeError::Membership("device credential is not active".to_owned())
         })?;
@@ -3312,7 +3348,7 @@ async fn owner_stream_grant_of_type(
     let devices = catalog
         .list_devices_filtered(consumer, &DeviceListFilter::default(), Utc::now())
         .await
-        .map_err(|_| PeerRuntimeError::Membership("device catalog unavailable".to_owned()))?;
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_DEVICE_CATALOG_UNAVAILABLE.to_owned()))?;
     let Some(device) = devices
         .into_iter()
         .find(|device| device.device_id == device_id)
@@ -3341,7 +3377,7 @@ async fn owner_stream_grant_of_type(
     let grant = catalog
         .authorize(consumer, device_id, service_id, Utc::now(), Utc::now())
         .await
-        .map_err(|_| PeerRuntimeError::Membership("authorization unavailable".to_owned()))?
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_AUTHORIZATION_UNAVAILABLE.to_owned()))?
         .ok_or_else(|| PeerRuntimeError::Membership("service is not authorized".to_owned()))?;
     if !grant.permissions.allows(operation) {
         return Err(PeerRuntimeError::Membership(
@@ -4712,11 +4748,12 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
 /// holds the owner token this relay resolved (task row M7-C110).  Nothing was
 /// dispatched and this relay has dropped its cached route, so a consumer
 /// retry performs a fresh authoritative owner lookup (docs/cluster.md: the
-/// relay never reselects an owner itself).  `OWNER_CHANGED` is the internal
-/// peer outcome; the public answer keeps the consumer vocabulary's existing
-/// retryable `PEER_UNAVAILABLE` / `not_dispatched`, as for an owner that is
-/// not ready, so every consumer and gate that already retries that class
-/// keeps doing so.  The owner fault record names `owner_changed`.
+/// relay never reselects an owner itself).  `OWNER_CHANGED` exists only as
+/// the internal peer admission marker; consumers never receive it.  The
+/// public answer keeps the consumer vocabulary's retryable
+/// `PEER_UNAVAILABLE` / `not_dispatched`, as for an owner that is not ready.
+/// Only the ingress fault record names `owner_changed`; the owner records
+/// its refusal as `membership`.
 fn owner_changed_response(retry_after_ms: u64) -> Response {
     let retry_after_ms = retry_after_ms.clamp(1, OWNER_NOT_READY_RETRY_AFTER_MS.max(1));
     let mut response = (

@@ -1398,11 +1398,9 @@ const UNARY_ECHO_FIN_SEQUENCE: u64 = 2;
 /// The relay's RESET for an abandoned unary echo that was never dispatched
 /// (task row M7-C94): the first and only frame of its direction.
 const UNARY_ECHO_RESET_SEQUENCE: u64 = 1;
-/// How long an abandoned unary echo may wait for its terminal proofs before
-/// the session is closed rather than retaining it indefinitely (M7-C94).  The
-/// connector ends an admitted stream by its own operation deadline, so this
-/// is reached only by a peer that is no longer making progress.
-const UNARY_ABANDON_TIMEOUT: Duration = Duration::from_secs(60);
+/// The margin above the derived bound an abandoned unary echo may wait for
+/// its terminal proofs (task row M7-C94; see `unary_abandon_bound`).
+const UNARY_ABANDON_MARGIN: Duration = Duration::from_secs(10);
 const UNARY_ABANDON_TIMEOUT_REASON: &str = "UNARY_ABANDON_TIMEOUT";
 
 /// A unary echo that has left `session.pending` but whose connector-side
@@ -13286,11 +13284,12 @@ impl RelayActor {
             // past this bound belongs to a peer that stopped making
             // progress: close the session rather than retain it.
             let abandon_overdue = self.session_for(&key).is_some_and(|session| {
+                let bound = self.unary_abandon_bound(session);
                 session.pending.values().any(|pending| {
                     pending
                         .abandon
                         .abandoned_at
-                        .is_some_and(|at| at.elapsed() > UNARY_ABANDON_TIMEOUT)
+                        .is_some_and(|at| at.elapsed() > bound)
                 })
             });
             if abandon_overdue {
@@ -14660,6 +14659,34 @@ impl RelayActor {
         self.sessions
             .get_mut(&key.scope())
             .filter(|session| session.key == *key)
+    }
+
+    /// How long an abandoned unary echo may wait for its terminal proofs
+    /// before the session is closed rather than retaining it indefinitely
+    /// (task row M7-C94).  The connector ends an admitted stream by its own
+    /// operation deadline, which can run for the whole operation timeout from
+    /// its start, and a rotation can hold the writer for up to its overlap
+    /// deadline plus one handshake budget; the bound is their sum plus a
+    /// margin, so only a peer that has stopped making progress reaches it.
+    /// (A fixed 60 s closed healthy sessions whose operation timeout was
+    /// longer, up to the configured 300 s: review of PR #171.)
+    fn unary_abandon_bound(&self, session: &DeviceSession) -> Duration {
+        let rotation = session
+            .rotation
+            .as_ref()
+            .map_or(Duration::ZERO, |rotation| {
+                let config = rotation.state.config();
+                Duration::from_millis(
+                    config
+                        .overlap_timeout_ms
+                        .saturating_add(config.handshake_timeout_ms),
+                )
+            });
+        self.options
+            .limits
+            .operation_timeout
+            .saturating_add(rotation)
+            .saturating_add(UNARY_ABANDON_MARGIN)
     }
 
     /// The maintenance tick's expiry of unary echoes: one whose consumer has

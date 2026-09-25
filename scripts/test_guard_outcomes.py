@@ -350,8 +350,10 @@ EXPECTED_GUARD_ANCHORS = {
     # M7-C95, M7-C98, M7-C109, M7-C110).  Re-measured the same way: 61 first,
     # which fails naming m3, then 60.  Then **61** for the relay half of
     # M7-C98 (the frozen fence binds only the old carrier): 62 first, which
-    # fails naming m3 ("found 61"), then 61.
-    "m3-guard-deletion.py": 61,
+    # fails naming m3 ("found 61"), then 61.  Then **63** for the review of
+    # PR #171 (a transient owner catalog refusal and a busy session's
+    # retention clock): 64 first, which fails naming m3 ("found 63"), then 63.
+    "m3-guard-deletion.py": 63,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

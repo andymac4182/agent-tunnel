@@ -3727,3 +3727,367 @@ async fn the_ingress_drops_a_stale_route_on_owner_changed_and_answers_typed() {
     assert_eq!(fresh.owner_token(), &second.token);
     fixture.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Review of PR #171 (task row M7-C110): an owner that cannot read its catalog
+// must answer the retryable owner-not-ready marker, never a non-retryable
+// 403/401, on each path that reads the catalog before admission.
+// ---------------------------------------------------------------------------
+
+/// A memory catalog whose device, device-list and consumer reads can each be
+/// made to fail as an unreachable authority.
+struct FlakyCatalog {
+    inner: Arc<MemoryCatalog>,
+    device_down: std::sync::atomic::AtomicBool,
+    list_down: std::sync::atomic::AtomicBool,
+    consumer_down: std::sync::atomic::AtomicBool,
+}
+
+fn catalog_unreachable() -> tunnel_catalog::CatalogError {
+    tunnel_catalog::CatalogError::Database(
+        std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+    )
+}
+
+#[async_trait::async_trait]
+impl Catalog for FlakyCatalog {
+    async fn resolve_device(
+        &self,
+        spki_fingerprint: &str,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<Option<DeviceIdentity>, tunnel_catalog::CatalogError> {
+        if self.device_down.load(Ordering::Acquire) {
+            return Err(catalog_unreachable());
+        }
+        self.inner.resolve_device(spki_fingerprint, at).await
+    }
+    async fn resolve_consumer(
+        &self,
+        issuer: &str,
+        subject: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Option<tunnel_catalog::AuthenticatedConsumer>, tunnel_catalog::CatalogError> {
+        if self.consumer_down.load(Ordering::Acquire) {
+            return Err(catalog_unreachable());
+        }
+        self.inner
+            .resolve_consumer(issuer, subject, tenant_id)
+            .await
+    }
+    async fn authorize(
+        &self,
+        principal: &tunnel_catalog::AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        read_started_at: chrono::DateTime<Utc>,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<Option<tunnel_catalog::GrantSnapshot>, tunnel_catalog::CatalogError> {
+        self.inner
+            .authorize(principal, device_id, service_id, read_started_at, at)
+            .await
+    }
+    async fn list_devices_filtered(
+        &self,
+        principal: &tunnel_catalog::AuthenticatedConsumer,
+        filter: &tunnel_catalog::DeviceListFilter,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<Vec<tunnel_catalog::DeviceSummary>, tunnel_catalog::CatalogError> {
+        if self.list_down.load(Ordering::Acquire) {
+            return Err(catalog_unreachable());
+        }
+        self.inner
+            .list_devices_filtered(principal, filter, at)
+            .await
+    }
+    async fn upsert_grant(
+        &self,
+        spec: &GrantSpec,
+    ) -> Result<tunnel_catalog::GrantSnapshot, tunnel_catalog::CatalogError> {
+        self.inner.upsert_grant(spec).await
+    }
+    async fn revoke_grant(
+        &self,
+        tenant_id: Uuid,
+        principal_id: Uuid,
+        device_id: Uuid,
+        service_id: Uuid,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<u64, tunnel_catalog::CatalogError> {
+        self.inner
+            .revoke_grant(tenant_id, principal_id, device_id, service_id, at)
+            .await
+    }
+    async fn revoke_device(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<u64, tunnel_catalog::CatalogError> {
+        self.inner.revoke_device(tenant_id, device_id, at).await
+    }
+    async fn revoke_credential(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+        credential_id: Uuid,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<u64, tunnel_catalog::CatalogError> {
+        self.inner
+            .revoke_credential(tenant_id, device_id, credential_id, at)
+            .await
+    }
+    async fn seed_fixture(
+        &self,
+        fixture: &CatalogFixture,
+    ) -> Result<(), tunnel_catalog::CatalogError> {
+        self.inner.seed_fixture(fixture).await
+    }
+    async fn claim_owner(
+        &self,
+        request: &OwnerClaimRequest,
+    ) -> Result<OwnerClaim, tunnel_catalog::CatalogError> {
+        self.inner.claim_owner(request).await
+    }
+    async fn renew_owner(
+        &self,
+        token: &OwnerToken,
+        lease_expires_at: chrono::DateTime<Utc>,
+    ) -> Result<bool, tunnel_catalog::CatalogError> {
+        self.inner.renew_owner(token, lease_expires_at).await
+    }
+    async fn release_owner(
+        &self,
+        token: &OwnerToken,
+    ) -> Result<bool, tunnel_catalog::CatalogError> {
+        self.inner.release_owner(token).await
+    }
+    async fn current_owner(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<Option<OwnerClaim>, tunnel_catalog::CatalogError> {
+        self.inner.current_owner(tenant_id, device_id, at).await
+    }
+    async fn issue_attachment_ticket(
+        &self,
+        request: &tunnel_catalog::AttachmentTicketIssueRequest,
+    ) -> Result<tunnel_catalog::AttachmentTicket, tunnel_catalog::CatalogError> {
+        self.inner.issue_attachment_ticket(request).await
+    }
+    async fn consume_attachment_ticket(
+        &self,
+        request: &tunnel_catalog::AttachmentTicketConsumeRequest,
+    ) -> Result<tunnel_catalog::ConsumedAttachmentTicket, tunnel_catalog::CatalogError> {
+        self.inner.consume_attachment_ticket(request).await
+    }
+    async fn read_signed_membership(
+        &self,
+    ) -> Result<Option<tunnel_catalog::SignedMembershipRecord>, tunnel_catalog::CatalogError> {
+        self.inner.read_signed_membership().await
+    }
+}
+
+/// An H3 fixture whose production owner handler reads `FlakyCatalog`.
+async fn flaky_owner_fixture() -> (H3PeerFixture, Arc<FlakyCatalog>) {
+    let slot: Arc<std::sync::Mutex<Option<Arc<FlakyCatalog>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured = Arc::clone(&slot);
+    let fixture = H3PeerFixture::new_with(
+        move |runtime, handle, catalog, oidc, _device, returned_errors| {
+            let flaky = Arc::new(FlakyCatalog {
+                inner: catalog,
+                device_down: std::sync::atomic::AtomicBool::new(false),
+                list_down: std::sync::atomic::AtomicBool::new(false),
+                consumer_down: std::sync::atomic::AtomicBool::new(false),
+            });
+            *captured.lock().expect("flaky slot") = Some(Arc::clone(&flaky));
+            let shared: tunnel_catalog::SharedCatalog = flaky;
+            let production_handler = peer_ingress_handler(
+                handle,
+                shared,
+                oidc,
+                DESTINATION_NODE.to_owned(),
+                DESTINATION_BOOT.to_owned(),
+            );
+            runtime.server_handler(RecordingHandler {
+                inner: production_handler,
+                returned_errors,
+            })
+        },
+    )
+    .await;
+    let flaky = slot
+        .lock()
+        .expect("flaky slot")
+        .take()
+        .expect("flaky catalog built");
+    (fixture, flaky)
+}
+
+async fn claim_flaky_owner(fixture: &H3PeerFixture, session: &str) -> OwnerClaim {
+    fixture
+        .catalog
+        .claim_owner(&OwnerClaimRequest {
+            deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+            tenant_id: tenant_id(),
+            device_id: device_id(),
+            node_id: DESTINATION_NODE.to_owned(),
+            boot_id: DESTINATION_BOOT.to_owned(),
+            session_id: session.to_owned(),
+            lease_expires_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+        .await
+        .expect("claim the owner")
+}
+
+/// Send one envelope on a raw request and return its response headers.
+async fn refusal_for(fixture: &H3PeerFixture, envelope: RequestEnvelope) -> http::Response<()> {
+    let mut stream = open_raw(fixture, envelope.route).await;
+    stream
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &envelope.encode().expect("encode envelope"),
+        ))
+        .await
+        .expect("send envelope");
+    let response = timeout(Duration::from_secs(3), stream.recv_response())
+        .await
+        .expect("refusal deadline")
+        .expect("the owner answers with response headers");
+    stream.cancel();
+    response
+}
+
+fn assert_owner_not_ready(response: &http::Response<()>, path: &str) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header("x-agent-tunnel-admission").as_deref(),
+        Some("owner_not_ready"),
+        "{path}: an unreadable catalog is retryable, not a denial"
+    );
+    assert_eq!(
+        header("x-agent-tunnel-retryable").as_deref(),
+        Some("true"),
+        "{path}"
+    );
+}
+
+fn http_forward_envelope(owner: &OwnerToken, token: &str) -> RequestEnvelope {
+    let source = PeerIdentity::new(SOURCE_NODE, SOURCE_BOOT);
+    let destination = Destination::new(owner.clone(), service_id());
+    let bearer =
+        ForwardedConsumerBearer::new(token.to_owned(), owner.clone()).expect("consumer bearer");
+    RequestEnvelope::new(
+        InternalRoute::ConsumerStreams,
+        "flaky-http-request",
+        source,
+        destination,
+        20_000,
+        Some(20_000),
+        InternalRequest::ConsumerStreams(ConsumerStreamsRequest {
+            stream_id: "flaky-http-stream".to_owned(),
+            required_scope: crate::HTTP_FORWARD_OPERATION.to_owned(),
+            bearer,
+            bytes: Vec::new(),
+        }),
+    )
+}
+
+fn http_scope_token(fixture: &H3PeerFixture) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = Some("cleanup".to_owned());
+    let claims = super::Claims {
+        iss: super::ISSUER.to_owned(),
+        sub: super::SUBJECT.to_owned(),
+        aud: super::AUDIENCE.to_owned(),
+        exp: (Utc::now().timestamp() + 60) as usize,
+        scope: crate::HTTP_FORWARD_OPERATION.to_owned(),
+    };
+    jsonwebtoken::encode(&header, &claims, &fixture.consumer_signer).expect("http token")
+}
+
+#[tokio::test]
+async fn an_unreadable_device_catalog_refuses_control_and_data_attachments_as_retryable() {
+    let (fixture, flaky) = flaky_owner_fixture().await;
+    let owner = claim_flaky_owner(&fixture, "flaky-device").await;
+    flaky.device_down.store(true, Ordering::Release);
+    for route in [InternalRoute::DeviceControl, InternalRoute::DeviceData] {
+        let response = refusal_for(
+            &fixture,
+            device_envelope(
+                route,
+                "flaky-device-request",
+                "flaky-device-stream",
+                &owner.token,
+            ),
+        )
+        .await;
+        assert_owner_not_ready(&response, &format!("{route:?}"));
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_grant_catalog_refuses_echo_and_http_streams_as_retryable() {
+    let (fixture, flaky) = flaky_owner_fixture().await;
+    let owner = claim_flaky_owner(&fixture, "flaky-grant").await;
+    flaky.list_down.store(true, Ordering::Release);
+    let echo = refusal_for(
+        &fixture,
+        consumer_envelope(
+            "flaky-echo-request",
+            "flaky-echo-stream",
+            &owner.token,
+            &fixture.consumer_token,
+        ),
+    )
+    .await;
+    assert_owner_not_ready(&echo, "echo grant");
+    let token = http_scope_token(&fixture);
+    let http = refusal_for(&fixture, http_forward_envelope(&owner.token, &token)).await;
+    assert_owner_not_ready(&http, "http-forward grant");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_consumer_catalog_refuses_as_retryable_and_a_bad_token_still_as_401() {
+    let (fixture, flaky) = flaky_owner_fixture().await;
+    let owner = claim_flaky_owner(&fixture, "flaky-consumer").await;
+    flaky.consumer_down.store(true, Ordering::Release);
+    let unavailable = refusal_for(
+        &fixture,
+        consumer_envelope(
+            "flaky-consumer-request",
+            "flaky-consumer-stream",
+            &owner.token,
+            &fixture.consumer_token,
+        ),
+    )
+    .await;
+    assert_owner_not_ready(&unavailable, "consumer authentication");
+    flaky.consumer_down.store(false, Ordering::Release);
+    // A real rejection keeps its non-retryable status: a token with the
+    // wrong scope for this route.
+    let wrong_scope = http_scope_token(&fixture);
+    let denied = refusal_for(
+        &fixture,
+        consumer_envelope(
+            "flaky-denied-request",
+            "flaky-denied-stream",
+            &owner.token,
+            &wrong_scope,
+        ),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    assert!(denied.headers().get("x-agent-tunnel-admission").is_none());
+    fixture.shutdown().await;
+}

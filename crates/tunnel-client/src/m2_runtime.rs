@@ -4142,7 +4142,12 @@ impl M2Actor {
     /// fresh session", and nothing ever started one.  Ending the session
     /// with the typed, retryable `OpenRetentionFull` lets `connect` replace
     /// it with a fresh session whose journal is empty.
-    fn check_open_retention_exhaustion(&self) -> Result<(), ClientError> {
+    fn check_open_retention_exhaustion(&mut self) -> Result<(), ClientError> {
+        // A session at its live limit is busy, not wedged: its retention is
+        // concurrent work, so the give-up clock restarts.
+        if self.active_stream_count() >= self.config.limits.max_streams {
+            self.open_retention_exhausted_since = None;
+        }
         match self.open_retention_exhausted_since {
             Some(since) if since.elapsed() >= self.open_retention_exhaustion_grace() => {
                 Err(ClientError::OpenRetentionFull)
@@ -4190,7 +4195,12 @@ impl M2Actor {
                 // stream.  Admission is untouched, so a retry still receives
                 // the same typed refusal while the journal is full.
                 self.retired_streams.insert(open.stream_id);
-                self.note_open_retention_exhausted();
+                // A journal held by the negotiated maximum of live streams is
+                // concurrent work, not unreclaimed retention (review of PR
+                // #171): only a session below its live limit starts the clock.
+                if self.active_stream_count() < self.config.limits.max_streams {
+                    self.note_open_retention_exhausted();
+                }
                 return self.send_rejected(
                     &open,
                     "RESOURCE_EXHAUSTED",
@@ -16157,6 +16167,34 @@ mod tests {
             "{closed:?}"
         );
         Ok(())
+    }
+
+    /// Task row M7-C95, review of PR #171: a session whose retention is full
+    /// because it is at its negotiated live-stream limit is busy, not wedged,
+    /// and must never be given up; the clock restarts instead.  Once the
+    /// live streams fall below the limit an exhaustion that outlives the
+    /// grace still gives up.
+    #[tokio::test]
+    async fn a_busy_session_at_its_live_limit_is_not_given_up_for_retention() {
+        let (mut actor, _key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let max = actor.config.limits.max_streams;
+        for stream_id in 1..=max as u64 {
+            actor.streams.insert(stream_id, test_stream());
+        }
+        let long_ago = Instant::now() - Duration::from_secs(3_600);
+        actor.open_retention_exhausted_since = Some(long_ago);
+        assert!(
+            actor.check_open_retention_exhaustion().is_ok(),
+            "a session at its live limit is busy"
+        );
+        assert!(actor.open_retention_exhausted_since.is_none());
+        actor.streams.remove(&1);
+        actor.open_retention_exhausted_since = Some(long_ago);
+        assert!(matches!(
+            actor.check_open_retention_exhaustion(),
+            Err(ClientError::OpenRetentionFull)
+        ));
     }
 
     /// Task row M7-C84, forced end to end on the real session loop.  A

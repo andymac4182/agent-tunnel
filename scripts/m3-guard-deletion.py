@@ -1524,7 +1524,48 @@ M7_CONNECTOR_RELAY_CASES.append(
         ),
     )
 )
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # Review of PR #171: an unreadable owner catalog is retryable.
+        "an owner that cannot read its catalog refuses as owner-not-ready, not 403",
+        [
+            (
+                RELAY_HTTP,
+                "    if is_transient_owner_refusal(error) {\n"
+                "        let _ = request.reject_owner_not_ready().await;\n",
+                "    if false {\n"
+                "        let _ = request.reject_owner_not_ready().await;\n",
+            )
+        ],
+        frozenset(
+            {
+                PEER_H3
+                + "an_unreadable_device_catalog_refuses_control_and_data_attachments_as_retryable",
+                PEER_H3 + "an_unreadable_grant_catalog_refuses_echo_and_http_streams_as_retryable",
+            }
+        ),
+    )
+)
 M7_CONNECTOR_CLIENT_CASES: list[Case] = [
+    Case(
+        # Review of PR #171: a session at its live limit is busy, not wedged.
+        "a busy session at its live limit is never given up for retention",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        if self.active_stream_count() >= self.config.limits.max_streams {\n"
+                "            self.open_retention_exhausted_since = None;\n"
+                "        }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "a_busy_session_at_its_live_limit_is_not_given_up_for_retention",
+            }
+        ),
+    ),
     Case(
         # M7-C84: an error raised after the stop's own cancellation is a stop.
         "an orderly stop that lands inside a tick is reported as stopped",
