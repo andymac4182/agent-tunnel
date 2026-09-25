@@ -31,8 +31,11 @@
 //!   left the group escapes the sentinel exactly as it escapes the
 //!   supervisor, and `docs/tasks.md` M3-09 records which mechanisms would and
 //!   would not close that on which platform.
-//! * Dropping the [`ChildHandle`] kills the process group; the supervisor
-//!   reaps the leader.
+//! * Dropping the [`ChildHandle`] sends the process group `SIGKILL`
+//!   synchronously, in `Drop`, while the leader is not known to be reaped;
+//!   the supervisor task reaps the leader.  The synchronous signal is what
+//!   holds when a runtime is torn down without polling that task (task row
+//!   M6-C28, ported from `tunnel-acp-export`).
 //!   No lock is held across child I/O: a writer task owns stdin, a reader
 //!   task owns stdout and a supervisor task owns the process.
 
@@ -116,12 +119,13 @@ pub struct ChildCounters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpawnError;
 
-/// The owner's handle.  Dropping it kills the child.
+/// The owner's handle.  Dropping it kills the child's process group.
 #[derive(Debug)]
 pub struct ChildHandle {
     stdin: mpsc::Sender<Bytes>,
     kill: CancellationToken,
     exited: watch::Receiver<bool>,
+    pid: Option<u32>,
 }
 
 impl ChildHandle {
@@ -153,8 +157,31 @@ impl ChildHandle {
 }
 
 impl Drop for ChildHandle {
+    /// Kill the child's process group **synchronously, here** (task row
+    /// M6-C28, the port of `tunnel-acp-export`'s M8-C07 fix).
+    ///
+    /// Cancelling the token is not enough: the task that acts on it is a
+    /// tokio task, and when a runtime is torn down -- returning from `main`
+    /// straight after a kill request, a panic unwinding `main`, a panicking
+    /// `#[tokio::test]` -- that task is dropped rather than run.
+    /// `kill_on_drop` then kills the **leader only**, and the group is left to
+    /// the sentinel, or alive when none is installed.  This is one `rustix`
+    /// syscall, so it can run in `Drop` on any thread with no runtime at all.
+    ///
+    /// The signal is sent only while `exited` says the leader has not been
+    /// reaped, which **narrows** the window in which `pid` could name some
+    /// other group; it does not close it.  POSIX keeps a process-group ID from
+    /// being reused while any member lives, but that argument assumes the
+    /// supervisor task is the only reaper, and it is not: during runtime
+    /// teardown tokio's own orphan reaper can reap the `kill_on_drop`ped
+    /// leader before this runs, while `exited` is still false.  The remaining
+    /// race is microseconds wide and needs pid wraparound on top, so it is
+    /// theoretical -- but it is narrowed, not eliminated.
     fn drop(&mut self) {
         self.kill.cancel();
+        if !*self.exited.borrow() {
+            let _ = kill_group(self.pid);
+        }
     }
 }
 
@@ -285,6 +312,7 @@ pub fn spawn(
             stdin: stdin_tx,
             kill,
             exited: exited_rx,
+            pid: group,
         },
         events_rx,
     ))

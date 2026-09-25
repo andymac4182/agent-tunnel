@@ -1293,7 +1293,10 @@ const SUPERVISED_CHILD_REAP_BOUND: std::time::Duration = std::time::Duration::fr
 /// before they ran would tear the runtime down with that task possibly
 /// never polled -- measured (M6-C29) to leave an in-group helper alive in 7
 /// of 50 runs on this runtime flavour, and every time on a current-thread
-/// one, when no sentinel is installed. A timed-out wait is not an error, but
+/// one, when no sentinel is installed. Since M6-C28 a `ChildHandle` dropped
+/// by that teardown signals its group synchronously, so the helper no longer
+/// survives it; the wait still keeps the reap and the sentinel's stand-down,
+/// rather than its firing, on the orderly path. A timed-out wait is not an error, but
 /// it is not silent either: the result is how many children were still
 /// unreaped at the bound, and the caller reports a non-zero count
 /// (`report_unreaped`).
