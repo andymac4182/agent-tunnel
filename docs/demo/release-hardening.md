@@ -5,8 +5,8 @@ binaries, pack the archive exactly as CI does, and run the release gate
 against the **unpacked** archive with its planted-defect controls. It then
 shows how a tester checks a published archive's build attestation. The
 hosted equivalent runs in `.github/workflows/release.yml` on every main
-release and on every same-repository pull request that touches the release
-path (task rows M6-C13, M6-C102, M6-C113, M6-C114, M6-C116).
+release; a same-repository pull request that touches the release path runs
+its build and verify jobs, but is never attested or published (task rows M6-C13, M6-C102, M6-C113, M6-C114, M6-C116).
 
 It needs no relay: the archive is the thing being demonstrated. To go on and
 connect the unpacked client to a relay, follow
@@ -83,8 +83,9 @@ gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink \
   --source-ref refs/heads/main
 ```
 
-A pass names the workflow run and commit that built the file; compare the
-commit with `sourceSha` in the archive's `release.json`. It is provenance, not
+A pass names the release run and main's tip when that run started. That commit
+can be later than the one the archive was built from; the source identity is
+`sourceSha` in the archive's `release.json`. It is provenance, not
 code signing and not a review of the source (see join-relay.md section 1).
 A release published before this change answers `HTTP 404`.
 
@@ -93,15 +94,17 @@ A release published before this change answers `HTTP 404`.
 `aarch64-unknown-linux-gnu` is a CI-only target (`ci-only-targets` in the
 root `Cargo.toml`). Advertising it is an owner decision (M6-C115). The
 release workflow builds it on `ubuntu-24.04-arm` as a client-only archive,
-verifies the unpacked archive there, and attests it, but never publishes it.
-Take it from a green run's workflow artifact, which is kept for 7 days. Run
-36153487478 is one such run:
+verifies the unpacked archive there, and, on a main release run, attests it,
+but never publishes it. Take it from a green **main release** run's workflow
+artifact, which is kept for 7 days. Pull-request runs build and verify it but
+are not attested, and the attestation check below refuses them:
 
 ```text
 gh run download <run-id> -R andymac4182/agentuplink -n release-aarch64-unknown-linux-gnu -D armlinux
 cd armlinux && sha256sum -c agentuplink-*.tar.gz.sha256
 gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink \
-  --signer-workflow andymac4182/agentuplink/.github/workflows/release.yml
+  --signer-workflow andymac4182/agentuplink/.github/workflows/release.yml \
+  --source-ref refs/heads/main
 mkdir release && tar -xzf agentuplink-*.tar.gz -C release
 ```
 

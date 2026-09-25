@@ -5,10 +5,10 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  # A pull request that changes the release path builds, verifies and attests
-  # the complete matrix exactly as main does, and never publishes: `publish`
-  # runs only for `workflow_run` (docs/tasks.md M6-C13).  Fork pull requests
-  # are skipped; they get no OIDC token to attest with.
+  # A pull request that changes the release path builds and verifies the
+  # complete matrix exactly as main does, and never attests or publishes:
+  # `attest` and `publish` run only for `workflow_run` (docs/tasks.md M6-C13,
+  # M6-C114).  Fork pull requests are skipped.
   pull_request:
     paths:
       - 'scripts/*release*.py'
@@ -76,9 +76,17 @@ jobs:
       - name: Install pinned toolchain
         run: |
           set -euo pipefail
-          # The arm Linux image may not carry rustup; install it if absent.
+          # The arm Linux image may not carry rustup. If it is absent, install
+          # a pinned rustup-init, checked against a recorded SHA-256, rather
+          # than piping an unpinned installer script into a shell.
           if ! command -v rustup > /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            test "${{ matrix.target }}" = aarch64-unknown-linux-gnu
+            curl --proto '=https' --tlsv1.2 -sSfo rustup-init \
+              https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-unknown-linux-gnu/rustup-init
+            echo "15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433  rustup-init" | sha256sum -c -
+            chmod +x rustup-init
+            ./rustup-init -y --profile minimal --default-toolchain none
+            rm rustup-init
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
@@ -95,6 +103,15 @@ jobs:
         # what is packed, so the two cannot disagree.
         run: |
           set -euo pipefail
+          # Any RUSTFLAGS-style variable REPLACES `.cargo/config.toml`'s
+          # rustflags, which would silently drop the Windows static C runtime
+          # (M6-C116). Release builds must take their flags from the config.
+          for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "::error::$name is set; release builds must take rustflags from .cargo/config.toml"
+              exit 1
+            fi
+          done
           packages=()
           for binary in $(python3 -c 'import sys; sys.path.insert(0, "scripts"); from package_release import binaries_for; print(" ".join(binaries_for(sys.argv[1])))' "${{ matrix.target }}"); do
             packages+=(-p "$binary")
@@ -146,8 +163,11 @@ jobs:
       run:
         shell: bash
     steps:
-      # Only the verifier and what it imports; no toolchain is installed and
-      # nothing is built on this runner.
+      # Only the verifier and what it imports; nothing is installed or built
+      # here. The runner image has its own Rust toolchain, so the guarantee
+      # is narrower than "no cargo on the machine": every probe runs with a
+      # PATH of system directories only, and the verifier's `cli` check
+      # proves `cargo` is unreachable on that PATH before any probe runs.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.SOURCE_SHA }}
@@ -170,12 +190,18 @@ jobs:
 
   # GitHub build-provenance attestation for every archive and checksum file,
   # after every target has verified (demo-readiness defect D8).  It binds each
-  # file's SHA-256 to this repository, this workflow file, the commit and the
-  # run, signed through Sigstore; `gh attestation verify` checks it.  It is
-  # not code signing: macOS Gatekeeper and Windows SmartScreen still treat
-  # the binaries as unsigned.
+  # file's SHA-256 to this repository, this workflow file, the ref and commit
+  # the run executed on, and the run, signed through Sigstore.  It runs only
+  # on the main release path, so a pull-request build is never attested and
+  # the documented `--source-ref refs/heads/main` check admits release builds
+  # only.  A `workflow_run` job executes on main's tip at the time the release
+  # runs, which may be later than the commit it built (`sourceSha` in
+  # release.json); release.json is the source identity.  It is not code
+  # signing: macOS Gatekeeper and Windows SmartScreen still treat the binaries
+  # as unsigned.
   attest:
     needs: verify
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -204,7 +230,8 @@ jobs:
           count=0
           for file in dist/*; do
             gh attestation verify "$file" -R "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" > /dev/null
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref refs/heads/main > /dev/null
             echo "attestation verified: $(basename "$file")"
             count=$((count + 1))
           done

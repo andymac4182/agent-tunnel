@@ -11,3 +11,12 @@
 # statically too with this flag.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+#
+# Two consequences, both deliberate:
+# - This applies to every build of the target, so Windows host tests in CI
+#   (`ci.yml`'s Windows job) also link the C runtime statically. Accepted:
+#   tests then exercise the same runtime linkage that ships.
+# - Any of RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS or CARGO_BUILD_RUSTFLAGS
+#   REPLACES this list instead of adding to it, which would silently drop
+#   `+crt-static`. They must stay unset for release builds;
+#   `.github/workflows/release.yml`'s build step fails if any is set.

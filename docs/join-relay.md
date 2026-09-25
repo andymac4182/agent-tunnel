@@ -58,29 +58,27 @@ through the [downloads page](https://agentuplink.dev/docs/downloads).
 could replace one could replace both.
 
 **The build attestation says where it was built.** Releases built after the
-release-hardening change (M6-C13) carry a GitHub build-provenance attestation
+release-hardening change (M6-C114) carry a GitHub build-provenance attestation
 for every archive and every `.sha256` file. Check the archive with the GitHub
-CLI:
-
-```text
-gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink
-```
-
-For a stricter check, also require the release workflow and the main branch:
+CLI, using exactly this command; each flag narrows what passes:
 
 ```text
 gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink --signer-workflow andymac4182/agentuplink/.github/workflows/release.yml --source-ref refs/heads/main
 ```
 
-A pass means GitHub's Sigstore-backed signing service recorded that a
-file with exactly this SHA-256 was produced by a GitHub Actions run of
-that workflow in `andymac4182/agentuplink`, at the commit and run the output names.
-Compare that commit with the `sourceSha` in `release.json`. It does **not** mean
-the source was reviewed or is safe. It is not code signing: macOS and Windows
-still treat the binaries as unsigned. Anyone with write access to the repository's
-workflows can produce an attestation. Older releases have no attestation, and
-the command fails with `HTTP 404` for them; for those, the checksum is the only
-check.
+A pass means GitHub's Sigstore-backed signing service recorded that a file with
+exactly this SHA-256 was produced by a run of the release workflow
+(`release.yml`) in `andymac4182/agentuplink`, running on `main`. The commit the
+output names is **main's tip when the release ran**. This can be later than the
+commit the archive was built from, because the release starts after CI finishes
+on main. The source identity is `sourceSha` in the archive's `release.json`,
+not the attested commit.
+
+It does **not** mean the source was reviewed or is safe. It is not code signing:
+macOS and Windows still treat the binaries as unsigned. Anyone with write access
+to the repository's workflows can produce an attestation. Older releases have no
+attestation, and the command fails with `HTTP 404` for them; for those, the
+checksum is the only check.
 
 The archive has **no top-level folder**; it unpacks `LICENSE`, `README.txt`,
 `bin/`, `examples/`, `notices/` and `release.json` into the current directory

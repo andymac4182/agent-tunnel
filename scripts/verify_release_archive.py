@@ -457,26 +457,41 @@ def pe_imports(path: Path) -> list[str]:
     return names
 
 
-def check_portability(root: Path, target: str) -> Result:
+def read_dependencies(binary: Path, target_os: str) -> list[str]:
+    """The dynamic dependencies a binary's own headers declare."""
+    if target_os == "linux":
+        return elf_needed(binary)
+    if target_os == "windows":
+        return pe_imports(binary)
+    tool = shutil.which("otool")
+    if tool is None:
+        raise FileNotFoundError("otool")
+    listing = subprocess.run([tool, "-L", str(binary)], capture_output=True, text=True, check=False)
+    return [line.strip().split(" (")[0] for line in listing.stdout.splitlines()[1:] if line.strip()]
+
+
+def non_system(dependencies: list[str], target_os: str) -> list[str]:
+    """The dependencies a clean machine of `target_os` does not provide."""
+    if target_os == "linux":
+        return [d for d in dependencies if not LINUX_SYSTEM.match(d)]
+    if target_os == "windows":
+        system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        return [d for d in dependencies if WINDOWS_REDISTRIBUTABLE.match(d)
+                or (system32.is_dir() and not (system32 / d).exists() and not d.lower().startswith("api-ms-win-"))]
+    return [d for d in dependencies if not d.startswith(MACOS_SYSTEM_PREFIXES)]
+
+
+def check_portability(root: Path, target: str, reader=read_dependencies) -> Result:
+    """`reader` is the dependency reader; the self-test wraps the real one."""
     target_os, _ = target_os_arch(target)
     total = 0
     for name in binaries_for(target):
         binary = root / "bin" / exe(target, name)
-        if target_os == "linux":
-            dependencies = elf_needed(binary)
-            bad = [d for d in dependencies if not LINUX_SYSTEM.match(d)]
-        elif target_os == "windows":
-            dependencies = pe_imports(binary)
-            system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-            bad = [d for d in dependencies if WINDOWS_REDISTRIBUTABLE.match(d)
-                   or (system32.is_dir() and not (system32 / d).exists() and not d.lower().startswith("api-ms-win-"))]
-        else:
-            tool = shutil.which("otool")
-            if tool is None:
-                return fail("portability", "otool-missing", "otool is unavailable; dependencies not inspected")
-            listing = subprocess.run([tool, "-L", str(binary)], capture_output=True, text=True, check=False)
-            dependencies = [line.strip().split(" (")[0] for line in listing.stdout.splitlines()[1:] if line.strip()]
-            bad = [d for d in dependencies if not d.startswith(MACOS_SYSTEM_PREFIXES)]
+        try:
+            dependencies = reader(binary, target_os)
+        except FileNotFoundError:
+            return fail("portability", "otool-missing", "otool is unavailable; dependencies not inspected")
+        bad = non_system(dependencies, target_os)
         if not dependencies:
             return fail("portability", "no-dependencies-read",
                         f"read no dynamic dependencies from bin/{exe(target, name)}; the parser saw nothing")
@@ -606,22 +621,19 @@ def controls(root: Path, archive: Path, checksum: Path, target: str) -> list[tup
         return check_cli(copy, target, tmp)
     expect("a subcommand --help exits 2 (D6)", "subcommand-help", help_broken)
 
-    def non_system(tmp):
-        copy = _copy(root, tmp)
-        result = check_portability(copy, target)
-        if not result.ok:
-            return result
-        # Re-run the classifier with a dependency a clean machine lacks.
+    def planted_import(tmp):
+        # Through check_portability itself: the real reader parses the real
+        # client's headers, and one import a clean machine lacks is added to
+        # what it returns, so the classification and the verdict both run.
         target_os, _ = target_os_arch(target)
-        planted = {"linux": "libssl.so.3", "windows": "VCRUNTIME140.dll", "macos": "/opt/homebrew/lib/libssl.3.dylib"}[target_os]
-        if target_os == "linux":
-            bad = not LINUX_SYSTEM.match(planted)
-        elif target_os == "windows":
-            bad = bool(WINDOWS_REDISTRIBUTABLE.match(planted))
-        else:
-            bad = not planted.startswith(MACOS_SYSTEM_PREFIXES)
-        return fail("portability", "non-system-dependency" if bad else "classifier-accepts", f"planted {planted}")
-    expect("the classifier refuses a non-system library", "non-system-dependency", non_system)
+        planted = {"linux": "libssl.so.3", "windows": "VCRUNTIME140.dll",
+                   "macos": "/opt/homebrew/lib/libssl.3.dylib"}[target_os]
+
+        def reader(binary, os_name):
+            found = read_dependencies(binary, os_name)
+            return found + [planted] if binary.name == exe(target, "tunnel-client") else found
+        return check_portability(root, target, reader=reader)
+    expect("a planted import the clean OS lacks", "non-system-dependency", planted_import)
     return out
 
 
