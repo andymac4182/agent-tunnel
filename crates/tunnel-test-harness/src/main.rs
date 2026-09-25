@@ -3127,6 +3127,15 @@ pub(crate) async fn main() -> ExitCode {
             print_help();
             Ok(())
         }
+        // The MCP demo's cloud-side client (docs/demo/mcp.md).  Not a
+        // verification gate: it prints what a real client sees and exits
+        // non-zero on the first step that fails.
+        [command, rest @ ..] if command == "mcp-demo-client" => {
+            match tunnel_test_harness::mcp_demo_client::DemoArgs::parse(rest) {
+                Ok(demo) => tunnel_test_harness::mcp_demo_client::run(demo).await,
+                Err(error) => Err(error),
+            }
+        }
         _ => Err(HarnessError::InvalidInput(
             "unknown command; use --help".to_owned(),
         )),

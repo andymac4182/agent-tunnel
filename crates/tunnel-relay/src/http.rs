@@ -895,6 +895,12 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
             "/v1/devices/{device}/services/{service}/http/{*path}",
             axum::routing::any(crate::http::forward::http_forward_route),
         )
+        // M3-11: RFC 9728 protected-resource metadata for every
+        // `http-forward` route, at the path-inserted well-known location.
+        .route(
+            "/.well-known/oauth-protected-resource/v1/devices/{device}/services/{service}/http/{*path}",
+            get(crate::http::forward::authorization::protected_resource_metadata_route),
+        )
         // One URL for the descriptor and the upgrade, registered for every
         // method so the 405 is this route's own typed answer rather than the
         // router's fallback: the contract requires the filesystem error body
@@ -5664,3 +5670,5 @@ mod tenant_admission_tests;
 
 #[cfg(test)]
 mod consumer_refusal_tests;
+#[cfg(test)]
+mod mcp_authorization_tests;

@@ -2039,6 +2039,7 @@ pub async fn verify() -> Result<McpCloudClientEvidence> {
         request_body_bytes: None,
         response_body_bytes: None,
         deadline_seconds: None,
+        public_url: None,
     };
     let exports = match serve.exports() {
         Ok(exports) => exports,

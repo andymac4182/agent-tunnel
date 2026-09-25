@@ -51,10 +51,14 @@ use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
-    Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
-    PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerConfig, Tool,
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
+    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, Prompt, PromptArgument,
+    PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, Role, ServerCapabilities, ServerConfig,
+    SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::io::AsyncWriteExt;
 
@@ -235,10 +239,29 @@ pub fn escape_marker(pid_file: &Path) -> PathBuf {
     pid_file.with_extension(ESCAPE_MARKER_EXTENSION)
 }
 
+/// The synthetic text resource (task row M3-13).
+pub const RESOURCE_TEXT_URI: &str = "fixture://synthetic/readme.txt";
+/// The synthetic binary resource: [`IMAGE_PNG_BASE64`] as a blob.
+pub const RESOURCE_BLOB_URI: &str = "fixture://synthetic/pixel.png";
+/// The fixed body of [`RESOURCE_TEXT_URI`].
+pub const RESOURCE_TEXT: &str = "Synthetic fixture resource. It holds no user data.";
+/// The one prompt: `greet`, with a required `name` argument.
+pub const PROMPT_NAME: &str = "greet";
+
+/// The text `greet` renders for `name`.
+#[must_use]
+pub fn prompt_text(name: &str) -> String {
+    format!("Say hello to {name} from the synthetic fixture.")
+}
+
 /// The fixture server.
 #[derive(Clone, Debug, Default)]
 pub struct FixtureServer {
     marker_dir: Option<Arc<PathBuf>>,
+    /// Resource URIs a legacy (2025-11-25) client subscribed to on this
+    /// server instance.  One stdio child serves one session, so this is
+    /// per session there.
+    subscriptions: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl FixtureServer {
@@ -246,6 +269,7 @@ impl FixtureServer {
     pub fn new(marker_dir: Option<PathBuf>) -> Self {
         Self {
             marker_dir: marker_dir.map(Arc::new),
+            subscriptions: Arc::default(),
         }
     }
 
@@ -751,6 +775,11 @@ fn tools() -> Vec<Tool> {
             schema(serde_json::json!({"label": {"type": "string"}})),
         ),
         Tool::new(
+            "touch",
+            "Report a synthetic resource as updated to its subscribers",
+            schema(serde_json::json!({"uri": {"type": "string"}})),
+        ),
+        Tool::new(
             "detach",
             "Start a descendant that leaves this server's process group",
             schema(serde_json::json!({
@@ -803,8 +832,11 @@ impl ServerHandler for FixtureServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
-                .enable_tools()
                 .enable_logging()
+                .enable_prompts()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .enable_tools()
                 .build(),
         )
         .with_server_info(Implementation::new("tunnel-mcp-fixture", "0.1.0"))
@@ -1039,8 +1071,163 @@ impl ServerHandler for FixtureServer {
                         .into(),
                 )
             }
+            "touch" => {
+                let uri = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("uri"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(RESOURCE_TEXT_URI)
+                    .to_owned();
+                let subscribed = self
+                    .subscriptions
+                    .lock()
+                    .map(|set| set.contains(&uri))
+                    .unwrap_or(false);
+                if subscribed {
+                    let _ = context
+                        .peer
+                        .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                        .await;
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "touched subscribed={subscribed}"
+                ))])
+                .into())
+            }
             _ => Err(ErrorData::invalid_params("unknown tool", None)),
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.record("discovery.log", "resources/list").await;
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(RESOURCE_TEXT_URI, "readme").with_mime_type("text/plain"),
+            Resource::new(RESOURCE_BLOB_URI, "pixel").with_mime_type("image/png"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.record("invocations.log", "resources/read").await;
+        let contents = match request.uri.as_str() {
+            RESOURCE_TEXT_URI => ResourceContents::TextResourceContents {
+                uri: request.uri.clone(),
+                mime_type: Some("text/plain".to_owned()),
+                text: RESOURCE_TEXT.to_owned(),
+                meta: None,
+            },
+            RESOURCE_BLOB_URI => ResourceContents::BlobResourceContents {
+                uri: request.uri.clone(),
+                mime_type: Some("image/png".to_owned()),
+                blob: IMAGE_PNG_BASE64.to_owned(),
+                meta: None,
+            },
+            _ => return Err(ErrorData::resource_not_found("unknown resource", None)),
+        };
+        Ok(ReadResourceResult::new(vec![contents]).into())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        self.record("discovery.log", "prompts/list").await;
+        Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+            PROMPT_NAME,
+            Some("Greet someone by name"),
+            Some(vec![PromptArgument::new("name").with_required(true)]),
+        )]))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        self.record("invocations.log", "prompts/get").await;
+        if request.name != PROMPT_NAME {
+            return Err(ErrorData::invalid_params("unknown prompt", None));
+        }
+        let name = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, prompt_text(name))])
+                .with_description("A synthetic greeting")
+                .into(),
+        )
+    }
+
+    // `resources/subscribe` is the 2025-11-25 mechanism; rmcp marks it
+    // deprecated in favour of the 2026-07-28 `subscriptions/listen` below,
+    // and the fixture serves both profiles.
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.record("invocations.log", "resources/subscribe").await;
+        if let Ok(mut set) = self.subscriptions.lock() {
+            set.insert(request.uri);
+        }
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.record("invocations.log", "resources/unsubscribe")
+            .await;
+        if let Ok(mut set) = self.subscriptions.lock() {
+            set.remove(&request.uri);
+        }
+        Ok(())
+    }
+
+    /// 2026-07-28: accept resource subscriptions to the fixture's own URIs.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let uris: Vec<String> = requested
+            .resource_subscriptions
+            .iter()
+            .flatten()
+            .filter(|uri| uri.as_str() == RESOURCE_TEXT_URI || uri.as_str() == RESOURCE_BLOB_URI)
+            .cloned()
+            .collect();
+        Some(
+            SubscriptionFilter::builder()
+                .resource_subscriptions(uris)
+                .build(),
+        )
+    }
+
+    /// 2026-07-28: a per-request child cannot see a later `touch`, so the
+    /// listener reports each accepted URI updated once and then ends the
+    /// subscription gracefully, which the 2026 schema's final result marks.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        self.record("invocations.log", "subscriptions/listen").await;
+        for uri in context.accepted().resource_subscriptions.iter().flatten() {
+            let _ = context.sink().notify_resource_updated(uri.clone()).await;
+        }
+        Ok(())
     }
 }
 
