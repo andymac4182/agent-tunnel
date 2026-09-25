@@ -497,8 +497,43 @@ pub enum MembershipUnreadyReason {
     CatalogUnavailable,
     MembershipRejected,
     MissingLocalMembership,
+    MissingLocalKey,
     PersistenceUnavailable,
     Cancelled,
+}
+
+impl MembershipUnreadyReason {
+    /// Whether becoming unready for this reason must also withdraw this
+    /// relay's approved peer SPKI pins (M7-C86).
+    ///
+    /// **Recorded owner decision (2026-09-16).** Withdrawing the pin set is
+    /// the fail-closed answer when the *trust evidence itself* was rejected:
+    /// an authority this relay cannot verify, a signed record that failed
+    /// verification, or an expired checkpoint or key window. In those states
+    /// the relay can no longer say which peer keys are approved, so it must
+    /// approve none -- that is what makes a rogue-signed record fail closed
+    /// in both directions (`m7_deployment_spki_replacement` phase 6).
+    ///
+    /// The remaining reasons are *local or transient*: this relay's own
+    /// prerequisites are unmet, or an infrastructure read failed, while the
+    /// signed peer keys it already verified are untouched. Withdrawing trust
+    /// there turned one relay's transient local failure into a cluster-wide
+    /// trust blackout (M7-C81, M7-C83). Those retain the verified set and
+    /// withdraw *readiness* instead, which is what the readiness contract in
+    /// `docs/cluster.md` requires. Admission is not weakened: every forwarded
+    /// stream still binds against the verifier, and an unready relay fails
+    /// `/readyz` and public admission closed.
+    #[must_use]
+    pub const fn withdraws_peer_trust(self) -> bool {
+        match self {
+            Self::UnknownAuthority | Self::MembershipRejected | Self::CheckpointExpired => true,
+            Self::MissingLocalMembership
+            | Self::MissingLocalKey
+            | Self::CatalogUnavailable
+            | Self::PersistenceUnavailable
+            | Self::Cancelled => false,
+        }
+    }
 }
 
 impl fmt::Display for MembershipUnreadyReason {
@@ -509,6 +544,7 @@ impl fmt::Display for MembershipUnreadyReason {
             Self::CatalogUnavailable => "membership catalog unavailable",
             Self::MembershipRejected => "membership record rejected",
             Self::MissingLocalMembership => "local relay membership is unavailable",
+            Self::MissingLocalKey => "local relay key is not approved",
             Self::PersistenceUnavailable => "membership version state persistence unavailable",
             Self::Cancelled => "membership runtime cancelled",
         })
@@ -670,7 +706,37 @@ impl PeerInvalidationReason {
 pub struct PeerAdmissionCancellation {
     token: CancellationToken,
     reason: Arc<AtomicU8>,
-    expires_at: Option<Instant>,
+    expires_at: Option<SharedAdmissionExpiry>,
+}
+
+/// The monotonic trust deadline of one admission, shared between the
+/// runtime's active-admission table and every stream riding the admission.
+///
+/// It only ever moves when a successful reconcile re-binds an unchanged
+/// admission to freshly verified signed evidence (M7-C80); it is never moved
+/// earlier than a boundary already observed and never extended by a cache hit,
+/// a late response or a clock correction.
+#[derive(Clone, Debug)]
+struct SharedAdmissionExpiry(Arc<Mutex<Instant>>);
+
+impl SharedAdmissionExpiry {
+    fn new(expires_at: Instant) -> Self {
+        Self(Arc::new(Mutex::new(expires_at)))
+    }
+
+    fn get(&self) -> Instant {
+        match self.0.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set(&self, expires_at: Instant) {
+        match self.0.lock() {
+            Ok(mut guard) => *guard = expires_at,
+            Err(poisoned) => *poisoned.into_inner() = expires_at,
+        }
+    }
 }
 
 impl PeerAdmissionCancellation {
@@ -696,7 +762,7 @@ impl PeerAdmissionCancellation {
         Self {
             token,
             reason: Arc::new(AtomicU8::new(0)),
-            expires_at: Some(expires_at),
+            expires_at: Some(SharedAdmissionExpiry::new(expires_at)),
         }
     }
 
@@ -723,7 +789,7 @@ impl PeerAdmissionCancellation {
     /// exposed one.  It is never extended after construction.
     #[must_use]
     pub fn expires_at(&self) -> Option<Instant> {
-        self.expires_at
+        self.expires_at.as_ref().map(SharedAdmissionExpiry::get)
     }
 
     /// Return whether signed trust for this admission has ended.
@@ -742,7 +808,7 @@ impl PeerAdmissionCancellation {
             Some(PeerInvalidationReason::TrustExpired) => true,
             Some(_) => false,
             None => self
-                .expires_at
+                .expires_at()
                 .is_some_and(|deadline| Instant::now() >= deadline),
         }
     }
@@ -798,6 +864,7 @@ pub struct PeerAdmission {
     deadline: AdmissionDeadline,
     invalidation: CancellationToken,
     invalidation_reason: Arc<AtomicU8>,
+    expiry: SharedAdmissionExpiry,
 }
 
 impl fmt::Debug for PeerAdmission {
@@ -840,7 +907,7 @@ impl PeerAdmission {
         PeerAdmissionCancellation {
             token: self.invalidation.clone(),
             reason: self.invalidation_reason.clone(),
-            expires_at: Some(self.deadline.expires_at),
+            expires_at: Some(self.expiry.clone()),
         }
     }
 
@@ -867,6 +934,10 @@ struct RuntimeState {
     active_peers: BTreeMap<PeerIdentity, ActivePeer>,
     callback: Option<PeerInvalidationCallback>,
     last_persisted_version_state: Option<MembershipVersionState>,
+    /// Advanced only when a successful reconcile installs a verified
+    /// directory whose `(node, record_version)` set differs from the last.
+    directory_revision: u64,
+    directory_versions: Vec<(String, u64)>,
 }
 
 /// A cancellable, joined membership reconciliation task.
@@ -923,6 +994,22 @@ pub struct MembershipRuntime {
     state: Mutex<RuntimeState>,
     version_store: Option<Arc<MembershipVersionStateStore>>,
     started: AtomicBool,
+    /// Process-local observer of readiness transitions and verified
+    /// directory changes (M7-C91), with the last state it was told about.
+    change_observer: Mutex<ChangeObserverState>,
+}
+
+/// Callback invoked, outside every runtime lock, when this runtime's
+/// readiness changes or a reconcile installs a verified directory whose
+/// record versions differ from the previous one. It receives the readiness
+/// that triggered it; like [`PeerInvalidationCallback`] it carries no signed
+/// bytes, endpoint or credential.
+pub type MembershipChangeObserver = Arc<dyn Fn(&MembershipReadiness) + Send + Sync>;
+
+#[derive(Default)]
+struct ChangeObserverState {
+    observer: Option<MembershipChangeObserver>,
+    last: Option<(MembershipReadiness, u64)>,
 }
 
 impl fmt::Debug for MembershipRuntime {
@@ -1042,9 +1129,12 @@ impl MembershipRuntime {
                 active_peers: BTreeMap::new(),
                 callback: None,
                 last_persisted_version_state: persisted_version_state,
+                directory_revision: 0,
+                directory_versions: Vec::new(),
             }),
             version_store,
             started: AtomicBool::new(false),
+            change_observer: Mutex::new(ChangeObserverState::default()),
         }))
     }
 
@@ -1052,6 +1142,46 @@ impl MembershipRuntime {
     pub fn set_invalidation_callback(&self, callback: Option<PeerInvalidationCallback>) {
         if let Ok(mut state) = self.state.lock() {
             state.callback = callback;
+        }
+    }
+
+    /// Install or replace the process-local change observer (M7-C91).
+    ///
+    /// The observer runs after every readiness transition -- including the
+    /// reconcile that returns membership to `Ready`, which has no admission
+    /// left to invalidate and so never reaches the invalidation callback --
+    /// and after a reconcile that installs different record versions while
+    /// staying `Ready`. It runs outside every runtime lock and may call back
+    /// into this runtime. Installing it does not replay the current state.
+    pub fn set_change_observer(&self, observer: Option<MembershipChangeObserver>) {
+        let current = {
+            let state = self.state.lock().expect("membership state mutex poisoned");
+            (state.readiness.clone(), state.directory_revision)
+        };
+        if let Ok(mut observed) = self.change_observer.lock() {
+            observed.observer = observer;
+            observed.last = Some(current);
+        }
+    }
+
+    /// Tell the change observer about a readiness or directory change, once.
+    fn notify_change_observer(&self) {
+        let current = {
+            let state = self.state.lock().expect("membership state mutex poisoned");
+            (state.readiness.clone(), state.directory_revision)
+        };
+        let observer = {
+            let Ok(mut observed) = self.change_observer.lock() else {
+                return;
+            };
+            if observed.last.as_ref() == Some(&current) {
+                return;
+            }
+            observed.last = Some(current.clone());
+            observed.observer.clone()
+        };
+        if let Some(observer) = observer {
+            observer(&current.0);
         }
     }
 
@@ -1299,6 +1429,7 @@ impl MembershipRuntime {
                     deadline,
                     invalidation: CancellationToken::new(),
                     invalidation_reason: Arc::new(AtomicU8::new(0)),
+                    expiry: SharedAdmissionExpiry::new(deadline.expires_at),
                 };
                 if let Some(previous) = state.active_peers.insert(
                     identity.clone(),
@@ -1491,12 +1622,19 @@ impl MembershipRuntime {
                         && membership.record().record_version >= local_minimum_version
                 });
         let Some(local_membership) = local_membership else {
+            // Every record in the candidate verified; what is missing is a
+            // usable record for *this* node at or above the checkpoint's
+            // minimum version. That is `MissingLocalMembership`, the same
+            // condition as a checkpoint that does not name this node, and
+            // deliberately not `MembershipRejected`, which means a record
+            // failed verification: rejected evidence withdraws peer pins,
+            // this local condition retains them (M7-C86).
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
                 .await?;
             self.install_unready_candidate(
                 candidate_verifier,
-                MembershipUnreadyReason::MembershipRejected,
+                MembershipUnreadyReason::MissingLocalMembership,
                 checkpoint.checkpoint().checkpoint_version,
                 checkpoint_expiry,
                 checkpoint_received_wall,
@@ -1536,8 +1674,14 @@ impl MembershipRuntime {
                     PeerInvalidationReason::TrustExpired,
                 )
             } else {
+                // This relay's own certificate is not an approved key of its
+                // own record: a statement about this relay's right to serve,
+                // not about the peer keys it verified. Readiness, ownership
+                // and admission still fail closed; the peer pin set is
+                // retained (M7-C86). The *expired* local pin above stays
+                // `CheckpointExpired` and still withdraws.
                 (
-                    MembershipUnreadyReason::MembershipRejected,
+                    MembershipUnreadyReason::MissingLocalKey,
                     MembershipRuntimeError::PeerRejected,
                     PeerInvalidationReason::MembershipRevoked,
                 )
@@ -1595,6 +1739,22 @@ impl MembershipRuntime {
         state.verifier = candidate_verifier;
         state.readiness = MembershipReadiness::Ready;
         state.generation = state.generation.saturating_add(1);
+        let mut directory_versions = state
+            .verifier
+            .retained_memberships()
+            .into_iter()
+            .map(|membership| {
+                (
+                    membership.node_id().to_owned(),
+                    membership.record().record_version,
+                )
+            })
+            .collect::<Vec<_>>();
+        directory_versions.sort();
+        if directory_versions != state.directory_versions {
+            state.directory_versions = directory_versions;
+            state.directory_revision = state.directory_revision.saturating_add(1);
+        }
         state.checkpoint_version = Some(checkpoint.checkpoint().checkpoint_version);
         state.checkpoint_expires_at = Some(checkpoint_expiry);
         state.trust_expires_at = Some(trust_wall_expiry);
@@ -1602,6 +1762,7 @@ impl MembershipRuntime {
         state.last_verified_at = Some(checkpoint_received_wall);
         let invalidations = state.revalidate_active(
             checkpoint_received_wall,
+            checkpoint_received_mono,
             PeerInvalidationReason::MembershipChanged,
         );
         let snapshot = state.snapshot();
@@ -1804,6 +1965,10 @@ impl MembershipRuntime {
                 callback(invalidation.identity, invalidation.reason);
             }
         }
+        // Every state transition in this runtime is followed by a dispatch,
+        // even an empty one, so this is the one place a readiness or
+        // directory change is guaranteed to be observed.
+        self.notify_change_observer();
     }
 }
 
@@ -1929,14 +2094,31 @@ impl RuntimeState {
             .collect()
     }
 
+    /// Re-check every active admission against a freshly installed verified
+    /// directory.
+    ///
+    /// **M7-C80.** A re-signed record for an unchanged node, boot, key,
+    /// endpoint and server name, at a higher record version and with a trust
+    /// boundary that did not shrink, is the publisher renewing the authority
+    /// the admission already rests on. Invalidating it there killed every
+    /// in-flight peer stream at every routine re-sign. Such an admission is
+    /// now *re-bound*: it keeps its cancellation token, so the streams riding
+    /// it survive, and takes the new record version, the new binding and the
+    /// new deadline -- exactly what a fresh admission would get from the same
+    /// evidence, but never earlier than the deadline it already had.
+    ///
+    /// Anything else still invalidates: a binding that no longer verifies
+    /// (revoked or removed key), a changed key, endpoint or server name, a
+    /// shrunk signed boundary, or a passed deadline.
     fn revalidate_active(
         &mut self,
         now: DateTime<Utc>,
+        now_mono: Instant,
         default_reason: PeerInvalidationReason,
     ) -> Vec<Invalidation> {
         let mut invalidations = Vec::new();
         let peers = std::mem::take(&mut self.active_peers);
-        for (identity, peer) in peers {
+        for (identity, mut peer) in peers {
             let current = self.verifier.bind_peer(
                 &identity.node_id,
                 &identity.boot_id,
@@ -1950,7 +2132,7 @@ impl RuntimeState {
                 .find(|membership| membership.node_id() == identity.node_id.as_str())
                 .map(|membership| membership.record().record_version);
             let binding_changed = match current.as_ref() {
-                Ok(binding) => binding != peer.admission.binding(),
+                Ok(binding) => !same_peer_binding(binding, peer.admission.binding()),
                 Err(_) => true,
             };
             // Compare the signed wall-clock trust boundary. Recomputing a
@@ -1963,30 +2145,67 @@ impl RuntimeState {
                     expires_at.min(binding.valid_until())
                         < peer.admission.deadline.trust_expires_at()
                 });
-            if current.is_err()
-                || current_version.is_none()
-                || current_version != Some(peer.record_version)
-                || binding_changed
-                || trust_deadline_shrank
-                || peer.admission.deadline.is_expired()
-            {
-                invalidations.push(Invalidation {
-                    identity,
-                    token: peer.admission.invalidation,
-                    reason_cell: peer.admission.invalidation_reason,
-                    callback: self.callback.clone(),
-                    reason: if current.is_err() {
-                        PeerInvalidationReason::MembershipRevoked
-                    } else {
-                        default_reason
-                    },
-                });
-            } else {
-                self.active_peers.insert(identity, peer);
+            let version_regressed =
+                current_version.is_none_or(|version| version < peer.record_version);
+            match current {
+                Ok(binding)
+                    if !version_regressed
+                        && !binding_changed
+                        && !trust_deadline_shrank
+                        && !peer.admission.deadline.is_expired() =>
+                {
+                    let signed_boundary = self
+                        .trust_expires_at
+                        .map_or(binding.valid_until(), |expires_at| {
+                            expires_at.min(binding.valid_until())
+                        });
+                    let peer_deadline = monotonic_deadline(now, now_mono, binding.valid_until());
+                    let renewed = self
+                        .trust_deadline
+                        .map_or(peer_deadline, |deadline| deadline.min(peer_deadline))
+                        .max(peer.admission.deadline.expires_at);
+                    peer.admission.deadline = AdmissionDeadline {
+                        started_at: peer.admission.deadline.started_at,
+                        expires_at: renewed,
+                        trust_expires_at: signed_boundary,
+                    };
+                    peer.admission.expiry.set(renewed);
+                    peer.admission.binding = binding;
+                    if let Some(version) = current_version {
+                        peer.record_version = version;
+                    }
+                    self.active_peers.insert(identity, peer);
+                }
+                current => {
+                    invalidations.push(Invalidation {
+                        identity,
+                        token: peer.admission.invalidation,
+                        reason_cell: peer.admission.invalidation_reason,
+                        callback: self.callback.clone(),
+                        reason: if current.is_err() {
+                            PeerInvalidationReason::MembershipRevoked
+                        } else {
+                            default_reason
+                        },
+                    });
+                }
             }
         }
         invalidations
     }
+}
+
+/// Whether two verified bindings name the same peer authority: node, boot,
+/// key, SPKI, endpoint and server name. The signed validity window is
+/// deliberately excluded; a re-sign renewing it is compared separately as a
+/// trust boundary that must not shrink (M7-C80).
+fn same_peer_binding(left: &VerifiedPeerBinding, right: &VerifiedPeerBinding) -> bool {
+    left.node_id() == right.node_id()
+        && left.boot_id() == right.boot_id()
+        && left.key_id() == right.key_id()
+        && left.spki_sha256() == right.spki_sha256()
+        && left.peer_endpoint() == right.peer_endpoint()
+        && left.server_name() == right.server_name()
 }
 
 fn monotonic_deadline(

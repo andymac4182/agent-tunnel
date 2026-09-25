@@ -1696,28 +1696,19 @@ const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
 
 /// Install a recording invalidation callback on one relay.
 ///
-/// It **chains the fixture's own pin publication**, including the failed-closed
-/// handling and the `pin_publication_pending` latch (M7-C81), so installing it
-/// changes what the fixture records and nothing about what it does. A recorder
-/// that replaced the pin publication would have quietly turned this case into
-/// a second hint-drop gate.
+/// It **chains the relay's own shared pin publisher** (M7-C90), so installing
+/// it changes what the fixture records and nothing about what it does. A
+/// recorder that replaced the pin publication would have quietly turned this
+/// case into a second hint-drop gate.
 fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
-    let membership = Arc::clone(&relay.membership);
-    let pins = relay.pins.clone();
-    let pending = Arc::clone(&relay.pin_publication_pending);
+    let publisher = Arc::clone(&relay.pin_publisher);
     let ledger = Arc::clone(ledger);
     let observer = relay.node_id.clone();
     relay
         .membership
         .set_invalidation_callback(Some(Arc::new(move |identity, reason| {
             ledger.record(&observer, &identity.node_id, reason);
-            if let Err(error) = publish_verified_pins(&membership, &pins) {
-                tracing::warn!(?error, "key-rotation pin publication failed closed");
-                let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
-                pending.store(true, Ordering::SeqCst);
-            } else {
-                pending.store(false, Ordering::SeqCst);
-            }
+            publisher.publish();
         })));
 }
 
@@ -2420,7 +2411,7 @@ impl Gate<'_> {
         // of uncorrelated refusals.
         self.wait_owner_membership_ready().await?;
         for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
-            publish_verified_pins(&relay.membership, &relay.pins)?;
+            publish_verified_pins(&relay.pin_publisher)?;
         }
         self.wait_peers_ready().await?;
         self.settle_key_rotation_route().await?;
@@ -2757,12 +2748,9 @@ impl Gate<'_> {
         // --- half one: the pin withdrawal, on its own ---
         {
             let relay = self.cluster.relay("relay-c")?;
-            relay
-                .pins
-                .replace(std::iter::empty::<tunnel_transport::SpkiSha256>())
-                .map_err(|error| {
-                    HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
-                })?;
+            relay.pin_publisher.withdraw_and_hold().map_err(|error| {
+                HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
+            })?;
         }
         // Observed for a bounded window rather than asserted either way: the
         // point is to record what a pin withdrawal alone does to a stream that
@@ -2803,7 +2791,7 @@ impl Gate<'_> {
         self.cluster
             .set_peer_path_drop_from("relay-a", "relay-c", false)?;
         let relay = self.cluster.relay("relay-c")?;
-        super::publish_verified_pins(&relay.membership, &relay.pins)?;
+        super::publish_verified_pins(&relay.pin_publisher)?;
         // The route has to be answering again before the next case starts, or
         // that case would be measuring this one's recovery.
         self.wait_peers_ready().await?;

@@ -19,7 +19,6 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::OwnerClaim;
 use tunnel_client::{ConnectOptions, ConnectionHandle, ConnectionStatus, TransportProfile};
-use tunnel_transport::SpkiSha256;
 use uuid::Uuid;
 
 const PHASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -310,7 +309,7 @@ async fn run_with_proxy(
             "key-rotation gate began with empty relay-C peer pins".into(),
         ));
     }
-    if let Err(error) = relay.pins.replace(std::iter::empty::<SpkiSha256>()) {
+    if let Err(error) = relay.pin_publisher.withdraw_and_hold() {
         resume_data_direction(device_proxy, active_data_connection).await;
         let _ = stream.close().await;
         let _ = client.stop().await;
@@ -330,7 +329,7 @@ async fn run_with_proxy(
         ));
     }
     if let Err(error) = confirm_rotation_barrier(cluster, &client, &owner_before, &barrier).await {
-        let _ = publish_verified_pins(&relay.membership, &relay.pins);
+        let _ = publish_verified_pins(&relay.pin_publisher);
         resume_data_direction(device_proxy, active_data_connection).await;
         let _ = stream.close().await;
         let _ = client.stop().await;
@@ -351,7 +350,7 @@ async fn run_with_proxy(
     let stream_interrupted = match interrupted {
         Err(error) if is_expected_revocation_close(&error) => true,
         Err(error) => {
-            let _ = publish_verified_pins(&relay.membership, &relay.pins);
+            let _ = publish_verified_pins(&relay.pin_publisher);
             resume_data_direction(device_proxy, active_data_connection).await;
             let _ = client.stop().await;
             return Err(HarnessError::Process(format!(
@@ -359,7 +358,7 @@ async fn run_with_proxy(
             )));
         }
         Ok(()) => {
-            let _ = publish_verified_pins(&relay.membership, &relay.pins);
+            let _ = publish_verified_pins(&relay.pin_publisher);
             resume_data_direction(device_proxy, active_data_connection).await;
             let _ = client.stop().await;
             return Err(HarnessError::Process(
@@ -373,7 +372,7 @@ async fn run_with_proxy(
     let dispatch_after = match total_application_dispatches(cluster).await {
         Ok(dispatches) => dispatches,
         Err(error) => {
-            let _ = publish_verified_pins(&relay.membership, &relay.pins);
+            let _ = publish_verified_pins(&relay.pin_publisher);
             resume_data_direction(device_proxy, active_data_connection).await;
             let _ = client.stop().await;
             return Err(error);
@@ -381,7 +380,7 @@ async fn run_with_proxy(
     };
     let mut duplicate_response_rejected = dispatch_after.saturating_sub(dispatch_before) <= 1;
     if !duplicate_response_rejected {
-        let _ = publish_verified_pins(&relay.membership, &relay.pins);
+        let _ = publish_verified_pins(&relay.pin_publisher);
         resume_data_direction(device_proxy, active_data_connection).await;
         let _ = client.stop().await;
         return Err(HarnessError::Process(format!(
@@ -389,7 +388,7 @@ async fn run_with_proxy(
         )));
     }
 
-    if let Err(error) = publish_verified_pins(&relay.membership, &relay.pins) {
+    if let Err(error) = publish_verified_pins(&relay.pin_publisher) {
         resume_data_direction(device_proxy, active_data_connection).await;
         let _ = client.stop().await;
         return Err(error);

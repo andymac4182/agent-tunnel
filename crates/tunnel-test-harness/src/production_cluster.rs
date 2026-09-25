@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 use tunnel_catalog::{Catalog, OwnerClaimRequest, RedisMembershipPublisher, SharedCatalog};
 use tunnel_client::{ConnectOptions, ConnectionHandle, ConnectionStatus, TransportProfile};
 use tunnel_core::RotationConfig;
+use tunnel_relay::peer_pins::{PeerPinPublisher, PeerTrustTick, PinPublication, peer_trust_tick};
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
     ClusterConfig, ConsumerUpgradeBarrier, ControlAttachBarrier, ListenerSocketOptions,
@@ -344,6 +345,10 @@ use liveness::{
 };
 pub use liveness::{ProductionLivenessEvidence, validate_production_liveness_evidence};
 
+mod resign_stream;
+pub use resign_stream::{
+    ResignStreamEvidence, validate_resign_stream_evidence, verify as verify_resign_stream,
+};
 mod trust_expiry;
 pub use trust_expiry::{
     TrustExpiryEvidence, validate_trust_expiry_evidence, verify as verify_trust_expiry,
@@ -1562,9 +1567,9 @@ struct ProductionRelay {
     membership: Arc<MembershipRuntime>,
     membership_handle: Option<MembershipRuntimeHandle>,
     pins: SharedPeerPins,
-    /// Set when a membership invalidation's pin publication failed closed
-    /// because the runtime was momentarily not Ready (M7-C81).
-    pin_publication_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// The shared library wiring between membership and `pins` -- the same
+    /// publisher the serving relay installs (M7-C90).
+    pin_publisher: Arc<PeerPinPublisher>,
     peer_runtime: Arc<PeerRuntime>,
     peer_capacity: usize,
     consumer_socket_diagnostics: Option<AcceptedSocketDiagnostics>,
@@ -2504,9 +2509,7 @@ impl ProductionCluster {
         for relay in &mut relays {
             let cancel = CancellationToken::new();
             let task = tokio::spawn(peer_refresh_loop(
-                Arc::clone(&relay.membership),
-                relay.pins.clone(),
-                Arc::clone(&relay.pin_publication_pending),
+                Arc::clone(&relay.pin_publisher),
                 Arc::clone(&relay.peer_runtime),
                 relay.node_id.clone(),
                 relay.peer_capacity,
@@ -4475,12 +4478,9 @@ impl ProductionCluster {
             let _ = revoked_stream.close().await;
             return Err(error);
         }
-        relay
-            .pins
-            .replace(std::iter::empty::<SpkiSha256>())
-            .map_err(|error| {
-                HarnessError::Process(format!("revoking dynamic peer pins: {error}"))
-            })?;
+        relay.pin_publisher.withdraw_and_hold().map_err(|error| {
+            HarnessError::Process(format!("revoking dynamic peer pins: {error}"))
+        })?;
         sleep(Duration::from_millis(100)).await;
         let revoked_probe = async {
             let exchange = revoked_stream
@@ -4502,7 +4502,7 @@ impl ProductionCluster {
             }
         }
         .await;
-        let restore = publish_verified_pins(&relay.membership, &relay.pins);
+        let restore = publish_verified_pins(&relay.pin_publisher);
         if let Err(error) = restore {
             return Err(HarnessError::Process(format!(
                 "restoring dynamic peer pins after revocation probe: {error}"
@@ -5049,13 +5049,26 @@ impl ProductionCluster {
     /// boundaries instead of on a background timer.  It cannot be combined
     /// with [`Self::start_membership_resigning`].
     async fn resign_membership_now(&mut self) -> Result<u64> {
+        self.resign_membership_burst(1).await
+    }
+
+    /// Publish `count` consecutive re-signed record versions for every node
+    /// with no wait between them, then settle once on the last: the
+    /// back-to-back re-sign shape of M7-C81 and M7-C83.
+    async fn resign_membership_burst(&mut self, count: u64) -> Result<u64> {
+        if count == 0 {
+            return Err(HarnessError::InvalidInput(
+                "a membership re-sign burst needs at least one version".into(),
+            ));
+        }
         if self.membership_resign.is_some() {
             return Err(HarnessError::InvalidInput(
                 "membership re-signing is already running in the background".into(),
             ));
         }
         let inputs = &self.membership_resign_inputs;
-        let version = inputs.next_record_version;
+        let first_version = inputs.next_record_version;
+        let version = first_version.saturating_add(count - 1);
         let publisher =
             RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
                 .await
@@ -5071,37 +5084,39 @@ impl ProductionCluster {
             .iter()
             .map(|relay| relay.running.is_some() && !relay.pins.snapshot().is_empty())
             .collect();
-        let now = Utc::now();
-        for (identity, peer_endpoint) in &inputs.nodes {
-            let signed = self
-                .checkpoint_authority
-                .issuer
-                .sign_membership_identity(
-                    &inputs.deployment_id,
-                    &inputs.deployment_incarnation,
-                    identity,
-                    MembershipLifetimeOptions {
-                        record_version: version,
-                        peer_endpoint: *peer_endpoint,
-                        now,
-                        lifetime: M7_MEMBERSHIP_LIFETIME,
-                    },
-                )
-                .map_err(|error| {
-                    HarnessError::Pki(format!(
-                        "re-signing membership for {}: {error}",
-                        identity.node_id
-                    ))
-                })?;
-            publisher
-                .publish_signed_membership_for_node(&identity.node_id, &signed.catalog_record())
-                .await
-                .map_err(|error| {
-                    HarnessError::Redis(format!(
-                        "publishing membership for {}: {error}",
-                        identity.node_id
-                    ))
-                })?;
+        for record_version in first_version..=version {
+            let now = Utc::now();
+            for (identity, peer_endpoint) in &inputs.nodes {
+                let signed = self
+                    .checkpoint_authority
+                    .issuer
+                    .sign_membership_identity(
+                        &inputs.deployment_id,
+                        &inputs.deployment_incarnation,
+                        identity,
+                        MembershipLifetimeOptions {
+                            record_version,
+                            peer_endpoint: *peer_endpoint,
+                            now,
+                            lifetime: M7_MEMBERSHIP_LIFETIME,
+                        },
+                    )
+                    .map_err(|error| {
+                        HarnessError::Pki(format!(
+                            "re-signing membership for {}: {error}",
+                            identity.node_id
+                        ))
+                    })?;
+                publisher
+                    .publish_signed_membership_for_node(&identity.node_id, &signed.catalog_record())
+                    .await
+                    .map_err(|error| {
+                        HarnessError::Redis(format!(
+                            "publishing membership for {}: {error}",
+                            identity.node_id
+                        ))
+                    })?;
+            }
         }
         self.membership_resign_inputs.next_record_version = version.saturating_add(1);
         let nodes = self.membership_resign_inputs.nodes.len();
@@ -5163,7 +5178,7 @@ impl ProductionCluster {
 
     fn republish_peer_pins(&self) -> Result<()> {
         for relay in &self.relays {
-            publish_verified_pins(&relay.membership, &relay.pins)?;
+            publish_verified_pins(&relay.pin_publisher)?;
         }
         Ok(())
     }
@@ -5638,35 +5653,16 @@ async fn start_relay(
             .map_err(|error| HarnessError::Process(format!("peer readiness: {error}")))?,
     );
 
-    // Membership invalidation owns pin publication for this fixture.  Keep
-    // readiness route state under the authenticated peer probe loop: clearing
-    // every route for one invalidated admission races a legitimate v2
-    // refresh, and differs from the serving relay's callback contract.  The
-    // transport pin watcher still closes connections whose certificate is no
-    // longer approved; the next bounded probe records the affected route.
-    //
-    // A re-signed record can invalidate an admission while the runtime is
-    // momentarily not Ready.  That publication fails closed (empty pins), and
-    // nothing else republishes here, so every peer stayed untrusted for good
-    // (M7-C81).  The failure is remembered and retried by the refresh loop
-    // once the runtime is Ready again; an explicit withdrawal (which is not a
-    // failed publication) is still held.
-    let pin_membership = Arc::clone(&membership);
-    let pin_updates = pins.clone();
-    let pin_publication_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pending = Arc::clone(&pin_publication_pending);
-    membership.set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
-        if let Err(error) = publish_verified_pins(&pin_membership, &pin_updates) {
-            tracing::warn!(
-                ?error,
-                "production membership pin publication failed closed"
-            );
-            let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
-            pending.store(true, std::sync::atomic::Ordering::SeqCst);
-        } else {
-            pending.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    })));
+    // Pin publication is the serving relay's own wiring, from the library
+    // (M7-C90): the same rule (M7-C86's retention split, derived from
+    // verifier-filtered route targets), the same triggers -- every admission
+    // invalidation, every readiness transition and verified directory change
+    // (M7-C91) -- and the same refresh tick below. Readiness route state stays
+    // under the authenticated peer probe loop: clearing every route for one
+    // invalidated admission races a legitimate refresh. Gates that inject a
+    // pin withdrawal hold it through the publisher rather than racing it.
+    let pin_publisher = PeerPinPublisher::new(Arc::clone(&membership), pins.clone());
+    pin_publisher.install();
 
     // These are the listeners the gate-6 driver of `verify-m4-fs-client-e2e`
     // dials, and it dials them by loopback address: every endpoint in its plan
@@ -5849,7 +5845,7 @@ async fn start_relay(
             )),
         });
     }
-    if let Err(error) = publish_verified_pins(&membership, &pins) {
+    if let Err(error) = publish_verified_pins(&pin_publisher) {
         let cleanup = shutdown_membership_until(membership_handle, startup_cleanup_deadline).await;
         return Err(match cleanup {
             Ok(()) => error,
@@ -5925,7 +5921,7 @@ async fn start_relay(
         membership,
         membership_handle: Some(membership_handle),
         pins,
-        pin_publication_pending,
+        pin_publisher,
         peer_runtime,
         peer_capacity,
         consumer_socket_diagnostics,
@@ -6063,20 +6059,11 @@ impl PinWaitRelay for ProductionRelay {
     }
 
     fn retry_pending_publication(&self) {
-        if self
-            .pin_publication_pending
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && matches!(self.membership.readiness(), MembershipReadiness::Ready)
-            && publish_verified_pins(&self.membership, &self.pins).is_ok()
-        {
-            self.pin_publication_pending
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.pin_publisher.retry_pending();
     }
 
     fn publication_pending(&self) -> bool {
-        self.pin_publication_pending
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.pin_publisher.publication_pending()
     }
 
     fn pins_empty(&self) -> bool {
@@ -6253,38 +6240,25 @@ async fn wait_for_pins_over<R: PinWaitRelay>(
     }
 }
 
-fn publish_verified_pins(membership: &MembershipRuntime, pins: &SharedPeerPins) -> Result<()> {
-    let snapshot = membership.snapshot();
-    if !matches!(snapshot.readiness, MembershipReadiness::Ready) {
-        pins.replace(std::iter::empty::<SpkiSha256>())
-            .map_err(|error| {
-                HarnessError::Process(format!("publishing empty peer pins: {error}"))
-            })?;
-        return Err(HarnessError::Process(
-            "membership runtime is not Ready".into(),
-        ));
-    }
-    let mut digests = Vec::new();
-    for record in snapshot.memberships {
-        for digest in record.spki_sha256 {
-            digests.push(parse_spki_digest(&digest)?);
+/// Publish one relay's verified pins now through its shared publisher, ending
+/// any held fault-injection withdrawal. It fails unless the publication
+/// installed a set derived from a `Ready` runtime.
+fn publish_verified_pins(publisher: &PeerPinPublisher) -> Result<()> {
+    match publisher.release_hold() {
+        PinPublication::Published | PinPublication::PublishedEmpty | PinPublication::Coalesced => {
+            Ok(())
         }
+        outcome => Err(HarnessError::Process(format!(
+            "membership pins were not published from a Ready runtime: {outcome:?}"
+        ))),
     }
-    pins.replace(digests).map_err(|error| {
-        HarnessError::Process(format!("publishing verified peer pins: {error}"))
-    })?;
-    Ok(())
 }
 
 fn required_peer_routes(
     membership: &MembershipRuntime,
     local_node_id: &str,
 ) -> Vec<PeerRouteTarget> {
-    membership
-        .verified_peer_route_targets()
-        .into_iter()
-        .filter(|target| target.node_id() != local_node_id)
-        .collect()
+    tunnel_relay::peer_pins::required_peer_routes(membership, local_node_id)
 }
 
 /// Re-sign and republish every relay's membership record on a fixed interval.
@@ -6390,11 +6364,9 @@ async fn membership_resign_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The serving relay's peer-trust tick, shared from the library (M7-C90).
 async fn peer_refresh_loop(
-    membership: Arc<MembershipRuntime>,
-    pins: SharedPeerPins,
-    pin_publication_pending: Arc<std::sync::atomic::AtomicBool>,
+    publisher: Arc<PeerPinPublisher>,
     peer: Arc<PeerRuntime>,
     local_node_id: String,
     configured_capacity: usize,
@@ -6407,63 +6379,22 @@ async fn peer_refresh_loop(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = ticker.tick() => {
-                // Pin publication is driven by verified membership invalidation
-                // above.  Avoid refreshing it here so a focused key-revocation
-                // fixture can hold an explicit withdrawal until restoration;
-                // only a publication that failed closed is retried.
-                if pin_publication_pending.load(std::sync::atomic::Ordering::SeqCst)
-                    && matches!(membership.readiness(), MembershipReadiness::Ready)
-                    && publish_verified_pins(&membership, &pins).is_ok()
-                {
-                    pin_publication_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                if pins.snapshot().is_empty() {
-                    // No approved peer key material is published, so there is
-                    // no trust evidence to admit any peer.
-                    peer.withdraw_peer_trust();
-                    continue;
-                }
-                if !matches!(membership.readiness(), MembershipReadiness::Ready) {
-                    // Readiness and admission fail closed, but the verified
-                    // route and pin set stays installed so an authenticated
-                    // peer's bounded reachability probe is still answered.
-                    peer.withdraw_peer_readiness();
-                    continue;
-                }
-                peer.set_peer_capacity(configured_capacity);
-                let targets = required_peer_routes(&membership, &local_node_id);
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    result = peer.refresh_required_routes(targets) => {
-                        if let Err(error) = result {
-                            tracing::warn!(?error, "production peer readiness probe failed");
-                        }
-                    }
+                let tick = peer_trust_tick(
+                    &publisher,
+                    &peer,
+                    &local_node_id,
+                    configured_capacity,
+                    &shutdown,
+                )
+                .await;
+                if tick == PeerTrustTick::Shutdown {
+                    break;
                 }
             }
         }
     }
 }
 
-fn parse_spki_digest(value: &str) -> Result<SpkiSha256> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(HarnessError::Pki("invalid signed SPKI digest".into()));
-    }
-    let mut bytes = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (hex_value(chunk[0])? << 4) | hex_value(chunk[1])?;
-    }
-    Ok(SpkiSha256::from_bytes(bytes))
-}
-
-fn hex_value(value: u8) -> Result<u8> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(HarnessError::Pki("invalid hex digest".into())),
-    }
-}
 
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
