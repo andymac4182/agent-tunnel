@@ -278,12 +278,38 @@ declare, with no error and no log.
 
 What is **not** measured is any real backend: nothing has been probed, and the
 table's own "validate backend-specific coordinate and delta semantics" still
-stands as a warning about semantics rather than names. `display` is still sent
-on `screenshot` and `get_screen_size` knowing no backend declares it
-(`cua_pin::PARAMETERS_KNOWINGLY_DISCARDED`, consumer-visible half in M5-C12);
-`scroll`'s validated-but-inexpressible point is M5-C13; and the response side —
-`scale_percent`, `width` and `height`, none of which the released server sends —
-is M5-C14.
+stands as a warning about semantics rather than names. Three consumer-facing
+consequences of the pin were closed on `m5-code` without a desktop, each
+against the pinned 0.3.46 source rather than a probe:
+
+- **Display selection (M5-C12).** No pinned handler declares a display, so
+  `capture` and `screen_info` accept only the backend's default display
+  (`tunnel_cua::schema::SELECTABLE_DISPLAYS`). Any other index is refused
+  before dispatch with `NotDispatched::DisplayNotSelectable` instead of being
+  answered from the default display under the requested label. `display` is
+  still sent, always `0`, knowing no backend declares it
+  (`cua_pin::PARAMETERS_KNOWINGLY_DISCARDED`).
+- **`scroll` takes no position (M5-C13).** Every pinned backend scrolls at the
+  cursor. The consumer schema used to take a capture and a point, bounds-check
+  the point and then drop it; it now takes `dx`/`dy` only, and a request naming
+  a position is refused. A consumer that wants a position sends `move` first.
+  The sign is pinned beside the names: **positive `dy` scrolls up**, as the
+  macOS, Windows and VNC handlers state (`cua_pin::SCROLL_SIGN_CONVENTION`);
+  Linux states no convention and Android maps the amount onto a swipe, so on
+  those two it is inferred, not stated.
+- **Capture identity from what the server sends (M5-C14).** A released
+  `screenshot` answers `{success, image_data, format}` (VNC omits `format`) and
+  never sends `width`, `height` or a scale. The device reads the dimensions
+  from the PNG's `IHDR` (`tunnel_cua::image`), and takes the display scale
+  only from an explicit device declaration; with none, every coordinate on that
+  capture is refused with `CaptureRefusal::ScaleUndeclared` rather than
+  defaulted to 1x. The server cannot supply the scale: the macOS handler
+  resizes any capture wider than 1,920 px before encoding it, and its
+  `get_screen_size` reports the `ImageGrab` pixel size, so image width over
+  screen width measures that resize, not the point scale (and whether the
+  `ImageGrab` pixel size equals the input point space on a HiDPI display is
+  itself unmeasured). Where a real device
+  gets the declaration from is an owner decision that needs a probe (M5-C02).
 
 ### Authentication and platform limits
 

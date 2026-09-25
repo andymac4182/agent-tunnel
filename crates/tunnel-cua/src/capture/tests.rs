@@ -17,7 +17,7 @@ fn a_capture_carries_its_identity_dimensions_scale_and_target() {
     assert_eq!(identity.display(), 0);
     assert_eq!(identity.width(), 128);
     assert_eq!(identity.height(), 96);
-    assert_eq!(identity.scale_percent(), IDENTITY_SCALE_PERCENT);
+    assert_eq!(identity.scale_percent(), Some(IDENTITY_SCALE_PERCENT));
     assert_eq!(captures.resolve(identity.id(), &target).unwrap(), &identity);
 }
 
@@ -32,10 +32,16 @@ fn a_scaled_capture_converts_pixels_into_backend_points() {
     let mut captures = Captures::new();
     let identity = captures.record(&target(), 0, 256, 192, 200).unwrap();
 
-    assert_eq!(identity.to_backend_point(Point::new(100, 80)), (50, 40));
-    assert_eq!(identity.to_backend_point(Point::new(0, 0)), (0, 0));
+    assert_eq!(
+        identity.to_backend_point(Point::new(100, 80)),
+        Some((50, 40))
+    );
+    assert_eq!(identity.to_backend_point(Point::new(0, 0)), Some((0, 0)));
     // Truncating: pixel 101 is still inside backend point 50.
-    assert_eq!(identity.to_backend_point(Point::new(101, 81)), (50, 40));
+    assert_eq!(
+        identity.to_backend_point(Point::new(101, 81)),
+        Some((50, 40))
+    );
 
     // The control: at 1x the same arithmetic is the identity, so a test
     // written only against a 1x capture could not tell scaling from a
@@ -43,7 +49,10 @@ fn a_scaled_capture_converts_pixels_into_backend_points() {
     let unscaled = captures
         .record(&target(), 1, 128, 96, IDENTITY_SCALE_PERCENT)
         .unwrap();
-    assert_eq!(unscaled.to_backend_point(Point::new(100, 80)), (100, 80));
+    assert_eq!(
+        unscaled.to_backend_point(Point::new(100, 80)),
+        Some((100, 80))
+    );
 }
 
 /// The bounds check is half-open, so the pixel at `width` is outside.
@@ -204,6 +213,51 @@ fn impossible_capture_geometry_is_refused_rather_than_recorded() {
         .unwrap();
     assert_eq!(
         widest.to_backend_point(Point::new(MAX_CAPTURE_DIMENSION - 1, 0)),
-        ((MAX_CAPTURE_DIMENSION - 1) / 8, 0)
+        Some(((MAX_CAPTURE_DIMENSION - 1) / 8, 0))
+    );
+}
+
+/// **M5-C14: a capture whose scale nobody declared is recorded, bounds-checks,
+/// and refuses to place a point -- it never defaults to 1x.**
+#[test]
+fn an_undeclared_scale_is_refused_at_resolution_and_never_defaulted() {
+    let mut captures = Captures::new();
+    let target = target();
+    let identity = captures
+        .record_undeclared_scale(&target, 0, 256, 192)
+        .unwrap();
+    assert_eq!(identity.scale_percent(), None);
+    assert_eq!(identity.to_backend_point(Point::new(100, 80)), None);
+
+    // It is a real, current identity: resolving it succeeds...
+    assert_eq!(captures.resolve(identity.id(), &target).unwrap(), &identity);
+    // ...a point outside it is refused as outside, the more specific fact...
+    assert_eq!(
+        captures.resolve_point(identity.id(), &target, Point::new(256, 0)),
+        Err(CaptureRefusal::OutsideCapture)
+    );
+    // ...and a point inside it is refused for the missing scale.
+    assert_eq!(
+        captures.resolve_point(identity.id(), &target, Point::new(100, 80)),
+        Err(CaptureRefusal::ScaleUndeclared)
+    );
+
+    // The control: the same geometry with a declared scale resolves, so the
+    // refusal is the declaration and not the geometry.
+    let declared = captures.record(&target, 0, 256, 192, 200).unwrap();
+    assert!(
+        captures
+            .resolve_point(declared.id(), &target, Point::new(100, 80))
+            .is_ok()
+    );
+
+    // Geometry is still validated without a scale.
+    assert_eq!(
+        captures.record_undeclared_scale(&target, 0, 0, 1),
+        Err(GeometryError)
+    );
+    assert_eq!(
+        captures.record_undeclared_scale(&target, 0, MAX_CAPTURE_DIMENSION + 1, 1),
+        Err(GeometryError)
     );
 }

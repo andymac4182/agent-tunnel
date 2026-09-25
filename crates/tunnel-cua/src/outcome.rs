@@ -196,6 +196,19 @@ pub enum NotDispatched {
     /// The input lease or the capture identity refused the operation. Checked
     /// above the dispatch boundary; nothing was sent. See [`crate::plan`].
     InputAuthority(InputRefusal),
+    /// The request named a display the backend cannot select (M5-C12).
+    ///
+    /// Not a schema refusal: the index is well-formed. No pinned 0.3.46
+    /// handler's `screenshot` or `get_screen_size` declares a display, and the
+    /// released dispatcher discards the member, so a non-default display
+    /// would be answered from the backend's default display under the
+    /// requested label. See [`crate::schema::SELECTABLE_DISPLAYS`].
+    DisplayNotSelectable,
+    /// The consumer cancelled the operation **before a single byte of the
+    /// request was written** (M5-04). Nothing reached the backend, so a retry
+    /// is safe. A cancellation after writing began is
+    /// [`UnknownReason::Cancelled`] instead, never this.
+    Cancelled,
     /// The relay refused the request because the device-side peer was not
     /// ready: a rotation freeze, no active carrier, an unfenced owner.
     ///
@@ -303,6 +316,16 @@ pub enum UnknownReason {
     BackendRestarted,
     /// The exchange deadline expired after the request was fully written.
     DeadlineExpired,
+    /// **The consumer cancelled the operation after the request began to be
+    /// written** (M5-04).
+    ///
+    /// Cancellation abandons the answer, not the effect: once any byte of the
+    /// request may have left, the backend may have received all of it and
+    /// acted, and nothing will now tell us. So this is `Unknown`, never
+    /// retryable -- a cancelled click that is then "retried" is how it lands
+    /// twice. A cancellation before writing began is
+    /// [`NotDispatched::Cancelled`].
+    Cancelled,
     /// An HTTP status this profile has not reasoned about. Fails towards
     /// unknown on purpose.
     UnexpectedStatus { status: u16 },

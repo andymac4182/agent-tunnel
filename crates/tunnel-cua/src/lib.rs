@@ -87,6 +87,7 @@
 pub mod capability;
 pub mod capture;
 pub mod endpoint;
+pub mod image;
 pub mod json;
 pub mod lease;
 pub mod marker;

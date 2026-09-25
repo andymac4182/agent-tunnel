@@ -50,13 +50,23 @@
 //!    is the mechanism that frees it, and it must be driven by something that
 //!    learns the current revision.
 //!
-//! **That something does not exist today.** The device is not told that a
-//! grant was revoked — that is exactly M3-16 — so in the shipped shape both
-//! (1) and (2) are dormant: the revision the device holds never advances, so
-//! `check` never refuses and `reconcile_grant` is never called with anything
-//! that would drop an entry. The consequence, stated plainly rather than
-//! implied away: **a revoked consumer's lease persists for the life of the
-//! device-side tunnel session.** `docs/tasks.md` M5-C05 is that row; it is open.
+//! **Since M5-C05, learning a revision and freeing the target are one step.**
+//! The device-side facade (`tunnel_cua_fixture::client::SessionFacade::
+//! note_grant_revision`) records the revision and calls
+//! [`InputLeases::reconcile_grant`] under the same lock, so there is no window
+//! in which the device knows a holding is superseded and still honours it for
+//! exclusion. Ending a device-side session drops its leases outright
+//! ([`InputLeases::release_all_for_session`], via `DeviceState::end_session`),
+//! which is what M3-16 option (c) would do for a *revoked* grant.
+//!
+//! **What still does not exist is the delivery.** The device is not told that
+//! a grant moved — that is exactly M3-16, and choosing the signal is a queued
+//! protocol decision — so in the shipped shape the revision the device holds
+//! never advances and nothing ends a revoked session. The relay fences a
+//! revoked principal's traffic (M3-16 measured ~10 ms), so the holder cannot
+//! *use* the lease through the tunnel; what persists until delivery exists is
+//! the entry, which blocks other agents for the life of the device-side
+//! session. `docs/tasks.md` M5-C05 records both halves.
 //!
 //! Both mechanisms are nonetheless tested here against an explicitly supplied
 //! revision, so that when the signal arrives the behaviour is already pinned —
@@ -357,11 +367,11 @@ impl InputLeases {
     /// Drop every lease held by `session` under a revision older than
     /// `grant_revision`, and report which targets were freed.
     ///
-    /// **This is the M3-16 mechanism, and it has no caller in this repository.**
-    /// Nothing tells a device that a grant was revoked, so nothing supplies an
-    /// advanced revision. It is implemented and tested so that the open work is
-    /// the delivery of a revision rather than a policy decision nobody has
-    /// taken; M5-C05 is the row, and it is open.
+    /// **This is the M3-16 mechanism.** Since M5-C05 the device-side facade
+    /// calls it in the same step that records a new revision, so learning a
+    /// revision frees the target at once. Nothing yet *delivers* a revision to
+    /// a device -- that is the queued M3-16 protocol decision -- so the caller
+    /// itself has no production trigger; M5-C05 records it.
     pub fn reconcile_grant(
         &mut self,
         session: SessionId,
@@ -383,9 +393,10 @@ impl InputLeases {
 
     /// Drop every lease held by `session`, whatever its revision.
     ///
-    /// What a device-side session ending does to the leases it held. Also with
-    /// no caller in this chunk, for the same reason: there is no session
-    /// lifecycle here to hang it off.
+    /// What a device-side session ending does to the leases it held, and what
+    /// M3-16 option (c) -- ending the sessions of a revoked grant -- would do.
+    /// The device-side facade exposes it as `DeviceState::end_session`; nothing
+    /// delivers that signal yet (M5-C05).
     pub fn release_all_for_session(&mut self, session: SessionId) -> Vec<TargetSession> {
         let freed: Vec<TargetSession> = self
             .held

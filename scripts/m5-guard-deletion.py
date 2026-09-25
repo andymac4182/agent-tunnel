@@ -877,11 +877,14 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
                 # Re-pointed: the review round moved the multiplication into a
                 # `u64` intermediate. The rule is unchanged -- the conversion
                 # must happen -- and the replacement is the same pass-through.
-                "        (\n"
+                # Re-pointed again on `m5-code` (M5-C14): the conversion now
+                # returns `Option`, `None` for an undeclared scale; the
+                # replacement is still the pass-through.
+                "        Some((\n"
                 "            (point.x as u64 * identity / scale) as u32,\n"
                 "            (point.y as u64 * identity / scale) as u32,\n"
-                "        )",
-                "        (point.x, point.y)",
+                "        ))",
+                "        Some((point.x, point.y))",
             )
         ],
         False,
@@ -972,10 +975,15 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 PLAN,
-                "        capture.map_or((point.x, point.y), |identity| {\n"
-                "            identity.to_backend_point(point)\n"
-                "        })",
-                "        (point.x, point.y)",
+                # Re-pointed on `m5-code` (M5-C14): the conversion is fallible
+                # now, because an undeclared scale is refused rather than
+                # defaulted. The rule is unchanged -- the converted coordinate
+                # must be the one sent -- and the replacement is still the raw
+                # pixel.
+                "        Some(identity) => identity\n"
+                "            .to_backend_point(point)\n"
+                "            .ok_or(crate::capture::CaptureRefusal::ScaleUndeclared),",
+                "        Some(_) => Ok((point.x, point.y)),",
             )
         ],
         False,
@@ -1772,17 +1780,21 @@ CASES_C7: list[tuple[str, list[Edit], bool]] = [
         # cursor point under them passes every name assertion -- and scrolls
         # by the coordinate while discarding the deltas. Only the payload's
         # value is evidence here.
+        #
+        # Re-pointed on `m5-code` (M5-C13): `scroll` no longer carries a
+        # point to substitute, so the defeat now drops the deltas for
+        # constants. The rule it measures is the same -- the payload's `x`/`y`
+        # must be the consumer's deltas.
         "the scroll deltas may be dropped for the cursor point",
         [
             (
                 PLAN,
-                """        Params::Scroll { dx, dy, .. } => {
+                """        Params::Scroll { dx, dy } => {
             json!({"command": command, "params": {"x": dx, "y": dy}})
         }""",
-                """        Params::Scroll { point, dx, dy, .. } => {
+                """        Params::Scroll { dx, dy } => {
             let _ = (dx, dy);
-            let (x, y) = convert(*point);
-            json!({"command": command, "params": {"x": x, "y": y}})
+            json!({"command": command, "params": {"x": 0, "y": 0}})
         }""",
             )
         ],
@@ -1911,6 +1923,145 @@ CASES_C8: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# --------------------------------------------------------------- chunk 9
+#: `m5-code`: the rows closed without a desktop -- M5-C05 (the lease stops
+#: being honoured when the device learns a revision), M5-C12 (an unselectable
+#: display is refused), M5-C13 (`scroll` takes no position), M5-C14 (capture
+#: dimensions from the PNG the released server sends; no default scale) and
+#: M5-04 (a cancellation reports the stage it hit).
+#:
+#: **Every case here names its witness** in `WITNESSES` below, so none of them
+#: is credited to an unrelated red, and none is added to
+#: `scripts/guard_witness_debt.json`.
+IMAGE = CRATE / "src" / "image.rs"
+
+CASES_C9: list[tuple[str, list[Edit], bool]] = [
+    (
+        "M5-C05: learning a grant revision frees the lease it superseded in the same step",
+        [
+            (
+                CLIENT,
+                """        self.grant_revision = revision;
+        leases.reconcile_grant(self.session, revision)
+""",
+                """        self.grant_revision = revision;
+        let _ = &mut leases;
+        Vec::new()
+""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C12: a display no pinned backend can select is refused before dispatch",
+        [
+            (
+                PLAN,
+                """    if let Params::Capture { display } | Params::ScreenInfo { display } = request.params()
+        && !schema::SELECTABLE_DISPLAYS.contains(display)
+    {
+        return Err(Dispatch::NotDispatched(NotDispatched::DisplayNotSelectable));
+    }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C13: a scroll that names a position is refused rather than validated and dropped",
+        [
+            (
+                SCHEMA,
+                """        Operation::Scroll => &["dx", "dy"],""",
+                """        Operation::Scroll => &["capture", "x", "y", "dx", "dy"],""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C14: a capture with no declared scale refuses a coordinate at resolution",
+        [
+            (
+                CAPTURE,
+                """        if identity.scale_percent.is_none() {
+            return Err(CaptureRefusal::ScaleUndeclared);
+        }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C14: an undeclared scale is never defaulted to 1x in the conversion",
+        [
+            (
+                CAPTURE,
+                """        let Some(scale) = self.scale_percent else {
+            return None;
+        };
+""",
+                """        let scale = match self.scale_percent {
+            Some(scale) => scale,
+            None => IDENTITY_SCALE_PERCENT,
+        };
+""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C14: the device records an undeclared scale rather than assuming 1x",
+        [
+            (
+                CLIENT,
+                """            None => captures.record_undeclared_scale(&self.target, display, width, height),""",
+                """            None => captures.record(&self.target, display, width, height, 100),""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C14: capture dimensions are read from the PNG the released server sends",
+        [
+            (
+                CLIENT,
+                """        let Ok((width, height)) = tunnel_cua::image::capture_dimensions(result) else {""",
+                """        let Ok((width, height)) = Err::<(u32, u32), ()>(()) else {""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C14: a PNG header whose CRC does not match is refused",
+        [
+            (
+                IMAGE,
+                """    if crc32(&header[12..29]) != recorded {
+        return Err(ImageHeaderError::BadCrc);
+    }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-04: a cancellation after writing began is unknown, never not dispatched",
+        [
+            (
+                CLIENT,
+                """        began.store(true, std::sync::atomic::Ordering::SeqCst);
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+]
+
+
 @dataclass
 class Suite:
     name: str
@@ -1966,6 +2117,16 @@ SUITES: list[Suite] = [
         [CRATE, EXPORT, FIXTURE, DEADMAN],
         C4_CARGO_TEST,
         CASES_C8,
+        build=C4_BUILD,
+    ),
+    # `m5-code`. The export crate is in the test set because the supervision
+    # tests in `tunnel-cua-fixture` drive it, and in the restore set only for
+    # symmetry with `m5c8`; no case here mutates it.
+    Suite(
+        "m5c9",
+        [CRATE, EXPORT, FIXTURE],
+        C4_CARGO_TEST,
+        CASES_C9,
         build=C4_BUILD,
     ),
 ]
@@ -2072,7 +2233,8 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: The test(s) each case's deleted guard must make redden, keyed by
 #: `(suite, case)`.
 #:
-#: **Empty, and deliberately so (task row M4-23).**  A witness is a
+#: **Empty for suites `m5c2`..`m5c8`, and deliberately so (task row M4-23);
+#: `m5c9` is written with its witnesses from the start.**  A witness is a
 #: measurement -- the test that actually reddens when *this* guard is deleted,
 #: one `cargo test` per case -- and it cannot be read off the case's text.
 #: Filling this in by writing a plausible test name beside each case would
@@ -2084,7 +2246,61 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: keeps the old unattributed classification, and is reported as owing a
 #: witness.  Moving a case out of that ledger and into this table is the unit
 #: of progress; the ledger can only shrink, and a case may not appear in both.
-WITNESSES: dict[tuple[str, str], frozenset[str]] = {}
+WITNESSES: dict[tuple[str, str], frozenset[str]] = {
+    # `m5c9` is the first suite in this harness written with its witnesses,
+    # each measured by running the case and reading which test reddened.
+    (
+        "m5c9",
+        "M5-C05: learning a grant revision frees the lease it superseded in the same step",
+    ): frozenset(
+        {"a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_learns_of_it"}
+    ),
+    (
+        "m5c9",
+        "M5-C12: a display no pinned backend can select is refused before dispatch",
+    ): frozenset(
+        {
+            "plan::tests::a_display_no_pinned_backend_can_select_is_refused_before_dispatch",
+            "the_ledger_equals_the_commands_that_were_dispatched_and_nothing_more",
+        }
+    ),
+    (
+        "m5c9",
+        "M5-C13: a scroll that names a position is refused rather than validated and dropped",
+    ): frozenset(
+        {
+            "plan::tests::a_scroll_that_names_a_position_is_refused_rather_than_silently_not_honoured"
+        }
+    ),
+    (
+        "m5c9",
+        "M5-C14: a capture with no declared scale refuses a coordinate at resolution",
+    ): frozenset(
+        {"capture::tests::an_undeclared_scale_is_refused_at_resolution_and_never_defaulted"}
+    ),
+    (
+        "m5c9",
+        "M5-C14: an undeclared scale is never defaulted to 1x in the conversion",
+    ): frozenset(
+        {"capture::tests::an_undeclared_scale_is_refused_at_resolution_and_never_defaulted"}
+    ),
+    (
+        "m5c9",
+        "M5-C14: the device records an undeclared scale rather than assuming 1x",
+    ): frozenset({"a_capture_whose_scale_nobody_declared_refuses_every_coordinate"}),
+    (
+        "m5c9",
+        "M5-C14: capture dimensions are read from the PNG the released server sends",
+    ): frozenset({"a_capture_identity_and_its_display_scale_flow_into_the_click"}),
+    (
+        "m5c9",
+        "M5-C14: a PNG header whose CRC does not match is refused",
+    ): frozenset({"image::tests::every_malformed_header_is_refused_by_name"}),
+    (
+        "m5c9",
+        "M5-04: a cancellation after writing began is unknown, never not dispatched",
+    ): frozenset({"a_cancelled_click_reports_what_is_known_and_is_never_repeated"}),
+}
 
 #: The pinned ledger, loaded once.
 DEBT = load_witness_debt('m5-guard-deletion')
