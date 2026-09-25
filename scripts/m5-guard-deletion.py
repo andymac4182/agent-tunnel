@@ -2319,6 +2319,13 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
         "m5c9",
         "M5-C05: ending a session releases the leases it holds",
     ): frozenset({"ending_a_session_releases_its_lease_and_only_its_lease"}),
+    # The first `m5c7` case to earn a witness (M5-C13 review follow-up). Its
+    # defeat replaces the scroll deltas with constants, and the test that
+    # pins the payload's `x`/`y` to the consumer's deltas is what reddens.
+    (
+        "m5c7",
+        "the scroll deltas may be dropped for constants",
+    ): frozenset({"plan::tests::every_input_operation_plans_its_canonical_command_and_payload"}),
 }
 
 #: The pinned ledger, loaded once.
