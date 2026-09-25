@@ -19,7 +19,13 @@ The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call ser
 **Status: M1, M2 and M7 are locally verified against the gate each declared;
 M3, M4, M8, M5 and M6 are not complete. See [the roadmap](docs/roadmap.md) for
 the current state, which supersedes the historical figures below.** Outside
-testers start with [the operator guide](docs/operator.md). On
+testers start with [the operator guide](docs/operator.md). **Windows is a
+client-only, locked-checks target:** `tunnel-client` and `tunnel-deadman` build
+and pass the locked checks there, but the relay and `tunnel-client credentials
+create`/`import` refuse to run on Windows, so the M1 real-socket acceptance
+covers Linux and macOS only (task row M1-04). **Device certificates cannot be
+renewed in this alpha** (M6-C56): re-enrol a device before its certificate
+expires. On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe

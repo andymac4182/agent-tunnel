@@ -244,10 +244,14 @@ results above are unchanged by it.
 | `50b12df` | 36006258279, `M1 real-socket acceptance (macOS, Redis)` 107655066592 | macos-latest (macos-26-arm64), Homebrew Redis 8.10.1 started by the job | the `redis_catalog` tests and `verify` as above; the two restart scripts need Docker and are Linux-only | success; same acceptance line |
 | `50b12df` | 36006258279, `Rust (ubuntu-latest)`, `Rust (macos-latest)`, `Rust (windows-latest)` | ubuntu-24.04, macos-26-arm64, windows-2025-vs2026 | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace --all-targets --locked --no-fail-fast` (Windows adds `--exclude tunnel-relay`, M6-C83); the example-configuration dry runs | success on all three |
 
-There is **no Windows M1 acceptance**: the relay refuses to start off Unix
-(M6-C83) and credential creation and import are unsupported there. Whether
-Windows is advertised as a client-only target is an open owner decision on
-M1-04. Before `4aab5c4` the hosted acceptance was **not reliably green**: its
+There is **no Windows M1 acceptance, by owner decision**: the relay refuses to
+start off Unix (M6-C83) and credential creation and import are unsupported
+there. On 2026-09-25 the owner chose M1-04's option (a): **the M1 real-socket
+acceptance is scoped to the Unix targets (Linux and macOS), and Windows is a
+client-only, locked-checks target** -- the formatter, strict Clippy and the
+workspace tests (without `tunnel-relay`) run there on hosted CI, and the relay
+and `credentials create`/`import` refuse there. `x86_64-pc-windows-msvc` stays
+in `advertised-targets` as the device half only. Before `4aab5c4` the hosted acceptance was **not reliably green**: its
 pre-body admission assertion failed on four hosted Linux runs and, at `64863b5`,
 on macOS (run 36097122395, job 107951664801). That was M6-C85, a harness
 ordering race and not a relay defect. A held request was counted as holding
@@ -283,7 +287,7 @@ cargo test --workspace --locked
 The local macOS arm64 checks and full M1 acceptance passed as recorded above.
 CI must run these locked checks on its supported Linux, macOS, and Windows
 jobs, build the workspace binaries, and keep the Redis-backed acceptance result
-visible. Hosted CI results are linked in this document. Report
+visible on Linux and macOS (Windows is client-only; M1-04). Hosted CI results are linked in this document. Report
 M7 cluster routing, HA failover, and any unexecuted platform job as pending.
 
 Diagnostics use a versioned structured envelope with `schema_version`, command,

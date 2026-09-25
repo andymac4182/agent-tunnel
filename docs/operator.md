@@ -14,6 +14,20 @@ diagnostics the binaries have today. **Where the alpha cannot do something,
 this guide says "not supported in this alpha" and names the task row, instead of
 describing a procedure the code does not have.**
 
+> **Known limitation: device certificate renewal.** A device certificate
+> cannot be renewed in this alpha (task row M6-C56, deferred by owner
+> decision on 2026-09-25). `credentials import` refuses to replace an
+> installed certificate, and the relay's catalog keeps the **first**
+> certificate's expiry, so even a hand-installed renewal stops being accepted
+> at the original expiry. **Re-enrol the device before its certificate
+> expires**: create a new key and CSR in a new profile, have it issued, add
+> it as a new device, with a new device UUID, by `tunnel-relay add-device`
+> (with `add-service` and `set-grant` for its export and grant; section 2.5),
+> switch `connect` to the new profile, then `revoke-device` the old device.
+> The earliest expiry this affects is the dogfood credential's catalog
+> expiry, 2026-12-22; renewal must be resolved before certificates issued to
+> testers approach expiry.
+
 ## How this guide is tested
 
 Every command in a `console` block below is executed, as written, by
@@ -77,6 +91,8 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
 | Adding users, devices, services and grants after the first provisioning, replacing a grant, and revoking a grant, device or credential | Supported while `serve` runs, with `add-user`, `add-device`, `add-service`, `set-grant`, `revoke-grant`, `revoke-device` and `revoke-credential` (section 2.5); a second tenant, and changing or deactivating a user or service, are **not supported in this alpha** | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
+| Device certificate renewal | **Not supported in this alpha**: re-enrol before the certificate expires (see the known limitation above) | M6-C56 |
+| Windows | **Client-only**: `tunnel-client` and `tunnel-deadman` build and pass the locked checks; the relay, `credentials create` and `credentials import` refuse there, and the M1 real-socket acceptance runs on Linux and macOS only (section 1) | M1-04 |
 | Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
 | Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
 | Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** in general. One piece is nonetheless mixed-version safe by design: the statuses a cluster owner uses to refuse a forwarded device session, so a new relay never turns an older one's transient refusal into a terminal device exit ([runtime.md](runtime.md), M6-C38) | M6-C23 |
@@ -103,6 +119,11 @@ maintainer who built it with `scripts/m6-release-artifact.py bundle`.
 device half, and a Windows build of `tunnel-relay` exits 2 at once with
 `tunnel-relay: the relay runs only on Linux and macOS; on Windows, run the
 device binaries (tunnel-client) instead` (task row M6-C83).
+**Windows is a client-only, locked-checks target** (task row M1-04, owner
+decision 2026-09-25): hosted CI runs the formatter, strict Clippy and the
+workspace tests there, but the relay and `credentials create`/`credentials
+import` refuse to run on Windows, so the M1 real-socket acceptance is run on
+the Unix targets (Linux and macOS) only.
 
 **The bundle carries no documentation**, not even this guide (M6-C50). Read
 this guide and every document it links from the repository at the `commit`
@@ -277,8 +298,9 @@ relay also needs the device's CA in its `device_tls_client_ca` file, and a
 matching device and credential record in the Redis catalog, which section 2.3
 creates. Certificate renewal and self-service enrollment are not implemented
 (`credentials renew` and `enroll` in
-[runtime.md](runtime.md#proposed-cli-surface); the renewal shape is an open
-owner decision, M6-C56 and M0-03).
+[runtime.md](runtime.md#proposed-cli-surface); renewal is deferred by owner
+decision, M6-C56, and its shape is still open under M0-03). **Re-enrol before
+the certificate expires**; see the known limitation at the top of this guide.
 
 `credentials import` never leaves the profile half-updated by a **refusal**
 (M6-C55). It checks both destinations before writing either, writes each under

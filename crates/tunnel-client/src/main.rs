@@ -117,11 +117,16 @@ impl Cause {
     /// * `2` — the invocation or the configuration document is wrong; fix
     ///   local input. Nothing was attempted.
     /// * `3` — the credential or the authorization behind it was refused.
-    ///   `AUTHORIZATION_STALE` belongs here and not in the generic bucket:
-    ///   the documented meaning is "untrusted credentials / authorization
-    ///   denied", and the fix is to re-authorize, not to retry.
+    ///   Nothing else: a retry cannot help, and the fix is to re-enroll or
+    ///   re-authorize.
     /// * `4` — the relay or the network could not be reached, or closed the
     ///   session. A retry is meaningful once reachability returns.
+    ///   `AUTHORIZATION_STALE` belongs here and not at `3` (M6-C39, owner
+    ///   decision 2026-09-25): it is produced only when a stream's
+    ///   operation-authorization window lapsed before its queued frame was
+    ///   written, so the session was failed and restarted. Nothing about the
+    ///   credential or grant was refused; the likeliest cause is a stalled or
+    ///   congested data path, and the reconnect loop already retries it.
     /// * `5` — a bounded deadline elapsed.
     /// * `7` — the work was **refused before dispatch**: the device owner
     ///   slot is already held, or a bounded local budget was exhausted. No
@@ -147,8 +152,8 @@ impl Cause {
     fn exit_code(self) -> u8 {
         match self {
             Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => 2,
-            Self::CredentialError | Self::AuthorizationStale => 3,
-            Self::TransportError | Self::SessionClosed => 4,
+            Self::CredentialError => 3,
+            Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
             Self::OwnerBusy | Self::ResourceExhausted => 7,
             Self::Cancelled => 130,
@@ -2023,7 +2028,7 @@ mod tests {
                 3,
             ),
             (ClientError::HandshakeTimeout, "DEADLINE_EXCEEDED", 5),
-            (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 3),
+            (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 4),
             (ClientError::QueueLimit, "RESOURCE_EXHAUSTED", 7),
             (ClientError::OpenRetentionFull, "RESOURCE_EXHAUSTED", 7),
             (ClientError::Cancelled, "CANCELLED", 130),
@@ -2073,8 +2078,8 @@ mod tests {
         );
         assert_ne!(
             stale, internal,
-            "a stale authorization is not an internal failure: the operator \
-             re-authorizes"
+            "a lapsed stream authorization window is not an internal failure: \
+             the operator checks the data path and retries"
         );
         assert_ne!(
             owner_busy, cancelled,
@@ -2086,7 +2091,10 @@ mod tests {
         // distinct values, including nonsense ones, so pin the table too.
         assert_eq!(owner_busy, 7, "refused before dispatch");
         assert_eq!(cancelled, 130, "interrupted before orderly completion");
-        assert_eq!(stale, 3, "authorization denied");
+        assert_eq!(
+            stale, 4,
+            "a lapsed stream authorization window is transport class (M6-C39)"
+        );
         assert_eq!(internal, 1, "unexpected internal failure");
     }
 
