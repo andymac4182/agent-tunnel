@@ -3518,3 +3518,208 @@ async fn forwarded_rotation_freeze_refusal_keeps_its_distinct_reason() {
         fixture.shutdown().await;
     }
 }
+
+/// Task row M7-C110, at the owner.  A forwarded request whose envelope names
+/// an owner token this relay no longer holds (a superseded session of the same
+/// owner relay) must be answered on its own stream with the typed, retryable
+/// `OWNER_CHANGED` admission marker.  Before the fix the owner returned before
+/// any response, quinn finished the stream bare, and the ingress's HTTP/3
+/// client raised `H3_FRAME_UNEXPECTED` as a CONNECTION error, taking down every
+/// other request multiplexed on that peer connection.  So a healthy carrier is
+/// opened first on the same connection and must survive the refusal.
+#[tokio::test]
+async fn a_superseded_owner_token_is_refused_owner_changed_on_its_own_stream() {
+    let fixture = H3PeerFixture::new().await;
+    let target = register_control(&fixture, DEVICE_SPKI, device_id(), "m7c110-target").await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+
+    let owner = current_target_owner(&fixture).await;
+    let mut carrier = open_raw(&fixture, InternalRoute::DeviceData).await;
+    admit_device_data(
+        &mut carrier,
+        &owner.token,
+        &target_ticket,
+        "m7c110-carrier-request",
+        "m7c110-carrier-stream",
+    )
+    .await;
+    wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    drain_control_queue(&mut target_rx).await;
+
+    // The same owner relay, an earlier session: a token the catalog no
+    // longer names, exactly what a stale ingress route cache carries.
+    let mut superseded = owner.token.clone();
+    superseded.session_id = "m7c110-superseded-session".to_owned();
+    let mut refused = open_raw(&fixture, InternalRoute::DeviceData).await;
+    let envelope = device_envelope(
+        InternalRoute::DeviceData,
+        "m7c110-superseded-request",
+        "m7c110-superseded-stream",
+        &superseded,
+    );
+    refused
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &envelope.encode().expect("encode superseded envelope"),
+        ))
+        .await
+        .expect("send superseded envelope");
+
+    let response = timeout(Duration::from_secs(3), refused.recv_response())
+        .await
+        .expect("superseded request response deadline")
+        .expect("a superseded owner token must be answered with response headers");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header("x-agent-tunnel-admission").as_deref(),
+        Some("owner_changed")
+    );
+    assert_eq!(
+        header("x-agent-tunnel-execution").as_deref(),
+        Some("not_dispatched")
+    );
+    assert_eq!(header("x-agent-tunnel-retryable").as_deref(), Some("true"));
+
+    // The healthy carrier multiplexed on the same peer connection survives.
+    let after = wait_snapshot_for(&fixture.handle, Duration::from_secs(3), &mut |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    assert!(find_session(&after, device_id()).is_some());
+
+    refused.cancel();
+    drop(refused);
+    carrier.cancel();
+    drop(carrier);
+    fixture.shutdown().await;
+}
+
+/// Task row M7-C110, at the ingress.  The ingress resolved and cached an
+/// owner route; the device then reattached to the same owner relay under a new
+/// epoch.  Opening through the stale route reaches the production owner, which
+/// refuses `OWNER_CHANGED`; the ingress must surface the typed, retryable,
+/// `not_dispatched` outcome and drop the cached route so the consumer's retry
+/// performs a fresh lookup.  Before the fix the refusal was a connection-level
+/// HTTP/3 error, the consumer saw an `unknown` outcome, and the stale route
+/// stayed cached.
+#[tokio::test]
+async fn the_ingress_drops_a_stale_route_on_owner_changed_and_answers_typed() {
+    let fixture = H3PeerFixture::new().await;
+    let claim = |session_id: &str| OwnerClaimRequest {
+        deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+        tenant_id: tenant_id(),
+        device_id: device_id(),
+        node_id: DESTINATION_NODE.to_owned(),
+        boot_id: DESTINATION_BOOT.to_owned(),
+        session_id: session_id.to_owned(),
+        lease_expires_at: Utc::now() + ChronoDuration::minutes(5),
+    };
+    let first = fixture
+        .catalog
+        .claim_owner(&claim("m7c110-first"))
+        .await
+        .expect("claim the first owner session");
+    let scope = OwnerScope::new(tenant_id(), device_id());
+    let stale_route = fixture
+        .runtime
+        .resolve(scope, Utc::now())
+        .await
+        .expect("resolve and cache the first owner route");
+    assert_eq!(stale_route.owner_token(), &first.token);
+    assert_eq!(
+        fixture
+            .runtime
+            .owner_router()
+            .cached_owner_epoch(scope)
+            .await,
+        Some(first.token.epoch),
+        "the ingress cached the first route"
+    );
+
+    assert!(
+        fixture
+            .catalog
+            .release_owner(&first.token)
+            .await
+            .expect("release the first owner session")
+    );
+    let second = fixture
+        .catalog
+        .claim_owner(&claim("m7c110-second"))
+        .await
+        .expect("claim the second owner session");
+    assert!(second.token.epoch > first.token.epoch);
+
+    let envelope = consumer_envelope(
+        "m7c110-stale-request",
+        "m7c110-stale-stream",
+        stale_route.owner_token(),
+        &fixture.consumer_token,
+    );
+    let exchange = fixture
+        .runtime
+        .open(&stale_route, envelope)
+        .await
+        .expect("open through the stale route");
+    let (_send, mut recv) = exchange.split();
+    let error = timeout(Duration::from_secs(3), recv.accept_response())
+        .await
+        .expect("stale route response deadline")
+        .expect_err("the owner refuses a superseded owner token");
+    assert!(
+        matches!(
+            error,
+            PeerRuntimeError::OwnerChanged {
+                retry_after_ms: 250
+            }
+        ),
+        "unexpected ingress error {error:?}"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .owner_router()
+            .cached_owner_epoch(scope)
+            .await,
+        None,
+        "OWNER_CHANGED must drop the stale cached route"
+    );
+    let response = crate::http::peer_failure_response(error);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("bounded refusal body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("refusal JSON");
+    assert_eq!(body["code"], "OWNER_CHANGED");
+    assert_eq!(body["execution"], "not_dispatched");
+    assert_eq!(body["retryable"], true);
+
+    let fresh = fixture
+        .runtime
+        .resolve(scope, Utc::now())
+        .await
+        .expect("a retry resolves afresh");
+    assert_eq!(fresh.owner_token(), &second.token);
+    fixture.shutdown().await;
+}

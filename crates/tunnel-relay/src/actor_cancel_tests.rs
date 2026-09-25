@@ -90,6 +90,7 @@ fn cancel_fixture(
         dispatched: true,
         authorization_in_flight: false,
         deferred_authorization: None,
+        abandon: super::UnaryAbandon::default(),
     };
     actor
         .sessions

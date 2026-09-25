@@ -29,7 +29,7 @@ pub const PEER_FAULT_STAGES: [&str; 11] = [
     "owner",
 ];
 /// The relay's closed peer fault cause vocabulary.
-pub const PEER_FAULT_CAUSES: [&str; 27] = [
+pub const PEER_FAULT_CAUSES: [&str; 28] = [
     "no_live_owner",
     "catalog",
     "membership",
@@ -54,6 +54,7 @@ pub const PEER_FAULT_CAUSES: [&str; 27] = [
     "owner_not_ready",
     "rotation_freeze",
     "capacity",
+    "owner_changed",
     "membership_expired",
     "closed",
     "deadline",

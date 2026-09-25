@@ -358,11 +358,18 @@ async fn mismatched_pending_challenge_fails_the_operation_promptly_with_its_type
             }
             other => panic!("{mismatch:?}: the operation must fail promptly: {other:?}"),
         }
+        // Task row M7-C94: on an M2 session the refused operation is
+        // answered at once but retained, abandoned, until the connector's
+        // own terminal proves its stream ended and it can be forgotten.
         assert!(
-            !actor.sessions[&fixture.key.scope()]
+            actor.sessions[&fixture.key.scope()]
                 .pending
-                .contains_key(&stream_id),
-            "{mismatch:?}: the refused pending operation must be reclaimed"
+                .get(&stream_id)
+                .is_some_and(|pending| pending.abandon.abandoned
+                    && !pending.dispatched
+                    && pending.body.is_empty()),
+            "{mismatch:?}: the refused pending operation must be answered and abandoned, \
+             never dispatched"
         );
         match drain_control(&mut control_rx).as_slice() {
             [ControlMessage::AuthorizationInvalidated(invalidated)] => {

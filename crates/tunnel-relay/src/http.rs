@@ -3059,58 +3059,112 @@ async fn handle_peer_ingress_inner(
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
     let now = Utc::now();
-    let owner = catalog
+    // Every refusal before the stream is split is answered on this request's
+    // own stream (task row M7-C110); see `reject_owner_changed`.
+    let owner = match catalog
         .current_owner(destination.tenant_id, destination.device_id, now)
         .await
-        .map_err(|_| PeerRuntimeError::Membership("owner catalog unavailable".to_owned()))?
-        .ok_or_else(|| PeerRuntimeError::Membership("owner is unavailable".to_owned()))?;
+    {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            // The owner the request named no longer holds the device.
+            let _ = request.reject_owner_changed().await;
+            return Err(PeerRuntimeError::OwnerChanged {
+                retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,
+            });
+        }
+        Err(_) => {
+            let _ = request.reject_owner_not_ready().await;
+            return Err(PeerRuntimeError::Membership(
+                "owner catalog unavailable".to_owned(),
+            ));
+        }
+    };
     if owner.token != destination.owner_token
         || owner.token.node_id != local_node_id
         || owner.token.boot_id != local_boot_id
     {
-        return Err(PeerRuntimeError::Membership(
-            "peer request is not for this owner".to_owned(),
-        ));
+        // Task row M7-C110: answer on this request's own stream with the
+        // typed, retryable OWNER_CHANGED before returning.  Returning bare
+        // let quinn finish the stream with no response headers, which the
+        // ingress's HTTP/3 client raises as a connection error, taking down
+        // every other request multiplexed on that peer connection.
+        let _ = request.reject_owner_changed().await;
+        return Err(PeerRuntimeError::OwnerChanged {
+            retry_after_ms: crate::peer_runtime::OWNER_NOT_READY_RETRY_AFTER_MS,
+        });
     }
     if owner.lease_expires_at <= now {
         // The claim is this relay's, but its Redis lease has lapsed: a
         // distinct bounded stage from an owner mismatch.
         fault.mark(PeerOpenDiagnosticStage::Lease);
+        // The claim is still this relay's; the lease renewal may catch up.
+        let _ = request.reject_owner_not_ready().await;
         return Err(PeerRuntimeError::Membership(
             "peer owner lease has expired".to_owned(),
         ));
     }
-    let verified_peer = VerifiedPeerIdentity::from_verified_peer_binding(request.binding())
-        .map_err(|_| PeerRuntimeError::Membership("peer envelope rejected".to_owned()))?;
+    let Ok(verified_peer) = VerifiedPeerIdentity::from_verified_peer_binding(request.binding())
+    else {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+        return Err(PeerRuntimeError::Membership(
+            "peer envelope rejected".to_owned(),
+        ));
+    };
     let owner_access = match &envelope.request {
         InternalRequest::ConsumerStreams(stream) => {
             let authorization = format!("Bearer {}", stream.bearer.token());
-            Some(
-                oidc.authenticate_for_scope(
+            match oidc
+                .authenticate_for_scope(
                     &*catalog,
                     &authorization,
                     Some(destination.tenant_id),
                     &stream.required_scope,
                 )
                 .await
-                .map_err(|_| {
-                    PeerRuntimeError::Membership("consumer authentication failed".to_owned())
-                })?,
-            )
+            {
+                Ok(access) => Some(access),
+                Err(_) => {
+                    let _ = request.reject_refused(StatusCode::UNAUTHORIZED).await;
+                    return Err(PeerRuntimeError::Membership(
+                        "consumer authentication failed".to_owned(),
+                    ));
+                }
+            }
         }
         _ => None,
     };
-    envelope
+    if envelope
         .validate(now, &verified_peer, &destination, owner_access.as_ref())
-        .map_err(|_| PeerRuntimeError::Membership("peer envelope rejected".to_owned()))?;
+        .is_err()
+    {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+        return Err(PeerRuntimeError::Membership(
+            "peer envelope rejected".to_owned(),
+        ));
+    }
 
     match envelope.request.clone() {
         InternalRequest::DeviceControl(request_body) => {
-            let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
+            let device =
+                match resolve_peer_device(&catalog, &request_body.authentication, now).await {
+                    Ok(device) => device,
+                    Err(error) => {
+                        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                        return Err(error);
+                    }
+                };
             handle_peer_device_control(request, handle.clone(), device, fault).await
         }
         InternalRequest::DeviceData(request_body) => {
-            let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
+            let device =
+                match resolve_peer_device(&catalog, &request_body.authentication, now).await {
+                    Ok(device) => device,
+                    Err(error) => {
+                        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                        return Err(error);
+                    }
+                };
             handle_peer_device_data(request, handle.clone(), device, fault).await
         }
         InternalRequest::ConsumerStreams(request_body)
@@ -3122,7 +3176,7 @@ async fn handle_peer_ingress_inner(
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
             })?;
-            let (grant, capabilities) = owner_stream_grant_of_type(
+            let (grant, capabilities) = match owner_stream_grant_of_type(
                 &catalog,
                 &access.consumer,
                 destination.device_id,
@@ -3131,7 +3185,14 @@ async fn handle_peer_ingress_inner(
                 crate::HTTP_FORWARD_SERVICE_TYPE,
                 crate::HTTP_FORWARD_OPERATION,
             )
-            .await?;
+            .await
+            {
+                Ok(granted) => granted,
+                Err(error) => {
+                    let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                    return Err(error);
+                }
+            };
             // The owner selects the profile from its own catalog read, never
             // from the forwarding relay's choice.
             let export = http_forward
@@ -3154,14 +3215,21 @@ async fn handle_peer_ingress_inner(
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
             })?;
-            let grant = owner_stream_grant(
+            let grant = match owner_stream_grant(
                 &catalog,
                 &access.consumer,
                 destination.device_id,
                 destination.service_id,
                 access.expires_at,
             )
-            .await?;
+            .await
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+                    return Err(error);
+                }
+            };
             handle_peer_consumer_stream(
                 request,
                 handle.clone(),
@@ -4534,6 +4602,9 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
         PeerRuntimeError::Capacity { retry_after_ms } => {
             return stream_limit_response(retry_after_ms);
         }
+        PeerRuntimeError::OwnerChanged { retry_after_ms } => {
+            return owner_changed_response(retry_after_ms);
+        }
         PeerRuntimeError::RemoteStatus(_)
         | PeerRuntimeError::Transport(_)
         | PeerRuntimeError::Envelope(_)
@@ -4624,6 +4695,31 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
             code: "PEER_UNAVAILABLE",
             execution: "not_dispatched",
             message: "selected owner is not ready; retry after the bounded hint",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The answer for a request the selected peer refused because it no longer
+/// holds the owner token this relay resolved (task row M7-C110).  Nothing was
+/// dispatched and this relay has dropped its cached route, so a consumer
+/// retry performs a fresh authoritative owner lookup (docs/cluster.md: the
+/// relay never reselects an owner itself).
+fn owner_changed_response(retry_after_ms: u64) -> Response {
+    let retry_after_ms = retry_after_ms.clamp(1, OWNER_NOT_READY_RETRY_AFTER_MS.max(1));
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: "OWNER_CHANGED",
+            execution: "not_dispatched",
+            message: "the device's owner relay changed; retry after the bounded hint",
             retryable: Some(true),
             retry_after_ms: Some(retry_after_ms),
         }),

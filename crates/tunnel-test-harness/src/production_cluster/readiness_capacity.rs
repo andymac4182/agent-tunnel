@@ -1673,6 +1673,7 @@ fn peer_admission_harness_error(stage: &str, error: PeerRuntimeError) -> Harness
         PeerRuntimeError::Capacity { .. } => "owner_capacity",
         PeerRuntimeError::OwnerNotReady { .. } => "owner_not_ready",
         PeerRuntimeError::RotationFreeze { .. } => "rotation_freeze",
+        PeerRuntimeError::OwnerChanged { .. } => "owner_changed",
         PeerRuntimeError::RemoteStatus(status) => {
             return HarnessError::Http(format!(
                 "peer-capacity {stage} failed with owner status {}",
