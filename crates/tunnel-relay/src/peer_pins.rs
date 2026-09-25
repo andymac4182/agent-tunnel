@@ -40,8 +40,8 @@ pub enum PinPublication {
     /// installed and both peer directions now fail closed.
     PublishedEmpty,
     /// The membership runtime was not `Ready` for a local or transient
-    /// reason, so no fresh set could be derived and the previously verified
-    /// one was left installed.
+    /// reason, so the previously published set was kept -- narrowed to the
+    /// keys the installed verifier still approves, never widened.
     RetainedWhileUnready,
     /// The membership runtime was not `Ready` because the trust evidence
     /// itself was rejected, so the pin set was withdrawn.
@@ -74,7 +74,28 @@ impl Error for PinDerivationError {}
 enum PinDecision {
     Install(Vec<SpkiSha256>),
     Withdraw,
-    Retain,
+    /// Keep the installed set, but only the part of it that the installed
+    /// verifier still approves right now: retention may shrink the set and
+    /// never keep a key the newest verified evidence revoked or removed.
+    Retain(Vec<SpkiSha256>),
+}
+
+fn approved_digests(
+    targets: Vec<crate::PeerRouteTarget>,
+) -> Result<Vec<SpkiSha256>, PinDerivationError> {
+    let mut digests = Vec::new();
+    for target in targets {
+        for digest in target.approved_spki_sha256() {
+            let bytes = decode_hex_digest(digest).ok_or_else(|| {
+                PinDerivationError(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid membership SPKI digest",
+                )))
+            })?;
+            digests.push(SpkiSha256::from_bytes(bytes));
+        }
+    }
+    Ok(digests)
 }
 
 /// Derive the pin decision for the runtime's current state without touching
@@ -87,7 +108,9 @@ fn derive_pins(membership: &MembershipRuntime) -> Result<PinDecision, PinDerivat
             return Ok(PinDecision::Withdraw);
         }
         MembershipReadiness::Starting | MembershipReadiness::Unready(_) => {
-            return Ok(PinDecision::Retain);
+            return Ok(PinDecision::Retain(approved_digests(
+                membership.currently_approved_peer_route_targets(),
+            )?));
         }
     }
     // Derive the pin set from current, verifier-filtered route targets rather
@@ -95,19 +118,9 @@ fn derive_pins(membership: &MembershipRuntime) -> Result<PinDecision, PinDerivat
     // bounded historical key metadata, so publishing it could retain an
     // expired/revoked SPKI in the transport trust set until the next full
     // candidate swap.
-    let mut digests = Vec::new();
-    for target in membership.verified_peer_route_targets() {
-        for digest in target.approved_spki_sha256() {
-            let bytes = decode_hex_digest(digest).ok_or_else(|| {
-                PinDerivationError(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid membership SPKI digest",
-                )))
-            })?;
-            digests.push(SpkiSha256::from_bytes(bytes));
-        }
-    }
-    Ok(PinDecision::Install(digests))
+    Ok(PinDecision::Install(approved_digests(
+        membership.verified_peer_route_targets(),
+    )?))
 }
 
 fn apply_pins(
@@ -115,7 +128,21 @@ fn apply_pins(
     decision: PinDecision,
 ) -> Result<PinPublication, PinDerivationError> {
     match decision {
-        PinDecision::Retain => Ok(PinPublication::RetainedWhileUnready),
+        PinDecision::Retain(approved) => {
+            // Intersect: keep an installed pin only while the installed
+            // verifier still approves it. Replace only when that shrinks the
+            // set, so an unchanged retention does not bump the revision.
+            let current = pins.snapshot();
+            let kept = approved
+                .into_iter()
+                .filter(|pin| current.contains(*pin))
+                .collect::<std::collections::BTreeSet<_>>();
+            if kept.len() != current.len() {
+                pins.replace(kept)
+                    .map_err(|error| PinDerivationError(Box::new(error)))?;
+            }
+            Ok(PinPublication::RetainedWhileUnready)
+        }
         PinDecision::Withdraw => {
             if !pins.snapshot().is_empty() {
                 tracing::warn!("membership trust evidence was rejected; withdrawing peer pins");

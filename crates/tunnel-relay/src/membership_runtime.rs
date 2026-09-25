@@ -717,24 +717,29 @@ pub struct PeerAdmissionCancellation {
 /// earlier than a boundary already observed and never extended by a cache hit,
 /// a late response or a clock correction.
 #[derive(Clone, Debug)]
-struct SharedAdmissionExpiry(Arc<Mutex<Instant>>);
+struct SharedAdmissionExpiry(Arc<Mutex<(Instant, Option<DateTime<Utc>>)>>);
 
 impl SharedAdmissionExpiry {
-    fn new(expires_at: Instant) -> Self {
-        Self(Arc::new(Mutex::new(expires_at)))
+    fn new(expires_at: Instant, trust_expires_at: Option<DateTime<Utc>>) -> Self {
+        Self(Arc::new(Mutex::new((expires_at, trust_expires_at))))
     }
 
-    fn get(&self) -> Instant {
+    fn load(&self) -> (Instant, Option<DateTime<Utc>>) {
         match self.0.lock() {
             Ok(guard) => *guard,
             Err(poisoned) => *poisoned.into_inner(),
         }
     }
 
-    fn set(&self, expires_at: Instant) {
+    fn get(&self) -> Instant {
+        self.load().0
+    }
+
+    fn set(&self, expires_at: Instant, trust_expires_at: DateTime<Utc>) {
+        let value = (expires_at, Some(trust_expires_at));
         match self.0.lock() {
-            Ok(mut guard) => *guard = expires_at,
-            Err(poisoned) => *poisoned.into_inner() = expires_at,
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => *poisoned.into_inner() = value,
         }
     }
 }
@@ -762,7 +767,7 @@ impl PeerAdmissionCancellation {
         Self {
             token,
             reason: Arc::new(AtomicU8::new(0)),
-            expires_at: Some(SharedAdmissionExpiry::new(expires_at)),
+            expires_at: Some(SharedAdmissionExpiry::new(expires_at, None)),
         }
     }
 
@@ -786,7 +791,10 @@ impl PeerAdmissionCancellation {
     }
 
     /// Return the admission's monotonic trust deadline when the provider
-    /// exposed one.  It is never extended after construction.
+    /// exposed one.  It is shared with the runtime's active-admission table,
+    /// so it reads the current value: a successful reconcile that re-binds an
+    /// unchanged admission to fresh signed evidence moves it later (M7-C80),
+    /// and nothing else ever moves it.
     #[must_use]
     pub fn expires_at(&self) -> Option<Instant> {
         self.expires_at.as_ref().map(SharedAdmissionExpiry::get)
@@ -819,7 +827,9 @@ impl PeerAdmissionCancellation {
 pub type PeerInvalidationCallback = Arc<dyn Fn(PeerIdentity, PeerInvalidationReason) + Send + Sync>;
 
 /// A monotonic deadline attached to one admission.  It is never extended by a
-/// Redis cache hit, a late HTTP response or a wall-clock correction.
+/// Redis cache hit, a late HTTP response or a wall-clock correction; only a
+/// successful reconcile re-binding the admission to freshly verified signed
+/// evidence for the same key moves it, and never earlier (M7-C80).
 #[derive(Clone, Copy, Debug)]
 pub struct AdmissionDeadline {
     started_at: Instant,
@@ -890,9 +900,17 @@ impl PeerAdmission {
         &self.binding
     }
 
+    /// The admission's current deadline, read through the same shared cell
+    /// its streams read, so a clone never reports a boundary the runtime has
+    /// since re-bound (M7-C80).
     #[must_use]
     pub fn deadline(&self) -> AdmissionDeadline {
-        self.deadline
+        let (expires_at, trust_expires_at) = self.expiry.load();
+        AdmissionDeadline {
+            started_at: self.deadline.started_at,
+            expires_at,
+            trust_expires_at: trust_expires_at.unwrap_or(self.deadline.trust_expires_at),
+        }
     }
 
     #[must_use]
@@ -1287,6 +1305,26 @@ impl MembershipRuntime {
         if !matches!(state.readiness, MembershipReadiness::Ready) {
             return Vec::new();
         }
+        Self::route_targets_at(&state, now)
+    }
+
+    /// Route targets the *installed* verifier approves at `now`, whatever this
+    /// runtime's own readiness (M7-C86).
+    ///
+    /// A local or transient unready state retains the published pin set, but
+    /// only as far as the newest verified evidence still approves it: an
+    /// unready candidate is installed *with* its verified records, so a peer
+    /// key that candidate revoked, removed or let expire is not approved here
+    /// and must leave the retained set at once. Empty without a fresh
+    /// checkpoint.
+    #[must_use]
+    pub fn currently_approved_peer_route_targets(&self) -> Vec<PeerRouteTarget> {
+        let now = Utc::now();
+        let state = self.state.lock().expect("membership state mutex poisoned");
+        Self::route_targets_at(&state, now)
+    }
+
+    fn route_targets_at(state: &RuntimeState, now: DateTime<Utc>) -> Vec<PeerRouteTarget> {
         let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
             return Vec::new();
         };
@@ -1429,7 +1467,10 @@ impl MembershipRuntime {
                     deadline,
                     invalidation: CancellationToken::new(),
                     invalidation_reason: Arc::new(AtomicU8::new(0)),
-                    expiry: SharedAdmissionExpiry::new(deadline.expires_at),
+                    expiry: SharedAdmissionExpiry::new(
+                        deadline.expires_at,
+                        Some(deadline.trust_expires_at),
+                    ),
                 };
                 if let Some(previous) = state.active_peers.insert(
                     identity.clone(),
@@ -2169,7 +2210,7 @@ impl RuntimeState {
                         expires_at: renewed,
                         trust_expires_at: signed_boundary,
                     };
-                    peer.admission.expiry.set(renewed);
+                    peer.admission.expiry.set(renewed, signed_boundary);
                     peer.admission.binding = binding;
                     if let Some(version) = current_version {
                         peer.record_version = version;
@@ -2737,6 +2778,7 @@ mod tests {
             )),
             expires_at: Some(SharedAdmissionExpiry::new(
                 Instant::now() - Duration::from_millis(1),
+                None,
             )),
         };
         revoked_after_deadline.token().cancel();
