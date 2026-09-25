@@ -1278,6 +1278,24 @@ FREEZE_HOLD_CASES: list[Case] = [
         ],
         frozenset({HOLD + "an_open_during_a_freeze_is_admitted_after_commit"}),
     ),
+    Case(
+        # A reorder, not a deletion: the review of #156 asked for the case
+        # that releases the hold before the flush.  The witness sees the
+        # release find the frozen record still queued.
+        "a commit releases the hold only after it flushes the frozen writes",
+        [
+            (
+                ACTOR,
+                "        self.flush_frozen_writes(key);\n"
+                "        // Then admit the OPENs held across the freeze, in arrival order.\n"
+                "        self.service_held_scope(&key.scope(), tokio::time::Instant::now());\n",
+                "        // Then admit the OPENs held across the freeze, in arrival order.\n"
+                "        self.service_held_scope(&key.scope(), tokio::time::Instant::now());\n"
+                "        self.flush_frozen_writes(key);\n",
+            )
+        ],
+        frozenset({HOLD + "an_open_during_a_freeze_is_admitted_after_commit"}),
+    ),
 ]
 
 #: **M3-31: an HTTP stream's owner STREAM_FORGET is published by its own

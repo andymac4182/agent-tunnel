@@ -408,9 +408,12 @@ impl RelayActor {
                 Release::Recovery => self.freeze_hold.counters.released_on_recovery += 1,
             }
             // Order: every caller settles the hold after the writer's frozen
-            // DATA/FIN/RESET were flushed, so nothing admitted from the hold
-            // overtakes them. This counts a release that found deferred writes
-            // still queued on the session (frozen or credit-parked).
+            // DATA/FIN/RESET were flushed, so on the data carrier nothing
+            // admitted from the hold is sequenced ahead of them.  The held
+            // OPEN itself travels on the control socket, which has no order
+            // relative to the data carrier.  This counts a release that found
+            // deferred writes still queued on the session (frozen or
+            // credit-parked).
             if !matches!(release, Release::Recovery)
                 && self.sessions.get(scope).is_some_and(|session| {
                     session.streams.values().any(|stream| {
