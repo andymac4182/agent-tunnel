@@ -1133,8 +1133,10 @@ def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
     #: m5-guard-deletion's 100 -> 591; fs-guard-deletion's gate2, gate3,
     #: gate4, gate5 and gate9-epoch-change (160) -> 431; acp-guard-deletion's
     #: seven suites less three unwitnessable cases (141) -> 290;
-    #: fs-guard-deletion's gate7, gate8, gate10 and gate11 (127) -> 163.
-    PINNED_WITNESS_DEBT = 163
+    #: fs-guard-deletion's gate7, gate8, gate10 and gate11 (127) -> 163;
+    #: its gate6-adapters, gate6-e2e, gate12, gate13 and gate14 (160) -> 3.
+    #: The 3 left are acp cases that no run could witness (M4-42).
+    PINNED_WITNESS_DEBT = 3
 
     directory = Path(__file__).resolve().parent
     ledger = json.loads(WITNESS_DEBT_FILE.read_text())
