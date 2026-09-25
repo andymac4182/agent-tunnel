@@ -157,6 +157,7 @@ async fn start() -> (std::net::SocketAddr, Signer) {
         None,
         None,
         Some(crate::http::forward::HttpForwardExports::new()),
+        None,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");

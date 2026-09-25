@@ -14712,6 +14712,9 @@ pub struct RunningRelay {
     peer_runtime: Option<Arc<crate::PeerRuntime>>,
     peer_diagnostics: Option<Arc<PeerServerDiagnostics>>,
     peer_planned_cancel: Option<CancellationToken>,
+    /// A single relay's Redis authority state (M6-C67), for the private
+    /// metrics listener.
+    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
     pub consumer_addr: std::net::SocketAddr,
     pub device_addr: std::net::SocketAddr,
 }
@@ -14726,6 +14729,23 @@ struct BeyondFenceObservation {
 }
 
 impl RunningRelay {
+    /// Serve the private metrics listener (task row M6-C24) on `listener`
+    /// until this relay is cancelled.  Plain HTTP, `GET /metrics` only, with
+    /// aggregate, payload-free series (see `metrics.rs`); it shares no route
+    /// with the public consumer or device listeners.  The caller decides the
+    /// address; `serve` accepts only a loopback or private one.  Connections
+    /// are capped, and each has a request-head and a lifetime deadline
+    /// ([`crate::metrics::serve_bounded`]).
+    pub fn serve_metrics(&self, listener: TcpListener) -> JoinHandle<Result<(), std::io::Error>> {
+        let router = crate::metrics::router(
+            self.handle.clone(),
+            self.peer_runtime.clone(),
+            self.authority.clone(),
+        );
+        let cancel = self.cancel.child_token();
+        tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
+    }
+
     /// Return the same redacted, in-process diagnostics as [`RelayHandle`].
     /// The listener wrapper intentionally adds no unauthenticated debug
     /// route; harnesses holding the running value can inspect counters
@@ -14873,6 +14893,13 @@ pub struct ListenerSocketOptions {
     /// validated on the owner relay (gate 5).  `ServeConfig` fills it from
     /// its `[http_forward]` table; `None` answers 404.
     pub http_forward: Option<crate::http::forward::HttpForwardExports>,
+    /// Task row M6-C67: follow the Redis authority in `/readyz` on a relay
+    /// without a peer runtime.  A bounded background check
+    /// ([`crate::authority_readiness`]) publishes the authority's state and
+    /// `/readyz` reads it.  `ServeConfig` sets it for every relay without
+    /// `[cluster]`; a relay with a peer runtime ignores it, so cluster
+    /// readiness is unchanged.  Library callers default to `false`.
+    pub authority_readiness: bool,
 }
 
 impl Relay {
@@ -15087,6 +15114,13 @@ impl Relay {
             } else {
                 (None, None, None, None)
             };
+        let authority =
+            (listener_options.authority_readiness && peer_runtime.is_none()).then(|| {
+                crate::authority_readiness::AuthorityReadiness::spawn(
+                    catalog.clone(),
+                    cancel.child_token(),
+                )
+            });
         let consumer_router = http::consumer_router_with_peer_and_barriers(
             handle.clone(),
             catalog.clone(),
@@ -15096,6 +15130,7 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
             listener_options.http_forward.clone(),
+            authority.clone(),
         );
         let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
@@ -15139,6 +15174,7 @@ impl Relay {
             peer_runtime,
             peer_diagnostics,
             peer_planned_cancel,
+            authority,
             consumer_addr,
             device_addr,
         })

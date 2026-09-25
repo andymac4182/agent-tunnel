@@ -846,6 +846,7 @@ pub fn consumer_router_with_peer_and_barrier(
         consumer_upgrade_barrier,
         None,
         None,
+        None,
     )
 }
 
@@ -863,6 +864,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
 ) -> Router {
     let state = HttpState {
         handle,
@@ -881,7 +883,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         http_forward,
     };
     Router::new()
-        .merge(health::router::<HttpState>(state.peer.clone()))
+        .merge(health::router::<HttpState>(state.peer.clone(), authority))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{device}/services", get(list_services))
         .route("/v1/devices/{device}/services/{service}/echo", post(echo))
@@ -2402,6 +2404,7 @@ static CONSUMER_REFUSAL_LOG: std::sync::LazyLock<tunnel_transport::log_limit::Re
 /// a count or an identifier the relay resolved itself; the token, its claims,
 /// the request path and the body are never logged.
 pub(crate) fn log_consumer_refusal(route: &'static str, refusal: &ConsumerRefusal) {
+    crate::metrics::count_consumer_refusal(route, refusal.stage);
     log_consumer_refusal_with(&CONSUMER_REFUSAL_LOG, route, refusal);
 }
 
@@ -2436,6 +2439,7 @@ pub(crate) fn log_consumer_grant_refusal(
     device_id: Uuid,
     service_id: Option<Uuid>,
 ) {
+    crate::metrics::count_consumer_refusal(crate::metrics::route_label(route), "grant");
     tracing::info!(
         phase = "consumer_refused",
         route,

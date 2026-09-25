@@ -4,9 +4,21 @@
 //! never hides a transport failure behind a generic reconnecting pool.  The
 //! command that observes the failure returns it, so authorization, ownership
 //! and recovery callers keep their fail-closed and unknown-outcome semantics;
-//! nothing is replayed and nothing reconnects in the background.  A lane
-//! re-establishes its connection only for a *later* command, and only after
-//! repeating the bounded PING/INFO identity check used at startup.
+//! nothing is replayed.  A lane re-establishes its connection only when a
+//! *later* command needs it, and only after repeating the bounded PING/INFO
+//! identity check used at startup.
+//!
+//! **Reconnect budget (M6-C74).**  That reconnect has the full
+//! `REDIS_CONNECT_TIMEOUT` for DNS, TCP, TLS and `AUTH` -- a cold lookup on a
+//! fresh machine alone can exceed the two-second command deadline -- so it
+//! runs as one single-flight task per lane, started by the command that found
+//! the lane without a connection and never holding the lane lock while it
+//! connects.  Every caller, the one that started it included, waits for it at
+//! most its own `REDIS_OPERATION_TIMEOUT` and otherwise fails closed with the
+//! ordinary timeout; the task keeps going and installs its connection for the
+//! next command, but only while the lane still has no connection and the
+//! attempt is still the lane's current one.  At most one reconnect is in
+//! flight per lane, and its whole run is bounded by [`LANE_RECONNECT_BUDGET`].
 //!
 //! A primary whose `run_id` differs from the one the catalog is bound to has
 //! restarted, been restored or been replaced.  The lanes of one catalog share
@@ -52,7 +64,8 @@
 //! command.
 //!
 //! A lane does not serialize its callers.  The lane lock is held only across
-//! the bounded probe or reconnect that verifies the physical connection;
+//! the bounded probe that verifies the physical connection (never across a
+//! reconnect, see above);
 //! every caller then runs its own command on a handle to that multiplexed
 //! connection, so concurrent commands pipeline on one socket and the
 //! per-command deadline measures the authority's reply, never the time spent
@@ -70,11 +83,11 @@ use std::{
 };
 
 use redis::{FromRedisValue, RedisError, aio::MultiplexedConnection};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use super::{
-    BOUND_RUN_MARKER, REDIS_OPERATION_TIMEOUT, bound_run_id, eval_command,
-    open_verified_connection, redis_timeout,
+    BOUND_RUN_MARKER, REDIS_CONNECT_TIMEOUT, REDIS_OPERATION_TIMEOUT, bound_run_id,
+    connection_config, eval_command, open_verified_connection_with, redis_timeout,
 };
 use crate::{CatalogConnectionError, CatalogError, UnknownWriteCause};
 
@@ -101,6 +114,18 @@ pub(crate) const CONTINUITY_MISMATCH: &str = "Redis authority continuity token";
 /// read with `CONFIG GET`), so a continuity token proves nothing (M6-C65).
 pub(crate) const PERSISTENCE_UNSOUND: &str =
     "Redis persistence does not make acknowledged writes durable";
+
+/// The whole of one lane reconnect: opening the connection within
+/// [`REDIS_CONNECT_TIMEOUT`], the PING/INFO identity check, and the run
+/// re-binding decision, each of the last three bounded by
+/// [`REDIS_OPERATION_TIMEOUT`] (M6-C74).
+const LANE_RECONNECT_BUDGET: Duration = REDIS_CONNECT_TIMEOUT
+    .saturating_add(REDIS_OPERATION_TIMEOUT)
+    .saturating_add(REDIS_OPERATION_TIMEOUT)
+    .saturating_add(REDIS_OPERATION_TIMEOUT);
+
+/// Outcome of one lane reconnect: `None` while in flight.
+type ReconnectOutcome = Option<Result<(), CatalogError>>;
 
 /// Most continuity tokens whose write outcome is unknown that a witness keeps
 /// as candidates.  Beyond it the oldest is forgotten, which can only make a
@@ -456,12 +481,50 @@ struct LaneState {
     /// caller that observed a loss on an older connection cannot release one
     /// that a sibling caller has since re-established.
     connection_generation: u64,
+    /// The reconnect in flight, if any: at most one per lane (M6-C74).
+    reconnect: Option<ReconnectAttempt>,
+    /// Numbers reconnect attempts, so a finishing attempt installs its
+    /// connection only while it is still the lane's current one.
+    reconnect_epoch: u64,
+}
+
+/// One single-flight lane reconnect running outside the lane lock.
+struct ReconnectAttempt {
+    epoch: u64,
+    /// `None` while in flight; the attempt's outcome once it has finished
+    /// and, on success, installed its connection.
+    outcome: watch::Receiver<ReconnectOutcome>,
+    abort: tokio::task::AbortHandle,
+}
+
+/// What [`AuthorityLane::verify`] found.
+enum Verified {
+    Ready(Admitted),
+    /// The lane has no connection and a reconnect is in flight.
+    Reconnecting(watch::Receiver<ReconnectOutcome>),
 }
 
 pub(super) struct AuthorityLane {
     client: redis::Client,
+    /// The redis-rs configuration a reconnect uses: production is
+    /// `connection_config(REDIS_CONNECT_TIMEOUT)`.
+    connect_config: redis::AsyncConnectionConfig,
     group: Arc<LaneGroup>,
-    state: Mutex<LaneState>,
+    state: Arc<Mutex<LaneState>>,
+}
+
+impl Drop for AuthorityLane {
+    /// A dropped lane abandons its in-flight reconnect instead of leaving a
+    /// task to finish a connection nobody will use.  The task only takes the
+    /// lock briefly, so `try_lock` almost always succeeds; if it does not,
+    /// the task still ends within [`LANE_RECONNECT_BUDGET`].
+    fn drop(&mut self) {
+        if let Ok(state) = self.state.try_lock()
+            && let Some(attempt) = state.reconnect.as_ref()
+        {
+            attempt.abort.abort();
+        }
+    }
 }
 
 /// A verified connection handed to one caller, and the run it belongs to.
@@ -482,14 +545,25 @@ impl AuthorityLane {
         let verified_generation = group.loss_generation.load(Ordering::Acquire);
         Self {
             client,
+            connect_config: connection_config(REDIS_CONNECT_TIMEOUT),
             group,
-            state: Mutex::new(LaneState {
+            state: Arc::new(Mutex::new(LaneState {
                 connection: Some(connection),
                 verified_run_id,
                 verified_generation,
                 connection_generation: 0,
-            }),
+                reconnect: None,
+                reconnect_epoch: 0,
+            })),
         }
+    }
+
+    /// Reconnect with `config` instead of the production configuration, for
+    /// example with a slow resolver.
+    #[cfg(test)]
+    fn with_connect_config(mut self, config: redis::AsyncConnectionConfig) -> Self {
+        self.connect_config = config;
+        self
     }
 
     /// Run one bounded command on this lane.
@@ -634,20 +708,52 @@ impl AuthorityLane {
     /// Hand out a handle to this lane's verified physical connection.
     ///
     /// Waiting for the lane lock is not part of any authority deadline: the
-    /// lock is only ever held across the bounded probe or reconnect in
-    /// [`Self::verify`], so a caller queued behind a sibling waits at most one
-    /// such verification and then shares the same multiplexed connection.
-    /// A verification that exceeds its deadline leaves the lane state as it
-    /// found it; a caller's command that times out releases the connection
-    /// (see [`Self::execute`]).
+    /// lock is only ever held across the bounded probe in [`Self::verify`]
+    /// and short bookkeeping, so a caller queued behind a sibling waits at
+    /// most one such probe and then shares the same multiplexed connection.
+    /// From then on the caller has [`REDIS_OPERATION_TIMEOUT`] in total, for
+    /// the probe and for waiting on a reconnect in flight (M6-C74).  A
+    /// verification that exceeds it leaves the lane state as it found it, and
+    /// a reconnect that exceeds it keeps running for the next command; a
+    /// caller's command that times out releases the connection (see
+    /// [`Self::execute`]).
     async fn admit(&self) -> Result<Admitted, CatalogError> {
         let mut state = self.state.lock().await;
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, self.verify(&mut state))
-            .await
-            .map_err(|_| CatalogError::Database(redis_timeout()))?
+        let deadline = tokio::time::Instant::now() + REDIS_OPERATION_TIMEOUT;
+        let timed_out = |_| CatalogError::Database(redis_timeout());
+        loop {
+            let mut outcome = match tokio::time::timeout_at(deadline, self.verify(&mut state)).await
+            {
+                Err(elapsed) => return Err(timed_out(elapsed)),
+                Ok(verified) => match verified? {
+                    Verified::Ready(admitted) => return Ok(admitted),
+                    Verified::Reconnecting(outcome) => outcome,
+                },
+            };
+            // Never hold the lane lock while a reconnect connects.
+            drop(state);
+            let finished: Result<(), CatalogError> =
+                match tokio::time::timeout_at(deadline, outcome.wait_for(Option::is_some)).await {
+                    Err(elapsed) => Err(timed_out(elapsed)),
+                    // The task ended without an outcome: the lane was dropped.
+                    Ok(Err(_)) => Err(CatalogError::Database(RedisError::from(
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "Redis authority lane reconnect abandoned",
+                        ),
+                    ))),
+                    Ok(Ok(outcome)) => outcome.clone().unwrap_or(Ok(())),
+                };
+            finished?;
+            // The reconnect installed its connection: verify again, which
+            // normally hands it out at once.
+            state = tokio::time::timeout_at(deadline, self.state.lock())
+                .await
+                .map_err(timed_out)?;
+        }
     }
 
-    async fn verify(&self, state: &mut LaneState) -> Result<Admitted, CatalogError> {
+    async fn verify(&self, state: &mut LaneState) -> Result<Verified, CatalogError> {
         let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
         if state.verified_generation != loss_generation
             && let Some(connection) = state.connection.as_mut()
@@ -666,21 +772,51 @@ impl AuthorityLane {
             }
         }
         if state.connection.is_none() {
-            let (connection, run_id) = self.reconnect().await?;
-            state.connection = Some(connection);
-            state.verified_run_id = run_id;
-            state.connection_generation += 1;
+            let outcome = match state.reconnect.as_ref() {
+                Some(attempt) => attempt.outcome.clone(),
+                None => self.start_reconnect(state, loss_generation),
+            };
+            return Ok(Verified::Reconnecting(outcome));
         }
         state.verified_generation = loss_generation;
         let connection = state
             .connection
             .clone()
             .ok_or(CatalogError::Conflict("Redis authority lane"))?;
-        Ok(Admitted {
+        Ok(Verified::Ready(Admitted {
             connection,
             connection_generation: state.connection_generation,
             run_id: state.verified_run_id.clone(),
-        })
+        }))
+    }
+
+    /// Start the lane's single reconnect, outside the lane lock.  The caller
+    /// holds the lock, so the task cannot finish before it is recorded.
+    fn start_reconnect(
+        &self,
+        state: &mut LaneState,
+        loss_generation: u64,
+    ) -> watch::Receiver<ReconnectOutcome> {
+        state.reconnect_epoch += 1;
+        let epoch = state.reconnect_epoch;
+        let (sender, outcome) = watch::channel(None);
+        let task = tokio::spawn(run_reconnect(
+            ReconnectTarget {
+                client: self.client.clone(),
+                config: self.connect_config.clone(),
+                group: Arc::clone(&self.group),
+                state: Arc::clone(&self.state),
+            },
+            epoch,
+            loss_generation,
+            sender,
+        ));
+        state.reconnect = Some(ReconnectAttempt {
+            epoch,
+            outcome: outcome.clone(),
+            abort: task.abort_handle(),
+        });
+        outcome
     }
 
     /// Release the connection a caller observed a transport loss on, unless a
@@ -694,17 +830,81 @@ impl AuthorityLane {
             self.group.loss_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
+}
 
-    async fn reconnect(&self) -> Result<(MultiplexedConnection, String), CatalogError> {
-        let (mut connection, run_id) = open_verified_connection(&self.client)
-            .await
-            .map_err(CatalogConnectionError::into_catalog_error)?;
-        // A different run is adopted only when the namespace proves it may
-        // (see the module documentation); until then no caller command runs
-        // on this connection.
-        self.group.binding.rebind(&mut connection, &run_id).await?;
-        Ok((connection, run_id))
-    }
+/// Everything a lane reconnect task needs from its lane.
+struct ReconnectTarget {
+    client: redis::Client,
+    config: redis::AsyncConnectionConfig,
+    group: Arc<LaneGroup>,
+    state: Arc<Mutex<LaneState>>,
+}
+
+/// One lane reconnect with the full connect budget, run as the lane's
+/// single-flight task (M6-C74).  Its connection is installed only while the
+/// lane still has none and this attempt is still the lane's current one, so
+/// it never clobbers a newer connection; otherwise it is dropped.  The
+/// outcome is published after the lane lock is released.
+async fn run_reconnect(
+    target: ReconnectTarget,
+    epoch: u64,
+    loss_generation: u64,
+    outcome: watch::Sender<ReconnectOutcome>,
+) {
+    let result = tokio::time::timeout(
+        LANE_RECONNECT_BUDGET,
+        reconnect(&target.client, &target.config, &target.group),
+    )
+    .await
+    .unwrap_or_else(|_| Err(CatalogError::Database(redis_timeout())));
+    let finished = {
+        let mut state = target.state.lock().await;
+        let current = state
+            .reconnect
+            .as_ref()
+            .is_some_and(|attempt| attempt.epoch == epoch);
+        if current {
+            state.reconnect = None;
+        }
+        match result {
+            Ok((connection, run_id)) => {
+                if current && state.connection.is_none() {
+                    state.connection = Some(connection);
+                    state.verified_run_id = run_id;
+                    // Verified against the loss generation current when the
+                    // attempt started: a loss observed since then makes the
+                    // next command probe this connection.
+                    state.verified_generation = loss_generation;
+                    state.connection_generation += 1;
+                }
+                // Otherwise the lane moved on: drop this connection and let
+                // the waiters verify the lane as it now is.
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    };
+    outcome.send_replace(Some(finished));
+}
+
+async fn reconnect(
+    client: &redis::Client,
+    config: &redis::AsyncConnectionConfig,
+    group: &LaneGroup,
+) -> Result<(MultiplexedConnection, String), CatalogError> {
+    let (mut connection, run_id) = open_verified_connection_with(client, config)
+        .await
+        .map_err(CatalogConnectionError::into_catalog_error)?;
+    // A different run is adopted only when the namespace proves it may
+    // (see the module documentation); until then no caller command runs
+    // on this connection.
+    tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        group.binding.rebind(&mut connection, &run_id),
+    )
+    .await
+    .map_err(|_| CatalogError::Database(redis_timeout()))??;
+    Ok((connection, run_id))
 }
 
 /// How a failure observed after the command was handed to the connection is
@@ -749,6 +949,7 @@ fn lane_lost(error: &RedisError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::open_verified_connection;
     use super::*;
     use std::{
         collections::VecDeque,
@@ -1503,5 +1704,177 @@ mod tests {
             2,
             "the timed-out connection must be replaced, not reused"
         );
+    }
+
+    /// A resolver that answers after `delay` with the fake authority's
+    /// address, standing in for the cold DNS lookup measured on a fresh Fly
+    /// machine (M6-C73), and counts its lookups.
+    struct DelayedResolver {
+        delay: Duration,
+        address: std::net::SocketAddr,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    impl redis::io::AsyncDNSResolver for DelayedResolver {
+        fn resolve<'a, 'b: 'a>(
+            &'a self,
+            _host: &'b str,
+            _port: u16,
+        ) -> redis::RedisFuture<'a, Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.lookups.fetch_add(1, Ordering::AcqRel);
+                tokio::time::sleep(self.delay).await;
+                Ok(Box::new(std::iter::once(self.address))
+                    as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+            })
+        }
+    }
+
+    /// Longer than the per-command deadline, well inside the connect budget.
+    const SLOW_RECONNECT: Duration = Duration::from_millis(3_000);
+    const _: () = assert!(SLOW_RECONNECT.as_millis() > REDIS_OPERATION_TIMEOUT.as_millis());
+    const _: () = assert!(SLOW_RECONNECT.as_millis() < REDIS_CONNECT_TIMEOUT.as_millis());
+    /// Scheduling slack allowed on top of the per-command deadline.
+    const DEADLINE_SLACK: Duration = Duration::from_millis(500);
+    /// Callers that arrive while the slow reconnect is in flight.
+    const SIBLING_CALLERS: usize = 5;
+
+    /// A PING whose wall time is measured, with a bound far above any
+    /// deadline under test so a queued caller is measured, not cut off.
+    async fn timed_ping(lane: &AuthorityLane) -> (Result<String, CatalogError>, Duration) {
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            lane.query::<String>(&redis::cmd("PING")),
+        )
+        .await
+        .expect("measurement bound");
+        (result, started.elapsed())
+    }
+
+    /// M6-C74 regression: after a severed connection, a lane reconnect that
+    /// needs longer than the two-second command deadline (a cold DNS lookup)
+    /// but less than `REDIS_CONNECT_TIMEOUT` completes and is installed,
+    /// while every caller that arrives during it -- the one that started it
+    /// included -- stays bounded at the command deadline and fails closed
+    /// with a timeout instead of queueing behind the connect.  Exactly one
+    /// reconnect runs, and the next command uses its connection at once.
+    ///
+    /// Before the fix `admit` cancelled the reconnect at two seconds while
+    /// holding the lane lock, so the siblings queued one full deadline each
+    /// and the lane never reconnected at all.
+    #[tokio::test]
+    async fn m6c74_slow_lane_reconnect_completes_while_callers_stay_bounded() {
+        let server = FakeAuthority::start("lane-run-a").await;
+        let direct = redis::Client::open(server.url()).expect("fake authority URL");
+        let group = Arc::new(LaneGroup::default());
+        let (connection, run_id) =
+            tokio::time::timeout(TEST_DEADLINE, open_verified_connection(&direct))
+                .await
+                .expect("bounded startup connection")
+                .expect("verified startup connection");
+        assert_eq!(run_id, "lane-run-a");
+        // The lane reconnects by host name through the slow resolver.
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let slow_client =
+            redis::Client::open(format!("redis://m6c74-cold-dns.invalid:{}/", server.port))
+                .expect("slow-resolver URL");
+        let config = connection_config(REDIS_CONNECT_TIMEOUT).set_dns_resolver(DelayedResolver {
+            delay: SLOW_RECONNECT,
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], server.port)),
+            lookups: Arc::clone(&lookups),
+        });
+        let lane = Arc::new(
+            AuthorityLane::new(slow_client, connection, run_id, Arc::clone(&group))
+                .with_connect_config(config),
+        );
+        assert_eq!(ping(&lane).await.expect("healthy lane"), "PONG");
+        assert_eq!(server.accepted(), 1);
+
+        server.sever_all().await;
+        assert_lost(ping(&lane).await, "severed lane");
+        let generation_after_loss = lane.state.lock().await.connection_generation;
+        assert_eq!(
+            lookups.load(Ordering::Acquire),
+            0,
+            "discovery never reconnects"
+        );
+
+        // Callers arrive while the slow reconnect is in flight: at once, and
+        // one second later.  None may wait longer than its own deadline.
+        let reconnect_started = tokio::time::Instant::now();
+        let mut callers = JoinSet::new();
+        for index in 0..SIBLING_CALLERS {
+            let lane = Arc::clone(&lane);
+            callers.spawn(async move {
+                if index + 1 == SIBLING_CALLERS {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                timed_ping(&lane).await
+            });
+        }
+        let mut observed = Vec::with_capacity(SIBLING_CALLERS);
+        while let Some(joined) = callers.join_next().await {
+            observed.push(joined.expect("caller task"));
+        }
+        for (result, elapsed) in &observed {
+            assert!(
+                *elapsed < REDIS_OPERATION_TIMEOUT + DEADLINE_SLACK,
+                "a caller waited {elapsed:?} behind the lane reconnect; callers must stay \
+                 bounded at {REDIS_OPERATION_TIMEOUT:?}: {observed:?}"
+            );
+            match result {
+                Err(CatalogError::Database(error)) if timed_out(error) => {}
+                other => panic!("a caller during the reconnect reported {other:?}, not a timeout"),
+            }
+        }
+        assert_eq!(
+            lookups.load(Ordering::Acquire),
+            1,
+            "concurrent callers share one single-flight reconnect"
+        );
+
+        // The reconnect outlives its callers and is installed.
+        loop {
+            if lane.state.lock().await.connection.is_some() {
+                break;
+            }
+            assert!(
+                reconnect_started.elapsed() < REDIS_CONNECT_TIMEOUT,
+                "the lane never reconnected within REDIS_CONNECT_TIMEOUT \
+                 ({REDIS_CONNECT_TIMEOUT:?}) although the reconnect needs only {SLOW_RECONNECT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reconnect_started.elapsed() >= SLOW_RECONNECT,
+            "the resolver delay applied"
+        );
+        {
+            let state = lane.state.lock().await;
+            assert!(state.reconnect.is_none(), "the finished attempt is cleared");
+            assert_eq!(
+                state.connection_generation,
+                generation_after_loss + 1,
+                "one installed connection advances the connection generation once"
+            );
+            assert_eq!(
+                state.verified_generation,
+                group.loss_generation.load(Ordering::Acquire)
+            );
+            assert_eq!(state.verified_run_id, "lane-run-a");
+        }
+        assert_eq!(server.accepted(), 2, "exactly one reconnect connection");
+
+        let (reply, elapsed) = timed_ping(&lane).await;
+        assert_eq!(reply.expect("the reconnected lane serves"), "PONG");
+        assert!(
+            elapsed < DEADLINE_SLACK,
+            "the next command used the installed connection: {elapsed:?}"
+        );
+        assert_eq!(server.accepted(), 2);
+        assert_eq!(lookups.load(Ordering::Acquire), 1);
+        server.shutdown().await;
     }
 }

@@ -78,11 +78,22 @@ so the check cannot run them. Only thirteen may be marked that way:
 and the seven day-2 catalog commands of section 2.5 (never with `--dry-run`,
 which contacts no Redis and is executed below). It
 checks only that the real binary accepts the documented subcommand and flags;
-**their runtime behaviour is not checked by this guide.** The provisioning
-and day-2 commands, `serve` and `connect` are instead run end to end, against
-a real Redis, by `scripts/m6-provisioning-verify.sh` (sections 2.3 and 2.5),
-and `connect`'s reconnect across a relay restart by
-`scripts/m6-reconnect-verify.sh` (section 3.1).
+**their runtime behaviour is not checked by `--check docs`.** A second check,
+`verify --check docs-redis --redis-url redis://HOST:PORT`, executes them
+against the same bundle with a disposable Redis you supply (task row M6-C33):
+it runs this guide's session, then, in the directory the session left, runs
+the shape-only provisioning and day-2 commands of sections 2.3 and 2.5 in
+document order, with `/etc/agent-tunnel/...` mapped to the rehearsal's own
+files, checks that `serve` refuses the namespace before `provision-catalog`
+(section 2.3), then runs `serve` and `connect` and one echo through them and
+stops both with SIGTERM. The relay's listener certificate and the identity
+issuer are stand-ins it makes with `openssl`. Without `--redis-url` it
+reports DID NOT RUN, never a pass. `recovery-observe`, `recover` and
+`rebind-redis-run` are not executed by it. `scripts/m6-provisioning-verify.sh`
+also runs the provisioning and day-2 commands, `serve` and `connect` end to end
+with cargo-built binaries (sections 2.3 and 2.5), and
+`scripts/m6-reconnect-verify.sh` runs `connect`'s reconnect across a relay
+restart (section 3.1).
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
@@ -115,7 +126,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | A Redis restart in place that keeps its data (one relay) | Supported: a serving relay with `redis_restart_continuity_seconds` re-binds by itself on a durable Redis (`appendfsync always`); a relay started after the restart needs `tunnel-relay rebind-redis-run` once (section 4). A Redis that came back empty or older than the relay's last token is refused. **Failover to a replica, or a restore: not supported this way** | M6-C65 |
-| Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
+| Metrics and audit log | Metrics: a minimal, opt-in, unauthenticated listener on a loopback or private address (`metrics_bind`, section 5). Audit log: **not supported in this alpha** | M6-C24 |
 | One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
 
 ## 1. Download and verify
@@ -523,15 +534,18 @@ one real request through the relay: an MCP `initialize` and a `tools/call`, an
 ACP `initialize`, and a 9P read of the file.
 
 Then, against your Redis, activate the relay's incarnation and write the
-records, in that order. **Do not start `serve` until `provision-catalog` has
-succeeded.** Provisioning refuses a namespace holding any key other than the
-incarnation binding, and nothing shipped removes a key a relay has written, so
-a relay started between the two commands can leave the namespace
-unprovisionable (M6-C34); if that happens, choose a new `redis_namespace` and
-start again. **Shape-only:** both write Redis, which this guide's
-check does not have. `scripts/m6-provisioning-verify.sh` runs them, `serve`,
-`connect` and an echo end to end with these binaries and the two examples
-against a real Redis:
+records, in that order. `serve` refuses a namespace that has been activated
+but not provisioned: it exits `1` with `Redis catalog connection failed;
+stage=authority_identity class=unprovisioned` before it writes anything, so
+starting it too early costs nothing and you run `provision-catalog` next
+(M6-C34). A `tunnel-relay` built before M6-C34 does not refuse; do not start
+one of those until `provision-catalog` has succeeded, because provisioning
+refuses a namespace holding any key other than the incarnation binding.
+**Shape-only:** both write Redis, which `--check docs` does not have.
+`--check docs-redis` runs them with this bundle's binaries against a
+disposable Redis ("How this guide is tested"), and
+`scripts/m6-provisioning-verify.sh` runs them, `serve`, `connect` and an echo
+end to end with cargo-built binaries and the two examples:
 
 ```sh shape-only
 tunnel-relay activate-first-incarnation --config /etc/agent-tunnel/relay.toml
@@ -543,17 +557,24 @@ first incarnation of namespace ...`. It refuses a namespace that holds any key
 at all, including one that already has an incarnation: changing an
 incarnation is recovery's job (section 4), and this command cannot be used to
 skip it. `provision-catalog` prints `Provisioned namespace ...` with the
-identifiers it wrote. It refuses a namespace without an active incarnation,
-and it runs **once** per namespace: a second run, or a run after a partial
-failure, is refused, and a namespace left partly written is discarded, not
-repaired. Choose a new `redis_namespace` and start again. No identifier it
-prints is secret; it prints no certificate, key or token.
+identifiers it wrote. It refuses a namespace without an active incarnation.
+It writes every record, and the reservation that makes it run once, in **one
+Redis script** (M6-C35): a refusal found part-way, such as a grant whose
+`expires_at` has already passed, or a Redis error part-way is rolled back in
+that script, so the namespace is either fully provisioned or exactly as
+activated. After a failure, fix the cause and run the same command again on
+the same namespace. Once it has succeeded, a second run is refused
+("namespace was already provisioned"). No identifier it prints is secret; it
+prints no certificate, key or token.
 
 Because an interrupted write cannot be undone, neither command stops part-way
 on the first SIGTERM or Ctrl-C: it says it received the signal, finishes (each
 Redis step is bounded), and prints and exits with its own outcome. A second
-signal abandons it at once with exit `130` and says the outcome is unknown;
-treat that namespace as partial. `initialize`, `recovery-initialize` and
+signal abandons it at once with exit `130` and says the outcome is unknown.
+Because each command is one Redis script, the namespace is then either
+written completely or untouched: run the command again, and "namespace
+already has a deployment incarnation" or "namespace was already provisioned"
+means the abandoned run completed. `initialize`, `recovery-initialize` and
 `recover` behave the same way (M6-C23).
 
 The activation also binds the namespace to the Redis server's run id, and
@@ -648,8 +669,11 @@ Each Redis connection the relay opens at startup, and each recovery
 connection, gets **10 seconds** to open, covering the DNS lookup, TCP
 connect, TLS handshake and `AUTH`. After that, each command gets 2 seconds
 (M6-C73). A lane that reconnects inside a running relay, for example after a
-Redis restart, still has only 2 seconds for the whole reconnect, DNS lookup
-included (M6-C74). On a fresh Fly machine the first lookup of a `.internal`
+Redis restart, gets the same 10 seconds for the whole reconnect, DNS lookup
+included, and runs it outside the lane lock: other callers on that lane are
+not queued behind it and still fail closed after their own 2 seconds while it
+runs (M6-C74). A relay built before M6-C74 gave a lane reconnect only 2
+seconds. On a fresh Fly machine the first lookup of a `.internal`
 name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
 one-second default, so that lookup alone failed `activate-first-incarnation`
 with `stage=connection_establishment class=timeout`.
@@ -739,7 +763,8 @@ Catalog change is valid for namespace agent-tunnel-m1: revoke-device tenant=1111
 ```
 
 Then, against your Redis, the writes. **Shape-only:** they write Redis, which
-this guide's check does not have. `scripts/m6-provisioning-verify.sh` runs
+`--check docs` does not have; `--check docs-redis` runs all seven in this
+order with this bundle's binaries. `scripts/m6-provisioning-verify.sh` runs
 the four additions, `revoke-grant` and `revoke-device` end to end against a
 real Redis while `serve` is running, and `revoke-credential`'s refusal of a
 credential that is no longer active:
@@ -799,8 +824,9 @@ looks up the user and authorizes the grant, in Redis. So:
 **Not supported in this alpha:** a second tenant, changing or deactivating a
 user or a membership, changing a service's type or operations, and
 reactivating a revoked device or credential. Renewing a device certificate is
-M6-C56. A namespace left partly provisioned (M6-C35) can take these additions,
-but it is still not repaired.
+M6-C56. Since M6-C35 `provision-catalog` cannot leave a namespace partly
+provisioned; one left partly written by an earlier `tunnel-relay` can take
+these additions, but it is still not repaired.
 
 ## 3. Deployment
 
@@ -951,10 +977,25 @@ deliberately minimal:
 | `GET /livez` | `200 {"status":"live"}` | The process answers HTTP. It consults nothing else. |
 | `GET /readyz` | `200 {"status":"ready"}` or `503 {"status":"unready"}` | Whether this relay should receive new public work |
 
-A relay without `[cluster]` is always ready once it is serving, even while
-its Redis authority is unavailable: after a Redis restart it answered `200`
-on `/readyz` while every request got `503` `AUTHORIZATION_UNAVAILABLE`
-(M6-C67). A cluster relay
+A relay without `[cluster]` is ready only while its Redis authority can
+serve (M6-C67). A background check runs once a second: the same read-only
+active-incarnation and Redis-run check `serve` makes at startup, on the
+relay's ordinary Redis connection, bounded at 5 s. `/readyz` only reads the
+last result and never reaches Redis itself. The relay answers `503
+{"status":"unready"}` within one check (at most about 6 s) of Redis stopping
+answering, being stopped, or coming back refused, and `200` again after the
+first check that succeeds. A refused namespace stays `503`:
+`class=run_changed` (Redis restarted and nothing re-attested it: run
+`rebind-redis-run`, section 4, and the same process is ready again within
+about a second; a relay with `redis_restart_continuity_seconds` re-binds by
+itself when it may), `class=unbound` (Redis came back without its data),
+`class=continuity` or `class=persistence`. Each change to not ready is logged
+once, in fixed words, as `relay Redis authority unavailable; not ready` with
+that `class`, at `warn`. Before M6-C67 such a relay answered `200` on
+`/readyz` while every request got `503` `AUTHORIZATION_UNAVAILABLE`, and
+builds without that fix still do. Measured locally with the shipped binaries
+and a Redis container paused, stopped, restarted and replaced by an empty
+one (`scripts/m6-redis-restart-verify.sh`). A cluster relay
 is ready only while its membership is current, its required peer routes are
 probed reachable, it has capacity, **and its set of approved peer keys is not
 empty** (M7-C89). Before M7-C89, a relay whose membership went unready had the
@@ -972,7 +1013,9 @@ What a load balancer should do:
 - Route new public traffic only to relays that answer `200` on `/readyz`.
   Leave `/livez` to the process supervisor for restart decisions. Do not use
   it for routing.
-- Expect short `503` episodes during ordinary operation. After a membership
+- Expect short `503` episodes during ordinary operation. A single relay goes
+  `503` for as long as its Redis authority is unavailable, which is exactly
+  when it could serve nothing. After a membership
   change, readiness can stay `503` until the next peer refresh tick
   (`min(membership_reconcile_seconds, 5 s)` plus any probe pass in flight);
   M7-C91 would shorten this. Mark a relay down only after several consecutive
@@ -1264,12 +1307,55 @@ old relays are stopped; the relay cannot verify it.
 
 ## 5. Metrics, logs and audit retention
 
-**There is no metrics endpoint and no audit log in this alpha** (M6-C24). The
-relay does not serve `/metrics`, and a gate asserts that it stays unserved
-(`crates/tunnel-test-harness/src/production_cluster/i04_fail_closed.rs`). The
-metrics list in [runtime.md](runtime.md#debugging-and-deployment-contract) is a
-design contract, not a delivered surface. The relay's peer-fault diagnostics
-snapshot exists in-process for the test gates and is not exposed to operators.
+**There is no audit log in this alpha, and metrics are a minimal, opt-in,
+private surface** (M6-C24). The public consumer and device listeners do not
+serve `/metrics`, and a gate asserts that it stays off them
+(`crates/tunnel-test-harness/src/production_cluster/i04_fail_closed.rs`).
+
+**Private metrics listener.** Set `metrics_bind` at the top level of the relay
+configuration, for example `metrics_bind = "127.0.0.1:9464"`, to open a
+separate plain-HTTP listener that serves only `GET /metrics` in the Prometheus
+text format; every other path is `404`. It is off by default. It has **no
+authentication**, so `serve` and `check-serve-config` refuse any address that
+is not loopback (`127.0.0.0/8`, `::1`) or private (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`, which includes Fly's `fdaa::`
+private network), refuse `0.0.0.0` and `::`, and refuse the consumer or device
+address. Keep it reachable only by your scraper. `serve` prints
+`tunnel-relay metrics listening: metrics=ADDRESS`. One scrape runs at a time (a
+concurrent one gets `503`), and each waits at most 2 s for the relay's
+snapshot. The listener holds at most 4 connections and closes any beyond
+that at once; each must send its request within 2 s, serves one request
+(no keep-alive) and is closed after 10 s at most, so an idle client cannot
+hold one open. **A relay binary older than this change refuses a configuration
+that names `metrics_bind`** (unknown field), so remove the key before rolling
+back. That includes the image currently deployed on Fly, `main-77bfd28`
+([deploy-fly.md](deploy-fly.md)).
+
+The series, all prefixed `tunnel_relay_`: `build_info{version}`, `ready`
+(what `/readyz` answers), and on a relay without `[cluster]`
+`authority_ready`, `authority_checks_total` and
+`authority_check_failures_total{class}` (section 3.2); the gauges
+`device_sessions`, `device_sockets`, `streams`, `sessions_rotating`,
+`sessions_owner_write_unknown`, `queue_bytes` and `replay_bytes` over the live
+sessions this relay owns; the counters `application_dispatches_total`,
+`control_registration_conflicts_total` (devices refused `owner_busy`),
+`consumer_write_timeouts_total`, `consumer_refusals_total{route,stage}` (the
+refusal stages below, counted even when their log line was rate limited, for
+the whole process), `peer_faults_total{stage}` and
+`peer_fault_causes_total{cause}`. Every value is a count, a gauge or a byte
+total, and every label value is a fixed word from a closed set: **no tenant,
+device, session, connection, stream or request identifier, subject, issuer,
+token, URL, path, endpoint, error text or payload is ever in a scrape.** A
+unit test seeds canaries into every identifier field of the relay snapshot
+and a process test sends a canary payload and a canary subject through a real
+relay, and both fail if any of them reaches the scrape (both were shown red by
+a deliberate leak). Counters restart from zero with the process.
+
+This covers only part of the metrics list in
+[runtime.md](runtime.md#debugging-and-deployment-contract): rotation duration,
+overlap time, credit stalls, peer RTT and request latency are not measured
+yet, device TLS and session refusals are logged but not counted, and the
+peer-fault series count only what the relay's diagnostics already record.
 
 What an operator can read today:
 
@@ -1277,6 +1363,7 @@ What an operator can read today:
 | --- | --- | --- |
 | Relay log | stderr of `tunnel-relay serve`, JSON lines, level from `RUST_LOG` | Bounded warnings and errors, session admission and closure, and one line per refusal (below). No retention or rotation: that is your log shipper's job |
 | `/livez`, `/readyz` | Consumer listener | Section 3.2 |
+| `/metrics` | The private `metrics_bind` listener, when configured | Aggregate counters and gauges, above |
 | `connect --json` | stdout of `tunnel-client connect` | One JSON object per lifecycle change: session, epoch, generation, connection IDs, rotation and recovery progress and deadlines, and the **local socket addresses** of the control, active and candidate connections. No payloads or credentials |
 | `doctor --json` | Section 6 | Local checks only |
 

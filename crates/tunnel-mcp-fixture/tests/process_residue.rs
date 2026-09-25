@@ -741,39 +741,45 @@ async fn orderly_return(
     (process_row(helper), armed, status.code())
 }
 
-/// Runs per multi-thread orderly-return measurement. On that flavour the
-/// leak is a race -- whether the runtime polls the supervisor task before
-/// it is torn down -- so one run proves nothing either way.
+/// Runs per multi-thread orderly-return measurement. On that flavour whether
+/// the runtime polls the supervisor task before it is torn down is a race,
+/// so one run proves nothing either way.
 const ORDERLY_RETURN_RUNS: usize = 10;
 
-/// **M6-C29, the defect, made deterministic.** Requesting the kill and
-/// returning from `main` at once -- what `tunnel-client connect` did after
-/// its orderly stop -- tears the runtime down without polling the
-/// supervisor task. The leader is killed only by `kill_on_drop`, and with no
-/// sentinel nobody signals its group: the in-group helper **survives**. On a
-/// current-thread runtime nothing else can poll the task first, so this is
-/// the race's losing side every time. It is the control for the test below:
-/// the two differ only in `nowait` against `wait`.
+/// **M6-C28: the helper dies with no wait and no sentinel.** Requesting the
+/// kill and returning from `main` at once -- what `tunnel-client connect`
+/// did after its orderly stop before M6-C29, and still does after a second
+/// stop request or a panic unwinding `main` -- tears the runtime down without
+/// polling the supervisor task; on a current-thread runtime nothing else can
+/// poll it first. Before M6-C28 the leader was then killed only by
+/// `kill_on_drop` and, with no sentinel, nobody signalled its group: the
+/// in-group helper **survived**, deterministically (asserted as
+/// `an_orderly_return_that_does_not_wait_leaks_the_helper_without_a_sentinel`,
+/// green at `929b096`). `ChildHandle::drop` now sends the group `SIGKILL`
+/// synchronously, so the helper is gone although nothing waited for the reap
+/// and no sentinel fired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_orderly_return_that_does_not_wait_leaks_the_helper_without_a_sentinel() {
+async fn an_orderly_return_that_does_not_wait_kills_the_helper_without_a_sentinel() {
     let (row, armed, code) = orderly_return(None, false, true).await;
     assert_eq!(armed, "0", "no sentinel was armed, which is the point");
     assert_eq!(code, Some(0), "the probe returned from main normally");
     assert!(
-        is_live(row.as_ref()),
-        "MEASUREMENT (M6-C29): returning straight after the kill request must leave the \
-         in-group helper alive when no sentinel is installed -- if it does not, the test \
-         below proves nothing and both must be re-derived. It was {row:?}"
+        !is_live(row.as_ref()),
+        "MEASUREMENT (M6-C28): returning straight after the kill request, with no wait \
+         for the reap and no sentinel, must still leave no in-group helper -- \
+         `ChildHandle::drop` signals the group itself. It was {row:?}"
     );
 }
 
-/// **M6-C29, the remedy `tunnel-client connect` now applies.** Waiting for
-/// the supervisor's `running` counter to reach zero before returning means
-/// the group kill has been sent and the leader reaped, so even with **no**
-/// sentinel the in-group helper is gone. `tunnel-client` waits on the same
-/// counter, summed over its MCP exports
-/// (`McpExportDiagnostics::children_running`), after its orderly stop.
-/// Defeated by passing `nowait`, this is the test above, and goes red.
+/// **M6-C29, the remedy `tunnel-client connect` applies on its orderly and
+/// error exits.** Waiting for the supervisor's `running` counter to reach
+/// zero before returning means the group kill has been sent and the leader
+/// reaped, so even with **no** sentinel the in-group helper is gone.
+/// `tunnel-client` waits on the same counter, summed over its MCP exports
+/// (`McpExportDiagnostics::children_running`), after its orderly stop. Since
+/// M6-C28 the test above has the same outcome without the wait: the wait
+/// orders the reap before the return, and `ChildHandle::drop` covers a
+/// return that does not wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_orderly_return_that_waits_for_the_reap_leaves_no_helper_without_a_sentinel() {
     let (row, armed, code) = orderly_return(None, true, true).await;
@@ -786,20 +792,21 @@ async fn an_orderly_return_that_waits_for_the_reap_leaves_no_helper_without_a_se
     );
 }
 
-/// **M6-C29 on the runtime flavour `tunnel-client` actually uses.** On a
-/// multi-thread runtime another worker may poll the supervisor task before
-/// teardown, so the leak is a race: measured 7 in 50 runs across five
-/// sequential batches (log nonces `m6c29-measure-20260923T012226Z-12550`
-/// and `m6c29-rate-20260923T012555Z-15600`), and 0 in 10 with a sentinel,
-/// because the sentinel **fires** on the bare end of file -- the orderly
-/// path had silently become the crash path.
+/// **M6-C28 on the runtime flavour `tunnel-client` actually uses.** On a
+/// multi-thread runtime another worker may or may not poll the supervisor
+/// task before teardown. Before M6-C28 the losing side of that race leaked
+/// the helper: measured 7 in 50 runs across five sequential batches (log
+/// nonces `m6c29-measure-20260923T012226Z-12550` and
+/// `m6c29-rate-20260923T012555Z-15600`), and 0 in 10 with a sentinel only
+/// because the sentinel **fired** on the bare end of file. With the
+/// synchronous group kill in `ChildHandle::drop`, neither side of the race
+/// leaves a helper, so every run must find none.
 ///
-/// Ignored because it is a race and asserts only that the leak is reachable
-/// (at least one survivor in [`ORDERLY_RETURN_RUNS`] runs); run it
-/// explicitly, on a quiet machine.
+/// Ignored because it runs [`ORDERLY_RETURN_RUNS`] probes; the deterministic
+/// current-thread test above is the gate. Run it explicitly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "M6-C29 measurement of a race; run explicitly"]
-async fn an_orderly_return_without_waiting_can_leak_the_helper_without_a_sentinel() {
+#[ignore = "M6-C28 repeated multi-thread measurement; run explicitly"]
+async fn an_orderly_return_without_waiting_never_leaks_the_helper_without_a_sentinel() {
     let mut survivors = 0;
     for run in 0..ORDERLY_RETURN_RUNS {
         let (row, armed, code) = orderly_return(None, false, false).await;
@@ -808,12 +815,12 @@ async fn an_orderly_return_without_waiting_can_leak_the_helper_without_a_sentine
         if is_live(row.as_ref()) {
             survivors += 1;
         }
-        eprintln!("MEASURED M6-C29 nowait run {run}: helper row {row:?}");
+        eprintln!("MEASURED M6-C28 nowait run {run}: helper row {row:?}");
     }
-    eprintln!("MEASURED M6-C29 nowait: {survivors} of {ORDERLY_RETURN_RUNS} helpers survived");
-    assert!(
-        survivors > 0,
-        "MEASUREMENT (M6-C29): no run leaked the helper; the race was not reproduced \
-         on this host, which is not evidence that it is gone"
+    eprintln!("MEASURED M6-C28 nowait: {survivors} of {ORDERLY_RETURN_RUNS} helpers survived");
+    assert_eq!(
+        survivors, 0,
+        "MEASUREMENT (M6-C28): a return that does not wait must never leak the in-group \
+         helper, on either side of the teardown race"
     );
 }

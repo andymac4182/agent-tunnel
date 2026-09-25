@@ -688,6 +688,29 @@ pub struct ServeConfig {
     /// it is refused together with `[cluster]`.
     #[serde(default)]
     pub redis_restart_continuity_seconds: Option<u64>,
+    /// Task row M6-C24: the address of the private metrics listener, plain
+    /// HTTP serving only `GET /metrics` (aggregate, payload-free series).
+    /// Absent, no metrics listener is opened.  It has no authentication, so
+    /// only a loopback or private address is accepted (`127.0.0.0/8`, `::1`,
+    /// `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), never an
+    /// unspecified one and never a public listener's address.
+    #[serde(default)]
+    pub metrics_bind: Option<SocketAddr>,
+}
+
+/// Whether `address` may carry the unauthenticated metrics listener: a
+/// loopback or private-network address, never an unspecified one.
+fn metrics_address_is_private(address: &SocketAddr) -> bool {
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| ip.is_loopback() || ip.is_private())
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 /// The `[http_forward]` table: the pinned application profiles a relay
@@ -916,6 +939,18 @@ impl ServeConfig {
                 ));
             }
         }
+        if let Some(metrics) = &self.metrics_bind {
+            if !metrics_address_is_private(metrics) {
+                return Err(ConfigError::Invalid(
+                    "metrics_bind must be a loopback or private address; the metrics listener has no authentication",
+                ));
+            }
+            if *metrics == self.consumer_bind || *metrics == self.device_bind {
+                return Err(ConfigError::Invalid(
+                    "metrics_bind must differ from consumer_bind and device_bind",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -932,6 +967,10 @@ impl ServeConfig {
                 .as_ref()
                 .map(HttpForwardServeConfig::exports)
                 .transpose()?,
+            // M6-C67: a relay without `[cluster]` follows its Redis
+            // authority in `/readyz`; a cluster relay's readiness is its
+            // membership and peer readiness, unchanged.
+            authority_readiness: self.cluster.is_none(),
             ..crate::ListenerSocketOptions::default()
         })
     }
@@ -1651,6 +1690,53 @@ consumer_tls_private_key = "consumer-key.pem"
                 .contains("cannot be combined with [cluster]"),
             "{error}"
         );
+    }
+
+    /// M6-C24: the metrics listener is off by default and accepts only a
+    /// loopback or private address that no public listener uses.
+    #[test]
+    fn metrics_bind_is_off_by_default_and_private_only() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
+        assert_eq!(config.metrics_bind, None);
+        for accepted in [
+            "127.0.0.1:9464",
+            "[::1]:9464",
+            "10.1.2.3:9464",
+            "172.16.0.9:9464",
+            "192.168.1.5:9464",
+            "[fdaa:0:1::3]:9464",
+        ] {
+            let input = format!("metrics_bind = \"{accepted}\"\n{}", valid_toml());
+            let config = ServeConfig::parse(&input)
+                .unwrap_or_else(|error| panic!("refused {accepted}: {error}"));
+            assert_eq!(
+                config.metrics_bind,
+                Some(accepted.parse().expect("address"))
+            );
+        }
+        for refused in [
+            "0.0.0.0:9464",
+            "[::]:9464",
+            "8.8.8.8:9464",
+            "172.32.0.1:9464",
+            "[2001:db8::1]:9464",
+        ] {
+            let input = format!("metrics_bind = \"{refused}\"\n{}", valid_toml());
+            let error = ServeConfig::parse(&input)
+                .expect_err(&format!("accepted a non-private metrics_bind {refused}"));
+            assert!(
+                error.to_string().contains("loopback or private"),
+                "{refused}: {error}"
+            );
+        }
+        let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
+        let clash = format!(
+            "metrics_bind = \"{}\"\n{}",
+            config.consumer_bind,
+            valid_toml()
+        );
+        let error = ServeConfig::parse(&clash).expect_err("accepted the consumer address");
+        assert!(error.to_string().contains("must differ"), "{error}");
     }
 
     #[test]
