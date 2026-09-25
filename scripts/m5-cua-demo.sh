@@ -89,9 +89,7 @@ fi
 # guest shows the fixture's red marker.
 GUEST_IP="$(TART="${TART}" "${VM_SCRIPT}" run "${VM}" | tail -1)"
 case "${GUEST_IP}" in 192.168.64.*) ;; *) die "unexpected guest address ${GUEST_IP}";; esac
-HOST_IP="$(ifconfig | awk -v net="${GUEST_IP%.*}." '$1=="inet" && index($2, net)==1 {print $2; exit}')"
-[ -n "${HOST_IP}" ] || die "no host address on the guest's private network"
-log "guest ${GUEST_IP}, host ${HOST_IP} on Tart's private network"
+log "guest ${GUEST_IP} on Tart's private network"
 gexec() { "${TART}" exec "${VM}" "$@"; }
 gexec_in() { "${TART}" exec -i "${VM}" "$@"; }
 gexec sudo bash /opt/cua-fixture/guest-manifest.sh >"${OUT}/manifest.json"
@@ -103,8 +101,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=m5-cua-demo synthet
   -keyout "${S}/server-ca-key.pem" -out "${S}/server-ca.pem" 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=m5-cua-demo synthetic relay" \
   -keyout "${S}/relay-key.pem" -out "${S}/relay.csr" 2>/dev/null
-printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s,DNS:localhost,IP:127.0.0.1,IP:%s\n' \
-  "${RELAY_HOST}" "${HOST_IP}" >"${S}/relay-ext.cnf"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s,DNS:localhost,IP:127.0.0.1\n' \
+  "${RELAY_HOST}" >"${S}/relay-ext.cnf"
 openssl x509 -req -in "${S}/relay.csr" -CA "${S}/server-ca.pem" -CAkey "${S}/server-ca-key.pem" \
   -CAcreateserial -days 1 -extfile "${S}/relay-ext.cnf" -out "${S}/relay-cert.pem" 2>/dev/null
 cat "${S}/relay-cert.pem" "${S}/server-ca.pem" >"${S}/relay-chain.pem"
@@ -123,13 +121,13 @@ CLEANUP+=("python3 $(printf %q "${TOOLS}") redis-clean $(printf %q "${REDIS_HOST
 # ---- relay configuration -------------------------------------------------------
 free_port() { python3 -c 'import socket,sys; s=socket.socket(); s.bind((sys.argv[1], 0)); print(s.getsockname()[1]); s.close()' "$1"; }
 CONSUMER_PORT="$(free_port 127.0.0.1)"
-DEVICE_PORT="$(free_port "${HOST_IP}")"
+DEVICE_PORT="$(free_port 127.0.0.1)"
 python3 - "${ROOT}/examples/m1-relay.toml" "${WORK}/relay.toml" <<EOF
 import re, sys
 text = open(sys.argv[1]).read()
 values = {
     "consumer_bind": '"127.0.0.1:${CONSUMER_PORT}"',
-    "device_bind": '"${HOST_IP}:${DEVICE_PORT}"',
+    "device_bind": '"127.0.0.1:${DEVICE_PORT}"',
     "oidc_issuer": '"${ISSUER}"',
     "oidc_jwks_path": '"${S}/jwks.json"',
     "redis_url": '"rediss://localhost:${REDIS_TLS_PORT}/${REDIS_DB}"',
@@ -156,14 +154,27 @@ COPYFILE_DISABLE=1 tar -C "${GUEST_BIN_DIR}" -cf - tunnel-client tunnel-deadman 
   | gexec_in sudo bash -c 'mkdir -p /opt/agentuplink/bin && tar -C /opt/agentuplink/bin -xf - && chmod 0755 /opt/agentuplink/bin/*'
 gexec_in sudo install -m 0755 /dev/stdin /opt/cua-fixture/cua-backend-supervised.sh <"${ROOT}/tests/cua-fixture/cua-backend-supervised.sh"
 # The relay's name, pinned in the disposable clone only.
-echo "${HOST_IP} ${RELAY_HOST}" | gexec_in sudo tee -a /etc/hosts >/dev/null
+echo "127.0.0.1 ${RELAY_HOST}" | gexec_in sudo tee -a /etc/hosts >/dev/null
+# The guest reaches the relay's device listener through an SSH REVERSE forward
+# over Tart's private network: guest 127.0.0.1:GUEST_PORT -> host
+# 127.0.0.1:DEVICE_PORT. The relay binds host loopback only, so the host's
+# application firewall (enabled, stealth mode, on the machine this was
+# measured on) needs no exception, and nothing changes any host security
+# setting. SSH authenticates the guest by the host key read over the
+# hypervisor channel, exactly as m5-cua-vm.sh's probe does.
+GUEST_PORT="$(gexec python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+SSH_STATE="${M5_CUA_VM_STATE:-${HOME}/.local/state/agentuplink-m5-cua-vm}"
+[ -f "${SSH_STATE}/id_ed25519" ] || die "no probe SSH key at ${SSH_STATE}/id_ed25519 (built with cua-golden)"
+hostkey="$(gexec cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')"
+case "${hostkey}" in "ssh-ed25519 "?*) ;; *) die "could not read the guest's ed25519 host key";; esac
+echo "${GUEST_IP} ${hostkey}" >"${S}/known_hosts"
 GD=/home/cua/demo
 gexec sudo -u cua mkdir -p "${GD}" /home/cua/cua-export
 gexec_in sudo -u cua tee "${GD}/server-ca.pem" >/dev/null <"${S}/server-ca.pem"
 python3 - "${ROOT}/examples/m1-client.toml" <<EOF | gexec_in sudo -u cua tee "${GD}/client.toml" >/dev/null
 import re, sys
 text = open(sys.argv[1]).read()
-text = re.sub(r'(?m)^relay_url = .*$', 'relay_url = "wss://${RELAY_HOST}:${DEVICE_PORT}/v1/tunnel/control"', text)
+text = re.sub(r'(?m)^relay_url = .*$', 'relay_url = "wss://${RELAY_HOST}:${GUEST_PORT}/v1/tunnel/control"', text)
 start = text.index("[exports.")
 end = text.index("\n\n", start)
 export = '''[exports."${SERVICE}"]
@@ -211,7 +222,23 @@ for port in "${CONSUMER_PORT}" "${DEVICE_PORT}"; do
   owners="$({ lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true; } | sort -u | tr '\n' ' ')"
   [ "${owners}" = "${RELAY_PID} " ] || die "port ${port} listeners are '${owners}', expected only the relay ${RELAY_PID}"
 done
-log "relay ${RELAY_PID} owns consumer 127.0.0.1:${CONSUMER_PORT} and device ${HOST_IP}:${DEVICE_PORT}"
+log "relay ${RELAY_PID} owns consumer 127.0.0.1:${CONSUMER_PORT} and device 127.0.0.1:${DEVICE_PORT}"
+ssh -i "${SSH_STATE}/id_ed25519" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${S}/known_hosts" \
+    -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes -o LogLevel=ERROR \
+    -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -N \
+    -R "127.0.0.1:${GUEST_PORT}:127.0.0.1:${DEVICE_PORT}" "admin@${GUEST_IP}" &
+SSH_PID=$!
+CLEANUP+=("kill ${SSH_PID} 2>/dev/null")
+# The guest-side ownership gate: the forwarded port's only listener is sshd.
+owner=""
+for _ in $(seq 1 40); do
+  kill -0 "${SSH_PID}" 2>/dev/null || die "ssh reverse forward exited"
+  owner="$(gexec sudo ss -Hltnp "sport = :${GUEST_PORT}" 2>/dev/null | grep -o 'users:(("[a-z-]*"' | sort -u | tr '\n' ' ')"
+  [ -n "${owner}" ] && break
+  sleep 0.5
+done
+case "${owner}" in 'users:(("sshd" '|'users:(("sshd-session" ') ;; *) false;; esac || die "guest port ${GUEST_PORT} listeners are '${owner}', expected only sshd"
+log "guest 127.0.0.1:${GUEST_PORT} forwards to the relay's device listener over SSH"
 
 # ---- connect the device (guest), opted in to Lane B ----------------------------
 gexec sudo -u cua env AGENT_TUNNEL_CUA_LANE_B=1 TUNNEL_DEADMAN_BIN=/opt/agentuplink/bin/tunnel-deadman \
