@@ -67,6 +67,21 @@ const M2_CONTROL_QUEUE_BYTES: usize = 64 * 1024;
 // duplicating the full writer queue.
 const M2_PENDING_CRITICAL_CONTROL_FRAMES: usize = 4;
 const M2_PENDING_CRITICAL_CONTROL_BYTES: usize = MAX_CONTROL_MESSAGE_BYTES;
+// OPEN refusals share the spill, and there can be one per OPEN the owner has
+// outstanding (task row M6-C120).  While an OPEN pair waits for writer room,
+// every later OPEN the connector refuses -- live limit, retained table, OPEN
+// retention -- is a REJECTED that must wait behind it.  The owner bounds its
+// outstanding OPENs per device (pending finite echoes and live streams each at
+// most `max_streams_per_device`), not by this spill, so a four-frame spill
+// turned the fifth such refusal into a session-fatal `QueueLimit`, and one
+// consumer flood ended the device's session for every user of it.  The spill
+// therefore holds one refusal per retained stream slot on top of the fixed
+// critical allowance (a REJECTED is a few hundred bytes; the per-refusal
+// byte allowance leaves room for maximum-length identifiers), and the actor
+// stops reading the control socket while the spill is short of headroom, so
+// an owner beyond even that bound is back-pressured instead of failing the
+// session.
+const M2_PENDING_OPEN_REFUSAL_SPILL_BYTES: usize = 2 * 1024;
 const M2_CRITICAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 // A control STREAM_FORGET can legitimately overtake the final data-channel
 // ACK. Keep the authenticated terminal proof pending for one bounded window
@@ -1918,7 +1933,9 @@ async fn run_m2_session(
                     break Err(error);
                 }
             }
-            control = control_stream.next() => {
+            // Back-pressure the owner rather than fail the session when the
+            // critical spill is short of headroom (task row M6-C120).
+            control = control_stream.next(), if actor.control_read_ready() => {
                 if let Err(error) = actor.flush_pending_open() {
                     break Err(error);
                 }
@@ -2632,17 +2649,48 @@ impl M2Actor {
         }
     }
 
+    /// The critical spill's frame bound: the fixed critical allowance plus
+    /// one OPEN refusal per retained stream slot (task row M6-C120).
+    fn pending_critical_control_frame_limit(&self) -> usize {
+        M2_PENDING_CRITICAL_CONTROL_FRAMES
+            .saturating_add(retained_stream_limit(self.config.limits.max_streams))
+    }
+
+    /// The critical spill's byte bound, sized like its frame bound.
+    fn pending_critical_control_byte_limit(&self) -> usize {
+        M2_PENDING_CRITICAL_CONTROL_BYTES.saturating_add(
+            retained_stream_limit(self.config.limits.max_streams)
+                .saturating_mul(M2_PENDING_OPEN_REFUSAL_SPILL_BYTES),
+        )
+    }
+
+    /// Whether the actor may read the next inbound control message.  One
+    /// inbound message spills at most a few critical replies, so reading
+    /// stops while fewer than the fixed critical allowance of frames (or one
+    /// maximum control frame of bytes) remain; the writer drains the spill
+    /// on the deadline tick and reading resumes (task row M6-C120).
+    fn control_read_ready(&self) -> bool {
+        self.pending_critical_controls
+            .len()
+            .saturating_add(M2_PENDING_CRITICAL_CONTROL_FRAMES)
+            <= self.pending_critical_control_frame_limit()
+            && self
+                .pending_critical_control_bytes
+                .saturating_add(M2_PENDING_CRITICAL_CONTROL_BYTES)
+                <= self.pending_critical_control_byte_limit()
+    }
+
     fn defer_critical_control(
         &mut self,
         message: Message,
         deadline: DualDeadline,
     ) -> Result<(), ClientError> {
         let bytes = super::message_size(&message);
-        if self.pending_critical_controls.len() >= M2_PENDING_CRITICAL_CONTROL_FRAMES
+        if self.pending_critical_controls.len() >= self.pending_critical_control_frame_limit()
             || self
                 .pending_critical_control_bytes
                 .checked_add(bytes)
-                .is_none_or(|total| total > M2_PENDING_CRITICAL_CONTROL_BYTES)
+                .is_none_or(|total| total > self.pending_critical_control_byte_limit())
         {
             return Err(ClientError::QueueLimit);
         }
@@ -13607,10 +13655,121 @@ mod tests {
             MAX_CONTROL_MESSAGE_BYTES
         );
         assert_eq!(actor.pending_critical_controls.len(), 1);
+        // The spill stays bounded in bytes (M6-C120 sized it for OPEN
+        // refusals, not for arbitrarily many maximum frames), and the actor
+        // stops reading control before a further maximum frame could miss.
+        let fitting = actor.pending_critical_control_byte_limit() / MAX_CONTROL_MESSAGE_BYTES;
+        for _ in 1..fitting {
+            actor
+                .defer_critical_control(frame.clone(), deadline)
+                .expect("frames within the byte bound fit the spill");
+        }
+        assert!(!actor.control_read_ready());
         assert!(matches!(
             actor.defer_critical_control(frame, deadline),
             Err(ClientError::QueueLimit)
         ));
+    }
+
+    /// M6-C120: while one OPEN's response pair waits for writer room, every
+    /// later OPEN the connector refuses is a REJECTED that waits behind it
+    /// in the critical spill.  The spill held four frames, so the fifth
+    /// refusal returned `QueueLimit` from `handle_control`, which ends the
+    /// session: one consumer flood took the device from every user of it.
+    /// Here the connector's live limit is reached with a deferred OPEN at the
+    /// head, then the owner's remaining outstanding OPENs (up to its
+    /// retained-table bound) arrive: each must be refused with a retryable
+    /// REJECTED `RESOURCE_EXHAUSTED`, the admitted streams and the deferred
+    /// OPEN must survive, and the refusals must reach the writer in order
+    /// once it drains.
+    #[tokio::test]
+    async fn m6c120_open_refusals_behind_a_deferred_open_never_end_the_session() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("queue pressure should defer one bounded OPEN");
+        assert!(actor.pending_open.is_some());
+        let admitted: Vec<u64> = actor.streams.keys().copied().collect();
+        let limit = actor.config.limits.max_streams;
+
+        // Fill the connector's bounded OPEN queue up to its live limit.
+        let mut next_stream_id = 10_u64;
+        while actor.active_stream_count() + actor.pending_open_queue.len() + 1 < limit {
+            actor
+                .handle_control(ControlMessage::Open(test_open(next_stream_id)))
+                .await
+                .expect("an OPEN below the live limit is queued");
+            next_stream_id += 1;
+        }
+        let queued = actor.pending_open_queue.len();
+
+        // Every further OPEN is over the limit and must be refused, never
+        // end the session.  The owner can have at most its retained-table
+        // bound of OPENs outstanding at once.
+        let outstanding = retained_stream_limit(limit);
+        let refused_from = next_stream_id;
+        let refusals = outstanding - admitted.len() - 1 - queued;
+        assert!(refusals > M2_PENDING_CRITICAL_CONTROL_FRAMES);
+        for _ in 0..refusals {
+            actor
+                .handle_control(ControlMessage::Open(test_open(next_stream_id)))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "OPEN {next_stream_id} over the limit must be refused, not end the \
+                         session: {}",
+                        error.safe_message()
+                    )
+                });
+            next_stream_id += 1;
+        }
+        assert_eq!(actor.pending_critical_controls.len(), refusals);
+        for stream_id in &admitted {
+            assert!(actor.streams.contains_key(stream_id));
+        }
+        assert!(actor.pending_open.is_some());
+        assert_eq!(actor.pending_open_queue.len(), queued);
+
+        // Drain the writer: the deferred OPEN is admitted first, then the
+        // spilled refusals follow it in order.
+        let mut messages = Vec::new();
+        for _ in 0..(outstanding * 4) {
+            messages.extend(drain_control_messages(&mut control_receiver));
+            actor
+                .flush_pending_open()
+                .expect("a drained queue resolves the deferred OPEN");
+            actor
+                .flush_pending_critical_controls()
+                .expect("refusals drain once the OPEN pair is queued");
+            if actor.pending_open.is_none() && actor.pending_critical_controls.is_empty() {
+                break;
+            }
+        }
+        messages.extend(drain_control_messages(&mut control_receiver));
+        assert!(actor.pending_critical_controls.is_empty());
+        let refused: Vec<u64> = messages
+            .iter()
+            .filter_map(|message| match message {
+                ControlMessage::Rejected(rejected) => {
+                    assert_eq!(rejected.code, "RESOURCE_EXHAUSTED");
+                    Some(rejected.stream_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            (refused_from..refused_from + refusals as u64).collect::<Vec<_>>()
+        );
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ControlMessage::Opened(opened) if opened.stream_id == 9
+        )));
     }
 
     /// M6-C75: a relay WebSocket Ping on the control socket that arrives
