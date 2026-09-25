@@ -15,6 +15,10 @@ use std::{
 };
 use tempfile::{TempDir, tempdir};
 
+/// The synthetic device the fixture certificate names in its role SAN, and
+/// the profile's `device_id` (M6-C44).
+const FIXTURE_DEVICE: &str = "3a3b3c3d-3e3f-4a3b-8c3d-3e3f3a3b3c3d";
+
 struct Fixture {
     root: TempDir,
     config: PathBuf,
@@ -31,6 +35,11 @@ impl Fixture {
         let mut params = CertificateParams::default();
         params.not_before = rcgen::date_time_ymd(2023, 1, 1);
         params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("urn:agent-tunnel:device:{FIXTURE_DEVICE}")
+                .try_into()
+                .expect("device role URI SAN"),
+        )];
         let certificate = params
             .self_signed(&key_pair)
             .expect("self-sign doctor fixture certificate");
@@ -46,7 +55,7 @@ impl Fixture {
 
         let config = root.path().join("client.toml");
         let config_text = format!(
-            "device_id = \"doctor-cli-fixture\"\nrelay_url = \"wss://relay.example.test/v1/tunnel/control\"\nclient_cert = {}\nprivate_key = {}\nserver_ca = {}\n",
+            "device_id = \"{FIXTURE_DEVICE}\"\nrelay_url = \"wss://relay.example.test/v1/tunnel/control\"\nclient_cert = {}\nprivate_key = {}\nserver_ca = {}\n",
             toml_string(&certificate_path),
             toml_string(&key_path),
             toml_string(&server_ca_path),
@@ -168,10 +177,37 @@ fn doctor_binary_reports_private_fixture_success_and_pending_supervisor_ipc() {
     assert_eq!(report["result"]["credential_key_match"]["status"], "ok");
     assert_eq!(report["result"]["permissions"]["status"], "ok");
     assert_eq!(report["result"]["expiry"]["status"], "ok");
+    assert_eq!(report["result"]["device_identity"]["status"], "ok");
     assert_eq!(
         report["result"]["supervisor_ipc"]["status"],
         "not_implemented"
     );
+    assert_redacted(&report, &output);
+}
+
+/// M6-C44, through the real binary: a profile whose `device_id` was edited
+/// after `credentials import` to another device is refused by the relay on
+/// every HELLO, so `doctor` must not report it healthy.  Before the fix this
+/// exited `0` with `"ok":true`.
+#[test]
+fn doctor_binary_returns_exit_three_when_device_id_is_not_the_certificates_device() {
+    let fixture = Fixture::valid();
+    let text = fs::read_to_string(&fixture.config).expect("read doctor configuration");
+    let edited = text.replacen(FIXTURE_DEVICE, "44444444-4444-4444-8444-444444444444", 1);
+    assert_ne!(text, edited);
+    fs::write(&fixture.config, edited).expect("edit doctor configuration");
+    let output = run_doctor(&fixture.config);
+    assert_eq!(output.status.code(), Some(3));
+    let report = report(&output);
+    assert!(!report["ok"].as_bool().unwrap_or(true));
+    assert_eq!(report["error"]["code"], "CREDENTIAL_DEVICE_MISMATCH");
+    assert_eq!(report["result"]["device_identity"]["status"], "failed");
+    assert_eq!(
+        report["result"]["device_identity"]["code"],
+        "CREDENTIAL_DEVICE_MISMATCH"
+    );
+    assert_eq!(report["result"]["credential_key_match"]["status"], "ok");
+    assert_capabilities_reported(&report);
     assert_redacted(&report, &output);
 }
 
@@ -245,5 +281,6 @@ fn doctor_binary_rejects_invalid_configuration_with_exit_two() {
     );
     assert_eq!(report["result"]["permissions"]["status"], "not_run");
     assert_eq!(report["result"]["expiry"]["status"], "not_run");
+    assert_eq!(report["result"]["device_identity"]["status"], "not_run");
     assert_redacted(&report, &output);
 }
