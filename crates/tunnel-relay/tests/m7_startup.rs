@@ -331,6 +331,11 @@ require_private_ip = true
     /// child process, and the kernel has closed every socket a reaped process
     /// held, so re-binding a released port could only race other processes.
     fn assert_bindings_available(&self) {
+        assert!(
+            self.held_consumer.is_some() || self.held_device.is_some() || self.held_peer.is_some(),
+            "no address is held, so this check would prove nothing; do not call it after \
+             releasing every address to `serve`"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
@@ -649,7 +654,8 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
     // redacted readiness state; the executable refuses to serve with the
     // bounded, stable startup-level reason.
     assert_failure(&output, "cluster membership bootstrap did not reach ready");
-    fixture.assert_bindings_available();
+    // Every address was released to `serve`, so nothing is left to prove
+    // unbound (see `assert_bindings_available`).
 }
 
 /// The four fake-Redis tests above failed on the GitHub Linux runner with
@@ -935,7 +941,8 @@ fn serve_sigterm_during_the_membership_bootstrap_exits_interrupted() {
     fixture.let_serve_bind_peer();
     let (output, after_signal) = signal_serve_during_startup(&config, &checkpoint, "TERM", false);
     assert_interrupted_during_startup(&output, after_signal, "TERM");
-    fixture.assert_bindings_available();
+    // Every address was released to `serve`, so nothing is left to prove
+    // unbound (see `assert_bindings_available`).
 }
 
 // ------------------------------------------------------------------------

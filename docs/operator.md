@@ -1357,7 +1357,17 @@ ended), `rotation_freeze_hold_released_total{outcome}` (`commit`, `abort`,
 `rotation_freeze_hold_refused_total{reason}` (`after_bound`: held past the
 bound; `hold_full`: never held because the hold was full),
 `rotation_freeze_hold_cancelled_total` (the consumer went away while held) and
-the gauge `rotation_freeze_hold_max_wait_ms`. Every held OPEN leaves the hold
+the gauge `rotation_freeze_hold_max_wait_ms`. **Do not add
+`consumer_refusals_total{stage="rotation_freeze"}` to
+`rotation_freeze_hold_refused_total`:** the two overlap without either containing the
+other. A request this relay refuses as owner because the hold's bound passed or
+the hold was full is counted in both, so their sum counts it twice. Only the
+hold counts such a refusal for a request that reached the owner through a peer
+hop (the ingress relay counts it as a peer fault), and only
+`consumer_refusals_total` counts a request released from one hold into a
+freeze that has begun again, which is refused without being held twice. Read
+the first for which local route was refused and the second for why the hold
+refused. Every held OPEN leaves the hold
 exactly once, so `held_total` equals `current` plus every `released_total`,
 `refused_total{reason="after_bound"}` and `cancelled_total`; a scrape where it
 does not is a relay defect worth reporting. Every value is a count, a gauge or a byte

@@ -7275,7 +7275,11 @@ impl M2Actor {
             // observed the close yet; it will, and its ROTATE_ABORT decides
             // the attempt.  Admission and old writes are already frozen by
             // `defer_candidate_abort`, and there is no candidate to barrier,
-            // so the crossed QUIESCE is recorded as seen and not applied.
+            // so the crossed QUIESCE is not applied and no actor state keeps
+            // it.  The rotation journal already holds it as a pending entry
+            // (observed before this handler runs), so a retransmission is a
+            // pending duplicate; the owner's ABORT, or else the overlap
+            // deadline, settles the attempt.
             // Failing the session here would turn a candidate loss the
             // protocol recovers from into a terminal protocol error.
             return Ok(());
@@ -16412,16 +16416,16 @@ mod tests {
             .expect("old carrier task joins after the forced closure");
     }
 
-    /// Task row M2-07: the owner sends `ROTATE_QUIESCE` as soon as the
-    /// candidate is data-ready, and the candidate can close while that
-    /// QUIESCE is on the wire (the M2 candidate-abort gate closes it in any
-    /// precommit phase).  The connector then holds the closure for the
-    /// owner's ABORT and has neither a pending nor an installed candidate.
-    /// The crossed QUIESCE must not fail the session with a candidate
-    /// identity mismatch; the owner's ABORT must still settle the attempt.
-    #[tokio::test]
-    async fn a_quiesce_crossing_the_candidate_close_waits_for_the_owner_abort() {
-        let (mut actor, active_key, _active_receiver, mut control_receiver) =
+    /// Task row M2-07: an actor whose candidate closed in `Preparing` and
+    /// which then read the owner's crossed `ROTATE_QUIESCE` for that attempt.
+    async fn actor_after_a_crossed_quiesce() -> (
+        M2Actor,
+        RotationAttemptIdentity,
+        CarrierKey,
+        RotateQuiesce,
+        mpsc::Receiver<crate::QueuedMessage>,
+    ) {
+        let (mut actor, active_key, _active_receiver, control_receiver) =
             test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
         let candidate_key = CarrierKey::new(2, "candidate");
         // The receiver is dropped: the carrier has no task, so its close is
@@ -16483,6 +16487,20 @@ mod tests {
         assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
         assert!(actor.writes_frozen && !actor.accepting);
 
+        (actor, attempt, candidate_key, quiesce, control_receiver)
+    }
+
+    /// Task row M2-07: the owner sends `ROTATE_QUIESCE` as soon as the
+    /// candidate is data-ready, and the candidate can close while that
+    /// QUIESCE is on the wire (the M2 candidate-abort gate closes it in any
+    /// precommit phase).  The connector then holds the closure for the
+    /// owner's ABORT and has neither a pending nor an installed candidate.
+    /// The crossed QUIESCE must not fail the session with a candidate
+    /// identity mismatch; the owner's ABORT must still settle the attempt.
+    #[tokio::test]
+    async fn a_quiesce_crossing_the_candidate_close_waits_for_the_owner_abort() {
+        let (mut actor, attempt, candidate_key, quiesce, mut control_receiver) =
+            actor_after_a_crossed_quiesce().await;
         // A QUIESCE for any other attempt is still refused.
         let mut other = quiesce;
         other.message_id = "quiesce-other".to_owned();
@@ -16519,5 +16537,35 @@ mod tests {
         assert_eq!(aborted.reply_to, "abort");
         assert_eq!(aborted.attempt, attempt);
         assert_eq!(aborted.closed_connection_id, candidate_key.connection_id);
+    }
+
+    /// Task row M2-07, review: a crossed QUIESCE never replaces the owner's
+    /// decision.  If ROTATE_ABORT never arrives, the overlap deadline moves
+    /// the attempt to `Recovering` and the session fails with the bounded,
+    /// retryable transport error, as it does for any undecided candidate
+    /// loss; the crossed QUIESCE does not keep the attempt alive.
+    #[tokio::test]
+    async fn a_crossed_quiesce_without_an_abort_reaches_the_overlap_deadline() {
+        let (mut actor, _attempt, _candidate_key, _quiesce, _control_receiver) =
+            actor_after_a_crossed_quiesce().await;
+        cross_overlap_deadline_and_grace(&mut actor);
+        let mut failure = None;
+        for _ in 0..4 {
+            if let Err(error) = actor.handle_rotation_deadline().await {
+                failure = Some(error);
+                break;
+            }
+        }
+        let failure = failure.expect("the overlap deadline ends the undecided attempt");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Recovering);
+        assert!(failure.retryable(), "{failure:?}");
+        assert!(
+            matches!(
+                &failure,
+                ClientError::Transport { scope: "data rotation", detail }
+                    if detail == "candidate abort owner decision not received before overlap deadline"
+            ),
+            "{failure:?}"
+        );
     }
 }
