@@ -2168,6 +2168,53 @@ CASES_C20: list[tuple[str, list[Edit], bool]] = [
     ),
 ]
 
+#: The relay half of Lane B (PR #170 review): `computer-v1` is a selectable
+#: `http_forward` profile, and a stock client's `accept` is dropped for it.
+RELAY_CRATE = REPO / "crates" / "tunnel-relay"
+RELAY_CONFIG = RELAY_CRATE / "src" / "config.rs"
+RELAY_FORWARD = RELAY_CRATE / "src" / "http" / "forward.rs"
+RELAY_CUA_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "computer_v1",
+    "stock_accept",
+]
+
+CASES_C20_RELAY: list[tuple[str, list[Edit], bool]] = [
+    (
+        "M5-C21: the relay resolves computer-v1 as an http_forward profile",
+        [
+            (
+                RELAY_CONFIG,
+                """} else if let Some(profile) = tunnel_cua::CuaProfile::parse_id(id) {""",
+                """} else if let Some(profile) = tunnel_cua::CuaProfile::parse_id(id).filter(|_| false) {""",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C26: a stock client's accept is dropped where the profile does not allowlist it",
+        [
+            (
+                RELAY_FORWARD,
+                """    http::HeaderName::from_static("sec-fetch-mode"),
+    header::ACCEPT,
+];""",
+                """    http::HeaderName::from_static("sec-fetch-mode"),
+    header::ACCEPT_LANGUAGE,
+];""",
+            )
+        ],
+        False,
+    ),
+]
+
 #: The Lane B export lives in `tunnel-client` behind the non-default `cua`
 #: feature, so its suite builds that crate with the feature; the workspace
 #: test run never does.
@@ -2186,6 +2233,22 @@ CLIENT_CUA_CARGO_TEST = [
 ]
 
 CASES_C20_CLIENT: list[tuple[str, list[Edit], bool]] = [
+    (
+        "M5-C20: a request without a principal binding gets no session",
+        [
+            (
+                CLIENT_CUA_EXPORT,
+                """            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+        else {""",
+                """            .filter(|value| !value.is_empty())
+            .or(Some("none"))
+            .map(str::to_owned)
+        else {""",
+            )
+        ],
+        False,
+    ),
     (
         "M5-C21: a cua build refuses a cua export without the environment opt-in",
         [
@@ -2311,6 +2374,13 @@ SUITES: list[Suite] = [
         C4_CARGO_TEST,
         CASES_C20,
         build=C4_BUILD,
+    ),
+    # The relay half of Lane B.
+    Suite(
+        "m5c20-relay",
+        [RELAY_CRATE],
+        RELAY_CUA_CARGO_TEST,
+        CASES_C20_RELAY,
     ),
     # The Lane B export, tested with `--features cua`.
     Suite(
@@ -2640,6 +2710,20 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
             "client::tests::a_truncated_chunked_response_is_not_a_body",
         }
     ),
+    (
+        "m5c20-relay",
+        "M5-C21: the relay resolves computer-v1 as an http_forward profile",
+    ): frozenset({"config::tests::the_computer_v1_profile_is_selectable_with_its_own_limits"}),
+    (
+        "m5c20-relay",
+        "M5-C26: a stock client's accept is dropped where the profile does not allowlist it",
+    ): frozenset(
+        {"http::forward::tests::a_stock_accept_is_dropped_for_computer_v1_and_kept_where_allowlisted"}
+    ),
+    (
+        "m5c20-client",
+        "M5-C20: a request without a principal binding gets no session",
+    ): frozenset({"cua_export::tests::a_request_without_a_principal_binding_is_refused"}),
     (
         "m5c20-client",
         "M5-C21: a cua build refuses a cua export without the environment opt-in",
