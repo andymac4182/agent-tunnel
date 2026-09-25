@@ -392,6 +392,16 @@ async fn run(command: Command) -> Result<(), CliError> {
                 "Imported {} client certificate(s) and {} server CA certificate(s).",
                 output.certificate_count, output.ca_certificate_count
             );
+            // M6-C54: imported, because a host clock behind the issuer's sees
+            // every fresh certificate this way, but not a plain success.
+            if let Some(not_before) = output.not_yet_valid_until {
+                eprintln!(
+                    "tunnel-client: warning: the imported client certificate is not valid \
+                     until unix time {not_before} on this host's clock; `doctor` reports \
+                     CREDENTIAL_NOT_YET_VALID and `connect` retries until then (check this \
+                     host's clock if the issuer's is correct)"
+                );
+            }
             Ok(())
         }
         Command::Doctor { .. } => unreachable!("doctor is handled before the async command runner"),

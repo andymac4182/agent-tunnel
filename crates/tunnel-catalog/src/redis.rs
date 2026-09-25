@@ -3474,6 +3474,7 @@ if expiry and expiry > now then
     local selected = math.max(expiry, lease)
     redis.call('HSET', KEYS[1], 'lease_expires_at_us', string.format('%.0f', selected))
     redis.call('PEXPIREAT', KEYS[1], math.floor(selected / 1000))
+    redis.call('HSET', KEYS[3], 'last_seen_at_us', string.format('%.0f', now))
     return {'ok', h(KEYS[1], 'owner_epoch'), string.format('%.0f', selected)}
   end
   return {'busy'}
@@ -3491,6 +3492,9 @@ redis.call('HSET', KEYS[1],
   'session_id', ARGV[5], 'owner_epoch', epoch, 'lease_expires_at_us', ARGV[6])
 redis.call('PEXPIREAT', KEYS[1], math.floor(lease / 1000))
 redis.call('SET', KEYS[6], next_generation)
+-- Task row M6-C63: an admitted owner is a device seen now.  Written in the
+-- same script as the claim, on the Redis clock, and only on success.
+redis.call('HSET', KEYS[3], 'last_seen_at_us', string.format('%.0f', now))
 return {'ok', epoch, ARGV[6]}
 "#;
 
@@ -3513,6 +3517,10 @@ if h(KEYS[1], 'owner_epoch') ~= ARGV[3]
    or h(KEYS[1], 'session_id') ~= ARGV[6] then return {'stale'} end
 redis.call('HSET', KEYS[1], 'lease_expires_at_us', ARGV[7])
 redis.call('PEXPIREAT', KEYS[1], math.floor(tonumber(ARGV[7]) / 1000))
+-- Task row M6-C63: every successful renewal of a live owner advances the
+-- device's last-seen time, so it is refreshed at the renewal rate while the
+-- device is connected and never by a stale or fenced owner.
+redis.call('HSET', KEYS[2], 'last_seen_at_us', string.format('%.0f', now))
 return {'ok'}
 "#;
 

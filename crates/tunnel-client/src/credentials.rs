@@ -39,6 +39,12 @@ pub struct ImportedCredential {
     pub server_ca_path: PathBuf,
     pub certificate_count: usize,
     pub ca_certificate_count: usize,
+    /// The end-entity certificate's `notBefore`, as unix seconds, when it is
+    /// still ahead of this host's clock (task row M6-C54).  Such a
+    /// certificate is imported, because a host whose clock is behind sees
+    /// every fresh certificate this way and `connect` retries it until it is
+    /// valid, but the caller must say so rather than report a plain success.
+    pub not_yet_valid_until: Option<i64>,
 }
 
 /// Generate a local ECDSA key and a PEM CSR without overwriting files.
@@ -81,14 +87,39 @@ pub fn create_csr(
 
 /// Validate and import an externally issued certificate and server trust
 /// bundle.  Destination files are never overwritten by this operation.
+///
+/// **All or nothing (task row M6-C55).**  Every check, including whether
+/// either destination already exists, runs before any file is written, and
+/// the two files are then installed together: each is written and synced
+/// under a private staging name beside its destination and linked into
+/// place without replacing anything, and if the second cannot be installed
+/// the first is removed again.  A refusal therefore leaves the profile as it
+/// was.  Before M6-C55 the certificate was written first and a refusal on the
+/// server CA left it behind, which the next attempt then refused to
+/// overwrite.
 #[cfg(unix)]
 pub fn import_certificate(
     config: &RuntimeConfig,
     certificate_source: impl AsRef<Path>,
     server_ca_source: impl AsRef<Path>,
 ) -> Result<ImportedCredential, CredentialError> {
-    let certificate_source = certificate_source.as_ref();
-    let server_ca_source = server_ca_source.as_ref();
+    import_certificate_at(
+        config,
+        certificate_source.as_ref(),
+        server_ca_source.as_ref(),
+        unix_now(),
+    )
+}
+
+/// [`import_certificate`] against an explicit clock, so the validity window
+/// can be tested deterministically.
+#[cfg(unix)]
+fn import_certificate_at(
+    config: &RuntimeConfig,
+    certificate_source: &Path,
+    server_ca_source: &Path,
+    now_unix: i64,
+) -> Result<ImportedCredential, CredentialError> {
     let key = load_private_key(&config.credentials.client_key)?;
     let certificate_chain = load_certificates(certificate_source)?;
     if certificate_chain.is_empty() {
@@ -101,30 +132,68 @@ pub fn import_certificate(
     // than one catch-all "key mismatch" (task row M6-C25).
     verify_certificate_key(&certificate_chain, key)?;
     verify_device_role(&certificate_chain[0], &config.device_id)?;
+    let not_yet_valid_until = check_import_validity(&certificate_chain[0], now_unix)?;
 
     let ca_chain = load_certificates(server_ca_source)?;
     if ca_chain.is_empty() {
         return Err(CredentialError::NoCertificates(server_ca_source.to_owned()));
     }
 
+    let mut installs = Vec::with_capacity(2);
     if certificate_source != config.credentials.client_certificate {
-        ensure_parent(&config.credentials.client_certificate, false)?;
-        copy_new(
+        installs.push((
             certificate_source,
-            &config.credentials.client_certificate,
-            false,
-        )?;
+            config.credentials.client_certificate.as_path(),
+        ));
     }
     if server_ca_source != config.credentials.server_ca {
-        ensure_parent(&config.credentials.server_ca, false)?;
-        copy_new(server_ca_source, &config.credentials.server_ca, false)?;
+        installs.push((server_ca_source, config.credentials.server_ca.as_path()));
     }
+    install_new_files(&installs)?;
     Ok(ImportedCredential {
         certificate_path: config.credentials.client_certificate.clone(),
         server_ca_path: config.credentials.server_ca.clone(),
         certificate_count: certificate_chain.len(),
         ca_certificate_count: ca_chain.len(),
+        not_yet_valid_until,
     })
+}
+
+/// Refuse an end-entity certificate that is already past `notAfter` on this
+/// host's clock, and report one whose `notBefore` is still ahead (task row
+/// M6-C54).
+///
+/// The two are deliberately treated differently, matching `connect`: an
+/// expired certificate can never become valid, and `connect` exits `3` on it
+/// without retrying, so importing it only defers the same refusal; a
+/// certificate not yet valid is what a host whose clock is behind sees for
+/// every freshly issued certificate, so refusing it would turn clock skew
+/// into a failed import, and `connect` retries it until it is valid.
+#[cfg(unix)]
+fn check_import_validity(
+    leaf: &CertificateDer<'_>,
+    now_unix: i64,
+) -> Result<Option<i64>, CredentialError> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|error| CredentialError::CertificateUnparseable(error.to_string()))?;
+    let validity = parsed.validity();
+    let not_after = validity.not_after.timestamp();
+    if not_after <= now_unix {
+        return Err(CredentialError::CertificateExpired {
+            not_after_unix: not_after,
+        });
+    }
+    let not_before = validity.not_before.timestamp();
+    Ok((not_before > now_unix).then_some(not_before))
+}
+
+#[cfg(unix)]
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 /// Check that a client certificate chain is usable with `key`, classifying
@@ -323,14 +392,194 @@ fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialE
     file.sync_all().map_err(CredentialError::Io)
 }
 
+/// Install every `(source, destination)` pair, or none of them (task row
+/// M6-C55).
+///
+/// 1. Every destination is checked first.  One that already holds exactly
+///    its source's bytes is treated as installed and skipped -- the state a
+///    crash between two links leaves, so the same import re-run completes it
+///    (review of M6-C55); one that holds anything else is refused, naming it,
+///    and nothing has been written.
+/// 2. Staging files an earlier import left behind by crashing (named
+///    `.<file>.import-<pid>-<n>` beside the destination) are removed once
+///    they are more than [`STALE_STAGING_AGE`] old.
+/// 3. Each remaining source is copied to a staging file beside its
+///    destination (`create_new`, then synced), so a destination never appears
+///    holding a partial file.
+/// 4. Each staging file is hard-linked to its destination, and the directory
+///    is synced.  `link` fails rather than replacing an existing name, so a
+///    destination created concurrently after step 1 is still never
+///    overwritten.  A filesystem without hard links (exFAT, some SMB and FUSE
+///    mounts) falls back to writing the destination with `create_new`: still
+///    never overwriting, but a crash mid-write can leave a partial file, which
+///    the next import refuses by name rather than trusting.
+/// 5. If any step fails, every destination installed by this call is removed
+///    again -- it did not exist before, because its link or `create_new`
+///    succeeded -- and every staging file is removed on every path.
+///
+/// All-or-nothing therefore holds for every **refusal**; a **crash** can
+/// leave the first file installed and a staging file behind, which re-running
+/// the same import completes and cleans up.
 #[cfg(unix)]
-fn copy_new(source: &Path, destination: &Path, private: bool) -> Result<(), CredentialError> {
-    let mut bytes = Vec::new();
-    File::open(source)
-        .map_err(CredentialError::Io)?
-        .read_to_end(&mut bytes)
-        .map_err(CredentialError::Io)?;
-    write_new(destination, &bytes, private)
+fn install_new_files(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
+    let mut pending = Vec::with_capacity(installs.len());
+    for (source, destination) in installs {
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                let installed = fs::read(destination).map_err(CredentialError::Io)?;
+                let wanted = fs::read(source).map_err(CredentialError::Io)?;
+                if installed != wanted {
+                    return Err(CredentialError::AlreadyExists((*destination).to_owned()));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                pending.push((*source, *destination));
+            }
+            Err(error) => return Err(CredentialError::Io(error)),
+        }
+    }
+    for (_, destination) in &pending {
+        remove_stale_staging(destination);
+    }
+    stage_and_link(&pending)
+}
+
+/// How old a leftover staging file must be before an import removes it, so a
+/// concurrent import's live staging file is left alone.
+#[cfg(unix)]
+const STALE_STAGING_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Remove `.<file>.import-*` staging files beside `destination` that are
+/// older than [`STALE_STAGING_AGE`].  Best effort: a failure here leaves a
+/// stray file, never a changed credential.
+#[cfg(unix)]
+fn remove_stale_staging(destination: &Path) {
+    let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let prefix = format!(".{}.import-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_STAGING_AGE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Steps 3 to 5 of [`install_new_files`], without its up-front check, so the
+/// rollback can be exercised against a destination that appears after the
+/// check.
+#[cfg(unix)]
+fn stage_and_link(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
+    stage_and_link_with(
+        installs,
+        |staging, destination| fs::hard_link(staging, destination),
+        |destination, bytes| write_new(destination, bytes, false),
+    )
+}
+
+/// [`stage_and_link`] with the linking step and the no-link fallback write
+/// injected, so the fallback, and a fallback write that fails part-way, can
+/// be exercised on a filesystem that does support hard links.
+#[cfg(unix)]
+fn stage_and_link_with(
+    installs: &[(&Path, &Path)],
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
+    fallback_write: impl Fn(&Path, &[u8]) -> Result<(), CredentialError>,
+) -> Result<(), CredentialError> {
+    let mut staged: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(installs.len());
+    let mut linked: Vec<PathBuf> = Vec::with_capacity(installs.len());
+    let result = (|| {
+        for (source, destination) in installs {
+            ensure_parent(destination, false)?;
+            let mut bytes = Vec::new();
+            File::open(source)
+                .map_err(CredentialError::Io)?
+                .read_to_end(&mut bytes)
+                .map_err(CredentialError::Io)?;
+            let staging = staging_path(destination);
+            write_new(&staging, &bytes, false)?;
+            staged.push((staging, bytes));
+        }
+        for ((_, destination), (staging, bytes)) in installs.iter().zip(&staged) {
+            match link(staging, destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(CredentialError::AlreadyExists((*destination).to_owned()));
+                }
+                // No hard links here: write the destination directly, still
+                // with `create_new`, so it is never overwritten.  If that
+                // write created the file and then failed (a full disk during
+                // `write_all` or `sync_all`), the partial file is this call's
+                // and is removed, so the refusal leaves the profile unchanged.
+                // `AlreadyExists` means the file is someone else's: leave it.
+                Err(_) => match fallback_write(destination, bytes) {
+                    Ok(()) => {}
+                    Err(error @ CredentialError::AlreadyExists(_)) => return Err(error),
+                    Err(error) => {
+                        let _ = fs::remove_file(destination);
+                        return Err(error);
+                    }
+                },
+            }
+            linked.push((*destination).to_owned());
+            sync_parent(destination)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for destination in &linked {
+            let _ = fs::remove_file(destination);
+        }
+    }
+    for (staging, _) in &staged {
+        let _ = fs::remove_file(staging);
+    }
+    result
+}
+
+/// Sync the directory holding `path`, so a new link survives a crash.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), CredentialError> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(CredentialError::Io)
+}
+
+/// A staging name beside `destination`, unique to this process and call.
+#[cfg(unix)]
+fn staging_path(destination: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    destination.with_file_name(format!(
+        ".{name}.import-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// Errors returned by credential parsing/provisioning.
@@ -353,6 +602,11 @@ pub enum CredentialError {
     /// The TLS stack refused the certificate for a reason other than those
     /// above; the detail is the provider's.
     CertificateRefused(String),
+    /// The end-entity certificate is past its `notAfter` on this host's
+    /// clock (task row M6-C54); the value is that time as unix seconds.
+    CertificateExpired {
+        not_after_unix: i64,
+    },
     /// The certificate has no usable `urn:agent-tunnel:device:<id>` URI SAN.
     MissingDeviceRole(String),
     /// The profile's `device_id` is not a UUID, which the relay requires.
@@ -410,6 +664,12 @@ impl fmt::Display for CredentialError {
             Self::CertificateRefused(error) => write!(
                 formatter,
                 "client certificate was refused by the TLS stack: {error}"
+            ),
+            Self::CertificateExpired { not_after_unix } => write!(
+                formatter,
+                "client certificate expired at unix time {not_after_unix} on this host's \
+                 clock; the relay refuses it and `connect` would exit 3 on it, so it was \
+                 not imported (ask the issuer for a new certificate)"
             ),
             Self::MissingDeviceRole(error) => write!(
                 formatter,
@@ -563,6 +823,19 @@ mod tests {
                 .distinguished_name
                 .push(DnType::CommonName, format!("device/{DEVICE}"));
             params.subject_alt_names = sans;
+            params.self_signed(key).expect("v3 certificate").pem()
+        }
+
+        /// A v3 device certificate for `key` valid over `[not_before,
+        /// not_after]`, given as years.
+        pub(super) fn v3_pem_between(key: &KeyPair, not_before: i32, not_after: i32) -> String {
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, format!("device/{DEVICE}"));
+            params.subject_alt_names = vec![device_san(DEVICE)];
+            params.not_before = rcgen::date_time_ymd(not_before, 1, 1);
+            params.not_after = rcgen::date_time_ymd(not_after, 1, 1);
             params.self_signed(key).expect("v3 certificate").pem()
         }
 
@@ -849,6 +1122,354 @@ mod tests {
             verify_device_role(&leaf, "not-a-uuid"),
             Err(CredentialError::DeviceIdNotUuid(_))
         ));
+    }
+
+    /// A profile directory with a pending key, an issued certificate and a
+    /// CA bundle, for the M6-C54 and M6-C55 cases.
+    #[cfg(unix)]
+    struct ImportFixture {
+        dir: tempfile::TempDir,
+        config: RuntimeConfig,
+        source: PathBuf,
+        ca: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ImportFixture {
+        fn new(key: &rcgen::KeyPair, certificate_pem: &str) -> Self {
+            let dir = tempdir().expect("temporary directory");
+            let mut config = RuntimeConfig {
+                device_id: material::DEVICE.to_owned(),
+                ..RuntimeConfig::default()
+            };
+            config.credentials.client_key = dir.path().join("device-key.pem");
+            config.credentials.client_certificate =
+                dir.path().join("credentials/installed-cert.pem");
+            config.credentials.server_ca = dir.path().join("credentials/installed-ca.pem");
+            fs::write(&config.credentials.client_key, key.serialize_pem()).expect("pending key");
+            let source = dir.path().join("issued.pem");
+            fs::write(&source, certificate_pem).expect("issued certificate");
+            let ca_key = rcgen::KeyPair::generate().expect("CA key");
+            let ca = dir.path().join("ca.pem");
+            fs::write(&ca, material::v3_pem(&ca_key, Vec::new())).expect("CA bundle");
+            Self {
+                dir,
+                config,
+                source,
+                ca,
+            }
+        }
+
+        fn import(&self) -> Result<ImportedCredential, CredentialError> {
+            import_certificate(&self.config, &self.source, &self.ca)
+        }
+
+        /// Every entry of the destination directory, staging files included.
+        fn installed(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.dir.path().join("credentials"))
+                .map(|entries| {
+                    entries
+                        .map(|entry| {
+                            entry
+                                .expect("directory entry")
+                                .file_name()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        }
+    }
+
+    /// M6-C55, the measured case: the server CA destination already exists
+    /// (the tester had moved only the certificate aside), so the import is
+    /// refused -- and it must refuse **before** writing the certificate.
+    /// Before the fix the certificate was installed first, the refusal named
+    /// only the CA, and the next attempt refused the certificate the failed
+    /// one had written.
+    #[test]
+    #[cfg(unix)]
+    fn a_refusal_on_the_server_ca_leaves_no_certificate_behind() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(material::DEVICE)]);
+        let fixture = ImportFixture::new(&key, &certificate);
+        fs::create_dir_all(fixture.dir.path().join("credentials")).expect("credential dir");
+        fs::write(&fixture.config.credentials.server_ca, "existing CA\n").expect("existing CA");
+
+        let error = fixture.import().expect_err("the CA destination exists");
+        assert!(
+            matches!(&error, CredentialError::AlreadyExists(path)
+                if path == &fixture.config.credentials.server_ca),
+            "{error:?}"
+        );
+        assert_eq!(
+            fixture.installed(),
+            vec!["installed-ca.pem".to_owned()],
+            "the refusal must leave the profile exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.config.credentials.server_ca).expect("CA"),
+            "existing CA\n",
+            "and must not touch the existing file"
+        );
+
+        // With the CA moved aside too, the same import now succeeds: nothing
+        // from the refused attempt is in its way.
+        fs::remove_file(&fixture.config.credentials.server_ca).expect("move CA aside");
+        let imported = fixture.import().expect("a clean retry imports");
+        assert_eq!(imported.certificate_count, 1);
+        assert_eq!(
+            fixture.installed(),
+            vec![
+                "installed-ca.pem".to_owned(),
+                "installed-cert.pem".to_owned()
+            ],
+            "both files, and no staging file left behind"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.config.credentials.client_certificate).expect("cert"),
+            certificate
+        );
+    }
+
+    /// M6-C55, the other order: an existing certificate is refused and the
+    /// CA is not written either.
+    #[test]
+    #[cfg(unix)]
+    fn a_refusal_on_the_certificate_writes_no_server_ca() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(material::DEVICE)]);
+        let fixture = ImportFixture::new(&key, &certificate);
+        fs::create_dir_all(fixture.dir.path().join("credentials")).expect("credential dir");
+        fs::write(&fixture.config.credentials.client_certificate, "old\n").expect("old cert");
+        let error = fixture
+            .import()
+            .expect_err("the certificate destination exists");
+        assert!(
+            matches!(&error, CredentialError::AlreadyExists(path)
+                if path == &fixture.config.credentials.client_certificate),
+            "{error:?}"
+        );
+        assert_eq!(fixture.installed(), vec!["installed-cert.pem".to_owned()]);
+    }
+
+    /// M6-C55, the install step itself: when the second link fails after
+    /// the first succeeded, the first destination is removed again and no
+    /// staging file survives.  The second destination is created after the
+    /// existence check -- by calling the staging step directly, which is the
+    /// race `link`'s no-clobber rule exists for -- so its link, and not the
+    /// check, is what refuses.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_second_link_rolls_back_the_first() {
+        let dir = tempdir().expect("temporary directory");
+        let first_source = dir.path().join("first-source");
+        let second_source = dir.path().join("second-source");
+        fs::write(&first_source, "first").expect("first source");
+        fs::write(&second_source, "second").expect("second source");
+        let out = dir.path().join("out");
+        fs::create_dir(&out).expect("destination directory");
+        let first = out.join("first");
+        let second = out.join("second");
+        fs::write(&second, "appeared after the check").expect("racing file");
+        let error = stage_and_link(&[(&first_source, &first), (&second_source, &second)])
+            .expect_err("the second link refuses to replace a file");
+        assert!(
+            matches!(&error, CredentialError::AlreadyExists(path) if path == &second),
+            "{error:?}"
+        );
+        assert!(!first.exists(), "the first destination was rolled back");
+        assert_eq!(
+            fs::read_to_string(&second).expect("second"),
+            "appeared after the check",
+            "the racing file is untouched"
+        );
+        let mut left: Vec<String> = fs::read_dir(&out)
+            .expect("destination directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["second".to_owned()], "no staging file survives");
+    }
+
+    /// Review of M6-C55, crash recovery: a crash between the two links leaves
+    /// the certificate installed and a staging file behind.  Re-running the
+    /// same import treats the byte-identical certificate as installed,
+    /// installs the CA, and removes the stale staging file; a certificate
+    /// that differs is still refused.
+    #[test]
+    #[cfg(unix)]
+    fn a_rerun_after_a_crash_between_links_completes_the_import() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(material::DEVICE)]);
+        let fixture = ImportFixture::new(&key, &certificate);
+        let credentials = fixture.dir.path().join("credentials");
+        fs::create_dir_all(&credentials).expect("credential dir");
+        // The crash: the certificate was linked, the CA was not, and the
+        // staging file of the CA survived.
+        fs::write(&fixture.config.credentials.client_certificate, &certificate)
+            .expect("certificate from the crashed run");
+        let stale = credentials.join(".installed-ca.pem.import-1-0");
+        fs::write(&stale, "partial").expect("stale staging");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the staging file");
+
+        fixture.import().expect("the re-run completes the import");
+        assert_eq!(
+            fixture.installed(),
+            vec![
+                "installed-ca.pem".to_owned(),
+                "installed-cert.pem".to_owned()
+            ],
+            "the CA is installed and the stale staging file is gone"
+        );
+
+        // A certificate that differs from the one being imported is still a
+        // refusal, not an overwrite.
+        fs::remove_file(&fixture.config.credentials.server_ca).expect("move CA aside");
+        fs::write(&fixture.config.credentials.client_certificate, "another\n").expect("other");
+        assert!(matches!(
+            fixture.import(),
+            Err(CredentialError::AlreadyExists(path))
+                if path == fixture.config.credentials.client_certificate
+        ));
+        assert!(!fixture.config.credentials.server_ca.exists());
+    }
+
+    /// Review of M6-C55: on a filesystem without hard links the install
+    /// falls back to writing each destination with `create_new`, and still
+    /// installs both files and leaves no staging file.
+    #[test]
+    #[cfg(unix)]
+    fn without_hard_links_the_install_falls_back_to_a_no_clobber_write() {
+        let dir = tempdir().expect("temporary directory");
+        let first_source = dir.path().join("first-source");
+        let second_source = dir.path().join("second-source");
+        fs::write(&first_source, "first").expect("first source");
+        fs::write(&second_source, "second").expect("second source");
+        let out = dir.path().join("out");
+        let first = out.join("first");
+        let second = out.join("second");
+        stage_and_link_with(
+            &[(&first_source, &first), (&second_source, &second)],
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |destination, bytes| write_new(destination, bytes, false),
+        )
+        .expect("the fallback installs both");
+        assert_eq!(fs::read_to_string(&first).expect("first"), "first");
+        assert_eq!(fs::read_to_string(&second).expect("second"), "second");
+        let mut left: Vec<String> = fs::read_dir(&out)
+            .expect("destination directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["first".to_owned(), "second".to_owned()]);
+    }
+
+    /// Review of M6-C55: a fallback write that creates the destination and
+    /// then fails (a full disk during `write_all` or `sync_all`) leaves no
+    /// partial file behind, and the first destination is rolled back too, so
+    /// the refusal leaves the profile unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn a_fallback_write_that_fails_part_way_leaves_no_partial_file() {
+        let dir = tempdir().expect("temporary directory");
+        let first_source = dir.path().join("first-source");
+        let second_source = dir.path().join("second-source");
+        fs::write(&first_source, "first").expect("first source");
+        fs::write(&second_source, "second").expect("second source");
+        let out = dir.path().join("out");
+        let first = out.join("first");
+        let second = out.join("second");
+        let result = stage_and_link_with(
+            &[(&first_source, &first), (&second_source, &second)],
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |destination, bytes| {
+                if destination.ends_with("second") {
+                    // Created, then the disk filled: half the bytes landed.
+                    fs::write(destination, &bytes[..bytes.len() / 2]).expect("partial write");
+                    return Err(CredentialError::Io(io::Error::other("no space left")));
+                }
+                write_new(destination, bytes, false)
+            },
+        );
+        assert!(matches!(result, Err(CredentialError::Io(_))), "{result:?}");
+        let left: Vec<String> = fs::read_dir(&out)
+            .expect("destination directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            left.is_empty(),
+            "no partial, installed or staging file: {left:?}"
+        );
+    }
+
+    /// M6-C54: an expired certificate is refused on import, before any file
+    /// is written.  Before the fix it was imported with exit 0, and the
+    /// failure surfaced only at `connect`.
+    #[test]
+    #[cfg(unix)]
+    fn an_expired_certificate_is_refused_on_import() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem_between(&key, 2020, 2021);
+        let fixture = ImportFixture::new(&key, &certificate);
+        let error = fixture.import().expect_err("an expired certificate");
+        assert!(
+            matches!(error, CredentialError::CertificateExpired { not_after_unix }
+                if not_after_unix == 1_609_459_200),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("expired at unix time 1609459200")
+        );
+        assert!(fixture.installed().is_empty(), "nothing was written");
+    }
+
+    /// M6-C54: a certificate not yet valid on this host's clock is imported
+    /// -- a clock behind the issuer's sees every fresh certificate this way,
+    /// and `connect` retries it until it is valid -- but the import reports
+    /// when it becomes valid rather than a plain success.
+    #[test]
+    #[cfg(unix)]
+    fn a_certificate_not_yet_valid_is_imported_and_reported() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem_between(&key, 2090, 2091);
+        let fixture = ImportFixture::new(&key, &certificate);
+        let imported = fixture.import().expect("imported with a report");
+        assert_eq!(imported.not_yet_valid_until, Some(3_786_912_000));
+        assert!(fixture.config.credentials.client_certificate.exists());
+        // And a currently valid one carries no such report.
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let current = material::v3_pem_between(&key, 2020, 2090);
+        let fixture = ImportFixture::new(&key, &current);
+        assert_eq!(fixture.import().expect("valid").not_yet_valid_until, None);
     }
 
     #[test]

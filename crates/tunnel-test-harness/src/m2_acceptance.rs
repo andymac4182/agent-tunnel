@@ -3279,7 +3279,8 @@ async fn verify_consumer_rejections(
         &insufficient_scope,
         device_id,
         service_id,
-        &[401],
+        // M6-C53: a valid token lacking the route's scope is `403`.
+        &[403],
         "insufficient-scope M2 consumer token",
     )
     .await?;

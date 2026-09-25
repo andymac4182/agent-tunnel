@@ -10,9 +10,9 @@ use std::collections::BTreeSet;
 use chrono::{Duration, Utc};
 use redis::AsyncCommands;
 use tunnel_catalog::{
-    Catalog, CatalogError, CatalogFixture, CredentialRecord, FixtureDevice, GrantSpec,
-    MembershipRecord, MembershipRole, PermissionSet, PrincipalIdentity, RedisCatalog, ServiceSpec,
-    TenantRecord, UserRecord,
+    Catalog, CatalogError, CatalogFixture, CredentialRecord, DeviceListFilter, FixtureDevice,
+    GrantSpec, MembershipRecord, MembershipRole, OwnerClaimRequest, OwnerToken, PermissionSet,
+    PrincipalIdentity, RedisCatalog, ServiceSpec, TenantRecord, UserRecord,
 };
 use uuid::Uuid;
 
@@ -198,6 +198,102 @@ async fn first_activation_then_provisioning_yields_records_serve_resolves() {
         .expect("recovery can observe a provisioned namespace");
     assert!(observation.key_count() > 0);
 
+    delete_namespace(&namespace).await;
+}
+
+/// Task row M6-C63: the device listing's `last_seen_at` is written by the
+/// relay's own owner claim and every successful renewal, on the Redis clock,
+/// in the same script as the lease; a stale token's renewal writes nothing.
+/// Before M6-C63 nothing in the shipped relay wrote it, so it was `null` for
+/// a device connected for minutes.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c63_owner_claim_and_renewal_record_last_seen() {
+    let namespace = fresh_namespace();
+    let bootstrap = RedisCatalog::connect_for_recovery(&url(), &namespace, INCARNATION)
+        .await
+        .expect("connect for bootstrap");
+    bootstrap
+        .activate_first_deployment_incarnation()
+        .await
+        .expect("first activation");
+    let (records, ids) = records();
+    bootstrap
+        .provision_initial_catalog(&records)
+        .await
+        .expect("provision");
+    let serving =
+        RedisCatalog::connect_with_deployment_incarnation(&url(), &namespace, INCARNATION)
+            .await
+            .expect("serve's catalog");
+    let consumer = serving
+        .resolve_consumer(ISSUER, SUBJECT, None)
+        .await
+        .expect("resolve consumer")
+        .expect("the member resolves");
+    let last_seen = || async {
+        serving
+            .list_devices_filtered(&consumer, &DeviceListFilter::default(), Utc::now())
+            .await
+            .expect("list devices")
+            .into_iter()
+            .find(|device| device.device_id == ids.device)
+            .expect("the device is listed")
+            .last_seen_at
+    };
+    assert_eq!(last_seen().await, None, "provisioned, never connected");
+
+    let before_claim = Utc::now() - Duration::seconds(2);
+    let claim = serving
+        .claim_owner(&OwnerClaimRequest {
+            deployment_incarnation: INCARNATION.into(),
+            tenant_id: ids.tenant,
+            device_id: ids.device,
+            node_id: "m6c63-node".into(),
+            boot_id: "m6c63-boot".into(),
+            session_id: "m6c63-session".into(),
+            lease_expires_at: Utc::now() + Duration::seconds(10),
+        })
+        .await
+        .expect("claim owner");
+    let claimed = last_seen().await.expect("the claim records last_seen_at");
+    assert!(claimed >= before_claim, "{claimed} is the claim's time");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        serving
+            .renew_owner(&claim.token, Utc::now() + Duration::seconds(10))
+            .await
+            .expect("renew")
+    );
+    let renewed = last_seen().await.expect("still recorded");
+    assert!(
+        renewed > claimed,
+        "renewal advances it: {claimed} -> {renewed}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let stale = OwnerToken {
+        session_id: "m6c63-stale".into(),
+        ..claim.token.clone()
+    };
+    assert!(
+        !serving
+            .renew_owner(&stale, Utc::now() + Duration::seconds(10))
+            .await
+            .expect("stale renew result")
+    );
+    assert_eq!(
+        last_seen().await,
+        Some(renewed),
+        "a refused renewal records nothing"
+    );
+    assert!(serving.release_owner(&claim.token).await.expect("release"));
+    println!(
+        "m6c63-last-seen ok namespace={namespace} claimed_us={} renewed_us={}",
+        claimed.timestamp_micros(),
+        renewed.timestamp_micros()
+    );
     delete_namespace(&namespace).await;
 }
 

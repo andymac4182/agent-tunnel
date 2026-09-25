@@ -5887,10 +5887,12 @@ async fn start_relay(
                 consumer: AcceptedSocketOptions {
                     send_buffer_bytes: consumer_send_buffer_bytes,
                     diagnostics: consumer_socket_diagnostics.clone(),
+                    listener: None,
                 },
                 device: AcceptedSocketOptions {
                     send_buffer_bytes: harness.device_send_buffer_bytes,
                     diagnostics: device_socket_diagnostics.clone(),
+                    listener: None,
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,

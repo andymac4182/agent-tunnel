@@ -514,9 +514,12 @@ async fn verify_jwt_rejections(
         b"scope".to_vec(),
     )
     .await?;
+    // M6-C53: a token whose signature, claims and consumer all pass but that
+    // lacks the route's scope is `403` -- the token is fine, the route is not
+    // in it -- where it was `401` before.
     assert_status(
         &response,
-        hyper::StatusCode::UNAUTHORIZED,
+        hyper::StatusCode::FORBIDDEN,
         "missing echo scope",
     )?;
     evidence.auth_rejections += 1;

@@ -17,7 +17,10 @@ use std::fs;
 use serde::Serialize;
 use tunnel_client::{
     ConnectConfig,
-    credentials::{CredentialError, load_certificates, load_private_key, verify_certificate_key},
+    credentials::{
+        CredentialError, load_certificates, load_private_key, verify_certificate_key,
+        verify_device_role,
+    },
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -66,6 +69,13 @@ pub(crate) struct DoctorResult {
     pub(crate) credential_key_match: Check,
     pub(crate) permissions: PermissionCheck,
     pub(crate) expiry: ExpiryCheck,
+    /// Whether the profile's `device_id` names the device in the client
+    /// certificate's `urn:agent-tunnel:device:` role SAN, compared as UUIDs
+    /// exactly as the relay compares them (task row M6-C44).  The relay
+    /// refuses every HELLO that fails this, so a profile whose `device_id`
+    /// was edited after `credentials import` is no longer reported healthy.
+    /// It is placed after `expiry` so the fields before it keep their order.
+    pub(crate) device_identity: Check,
     pub(crate) supervisor_ipc: CapabilityCheck,
     /// Whether this installation can contain a supervised child's process
     /// group when the device itself is killed (M3-09).
@@ -174,6 +184,7 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
                 credential_key_match: not_run(),
                 permissions: PermissionCheck::not_run(),
                 expiry: ExpiryCheck::not_run(),
+                device_identity: not_run(),
                 supervisor_ipc,
                 process_containment,
             };
@@ -192,11 +203,13 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
     let key_match = check_key_match(&config);
     let permissions = check_permissions(&config);
     let expiry = check_expiry(&config, now);
+    let device_identity = check_device_identity(&config);
     let result = DoctorResult {
         config: ok(),
         credential_key_match: key_match,
         permissions,
         expiry,
+        device_identity,
         supervisor_ipc,
         process_containment,
     };
@@ -239,6 +252,10 @@ fn credential_error(code: &'static str) -> DoctorError {
             "a client certificate or server CA certificate is not yet valid"
         }
         "CREDENTIAL_MISSING" => "a configured credential file is missing or unreadable",
+        "CREDENTIAL_DEVICE_MISMATCH" => {
+            "the profile's device_id does not name the device in the client certificate's \
+             role SAN; the relay refuses this device"
+        }
         _ => "a configured credential is invalid",
     };
     DoctorError {
@@ -256,6 +273,7 @@ fn first_credential_failure(result: &DoctorResult) -> Option<&'static str> {
         .or(result.permissions.credential_directory.code)
         .or(result.expiry.client_certificate.code)
         .or(result.expiry.server_ca.code)
+        .or(result.device_identity.code)
 }
 
 fn check_key_match(config: &ConnectConfig) -> Check {
@@ -279,6 +297,27 @@ fn check_key_match(config: &ConnectConfig) -> Check {
     }
 }
 
+/// Task row M6-C44: compare the profile's `device_id` with the device the
+/// client certificate names, using the same check `credentials import`
+/// applies (`verify_device_role`, UUID comparison).  A certificate that does
+/// not load is not re-reported here; `credential_key_match` already fails
+/// for it, so this check is `not_run`.
+fn check_device_identity(config: &ConnectConfig) -> Check {
+    let Ok(certificates) = load_certificates(&config.credentials.client_certificate) else {
+        return not_run();
+    };
+    let Some(leaf) = certificates.first() else {
+        return not_run();
+    };
+    // The binding is named `refusal`, not `error`, so this arm stays textually
+    // distinct from `check_key_match`'s, which `scripts/m0-guard-exit-codes.py`
+    // anchors on exactly once.
+    match verify_device_role(leaf, &config.device_id) {
+        Ok(()) => ok(),
+        Err(refusal) => failed(credential_code(&refusal)),
+    }
+}
+
 fn credential_code(error: &CredentialError) -> &'static str {
     match error {
         CredentialError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -290,13 +329,18 @@ fn credential_code(error: &CredentialError) -> &'static str {
         }
         CredentialError::InvalidPem(_) | CredentialError::Tls(_) => "CREDENTIAL_INVALID",
         CredentialError::KeyMismatch(_) => "CREDENTIAL_KEY_MISMATCH",
+        CredentialError::CertificateExpired { .. } => "CREDENTIAL_EXPIRED",
+        // M6-C44: the relay refuses a HELLO whose `connector_id` is not the
+        // certificate's device, and a `device_id` that is not a UUID names
+        // no device; both are this profile/certificate disagreement.
+        CredentialError::DeviceIdNotUuid(_) | CredentialError::DeviceIdMismatch { .. } => {
+            "CREDENTIAL_DEVICE_MISMATCH"
+        }
         CredentialError::CertificateUnparseable(_)
         | CredentialError::UnsupportedCertificateVersion(_)
         | CredentialError::UnsupportedPrivateKey(_)
         | CredentialError::CertificateRefused(_)
         | CredentialError::MissingDeviceRole(_)
-        | CredentialError::DeviceIdNotUuid(_)
-        | CredentialError::DeviceIdMismatch { .. }
         | CredentialError::RelayRefusedIdentity => "CREDENTIAL_INVALID",
         CredentialError::AlreadyExists(_)
         | CredentialError::Provision(_)
@@ -762,6 +806,22 @@ mod tests {
         config: PathBuf,
     }
 
+    /// The synthetic device the fixture certificate names in its role SAN.
+    const FIXTURE_DEVICE: &str = "3a3b3c3d-3e3f-4a3b-8c3d-3e3f3a3b3c3d";
+
+    /// Rewrite the fixture profile's `device_id`, as an operator editing the
+    /// profile after `credentials import` would.
+    fn set_device_id(fixture: &Fixture, device_id: &str) {
+        let text = fs::read_to_string(&fixture.config).expect("fixture config read");
+        let rewritten = text.replacen(
+            &format!("device_id = \"{FIXTURE_DEVICE}\""),
+            &format!("device_id = \"{device_id}\""),
+            1,
+        );
+        assert_ne!(text, rewritten, "the fixture names FIXTURE_DEVICE");
+        fs::write(&fixture.config, rewritten).expect("fixture config write");
+    }
+
     fn fixture(expired: bool) -> Fixture {
         let directory = tempdir().expect("fixture directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -778,6 +838,11 @@ mod tests {
         } else {
             rcgen::date_time_ymd(2030, 1, 1)
         };
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("urn:agent-tunnel:device:{FIXTURE_DEVICE}")
+                .try_into()
+                .expect("device role URI SAN"),
+        )];
         let certificate = params.self_signed(&key_pair).expect("fixture certificate");
         let cert_path = directory.path().join("client.pem");
         let key_path = directory.path().join("client-key.pem");
@@ -789,7 +854,7 @@ mod tests {
             .expect("fixture key permissions");
         let config = directory.path().join("client.toml");
         let config_text = format!(
-            "device_id = \"doctor-fixture\"\nrelay_url = \"wss://relay.example.test/v1/tunnel/control\"\nclient_cert = \"{}\"\nprivate_key = \"{}\"\nserver_ca = \"{}\"\n",
+            "device_id = \"{FIXTURE_DEVICE}\"\nrelay_url = \"wss://relay.example.test/v1/tunnel/control\"\nclient_cert = \"{}\"\nprivate_key = \"{}\"\nserver_ca = \"{}\"\n",
             cert_path.display(),
             key_path.display(),
             ca_path.display(),
@@ -810,6 +875,7 @@ mod tests {
         let result = &inspection.output.result;
         assert_eq!(result.supervisor_ipc.status, "not_implemented");
         assert_eq!(result.credential_key_match.status, "ok");
+        assert_eq!(result.device_identity.status, "ok");
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
         assert!(!json.contains("client-key.pem"));
         assert!(!json.contains("relay.example.test"));
@@ -925,6 +991,83 @@ mod tests {
         );
     }
 
+    /// M6-C44: a profile whose `device_id` no longer names the certificate's
+    /// device -- edited after `credentials import`, which checks it -- is a
+    /// credential failure the relay would refuse on every HELLO.  Before the
+    /// fix `doctor` reported `"ok":true` for it.
+    #[test]
+    fn a_device_id_that_is_not_the_certificates_device_fails_the_doctor() {
+        let fixture = fixture(false);
+        set_device_id(&fixture, "44444444-4444-4444-8444-444444444444");
+        let inspection = inspect(
+            &fixture.config,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        assert!(!inspection.output.ok);
+        assert_eq!(inspection.exit_code, EXIT_CREDENTIAL_ERROR);
+        let result = &inspection.output.result;
+        assert_eq!(result.device_identity.status, "failed");
+        assert_eq!(
+            result.device_identity.code,
+            Some("CREDENTIAL_DEVICE_MISMATCH")
+        );
+        assert_eq!(result.credential_key_match.status, "ok");
+        assert_eq!(
+            inspection.output.error.as_ref().map(|error| error.code),
+            Some("CREDENTIAL_DEVICE_MISMATCH")
+        );
+        let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
+        assert!(
+            !json.contains("44444444-4444-4444-8444-444444444444")
+                && !json.contains(FIXTURE_DEVICE),
+            "the report carries codes, not identifiers: {json}"
+        );
+    }
+
+    /// M6-C44: the comparison is the relay's, by UUID value, so an uppercase
+    /// or hyphen-less spelling of the certificate's device is not a
+    /// mismatch, and a `device_id` that is not a UUID is one.
+    #[test]
+    fn the_device_identity_check_compares_uuids_as_the_relay_does() {
+        let fixture = fixture(false);
+        for spelling in [
+            FIXTURE_DEVICE.to_uppercase(),
+            FIXTURE_DEVICE.replace('-', ""),
+        ] {
+            set_device_id(&fixture, &spelling);
+            let inspection = inspect(
+                &fixture.config,
+                UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            );
+            assert_eq!(
+                inspection.output.result.device_identity.status, "ok",
+                "{spelling} names the certificate's device"
+            );
+            assert!(inspection.output.ok, "{spelling}");
+            set_device_id_back(&fixture, &spelling);
+        }
+        set_device_id(&fixture, "doctor-fixture");
+        let inspection = inspect(
+            &fixture.config,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        assert_eq!(
+            inspection.output.result.device_identity.code,
+            Some("CREDENTIAL_DEVICE_MISMATCH")
+        );
+        assert_eq!(inspection.exit_code, EXIT_CREDENTIAL_ERROR);
+    }
+
+    fn set_device_id_back(fixture: &Fixture, from: &str) {
+        let text = fs::read_to_string(&fixture.config).expect("fixture config read");
+        let rewritten = text.replacen(
+            &format!("device_id = \"{from}\""),
+            &format!("device_id = \"{FIXTURE_DEVICE}\""),
+            1,
+        );
+        fs::write(&fixture.config, rewritten).expect("fixture config write");
+    }
+
     #[test]
     fn expired_certificate_and_insecure_key_permissions_are_reported() {
         let fixture = fixture(true);
@@ -987,6 +1130,7 @@ mod tests {
         assert_eq!(result.expiry.status, "not_run");
         assert_eq!(result.expiry.client_certificate.status, "not_run");
         assert_eq!(result.expiry.server_ca.status, "not_run");
+        assert_eq!(result.device_identity.status, "not_run");
 
         // The capability checks are about the host, not the configuration, so
         // an unparseable configuration is no reason to withhold them -- and
