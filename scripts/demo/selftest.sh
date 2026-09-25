@@ -26,7 +26,12 @@ nonce=$(uuidgen)
 head=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 echo "demo-selftest nonce=$nonce head=$head rounds=$ROUNDS"
 
-die() { echo "demo-selftest FAILED round=$round: $*" >&2; echo "--- last output:" >&2; tail -40 "$OUT/last" >&2; exit 1; }
+die() {
+  echo "demo-selftest FAILED round=$round: $*" >&2
+  echo "--- last output:" >&2; tail -40 "$OUT/last" >&2
+  "$DIR/down.sh" --keep-logs >/dev/null 2>&1 && echo "--- cleaned up; logs kept in $DEMO_LOGS" >&2
+  exit 1
+}
 run() { # LABEL WANT_RC CMD...
   local label=$1 want=$2 rc
   shift 2

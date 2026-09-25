@@ -161,7 +161,8 @@ demo_timeout() {
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$i" -ge $((secs * 10)) ]; then
-      kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+      pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; sleep 1
+      pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
       return 124
     fi

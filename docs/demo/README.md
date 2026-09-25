@@ -4,7 +4,9 @@ Status: written for task rows M6-C127 to M6-C130 on 2026-09-26. Every command
 on this page was run on a Mac (Apple silicon, macOS, Docker Desktop) against
 `origin/main` at `6830ba7` plus this branch. The whole sequence (`up`, `show`
 for every ready feature, `down`) passed three rounds from clean with
-`scripts/demo/selftest.sh 3`.
+`scripts/demo/selftest.sh 3` at `f6eef6f`. A later change bounds the Docker
+calls and must be re-run the same way before the demo (task rows M6-C127,
+M6-C128 and M6-C130 stay open until then).
 
 One command brings up a complete **local** demo on this Mac: a real
 `tunnel-relay`, a real `tunnel-client` device and a throwaway Redis, wired
@@ -181,7 +183,9 @@ Remote mode is therefore not proven green end to end (task row M6-C129).
 | `docker is not running` | Docker Desktop is stopped | Start it; wait for `docker info` |
 | `port N is in use` | Another process holds a demo port | Stop it, or set the matching `DEMO_*_PORT` |
 | `cargo build failed` | Toolchain or network | Read `scripts/demo/.build.log`; `cargo build --locked` needs crates.io once |
+| `docker run did not start agentuplink-demo-redis (status 124 ...)` | Docker Desktop did not answer in 120 s. Seen while the machine ran several other agents' container builds (load average about 150): `docker run -d` hung for over 20 minutes | Restart Docker Desktop, then `down.sh` and `up.sh` |
 | `Redis did not answer PING over TLS` | Image missing and no network, or Docker slow | `docker pull redis:8.4.0-alpine`, then `up.sh` again |
+| `down.sh`: `container ... is still present after 60 s`, exit 1 | Docker Desktop is stuck removing it | Everything else is already stopped and deleted; run `down.sh` again once Docker answers |
 | `relay exited during startup` | Configuration or Redis | `down.sh --keep-logs`; read `scripts/demo/.state/logs/relay.log` |
 | `device exited during startup` | Credential or relay | `down.sh --keep-logs`; read `.state/logs/device.log` and `credentials.log` |
 | `show.sh`: `the local demo is not healthy` | A process died | `status.sh` names it; `up.sh` rebuilds the demo |
