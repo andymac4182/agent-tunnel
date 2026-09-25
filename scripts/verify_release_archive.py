@@ -19,7 +19,8 @@ prints, not left to a reader to infer:
 
   checksums    the adjacent `.sha256` file names the archive and its digest
   layout       safe member paths; exactly the target's binaries (no relay in
-               the Windows device half, M6-C83); `release.json` agrees with
+               a device-half archive: Windows, M6-C83, and every CI-only
+               target, M6-C115); `release.json` agrees with
                the archive name and the expected commit and run
   targets      every binary's executable format and CPU architecture match
                the triple, and the verifying host is that OS and architecture,
@@ -61,7 +62,7 @@ from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_release import (  # noqa: E402
-    binaries_for, device_side_example, named_examples, unresolved_links,
+    binaries_for, device_only, device_side_example, named_examples, unresolved_links,
 )
 
 TOP_LEVEL = {"LICENSE", "README.txt", "bin", "docs", "examples", "notices", "release.json"}
@@ -305,7 +306,7 @@ def check_assets(root: Path, target: str, work: Path) -> Result:
     named = named_examples(texts)
     missing = []
     for path in named:
-        if windows(target) and not device_side_example(path):
+        if device_only(target) and not device_side_example(path):
             continue
         location = root.joinpath(*path.rstrip("/").split("/"))
         present = location.is_dir() and any(location.iterdir()) if path.endswith("/") else location.is_file()
@@ -368,7 +369,7 @@ def check_cli(root: Path, target: str, work: Path) -> Result:
         return fail("cli", "config-check", f"config check on the shipped m1-client.toml exited "
                                            f"{completed.returncode}: {(completed.stderr or completed.stdout)[:160]}")
     serving = []
-    if not windows(target):
+    if "tunnel-relay" in binaries_for(target):
         relay = root / "bin" / "tunnel-relay"
         for args in (["--help"], *RELAY_SUBCOMMAND_HELP):
             completed = probe(relay, list(args), work)
@@ -541,12 +542,12 @@ def controls(root: Path, archive: Path, checksum: Path, target: str) -> list[tup
     def relay_in_wrong_half(tmp):
         copy = _copy(root, tmp)
         relay = copy / "bin" / exe(target, "tunnel-relay")
-        if windows(target):
-            relay.write_bytes(b"MZ")
+        if device_only(target):
+            relay.write_bytes(b"not the relay")
         else:
             relay.unlink()
         return check_layout(copy, archive, target, None, None)
-    expect("relay added to the Windows half / removed from a Unix one", "binary-set", relay_in_wrong_half)
+    expect("relay added to a device-only archive / removed from a full one", "binary-set", relay_in_wrong_half)
 
     def wrong_arch(tmp):
         copy = _copy(root, tmp)

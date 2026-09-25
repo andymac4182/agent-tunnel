@@ -59,6 +59,10 @@ jobs:
             target: x86_64-apple-darwin
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+          # CI-only (Cargo.toml `ci-only-targets`, M6-C115): client-only,
+          # built, verified and attested here, never published.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -70,22 +74,31 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
       - name: Install pinned toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --target "${{ matrix.target }}"
+        run: |
+          set -euo pipefail
+          # The arm Linux image may not carry rustup; install it if absent.
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install 1.95.0 --profile minimal --target "${{ matrix.target }}"
       - name: Test packaging
         run: python3 scripts/test_package_release.py
       - name: Fetch locked dependencies and licence sources
         run: cargo +1.95.0 fetch --locked
       - name: Build release binaries
-        # The relay is built for Unix targets only (task row M6-C83): it has
-        # never run on Windows, refuses to start there, and
-        # docs/architecture.md promises Linux relay images plus Windows
-        # *device* binaries. scripts/package_release.py packs the same set.
+        # The relay is not built for device-half targets: Windows (task row
+        # M6-C83 -- it has never run there and refuses to start) and every
+        # CI-only target (M6-C115). The set comes from
+        # scripts/package_release.py's `binaries_for`, which also decides
+        # what is packed, so the two cannot disagree.
         run: |
           set -euo pipefail
-          packages=(-p tunnel-client -p tunnel-deadman)
-          if [[ "${{ matrix.target }}" != *windows* ]]; then
-            packages+=(-p tunnel-relay)
-          fi
+          packages=()
+          for binary in $(python3 -c 'import sys; sys.path.insert(0, "scripts"); from package_release import binaries_for; print(" ".join(binaries_for(sys.argv[1])))' "${{ matrix.target }}"); do
+            packages+=(-p "$binary")
+          done
           cargo +1.95.0 build --release --locked --target "${{ matrix.target }}" "${packages[@]}" --bins
       # There is deliberately no smoke test of `target/` here any more: the
       # `verify` job below runs every probe it ran, and more, against the
@@ -108,8 +121,9 @@ jobs:
   # refuses to pass on a host whose OS or architecture differs from the
   # target's, so a label that moves to another architecture goes red rather
   # than silently verifying nothing natively.  `x86_64-apple-darwin` has no
-  # `-latest` Intel label; `macos-15-intel` is the Intel image.  Windows is
-  # the client-only device half (M6-C83).
+  # `-latest` Intel label; `macos-15-intel` is the Intel image, and
+  # `ubuntu-24.04-arm` is the arm Linux image.  Windows (M6-C83) and the
+  # CI-only arm Linux target (M6-C115) are client-only device halves.
   verify:
     needs: build
     strategy:
@@ -124,6 +138,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     defaults:

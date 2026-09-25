@@ -19,9 +19,17 @@ BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 DEVICE_BINARIES = ("tunnel-client", "tunnel-deadman")
 
 
-def binaries_for(target):
-    """The binaries one target's bundle carries."""
-    return DEVICE_BINARIES if target.endswith("windows-msvc") else BINARIES
+def binaries_for(target, root=None):
+    """The binaries one target's bundle carries.
+
+    Windows and every CI-only target (M6-C115) are the device half.
+    """
+    return DEVICE_BINARIES if device_only(target, root) else BINARIES
+
+
+def device_only(target, root=None):
+    """Whether a target's archive is the device half: no relay, no relay examples."""
+    return target.endswith("windows-msvc") or target in ci_only_targets(root or ROOT)
 
 
 TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
@@ -77,9 +85,33 @@ def advertised_targets(root=ROOT):
     return tuple(sorted(targets))
 
 
+def ci_only_targets(root=ROOT):
+    """Targets CI builds, verifies and attests but never publishes (M6-C115).
+
+    `[workspace.metadata.release] ci-only-targets`; absent means none.  The
+    same acceptance rule as `advertised-targets`, and the two must not share
+    a triple: a target is either offered to the public or it is not.
+    """
+    table = tomllib.loads((root / "Cargo.toml").read_text())
+    release = table.get("workspace", {}).get("metadata", {}).get("release", {})
+    targets = release.get("ci-only-targets", [])
+    if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+        raise ValueError("ci-only-targets must be a list of strings")
+    if len(set(targets)) != len(targets):
+        raise ValueError("ci-only-targets repeats a triple")
+    malformed = [t for t in targets if not TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise ValueError(f"ci-only-targets are not target triples: {malformed}")
+    shared = sorted(set(targets) & set(advertised_targets(root)))
+    if shared:
+        raise ValueError(f"ci-only-targets and advertised-targets share {shared}")
+    return tuple(sorted(targets))
+
+
 #: Kept as a module-level name because `scripts/test_package_release.py`
 #: imports it, but it is now *derived* rather than declared.
 TARGETS = advertised_targets()
+CI_ONLY_TARGETS = ci_only_targets()
 
 
 # --------------------------------------------------------------------------
@@ -251,7 +283,7 @@ def release_examples(root, target):
             shipped.add(named)
         else:
             raise ValueError(f"the shipped documents name {named!r}, which does not exist")
-    if target.endswith("windows-msvc"):
+    if device_only(target, root):
         shipped = {path for path in shipped if device_side_example(path)}
     if "examples/m1-client.toml" not in shipped:
         # `scripts/verify_release_archive.py` runs `config check` on it from
@@ -289,7 +321,7 @@ def package(root, target, sha, run, output, metadata):
     # Read from the manifest under `root` rather than from the module-level
     # TARGETS, so a caller packaging a different checkout is checked against
     # *that* checkout's declaration.
-    if target not in advertised_targets(root):
+    if target not in advertised_targets(root) + ci_only_targets(root):
         raise ValueError("unsupported target")
     tag = version(root, sha, run)
     output.mkdir(parents=True, exist_ok=True)
@@ -299,7 +331,7 @@ def package(root, target, sha, run, output, metadata):
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary)
         (staging / "bin").mkdir()
-        for binary in binaries_for(target):
+        for binary in binaries_for(target, root):
             name = binary + (".exe" if windows else "")
             source = root / "target" / target / "release" / name
             if not source.is_file() or source.stat().st_size == 0:
@@ -335,6 +367,8 @@ def package(root, target, sha, run, output, metadata):
         keep = (
             "Keep tunnel-client and tunnel-deadman together. This Windows bundle is the device half: the relay runs only on Linux and macOS.\n"
             if windows
+            else "Keep tunnel-client and tunnel-deadman together. This is a client-only CI build (not a published release target): it carries no relay.\n"
+            if device_only(target, root)
             else "Keep all three binaries together, including tunnel-deadman.\n"
         )
         (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting. Start with docs/operator.md in this archive; it and the documents it links describe this build's source commit.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
@@ -357,7 +391,7 @@ def package(root, target, sha, run, output, metadata):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, choices=TARGETS)
+    parser.add_argument("--target", required=True, choices=TARGETS + CI_ONLY_TARGETS)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--run", required=True)
     parser.add_argument("--output", type=Path, required=True)

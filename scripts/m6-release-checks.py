@@ -1381,7 +1381,8 @@ def site_array_count(source: str, pattern: re.Pattern[str]) -> int:
 
 def packaging_verdict(declared: list[str], matrix: list[str],
                       packager_source: str,
-                      site_source: str) -> tuple[bool, list[str]]:
+                      site_source: str,
+                      ci_only: list[str] | tuple[str, ...] = ()) -> tuple[bool, list[str]]:
     """Compare the declaration against the workflow matrix and the packager.
 
     Pure, so `--self-test` can drive it in both directions with recorded
@@ -1391,6 +1392,14 @@ def packaging_verdict(declared: list[str], matrix: list[str],
     notes: list[str] = []
     ok = True
     declared_set, matrix_set = sorted(set(declared)), sorted(set(matrix))
+    # CI-only targets (M6-C115) are built, verified and attested but never
+    # published or advertised: the matrix must build the union, and a triple
+    # may not be both, because it is either offered to the public or not.
+    built_set = sorted(set(declared) | set(ci_only))
+    shared = sorted(set(declared) & set(ci_only))
+    if shared:
+        notes.append(f"  FAIL: {shared} is declared both advertised and CI-only")
+        return False, notes
     if not matrix_set:
         notes.append(
             f"  FAIL: no `target:` entries found in {RELEASE_WORKFLOW}. Either the "
@@ -1398,9 +1407,9 @@ def packaging_verdict(declared: list[str], matrix: list[str],
             "matches it; an empty matrix must never compare equal to anything."
         )
         return False, notes
-    if declared_set != matrix_set:
-        missing = [t for t in matrix_set if t not in declared_set]
-        extra = [t for t in declared_set if t not in matrix_set]
+    if built_set != matrix_set:
+        missing = [t for t in matrix_set if t not in built_set]
+        extra = [t for t in built_set if t not in matrix_set]
         notes.append(
             f"  FAIL: the workflow matrix and the declaration disagree. Built but not "
             f"declared: {missing or 'none'}. Declared but not built: {extra or 'none'}. "
@@ -1410,8 +1419,9 @@ def packaging_verdict(declared: list[str], matrix: list[str],
         ok = False
     else:
         notes.append(
-            f"  {len(declared_set)} advertised targets, and {RELEASE_WORKFLOW}'s matrix "
-            f"builds exactly those: {declared_set}"
+            f"  {len(declared_set)} advertised targets and {len(ci_only)} CI-only "
+            f"target(s) {sorted(ci_only)}, and {RELEASE_WORKFLOW}'s matrix builds exactly "
+            f"those: {matrix_set}"
         )
 
     literals = sorted(set(TRIPLE_LITERAL.findall(packager_source)))
@@ -1500,9 +1510,12 @@ def check_packaging() -> Result:
 
     matrix = WORKFLOW_MATRIX_TARGET.findall(workflow.read_text(encoding="utf-8"))
     result.note(f"  declared: [workspace.metadata.release] advertised-targets = {declared}")
+    ci_only = release_table().get("ci-only-targets", [])
+    result.note(f"  declared: [workspace.metadata.release] ci-only-targets = {ci_only}")
     ok, notes = packaging_verdict(declared, matrix,
                                   packager.read_text(encoding="utf-8"),
-                                  site.read_text(encoding="utf-8"))
+                                  site.read_text(encoding="utf-8"),
+                                  ci_only)
     for line in notes:
         result.note(line)
     result.note(
@@ -2245,14 +2258,20 @@ def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
     declared = declared_targets()
     clean = (REPO / PACKAGER).read_text(encoding="utf-8")
     site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
+    extra = "i686-unknown-linux-gnu"
     cases = [
-        ("identical", declared, True),
-        ("one target dropped from the matrix", declared[:-1], False),
-        ("an extra target built but not declared", declared + ["i686-unknown-linux-gnu"], False),
-        ("an empty matrix", [], False),
+        ("identical", declared, (), True),
+        ("one target dropped from the matrix", declared[:-1], (), False),
+        ("an extra target built but not declared", declared + [extra], (), False),
+        ("an empty matrix", [], (), False),
+        # CI-only targets (M6-C115): built and declared CI-only is accepted;
+        # declared CI-only but not built, or declared both ways, is not.
+        ("an extra target declared CI-only", declared + [extra], (extra,), True),
+        ("a CI-only target the matrix does not build", declared, (extra,), False),
+        ("a target declared both advertised and CI-only", declared, (declared[0],), False),
     ]
-    for label, matrix, want in cases:
-        got, notes = packaging_verdict(declared, matrix, clean, site)
+    for label, matrix, ci_only, want in cases:
+        got, notes = packaging_verdict(declared, matrix, clean, site, ci_only)
         if got != want:
             return False, (
                 f"case {label!r}: verdict {got}, expected {want}. Notes: "
@@ -2261,7 +2280,8 @@ def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
     return True, (
         f"the comparison accepts the live {len(declared)}-target matrix and rejects a "
         "dropped target, an undeclared extra, and an empty matrix -- so a matrix that "
-        "no longer parses cannot pass by matching nothing"
+        "no longer parses cannot pass by matching nothing; it accepts an extra declared "
+        "CI-only and rejects a CI-only target left unbuilt or declared both ways"
     )
 
 

@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 import package_release
 from package_release import (
-    BINARIES, GUIDE, ROOT, SOURCE_URL, TARGETS, binaries_for, package,
+    BINARIES, CI_ONLY_TARGETS, GUIDE, ROOT, SOURCE_URL, TARGETS, binaries_for, package,
     release_documents, release_examples, stage_documents, unresolved_links, version,
 )
 from publish_release import assets
@@ -53,6 +53,7 @@ class PackagingTests(unittest.TestCase):
             '[workspace.package]\nversion = "0.1.0"\n\n'
             "[workspace.metadata.release]\n"
             f"advertised-targets = [\n{declaration}]\n"
+            f"ci-only-targets = {list(CI_ONLY_TARGETS)!r}\n".replace("'", '"')
         )
         (self.root / "LICENSE").write_text("Synthetic project licence")
         (self.root / "docs").mkdir()
@@ -67,7 +68,7 @@ class PackagingTests(unittest.TestCase):
         for name in ("tunnel-client.service", "tunnel-relay.service"):
             (self.root / "examples" / "service" / name).write_text("# unit")
         (self.root / "secret.key").write_text("must not ship")
-        for target in TARGETS:
+        for target in TARGETS + CI_ONLY_TARGETS:
             directory = self.root / "target" / target / "release"
             directory.mkdir(parents=True)
             for name in binaries_for(target):
@@ -195,6 +196,29 @@ class PackagingTests(unittest.TestCase):
         windows = release_examples(ROOT, next(t for t in TARGETS if t.endswith("windows-msvc")))
         self.assertIn("examples/m1-client.toml", windows)
         self.assertFalse([path for path in windows if "relay" in path or "catalog" in path], windows)
+
+    def test_a_ci_only_target_is_a_device_half_and_never_published(self):
+        # M6-C115: CI builds it, the release never carries it.
+        self.assertTrue(CI_ONLY_TARGETS, "the real manifest declares a CI-only target")
+        self.build_all()
+        for target in CI_ONLY_TARGETS:
+            archive = package(self.root, target, self.sha, "123", self.output, {"packages": []})
+            with tarfile.open(archive) as handle:
+                names = handle.getnames()
+            self.assertIn("bin/tunnel-client", names)
+            self.assertIn("bin/tunnel-deadman", names)
+            self.assertNotIn("bin/tunnel-relay", names)
+            self.assertFalse([n for n in names if n.startswith("examples/") and "relay" in n], names)
+        published = assets(self.output, version(self.root, self.sha, "123"))
+        self.assertEqual(len(published), 2 * len(TARGETS))
+        self.assertFalse([p for p in published if any(t in p.name for t in CI_ONLY_TARGETS)])
+
+    def test_a_triple_declared_both_ways_is_refused(self):
+        manifest = self.root / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace(
+            "ci-only-targets = [", f'ci-only-targets = ["{TARGETS[0]}", ', 1))
+        with self.assertRaises(ValueError):
+            package_release.ci_only_targets(self.root)
 
     def test_tar_modes_do_not_depend_on_the_build_host(self):
         # A Windows runner's file system has no execute bits, so the release
