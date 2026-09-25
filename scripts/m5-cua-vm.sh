@@ -85,7 +85,11 @@ disk_check() {
   [ $((free - need)) -ge "${MIN_FREE_GIB}" ] || die "aborting: free space would drop below ${MIN_FREE_GIB} GiB"
 }
 
-vm_exists() { "${TART}" list --quiet 2>/dev/null | grep -qx "$1"; }
+# Not `grep -q`: under `pipefail` an early-exiting grep leaves `tart list`
+# writing into a closed pipe, and the SIGPIPE makes an existing VM read as
+# absent -- measured on 2026-09-26, when `destroy` of a demo clone printed
+# "does not exist" and left it running (task row M5-C25).
+vm_exists() { "${TART}" list --quiet 2>/dev/null | grep -x "$1" >/dev/null; }
 vm_running() { "${TART}" list --format json | python3 -c 'import json,sys; n=sys.argv[1]; sys.exit(0 if any(v["Name"]==n and v["Running"] for v in json.load(sys.stdin)) else 1)' "$1"; }
 gexec() { local vm="$1"; shift; "${TART}" exec "${vm}" "$@"; }
 # gexec_in VM CMD...: as gexec, with the host's stdin attached (`tart exec -i`
@@ -349,7 +353,7 @@ cmd_cycle() {
   cmd_probe "${vm}"
   cmd_stop "${vm}"
   cmd_destroy "${vm}"
-  "${TART}" list --quiet | grep -qx "${vm}" && die "${vm} survived the cycle"
+  vm_exists "${vm}" && die "${vm} survived the cycle"
   log "cycle complete: ${vm} created, probed and deleted; remaining: $("${TART}" list --quiet | tr '\n' ' ')"
 }
 

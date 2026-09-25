@@ -35,7 +35,9 @@ TOOLS="${ROOT}/scripts/m5-cua-demo.py"
 NONCE="$(openssl rand -hex 6)"
 HEAD="$(git -C "${ROOT}" rev-parse --short HEAD)$(git -C "${ROOT}" diff --quiet || echo +dirty)"
 VM="cua-demo-${NONCE}"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/m5-cua-demo.${NONCE}.XXXX")"
+# Physical path: `tunnel-relay` refuses a Redis CA path through a symlink,
+# and macOS's TMPDIR (/var -> /private/var) is one.
+WORK="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/m5-cua-demo.${NONCE}.XXXX")" && pwd -P)"
 OUT="${1:-${WORK}/evidence}"
 RELAY_HOST="relay.cua-demo.test"
 ISSUER="https://issuer.m5-cua-demo.invalid/"
