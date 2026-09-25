@@ -1130,8 +1130,9 @@ def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
     #: Measured 2026-09-23 by driving each harness's own shipped classifier:
     #: 691.  Lowered by M4-42 only as whole suites earned measured witnesses
     #: (every drop is a `WITNESSES` entry, not a reclassification):
-    #: m5-guard-deletion's 100 -> 591.
-    PINNED_WITNESS_DEBT = 591
+    #: m5-guard-deletion's 100 -> 591; fs-guard-deletion's gate2, gate3,
+    #: gate4, gate5 and gate9-epoch-change (160) -> 431.
+    PINNED_WITNESS_DEBT = 431
 
     directory = Path(__file__).resolve().parent
     ledger = json.loads(WITNESS_DEBT_FILE.read_text())
