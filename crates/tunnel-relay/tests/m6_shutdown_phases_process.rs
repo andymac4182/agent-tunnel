@@ -960,12 +960,21 @@ enum Side {
 /// phase needs a different hold on each side; every hold is a single
 /// dropped inbound message kind or the candidate dial, and the witness --
 /// the stopped side's own reported phase -- is required before the signal.
+///
+/// **A hold drops the message it names and the one that would follow it**
+/// wherever the owner sends both. Holding `ROTATE_FROZEN` alone leaves the
+/// client quiescing while the relay, which has both fences, moves on and
+/// sends its `ROTATE_DRAINED`; the client then rejects a drain proof in the
+/// wrong phase and ends the session `PROTOCOL_ERROR` (measured: the first
+/// run's relay-draining case, log nonce `m606-shutdown-1790349672-24478`).
+/// A real owner never sends DRAINED before FROZEN on the ordered control
+/// socket, so that is the hook's artefact, not a product defect.
 fn cases(side: Side) -> [(&'static str, &'static str); 6] {
     match side {
         Side::Client => [
             ("active", ""),
             ("preparing", "candidate-dial"),
-            ("quiescing", "ROTATE_FROZEN"),
+            ("quiescing", "ROTATE_FROZEN,ROTATE_DRAINED"),
             ("draining", "ROTATE_DRAINED,ROTATE_COMMIT"),
             ("committing", "ROTATE_COMMIT"),
             ("aborting", "candidate-dial,ROTATE_ABORTED"),
@@ -974,7 +983,7 @@ fn cases(side: Side) -> [(&'static str, &'static str); 6] {
             ("active", ""),
             ("preparing", "candidate-dial"),
             ("quiescing", "ROTATE_QUIESCE"),
-            ("draining", "ROTATE_FROZEN"),
+            ("draining", "ROTATE_FROZEN,ROTATE_DRAINED"),
             ("committing", "ROTATE_COMMIT"),
             ("aborting", "candidate-dial,ROTATE_ABORT"),
         ],

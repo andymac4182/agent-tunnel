@@ -37,9 +37,11 @@ initial_delay_ms = 500
 max_delay_ms = 2000
 EOF
 tunnel-client credentials create --config client.toml --csr-out device.csr
-# Self-sign a synthetic certificate for the pending key (demo only).
+# Self-sign a synthetic device certificate for the pending key (demo only):
+# the device role SAN names the profile's device_id.
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:33333333-3333-4333-8333-333333333333\n' > device-ext.cnf
 openssl x509 -req -in device.csr -signkey credentials/device-key.pem -days 1 \
-  -out cert.pem 2>/dev/null
+  -extfile device-ext.cnf -out cert.pem 2>/dev/null
 tunnel-client credentials import --config client.toml --certificate cert.pem --server-ca cert.pem
 ```
 
@@ -62,15 +64,16 @@ Session: none
 Last session end: TRANSPORT_ERROR
 $ ls -l credentials/supervisor.sock
 srw-------  1 you  staff  0 ... credentials/supervisor.sock
-$ tunnel-client doctor --config client.toml --json | python3 -m json.tool | grep -A2 supervisor_ipc
-        "supervisor_ipc": {
-            "status": "ok",
-            "code": "SUPERVISOR_IPC_OK"
+$ tunnel-client doctor --config client.toml; echo "exit=$?"
+Local configuration, credential key match, permissions, and expiry are healthy.
+Supervisor IPC: ok (SUPERVISOR_IPC_OK)
+exit=0
+$ tunnel-client status --config client.toml --json
+{"schema_version":1,"command":"status","ok":true,"result":{"pid":51234,"state":"backoff","device_id":"33333333-3333-4333-8333-333333333333","sessions":0,"attempt":3,"retry_delay_ms":1947,"last_error_code":"TRANSPORT_ERROR","certificate_expires_at_unix":1790434565,"rotation_policy":{"interval_seconds":300,"handshake_timeout_seconds":10,"overlap_seconds":30},"exports":[{"name":"echo","kind":"echo"}],"session":null,"ipc":{"requests_served":4,"peers_refused":0,"bad_requests":1}},"error":null}
 ```
 
-`doctor` exits `3` here because this self-signed certificate carries no
-device role SAN (`device_identity` fails); the supervisor check is reported
-either way and never changes the exit status.
+The supervisor check in `doctor` is informational: `not_running` when no
+`connect` is up, and it never changes the exit status.
 
 The socket is the profile lock, and it is owner-only:
 
