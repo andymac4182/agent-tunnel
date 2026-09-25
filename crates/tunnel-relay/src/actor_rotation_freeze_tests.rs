@@ -2814,6 +2814,42 @@ async fn completed_unary_echo_is_forgotten_once_its_fin_is_acknowledged() {
     assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
 }
 
+/// M6-C120: the connector's own capacity refusal of a unary echo is a
+/// per-request, retryable `RESOURCE_EXHAUSTED` for the consumer, not a
+/// `DEVICE_REJECTED`, and the session keeps serving.
+#[tokio::test]
+async fn m6c120_connector_capacity_refusal_is_a_retryable_capacity_answer() {
+    let mut fixture = FreezeFixture::new("unary-capacity", false);
+    let (stream_id, operation_id, open_message_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::Rejected(Rejected::new(
+                "connector-capacity",
+                open_message_id,
+                fixture.key.session_id.clone(),
+                fixture.key.epoch,
+                stream_id,
+                operation_id,
+                "RESOURCE_EXHAUSTED",
+                "bounded OPEN admission is full",
+            )),
+        )
+        .await;
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "not_dispatched"
+        })
+    ));
+    // The session is untouched: the next echo is admitted.
+    let (next_stream, _, _, _next_receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    assert!(next_stream > stream_id);
+}
+
 /// M7-C92: a connector REJECTED for a unary echo OPEN is forgotten with the
 /// no-stream proof, and only for the REJECTED answering that OPEN's own
 /// message ID.
