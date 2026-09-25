@@ -85,7 +85,7 @@ rm -rf /opt/cua-server
 # anywhere else. Administrative prompts in the guest use the base image's
 # documented admin account.
 if ! id "${CUA_USER}" >/dev/null 2>&1; then
-  pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
+  pw="$(openssl rand -hex 10)"   # not `tr </dev/urandom | head`: SIGPIPE under pipefail
   sysadminctl -addUser "${CUA_USER}" -fullName "CUA Fixture" -password "${pw}" \
     -home "/Users/${CUA_USER}" >/dev/null 2>&1
   createhomedir -c -u "${CUA_USER}" >/dev/null 2>&1 || true
