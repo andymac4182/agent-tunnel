@@ -348,7 +348,10 @@ impl UnknownWriteCause {
 /// Errors returned by the durable catalog. User-facing handlers should map
 /// these to bounded public codes; backend details are never included in a
 /// response containing a bearer credential.
-#[derive(Debug)]
+///
+/// `Clone` lets one single-flight lane reconnect report its outcome to every
+/// caller that waited on it (M6-C74).
+#[derive(Clone, Debug)]
 pub enum CatalogError {
     Database(redis::RedisError),
     /// An owner-affecting write (`claim_owner`, `renew_owner`,

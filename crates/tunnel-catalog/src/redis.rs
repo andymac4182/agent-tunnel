@@ -74,12 +74,13 @@ const BOUND_RUN_MARKER: char = '\u{1}';
 /// 2,038 ms, so the old budget expired before TCP connect began.  Ten seconds
 /// is that cold lookup with about 4x headroom, and still bounded.
 ///
-/// It governs the connections a catalog opens (the primary and its lanes)
-/// and recovery connections.  **It does not reach a lane reconnect inside a
-/// running relay**: `AuthorityLane::admit` caps the whole verification,
-/// reconnect included, at [`REDIS_OPERATION_TIMEOUT`] while holding the lane
-/// lock, deliberately, so sibling callers never queue behind a ten-second
-/// connect (M6-C74).
+/// It governs the connections a catalog opens (the primary and its lanes),
+/// recovery connections, and a lane reconnect inside a running relay.  A
+/// lane reconnect runs as one single-flight task per lane, outside the lane
+/// lock, with this full budget (M6-C74): callers wait for it at most their
+/// own [`REDIS_OPERATION_TIMEOUT`] and fail closed with a timeout while it is
+/// still in flight, so no caller queues behind a ten-second connect, and a
+/// reconnect that outlives them is still installed for the next command.
 pub(crate) const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // The budget covers the measured 2,038 ms cold lookup with headroom and is
 // separate from, and longer than, the per-command deadline (M6-C73).
@@ -2735,9 +2736,9 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
 /// else; a reply slower than that is reported as a timeout distinct from a
 /// severed connection.  The connection timeout is set to `connect_budget`
 /// (the library default is one second, M6-C73), and callers apply the same
-/// budget around the call, so neither deadline undercuts the other.  (A lane
-/// reconnect inside a running relay is additionally capped by
-/// `AuthorityLane::admit`; see [`REDIS_CONNECT_TIMEOUT`].)  Host names are
+/// budget around the call, so neither deadline undercuts the other, lane
+/// reconnects inside a running relay included (see
+/// [`REDIS_CONNECT_TIMEOUT`]).  Host names are
 /// resolved by [`CatalogResolver`], so a lookup failure is classified `dns`.
 pub(crate) fn connection_config(connect_budget: Duration) -> redis::AsyncConnectionConfig {
     redis::AsyncConnectionConfig::new()
@@ -2800,12 +2801,18 @@ async fn connect_within(
 async fn open_verified_connection(
     client: &redis::Client,
 ) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
-    let connection = connect_within(
-        client,
-        &connection_config(REDIS_CONNECT_TIMEOUT),
-        REDIS_CONNECT_TIMEOUT,
-    )
-    .await?;
+    open_verified_connection_with(client, &connection_config(REDIS_CONNECT_TIMEOUT)).await
+}
+
+/// [`open_verified_connection`] with an explicit redis-rs configuration.
+/// Production passes [`connection_config`]`(`[`REDIS_CONNECT_TIMEOUT`]`)`;
+/// the lane tests substitute a slow resolver (M6-C74).  The outer budget is
+/// always [`REDIS_CONNECT_TIMEOUT`].
+async fn open_verified_connection_with(
+    client: &redis::Client,
+    config: &redis::AsyncConnectionConfig,
+) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
+    let connection = connect_within(client, config, REDIS_CONNECT_TIMEOUT).await?;
     verify_connection_identity(connection).await
 }
 
