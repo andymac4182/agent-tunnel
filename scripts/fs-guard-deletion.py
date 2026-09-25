@@ -1958,6 +1958,22 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        # Task row **M4-21** (applied by default pending owner confirmation,
+        # 2026-09-25).  Every reply must reach the carrier within the
+        # advertised `requestTimeoutSeconds` of its request's admission.
+        # Pushing the deadline a day out restores the defect: a consumer that
+        # sent a request and took no reply credit holds the session for ever,
+        # because queued or unsent work is never idle.
+        "a reply the consumer never takes is bounded by the request deadline",
+        [
+            (
+                CLIENT_FS,
+                "                match tokio::time::timeout_at(deadline, outbound.send_data(Bytes::from(record)))",
+                "                match tokio::time::timeout_at(deadline + std::time::Duration::from_secs(86_400), outbound.send_data(Bytes::from(record)))",
+            )
+        ],
+    ),
+    (
         "an unknown capability name is ignored, not admitted",
         [
             (
@@ -6470,6 +6486,7 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('gate4', 'return the bytes the invalidation discarded to the session budget'): frozenset({'actor::stream_identity_tests::an_invalidated_fs_stream_challenge_returns_its_discarded_bytes'}),
     ('gate4', 'the case behaviour is parsed and never guessed'): frozenset({'http::fs::tests::the_case_behaviour_is_parsed_and_never_guessed'}),
     ('gate4', "the connector's allowlist narrows the relay's capabilities"): frozenset({'fs_export::tests::the_local_allowlist_narrows_and_never_widens'}),
+    ('gate4', 'a reply the consumer never takes is bounded by the request deadline'): frozenset({'fs_export::tests::a_reply_the_consumer_never_takes_is_bounded_by_the_request_deadline'}),
     ('gate4', 'the flush mark is per queue entry, not per tag number'): frozenset({'a_tag_re_issued_and_flushed_again_drops_both_and_keeps_the_session'}),
     ('gate4', 'the record decoder bounds a declared length before allocating'): frozenset({'record::tests::a_declared_length_above_the_ceiling_is_refused_before_any_copy'}),
     ('gate4', 'the record decoder latches its first violation'): frozenset({'record::tests::the_first_violation_is_latched_and_a_valid_record_after_it_is_not_decoded'}),
