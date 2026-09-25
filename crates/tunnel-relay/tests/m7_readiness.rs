@@ -22,7 +22,8 @@ use tunnel_cluster::membership::{
     MembershipRecord, PrivateEndpointPolicy, RELAY_PEER_ROLE, RelayKey, TrustedPublisherKey,
 };
 use tunnel_relay::membership_runtime::{
-    MembershipFuture, MembershipSourceError, MembershipUnreadyReason,
+    LocalKeyApproval, LocalServingSwitchError, MembershipFuture, MembershipSourceError,
+    MembershipUnreadyReason,
 };
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
@@ -720,5 +721,138 @@ async fn ec011_periodic_reconcile_applies_rotation_without_refresh_hint() {
                 NEXT_SPKI_SHA256
             ))
             .is_ok()
+    );
+}
+
+// ---- M8-C45: a relay switches the identity it serves without restarting ----
+
+#[tokio::test]
+async fn m8c45_switching_the_served_key_keeps_the_relay_ready_when_the_old_key_is_withdrawn() {
+    // The relay starts serving the old key; the record approves old + next.
+    let fixture = RuntimeFixture::new(true);
+    fixture
+        .source
+        .replace(vec![fixture.overlap_record(1)])
+        .await;
+    fixture.runtime.bootstrap().await.expect("overlap ready");
+    assert_eq!(
+        fixture.runtime.local_serving_spki().as_deref(),
+        Some(SPKI_SHA256)
+    );
+    assert!(
+        fixture
+            .runtime
+            .local_key_approval(NEXT_SPKI_SHA256)
+            .is_approved()
+    );
+
+    let mut installed = false;
+    fixture
+        .runtime
+        .switch_local_serving_spki(NEXT_SPKI_SHA256, || {
+            installed = true;
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("an approved successor may be served");
+    assert!(installed);
+    assert_eq!(
+        fixture.runtime.local_serving_spki().as_deref(),
+        Some(NEXT_SPKI_SHA256)
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .local_peer_identity()
+            .map(|identity| identity.spki_sha256),
+        Some(NEXT_SPKI_SHA256.to_owned())
+    );
+
+    // The publisher withdraws the predecessor.  The relay now serves the
+    // successor, so it stays Ready: this is the interval M8-C28 said the
+    // product could not have.
+    fixture
+        .source
+        .replace(vec![fixture.next_key_only_record(2)])
+        .await;
+    fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect("withdrawing the predecessor must not unready a relay serving the successor");
+    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+}
+
+#[tokio::test]
+async fn m8c45_without_the_switch_withdrawing_the_served_key_still_fails_closed() {
+    // The control: the same records, no switch.  Readiness is bound to the
+    // key actually served, so withdrawing it unreadies the relay exactly as
+    // before -- a staged or merely approved successor never stands in.
+    let fixture = RuntimeFixture::new(true);
+    fixture
+        .source
+        .replace(vec![fixture.overlap_record(1)])
+        .await;
+    fixture.runtime.bootstrap().await.expect("overlap ready");
+    fixture
+        .source
+        .replace(vec![fixture.next_key_only_record(2)])
+        .await;
+    let error = fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect_err("the served key left the record");
+    assert!(matches!(error, MembershipRuntimeError::PeerRejected));
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+    );
+}
+
+#[tokio::test]
+async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_installed() {
+    let fixture = RuntimeFixture::new(true);
+    fixture
+        .source
+        .replace(vec![fixture.valid_record(1)])
+        .await;
+    fixture.runtime.bootstrap().await.expect("single-key ready");
+    assert_eq!(
+        fixture.runtime.local_key_approval(NEXT_SPKI_SHA256),
+        LocalKeyApproval::Absent
+    );
+    let mut installed = false;
+    let refused = fixture
+        .runtime
+        .switch_local_serving_spki(NEXT_SPKI_SHA256, || {
+            installed = true;
+            Ok::<(), ()>(())
+        })
+        .await;
+    assert!(matches!(
+        refused,
+        Err(LocalServingSwitchError::NotApproved(LocalKeyApproval::Absent))
+    ));
+    assert!(!installed, "nothing may be installed for an unapproved key");
+    assert_eq!(
+        fixture.runtime.local_serving_spki().as_deref(),
+        Some(SPKI_SHA256)
+    );
+
+    // An install failure leaves readiness bound to the previous key.
+    fixture
+        .source
+        .replace(vec![fixture.overlap_record(2)])
+        .await;
+    fixture.runtime.reconcile_once().await.expect("overlap ready");
+    let failed = fixture
+        .runtime
+        .switch_local_serving_spki(NEXT_SPKI_SHA256, || Err::<(), _>("transport refused"))
+        .await;
+    assert!(matches!(failed, Err(LocalServingSwitchError::Install(_))));
+    assert_eq!(
+        fixture.runtime.local_serving_spki().as_deref(),
+        Some(SPKI_SHA256)
     );
 }
