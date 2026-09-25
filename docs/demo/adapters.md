@@ -34,13 +34,17 @@ offers the tools, validates the input against each tool's schema, calls
     default;
   - `DEMO_REDIS_URL` (a `rediss://` URL) and `DEMO_REDIS_CA`, for a Redis of
     your own; a URL on port 63790 is refused;
-  - `DEMO_ALLOW_SHARED_REDIS=1`, which uses the shared plaintext verification
-    Redis on `127.0.0.1:63790` when Docker is unavailable. `tunnel-relay
+  - **Fallback only, not a verification path:** `DEMO_ALLOW_SHARED_REDIS=1`,
+    which uses the shared plaintext verification Redis on `127.0.0.1:63790`
+    when Docker cannot create containers. A run on this path shows the
+    adapters work; it does not stand in for the default path, which must
+    still be run to verify the demo. `tunnel-relay
     serve` accepts only `rediss://`, so the script puts a loopback TLS
     forwarder (`scripts/adapters-demo-tls-forward.py`, standard library only)
     in front of it with the run's synthetic relay certificate. The run's
-    namespace is unique and its keys are deleted on exit directly against
-    the shared Redis; if that deletion fails, the run fails.
+    namespace is unique; on exit the keys under `tunnel-catalog:<namespace>:`
+    are deleted directly against the shared Redis, and the run fails if that
+    deletion fails or any other key still names the namespace.
 - Free disk for a debug build of `tunnel-relay` and `tunnel-client`.
 
 ## Run it
@@ -84,8 +88,8 @@ The script:
    `scripts/adapters-demo-check.py`.
 
 Everything it started — relay, device, Redis container, key directory — is
-stopped and removed on exit, and this run's catalog keys (every key containing
-its unique `adapters-demo-<pid>-<time>` namespace) are deleted from Redis first,
+stopped and removed on exit, and this run's catalog keys (under
+`tunnel-catalog:adapters-demo-<pid>-<time>:`) are deleted from Redis first,
 so a Redis supplied through `DEMO_REDIS_URL` is left as it was found. A
 `DEMO_REDIS_URL` on port 63790 is refused: that is the shared verification
 Redis. Bearer tokens reach `curl` through a mode-600 header file (`-H @file`)

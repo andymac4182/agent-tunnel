@@ -6,9 +6,9 @@
 REDIS_URL is rediss://, or plaintext redis:// on loopback only (the shared
 verification Redis, reached with DEMO_ALLOW_SHARED_REDIS=1).
 
-Removes every key whose name contains NAMESPACE, which the demo makes unique
-per run (`adapters-demo-<pid>-<time>`), so a Redis supplied through
-DEMO_REDIS_URL is left as it was found. Refuses a namespace that does not start
+Removes the keys under `tunnel-catalog:NAMESPACE:`, the only prefix the relay
+writes; NAMESPACE is unique per run (`adapters-demo-<pid>-<time>`). It then
+fails if any other key still names the namespace, so nothing is left silently. Refuses a namespace that does not start
 with `adapters-demo-`, so a mistaken argument cannot sweep someone else's keys.
 Standard library only: a minimal RESP client over TLS, SCAN then UNLINK.
 Prints one line with the count; never prints a key's value.
@@ -82,24 +82,31 @@ def main():
         redis.call("AUTH", user, unquote(parts.password))
     db = parts.path.lstrip("/") or "0"
     redis.call("SELECT", db)
+    # Delete only the relay catalog's own keyspace for this run. Keys are
+    # written by tunnel-catalog as `tunnel-catalog:{namespace}:...`
+    # (crates/tunnel-catalog/src/redis.rs), and nothing else is touched.
+    pattern = f"tunnel-catalog:{namespace}:*"
     cursor, deleted = "0", 0
     while True:
-        cursor, keys = redis.call("SCAN", cursor, "MATCH", f"*{namespace}*", "COUNT", 1000)
+        cursor, keys = redis.call("SCAN", cursor, "MATCH", pattern, "COUNT", 1000)
         cursor = cursor.decode()
         if keys:
             deleted += redis.call("UNLINK", *keys)
         if cursor == "0":
             break
-    remaining, cursor = [], "0"
+    # Then look, without deleting, for any key naming the namespace outside
+    # that prefix: if the relay ever writes one, cleanup must fail loudly
+    # rather than leave it behind silently.
+    stray, cursor = 0, "0"
     while True:
         cursor, keys = redis.call("SCAN", cursor, "MATCH", f"*{namespace}*", "COUNT", 1000)
         cursor = cursor.decode()
-        remaining.extend(keys)
+        stray += len(keys)
         if cursor == "0":
             break
-    print(f"redis cleanup: deleted {deleted} key(s) in namespace {namespace}; {len(remaining)} remain")
+    print(f"redis cleanup: deleted {deleted} key(s) matching tunnel-catalog:{namespace}:*; {stray} key(s) naming the namespace remain")
     sock.close()
-    return 0 if not remaining else 1
+    return 0 if stray == 0 else 1
 
 
 if __name__ == "__main__":
