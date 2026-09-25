@@ -189,6 +189,26 @@ EOF
   die "${vm}: fixture did not come to the front full-screen"
 }
 
+# guest_detached VM NAME CMD TIMEOUT_S HOSTLOG: run CMD as root in the guest,
+# detached from the `tart exec` stream, and poll for its exit status. Measured
+# 2026-09-26: a single `tart exec` held open through the ~20-minute silent pip
+# install ended with "unavailable (14): Transport became inactive", killing
+# provisioning half-way; short polls do not depend on one long stream.
+guest_detached() {
+  local vm="$1" name="$2" cmd="$3" timeout="$4" hostlog="$5" waited=0 rc
+  groot "${vm}" rm -f "/var/log/agentuplink-${name}.log" "/var/log/agentuplink-${name}.rc"
+  groot "${vm}" bash -c "( ${cmd} >/var/log/agentuplink-${name}.log 2>&1; echo \$? >/var/log/agentuplink-${name}.rc ) </dev/null >/dev/null 2>&1 &"
+  while ! groot "${vm}" test -s "/var/log/agentuplink-${name}.rc" 2>/dev/null; do
+    [ "${waited}" -lt "${timeout}" ] || { log "${name}: no exit after ${timeout}s"; return 1; }
+    sleep 10
+    waited=$((waited + 10))
+  done
+  groot "${vm}" cat "/var/log/agentuplink-${name}.log" >"${hostlog}" 2>&1 || true
+  rc="$(groot "${vm}" cat "/var/log/agentuplink-${name}.rc")"
+  log "${name}: exit ${rc} after ~${waited}s"
+  [ "${rc}" = 0 ]
+}
+
 copy_fixture() {
   local vm="$1"
   COPYFILE_DISABLE=1 tar -C "${FIXTURE}" -cf - fixture_app.py provision-guest-macos.sh guest-manifest-macos.sh \
@@ -235,7 +255,8 @@ cmd_golden() {
   disk_check 3
   log "provisioning (python.org CPython, hash-locked cua-computer-server, cua user, launchd agents)"
   mkdir -p "${STATE}/logs"
-  groot "${GOLDEN}" bash /opt/cua-fixture/provision-guest-macos.sh >"${STATE}/logs/${GOLDEN}.provision.log" 2>&1 \
+  guest_detached "${GOLDEN}" provision "bash /opt/cua-fixture/provision-guest-macos.sh" 3600 \
+    "${STATE}/logs/${GOLDEN}.provision.log" \
     || die "provisioning failed; see ${STATE}/logs/${GOLDEN}.provision.log"
   log "rebooting into cua's autologin session"
   groot "${GOLDEN}" shutdown -r now >/dev/null 2>&1 || true
