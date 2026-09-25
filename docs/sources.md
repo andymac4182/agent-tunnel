@@ -112,4 +112,6 @@ The permalinks have been repointed at the release commit anyway, because a citat
 
 Axum is the selected web framework. [runtime.md](runtime.md) records the mTLS listener/CLI design and observed library versions; [cluster.md](cluster.md) cites HTTP/3, Redis consistency/ACL/notification behavior, rustls verification and membership-trust sources. The QUIC/H3 adapter is a separate listener sharing typed application services with Axum.
 
+- **Pinned 2026-09-25 (M6-C02):** crates.io [`h3-quinn` 0.0.10](https://crates.io/crates/h3-quinn/0.0.10), which `vendor/h3-quinn` patches, from h3 [`2dc3412bdf6083451920d5bfd7a9484d054c1859`](https://github.com/hyperium/h3/tree/2dc3412bdf6083451920d5bfd7a9484d054c1859/h3-quinn) (commit and path taken from the published crate's `.cargo_vcs_info.json`, then checked file by file against the upstream tree), crate checksum `8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4`. Its siblings `vendor/h3` and `vendor/quinn-proto` record theirs in the same file.
+
 These mutable library links identify implementation candidates. The bootstrap only depends on configuration parsing libraries in Cargo.lock. Pin and record network dependencies when implementation starts.

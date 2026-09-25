@@ -34,7 +34,29 @@ feature-depth = 1
 # database's age and refuses to call the result clean when it is stale,
 # because an advisories run against a six-week-old database is green for
 # reasons that have nothing to do with the workspace.
-ignore = []
+#
+# **Run against a freshly fetched database for docs/tasks.md M6-C03**
+# (2026-09-25, RustSec advisory-db `593df8c1b5ed`, committed
+# 2026-09-24T14:38:19Z and equal to upstream `main` when fetched): three
+# errors.  RUSTSEC-2026-0285 (`rustls` 0.23.44) was fixed by moving
+# `Cargo.lock` to 0.23.45.  The other two have no patched release and are
+# ignored below, each for a reason that is a property of this workspace, not
+# of the advisory.  cargo-deny reports an ignore that matches nothing as
+# `advisory-not-detected`, so an entry cannot outlive its crate silently.
+ignore = [
+    # Marvin attack: timing in RSA *private-key* operations (decryption and
+    # signing).  The shipped relay only *verifies* RS256 consumer tokens with
+    # public keys (`DecodingKey::from_rsa_components` in
+    # crates/tunnel-relay/src/main.rs); no shipped binary holds an RSA private
+    # key.  The one RSA signer, `EncodingKey::from_rsa_pem`, is in
+    # `tunnel-test-harness` and signs with a synthetic fixture key.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken: shipped code only verifies RS256 with public keys; the only RSA private key is a synthetic test-harness fixture (docs/tasks.md M6-C03)" },
+    # Unmaintained, not a vulnerability.  The replacement is
+    # `rustls_pki_types::pem::PemObject`; migrating touches the TLS
+    # credential loaders in tunnel-transport, tunnel-client and tunnel-relay,
+    # so it is its own tracked row rather than a lockfile edit.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained with no advisory against its code; migration to rustls-pki-types PemObject is docs/tasks.md M6-C100" },
+]
 
 [licenses]
 # **Fail-closed allowlist.**  Any SPDX expression that cannot be satisfied
