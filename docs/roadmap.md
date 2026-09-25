@@ -36,7 +36,8 @@ Gate: the local macOS arm64 run satisfies the formatting, strict Clippy,
 workspace test, Redis integration, AOF restart, and full M1 acceptance checks.
 Hosted Linux/macOS/Windows CI repeats the locked checks (task row M0-01,
 verified at `50b12df`); the hosted M1 acceptance runs on Linux and macOS only,
-and M1-04 stays open on the Windows decision and the M6-C85 flake. New fields/commands in [runtime.md](runtime.md) remain proposals
+and by owner decision (2026-09-25, M1-04) Windows is a client-only,
+locked-checks target with no M1 acceptance lane. New fields/commands in [runtime.md](runtime.md) remain proposals
 unless the source and acceptance evidence say otherwise.
 
 ## M1 — Axum and authenticated multi-user tunnel

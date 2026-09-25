@@ -222,19 +222,45 @@ CASES: list[Case] = [
         ),
     ),
     Case(
-        # A stale authorization is an authorization decision, not a bug.  The
-        # documented meaning of `3` is "untrusted credentials / authorization
-        # denied"; putting this at `1` tells an operator to file a defect
-        # report instead of re-authorizing.
-        "a stale authorization is reported as an authorization failure",
+        # **M6-C39, owner decision 2026-09-25 (option (a)).**
+        # `AUTHORIZATION_STALE` is produced only when one stream's
+        # operation-authorization window lapsed before its queued frame was
+        # written, so the session was failed and restarted.  Nothing about
+        # the credential or the grant was refused; the likeliest cause is a
+        # stalled or congested data path.  It therefore exits `4` ("check
+        # reachability, then retry"), the class its reconnect arm already
+        # has, and `3` keeps meaning "a credential or authorization was
+        # refused".
+        #
+        # The defeat restores the mapping the decision replaced -- the arm
+        # back at `3` -- because that is the regression this case exists to
+        # catch: an operator sent to re-enroll a healthy credential.  Moving
+        # it to `1` instead would also redden, but it would measure the
+        # separation from "internal failure", which the owner-busy and
+        # cancelled cases already hold.
+        "a lapsed stream authorization window is reported as transport class",
         [
             (
                 MAIN,
-                "            Self::CredentialError | Self::AuthorizationStale => 3,",
-                "            Self::CredentialError => 3,\n            Self::AuthorizationStale => 1,",
+                "            Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,",
+                "            Self::TransportError | Self::SessionClosed => 4,\n"
+                "            Self::AuthorizationStale => 3,",
             )
         ],
-        frozenset({"tests::causes_needing_different_actions_do_not_share_an_exit_code"}),
+        # **Only the first witness names this rule.**
+        # `causes_needing_different_actions_do_not_share_an_exit_code` holds
+        # `assert_eq!(stale, 4, "... transport class (M6-C39)")`, so its red
+        # says that a lapsed authorization window left the transport class.
+        # `every_client_error_variant_maps_to_an_actionable_exit_code` is a
+        # per-variant table that goes red on *any* change to *any* mapping;
+        # it is declared too, so that both must be among the failures, but a
+        # red on it alone would not identify this rule.
+        frozenset(
+            {
+                "tests::causes_needing_different_actions_do_not_share_an_exit_code",
+                "tests::every_client_error_variant_maps_to_an_actionable_exit_code",
+            }
+        ),
     ),
     Case(
         # The one non-doctor status any fixture in this repository can reach
@@ -243,12 +269,17 @@ CASES: list[Case] = [
         # redden **for the reason it names** rather than merely being green:
         # the `ExitCode::from` plumbing between `Cause::exit_code` and the
         # caller's `$?` has no other witness.
+        #
+        # **Since M6-C39 this arm also carries `AUTHORIZATION_STALE`**, so the
+        # defeat moves it to `1` together with the transport causes.  That
+        # does not change what the case measures -- its witness is the
+        # transport process fixture -- but the edit is wider than it was.
         "the chosen exit code reaches the process exit status",
         [
             (
                 MAIN,
-                "            Self::TransportError | Self::SessionClosed => 4,",
-                "            Self::TransportError | Self::SessionClosed => 1,",
+                "            Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,",
+                "            Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 1,",
             )
         ],
         # **The witness is the process fixture, and declaring it is the whole

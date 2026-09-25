@@ -2214,6 +2214,13 @@ pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate valid
 /// without touching the device.
 pub const RELAY_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "relay certificate validity";
 
+/// Safe message of `ClientError::AuthorizationExpired` (`AUTHORIZATION_STALE`,
+/// exit `4`). Published so a harness that buckets CLI messages matches the
+/// text by name rather than by a copy that can drift (task row M6-C39).
+pub const AUTHORIZATION_EXPIRED_MESSAGE: &str = "a stream's authorization window lapsed before \
+its frame was written, so the session was restarted; this is usually a stalled or congested \
+data path";
+
 /// How a TLS handshake failure is classified before sanitization.
 enum TlsFailure {
     /// A refusal no retry can fix; the reason is fixed text.
@@ -2513,7 +2520,7 @@ impl ClientError {
             }
             Self::TlsRefused(reason) => (*reason).to_owned(),
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
-            Self::AuthorizationExpired => "authorization confirmation deadline expired".to_owned(),
+            Self::AuthorizationExpired => AUTHORIZATION_EXPIRED_MESSAGE.to_owned(),
             Self::QueueLimit => "bounded connector queue limit reached".to_owned(),
             Self::OpenRetentionFull => {
                 "OPEN idempotency retention is full; start a fresh session".to_owned()
