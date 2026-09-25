@@ -17,9 +17,13 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "typecheck": "tsc --project tsconfig.json",
+    "lint": "node scripts/lint.ts",
     "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
     "test:peers": "node --test --test-reporter=spec \"test/peers/*.peers.ts\"",
-    "typecheck": "tsc --project tsconfig.json",
+    "check": "npm run lint && npm run typecheck && npm run build && npm test && npm run test:peers",
+    "demo:adapters": "../../scripts/adapters-demo.sh",
     "fuzz:generate": "node fuzz/generate.ts"
   },
   "dependencies": {},
