@@ -188,6 +188,35 @@ allocated by this owner in this session even when the connector never saw it.
 A `STREAM_FORGET` naming an ID **above** the watermark that this session never
 retained remains the protocol error it is.
 
+The control and data sockets are independent, so an owner's `STREAM_FORGET`
+can legally overtake the owner's final data-channel ACK for the connector's
+terminal. A connector whose proof fails **only** because that ACK (or bounded
+carrier-control debt) is still outstanding retains the message for one bounded
+revalidation window (5 s, an absolute deadline that neither a duplicate
+message nor a barrier retry extends) and revalidates it as data progresses.
+The proof is validated before the clock is consulted, so a proof that is
+complete when it is examined completes even if its last evidence arrived after
+the deadline; the deadline bounds retention, not safety. A proof still
+incomplete at the deadline ends the session, and nothing is reclaimed. That
+failure is **not** a protocol violation when everything except the owner's
+final ACK already holds -- the owner's sender evidence, the receive-side
+match, the sequence reconciliation and the owner snapshot's own invariants,
+with only the connector sender's pending-ACK state and that ACK's queued
+carrier control treated as satisfied. Missing evidence is what a stalled or
+lossy device produces: a process stopped (a monotonic clock keeps running
+through SIGSTOP, so the deadline has passed when the process resumes and can
+fire before the buffered ACK is read), or a data path gone, including a host
+suspended long enough for the relay's 30 s idle eviction, after which the ACK
+never arrives. (A suspended host's monotonic clock does not advance on macOS
+or Linux, so suspend reaches this only through that eviction.) The connector
+cannot distinguish missing evidence from a relay that never sent the ACK. It
+is a retryable transport failure, and the successor session starts with an
+empty journal, so nothing is replayed; the relay answers exchanges that were
+still in flight with an explicit unknown execution outcome (task row M6-C105).
+Evidence that **contradicts** the proof -- a mismatched cursor, byte count,
+terminal or identity -- or an owner snapshot that is invalid in itself stays a
+non-retryable protocol error, before or after the window.
+
 The connector also keeps a bounded monotonic record of reclaimed stream IDs,
 which covers the IDs it refused before journaling them: those can be above the
 watermark, since nothing was ever forgotten for them. That record is held as
@@ -351,7 +380,20 @@ stateDiagram-v2
 ### Scheduled handover: prepare, fence, drain, commit, retire
 
 1. **Prepare.** The owner issues `ROTATE_PREPARE` with one fresh generation, connection ID and single-use ticket. Repeated requests coalesce. Old data remains active while the candidate completes mTLS, attachment and readiness. Candidate readiness alone never authorizes DATA/FIN/RESET.
-2. **Quiesce admission.** The owner's session state machine serializes `OPEN` admission with `ROTATE_QUIESCE`. It pauses new OPEN requests and fixes a `snapshot_id` and bounded stream roster containing all live, pending-admission and unreclaimed terminal entries. OPEN already sent is ordered before QUIESCE on control; the connector must account for it even if OPENED is in flight. Unknown or missing roster entries fail the attempt. New requests wait in the existing bounded admission queue or receive retryable overload.
+2. **Quiesce admission.** The owner's session state machine serializes `OPEN` admission with `ROTATE_QUIESCE`. It pauses new OPEN requests and fixes a `snapshot_id` and bounded stream roster containing all live, pending-admission and unreclaimed terminal entries. OPEN already sent is ordered before QUIESCE on control; the connector must account for it even if OPENED is in flight. Unknown or missing roster entries fail the attempt. New requests wait in the owner's bounded admission hold described below; nothing is sent to the connector for them until the freeze ends.
+
+   **Admission hold across the freeze** (task row M3-15; owner decision, 2026-09-25). A new request that reaches the owner while an attempt is frozen (`Quiescing`, `Draining`, `Committing` or `Aborting`) is held by the owner and runs ordinary admission once the freeze ends, so a scheduled rotation is invisible to a consumer that does not retry. Two kinds are held: a consumer stream OPEN (the echo stream, `http-forward/1` and the filesystem upgrade) and a finite unary echo. The hold is a bounded FIFO, not an open-ended queue. It lasts at most 1.5 s, never more than the negotiated rotation handshake budget, and never more than half of any deadline that waits on the held request: the relay's operation timeout, on a cluster relay the peer idle timeout, and for the filesystem upgrade the client's handshake budget (the descriptor's `requestTimeoutSeconds`). It holds at most 8 requests per device (never more than the device's stream limit), 64 per tenant and 256 per relay. A held stream OPEN carries no request bytes. A held unary echo carries its body, at most 64 KiB. Those bytes are **not** charged to the session's `queue_budget`: the echo is charged only when it is dispatched. Instead they are bounded by the hold's fixed ceilings, at most 512 KiB per device, 4 MiB per tenant and 16 MiB per relay. Nothing held is in the roster or reaches the device, so the roster fixed at QUIESCE and the two-socket steady state are unchanged. Each held request leaves the hold once, with an explicit outcome:
+
+   | End of the hold | Consumer outcome |
+   | --- | --- |
+   | The attempt commits (`ROTATE_COMMITTED`) | Ordinary admission on the new carrier, in arrival order, after the writes frozen at the fence are flushed |
+   | The attempt aborts and the old carrier resumes (final `ROTATE_ABORTED`) | Ordinary admission on the old carrier, after its frozen writes resume |
+   | The attempt enters recovery | Ordinary admission, which gives the existing fault refusal (owner-not-ready; `RESOURCE_EXHAUSTED` for a unary echo) |
+   | The freeze outlasts the bound | `503 ROTATION_FREEZE`, `not_dispatched`, `retryable`, `retry_after_ms` 250, `Retry-After: 1` (the filesystem endpoint: `503 ROTATION_FREEZE` in its own error body, with `Retry-After`) |
+   | The consumer goes away | Dropped; nothing reached the device |
+   | The device session ends or is replaced, or the relay shuts down | The existing fault refusal, `not_dispatched` (owner-not-ready; `DEVICE_OFFLINE` for a unary echo); a successor session never inherits a held request |
+
+   An OPEN that arrives while the hold is full gets the same `ROTATION_FREEZE` answer at once. That code is used only for the scheduled freeze, so a consumer or gateway can retry it without other evidence. The owner-not-ready fault states (no active carrier, an unfenced cluster owner, an unknown owner write, recovery) keep their existing `503 PEER_UNAVAILABLE` body and are never held. On a cluster the owner decides the hold, because only the owner knows its session's rotation phase; a forwarded request's refusal reaches the ingress through its own `rotation_freeze` peer admission marker and the consumer still sees `ROTATION_FREEZE`. The relay snapshot's `rotation_freeze_hold` counts held requests and how each left the hold (commit, abort, recovery, bound, cancellation, session loss, cap), without payloads. Every relay in a cluster must run the same version with the same operation and peer idle timeouts; see [cluster.md](cluster.md#scheduled-data-rotation-and-the-admission-hold).
 3. **Freeze each writer.** Each endpoint stops accepting additional old-generation DATA/FIN/RESET into its writer. It finishes already queued old frames and flushes that writer before reporting `ROTATE_FROZEN`; no sequenced frame can be emitted on old after this local barrier unless the coordinator explicitly aborts the attempt. New adapter output, including a later FIN/RESET, stays bounded and applies backpressure until activation or abort. For each roster entry, FROZEN records the local direction's `last_emitted` fence, zero if none, including any emitted FIN/RESET. Both immutable fence sets reference the same snapshot and rotation attempt.
 4. **Drain both directions.** Receivers continue accepting old frames through the advertised peer fences. ACKs, credit updates, heartbeats and cancellation remain responsive; they do not extend deadlines. A control FROZEN marker can arrive before old data, so it is not a drain proof. Each receiver sends `ROTATE_DRAINED` only when its contiguous receive cursor reaches every peer fence. DRAINED carries the snapshot/peer-fence reference and corresponding cumulative ACK cursors. The sender validates these against its emitted state. The owner requires both DRAINED proofs and acknowledgement of every sequence through both fence sets. There can be no gap below a fence. Neither endpoint sends sequenced frames on the candidate during drain.
 5. **Commit.** The owner records the decision for this attempt in its live session state, enables candidate reception and sends `ROTATE_COMMIT` referencing both drain proofs. The connector validates the phase and proofs, activates candidate reception, sends `ROTATE_COMMITTED`, then resumes its writer on `n`. The relay resumes its writer only after that acknowledgement. New sequences follow the old fences without resetting counters; FIN already emitted remains terminal. A scheduled successful drain requires **no replay** of the drained prefix.

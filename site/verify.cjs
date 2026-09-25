@@ -11,7 +11,7 @@ const { chromium } = require('playwright');
     const files = { '/': 'index.html', '/style.css': 'style.css', '/hero.jpg': 'hero.jpg', '/theme.css': 'theme.css', '/theme.js': 'theme.js', '/brand-lab': 'brand-lab.html', '/brand-lab.css': 'brand-lab.css', '/brand-lab.js': 'brand-lab.js', '/logo-board.png': 'logo-board.png' };
     files['/docs.css'] = 'docs.css';
     files['/releases.js'] = 'releases.js';
-    const doc = route.match(/^\/docs(?:\/(index|downloads|setup|architecture|mcp|acp|cua|filesystems|support))?\/?$/);
+    const doc = route.match(/^\/docs(?:\/(index|downloads|join|setup|architecture|mcp|acp|cua|filesystems|support))?\/?$/);
     if (doc) files[route] = `docs/${doc[1] || 'index'}.html`;
     if (!files[route]) { res.writeHead(404).end(); return; }
     res.setHeader('Content-Type', route.endsWith('.css') ? 'text/css' : route.endsWith('.js') ? 'text/javascript' : route.endsWith('.jpg') ? 'image/jpeg' : route.endsWith('.png') ? 'image/png' : 'text/html');
@@ -50,7 +50,7 @@ const { chromium } = require('playwright');
       await page.screenshot({ path: `/tmp/agentuplink-brand-dark-${width}.png`, fullPage: true });
       await page.getByLabel('Colour theme').selectOption('light');
       assert.equal(await page.locator('html').getAttribute('data-theme'), 'light');
-      for (const slug of ['', 'downloads', 'setup', 'architecture', 'mcp', 'acp', 'cua', 'filesystems', 'support']) {
+      for (const slug of ['', 'downloads', 'join', 'setup', 'architecture', 'mcp', 'acp', 'cua', 'filesystems', 'support']) {
         const response = await page.goto(new URL(`/docs/${slug}`, page.url()).href, { waitUntil: 'networkidle' });
         assert.equal(response.status(), 200);
         assert.equal(await page.locator('h1').count(), 1);
@@ -65,7 +65,7 @@ const { chromium } = require('playwright');
         if (slug === 'setup') await page.screenshot({ path: `/tmp/agentuplink-docs-${width}.png`, fullPage: true });
       }
       assert.deepEqual(failures, []);
-      console.log(`PASS ${width}x${height}: homepage, brand lab, 9 docs pages, links, themes, images, layout`);
+      console.log(`PASS ${width}x${height}: homepage, brand lab, 10 docs pages, links, themes, images, layout`);
       await page.close();
     }
   } finally {

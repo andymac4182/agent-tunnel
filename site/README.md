@@ -15,7 +15,7 @@ Main release workflow activation requires landing `.github/workflows/release.yml
 on the default branch, and all existing main CI gates must pass before packaging.
 Published builds are prereleases, not production or complete platform acceptance.
 
-Eight static documentation pages live in `docs/`. Their reviewed content is
+Ten static documentation pages live in `docs/`, including `join`, the tester guide for joining an existing relay. Their reviewed content is
 maintained in `build-docs.cjs`; regenerate with `node site/build-docs.cjs` from
 the repository root. `provenance.json` records the reviewed origin/main revision,
 not a claim that the runtime's entire acceptance suite passed at that revision.

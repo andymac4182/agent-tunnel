@@ -841,6 +841,13 @@ async fn create_fixture_inner(
         .activate_deployment_incarnation()
         .await
         .map_err(|error| HarnessError::Redis(format!("activating Redis stage catalog: {error}")))?;
+    common::mark_catalog_provisioned(
+        partial
+            .catalog
+            .as_ref()
+            .expect("Redis stage catalog retained"),
+    )
+    .await?;
 
     let oidc = OidcFixture::new(
         format!("https://m7-redis-stage-oidc-{run_id}.invalid"),

@@ -220,6 +220,18 @@ pub trait Catalog: Send + Sync {
     async fn read_signed_memberships(&self) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
         Ok(self.read_signed_membership().await?.into_iter().collect())
     }
+
+    /// One bounded check that the authority this catalog serves from can
+    /// answer now (task row M6-C67).  A single relay's `/readyz` follows it.
+    ///
+    /// The Redis catalog runs the same active-incarnation and Redis-run check
+    /// `serve` applies at startup, on its ordinary lane, so a lost connection
+    /// reconnects (and a restarted Redis is re-bound or refused) exactly as a
+    /// request's command would.  It never writes.  A process-local catalog
+    /// has no external authority and is always available.
+    async fn check_authority(&self) -> Result<(), CatalogError> {
+        Ok(())
+    }
 }
 
 /// The object type used by relay state owners.

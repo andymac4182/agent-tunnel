@@ -764,6 +764,7 @@ async fn create_fixture() -> Result<ProcessFixture> {
         .activate_deployment_incarnation()
         .await
         .map_err(|error| HarnessError::Redis(format!("activating refresh catalog: {error}")))?;
+    common::mark_catalog_provisioned(&catalog).await?;
     let publisher = RedisMembershipPublisher::connect(&upstream_url, &namespace)
         .await
         .map_err(|error| HarnessError::Redis(format!("opening refresh publisher: {error}")))?;

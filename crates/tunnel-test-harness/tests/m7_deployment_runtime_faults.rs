@@ -511,6 +511,13 @@ async fn create_fixture_inner(
         .map_err(|error| {
             HarnessError::Redis(format!("activating runtime fault catalog: {error}"))
         })?;
+    common::mark_catalog_provisioned(
+        partial
+            .catalog
+            .as_ref()
+            .expect("runtime fault catalog retained"),
+    )
+    .await?;
     let publisher = RedisMembershipPublisher::connect(&upstream_url, &namespace)
         .await
         .map_err(|error| {

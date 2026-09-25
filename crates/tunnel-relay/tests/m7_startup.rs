@@ -1095,6 +1095,9 @@ where
                 format!("${}\r\n{}\r\n", body.len(), body).into_bytes()
             }
             Some("EVAL") => b"*1\r\n$2\r\nok\r\n".to_vec(),
+            // A provisioned namespace: `serve`'s provisioning fence (M6-C34)
+            // reads the reservation with `GET` and requires `1`.
+            Some("GET") => b"$1\r\n1\r\n".to_vec(),
             _ => b"+OK\r\n".to_vec(),
         };
         if stream.write_all(&response).await.is_err() {

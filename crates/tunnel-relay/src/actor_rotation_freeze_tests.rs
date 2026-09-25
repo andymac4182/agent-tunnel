@@ -34,7 +34,7 @@ use super::stream_identity_tests::{
 };
 use super::{
     CarrierKey, ControlOutbound, DataCarrier, DataOutbound, DeviceChallenge, DeviceSession,
-    DispatchRequest, EchoOutcome, M2Stream, RelayActor, RelayError, SessionKey, runtime, wire,
+    DispatchRequest, EchoOutcome, M2Stream, RelayActor, SessionKey, runtime, wire,
 };
 
 const STREAM_ID: u64 = 7;
@@ -135,6 +135,9 @@ struct FreezeFixture {
     relay_fence: Option<FenceSnapshot>,
     commit_message_id: String,
     retire_message_id: String,
+    /// OPENs seen by any control drain, including the drains inside the
+    /// phase helpers, so a test can count every OPEN the relay queued.
+    opens_drained: usize,
 }
 
 impl FreezeFixture {
@@ -304,6 +307,7 @@ impl FreezeFixture {
             relay_fence: None,
             commit_message_id: String::new(),
             retire_message_id: String::new(),
+            opens_drained: 0,
         }
     }
 
@@ -400,6 +404,9 @@ impl FreezeFixture {
                     let message = wire::parse_control(queued.as_bytes())
                         .expect("relay control message decodes");
                     queued.release();
+                    if matches!(message, ControlMessage::Open(_)) {
+                        self.opens_drained += 1;
+                    }
                     messages.push(message);
                 }
                 ControlOutbound::Close => panic!("relay closed the control socket"),
@@ -1021,13 +1028,13 @@ async fn open_admission_pauses_during_quiesce_and_roster_stays_matched() {
         fixture.consumer_expires_at,
         response,
     );
+    // M3-15: the OPEN is held, not refused, and nothing reaches the device
+    // while admission is paused.
     match receiver.try_recv() {
-        Ok(Err(RelayError::OwnerNotReady)) => {}
-        Ok(Err(other)) => {
-            panic!("OPEN during quiesce must be refused as retryable owner-not-ready, got {other}")
-        }
+        Err(oneshot::error::TryRecvError::Empty) => {}
+        Ok(Err(other)) => panic!("OPEN during quiesce must be held, got {other}"),
         Ok(Ok(_)) => panic!("OPEN must not be admitted while the roster is frozen"),
-        Err(_) => panic!("OPEN admission must answer synchronously"),
+        Err(oneshot::error::TryRecvError::Closed) => panic!("held OPEN dropped unanswered"),
     }
     assert!(
         fixture
@@ -1062,6 +1069,13 @@ async fn open_admission_pauses_during_quiesce_and_roster_stays_matched() {
     fixture.connector_frozen(0).await;
     fixture.connector_drained().await;
     fixture.connector_committed().await;
+    // The held OPEN is admitted once the candidate is active.
+    match receiver.try_recv() {
+        Ok(Ok(registration)) => assert_eq!(registration.stream_id, STREAM_ID + 1),
+        Ok(Err(error)) => panic!("held OPEN must be admitted after COMMITTED, got {error}"),
+        Err(error) => panic!("held OPEN must be answered at COMMITTED, got {error:?}"),
+    }
+    assert_eq!(fixture.session().streams.len(), 2);
 
     // Admission resumes once the candidate is active.
     let (response, mut receiver) = oneshot::channel();
@@ -1074,17 +1088,13 @@ async fn open_admission_pauses_during_quiesce_and_roster_stays_matched() {
         response,
     );
     match receiver.try_recv() {
-        Ok(Ok(registration)) => assert_eq!(registration.stream_id, STREAM_ID + 1),
+        Ok(Ok(registration)) => assert_eq!(registration.stream_id, STREAM_ID + 2),
         Ok(Err(error)) => panic!("OPEN after activation must be admitted, got {error}"),
         Err(_) => panic!("OPEN admission must answer synchronously"),
     }
-    assert!(
-        fixture
-            .drain_control()
-            .iter()
-            .any(|message| matches!(message, ControlMessage::Open(_)))
-    );
-    assert_eq!(fixture.session().streams.len(), 2);
+    let _ = fixture.drain_control();
+    assert_eq!(fixture.opens_drained, 2, "the held OPEN, then the new one");
+    assert_eq!(fixture.session().streams.len(), 3);
 }
 
 #[tokio::test]
@@ -1105,17 +1115,18 @@ async fn finite_echo_dispatch_pauses_during_quiesce() {
             response,
         })
         .await;
-    match receiver.try_recv() {
-        Ok(EchoOutcome::Failure { code, execution }) => {
-            assert_eq!(code, "RESOURCE_EXHAUSTED");
-            assert_eq!(execution, "not_dispatched");
-        }
-        Ok(EchoOutcome::Success(_)) => panic!("finite echo must not complete during quiesce"),
-        Err(_) => panic!("finite echo admission must answer synchronously"),
-    }
+    // M3-15: the finite echo is held (not answered) and stays out of the
+    // frozen roster; `freeze_hold_tests` follows it to its outcome.
+    assert!(
+        matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "a finite echo in a freeze is held, not refused"
+    );
     assert!(
         fixture.session().pending.is_empty(),
-        "a refused finite echo must not join the frozen roster"
+        "a held finite echo must not join the frozen roster"
     );
     assert!(
         fixture
@@ -3159,3 +3170,6 @@ async fn an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete
     assert_eq!(forgets[0].stream_id, STREAM_ID);
     assert_eq!(forgets[0].operation_id, OPERATION_ID);
 }
+
+#[path = "actor_freeze_hold_tests.rs"]
+mod freeze_hold_tests;

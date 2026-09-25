@@ -2785,8 +2785,24 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.leftover_processes,
                         evidence.not_covered.len(),
                     );
+                    let hold = &evidence.owner_freeze_hold;
                     println!(
-                        "M3 MCP cloud client not_dispatched totals: refusals={} freeze_retries={} (a refusal outside an observed rotation freeze is never resent)",
+                        "M3 MCP cloud client owner rotation-freeze hold: held={} admitted_after_hold={} released_on_commit={} released_on_abort={} released_on_recovery={} released_with_deferred_writes={} refused_after_bound={} refused_hold_full={} cancelled={} released_on_session_loss={} currently_held={} max_hold_wait_ms={}",
+                        hold.held,
+                        hold.admitted_after_hold,
+                        hold.released_on_commit,
+                        hold.released_on_abort,
+                        hold.released_on_recovery,
+                        hold.released_with_deferred_writes,
+                        hold.refused_after_bound,
+                        hold.refused_hold_full,
+                        hold.cancelled,
+                        hold.released_on_session_loss,
+                        hold.currently_held,
+                        hold.max_hold_wait_ms,
+                    );
+                    println!(
+                        "M3 MCP cloud client not_dispatched totals: refusals={} freeze_retries={} (only the relay's ROTATION_FREEZE answer is resent for a POST)",
                         evidence
                             .combos
                             .iter()

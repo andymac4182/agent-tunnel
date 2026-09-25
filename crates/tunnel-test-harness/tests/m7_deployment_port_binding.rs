@@ -543,6 +543,13 @@ async fn create_fixture_inner(
         .map_err(|error| {
             HarnessError::Redis(format!("activating port-binding catalog: {error}"))
         })?;
+    common::mark_catalog_provisioned(
+        partial
+            .catalog
+            .as_ref()
+            .expect("port-binding catalog retained"),
+    )
+    .await?;
     let publisher = RedisMembershipPublisher::connect(&upstream_url, &namespace)
         .await
         .map_err(|error| HarnessError::Redis(format!("opening port-binding publisher: {error}")))?;

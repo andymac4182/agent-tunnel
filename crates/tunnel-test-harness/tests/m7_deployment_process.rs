@@ -161,6 +161,7 @@ async fn run_configured_relay(stop: StopSignal) -> Result<()> {
         .map_err(|error| {
             HarnessError::Redis(format!("activating disposable Redis catalog: {error}"))
         })?;
+    common::mark_catalog_provisioned(&catalog).await?;
     let publisher = RedisMembershipPublisher::connect(&upstream_url, &namespace)
         .await
         .map_err(|error| HarnessError::Redis(format!("opening membership publisher: {error}")))?;
