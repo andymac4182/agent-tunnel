@@ -1153,7 +1153,11 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
 
     const CUA_EXPORT: &str = "[exports.55555555-5555-4555-8555-555555555555]\ntype = \"http-forward\"\n\n[exports.55555555-5555-4555-8555-555555555555.cua]\nprofile = \"computer-v1\"\npoint_width = 1280\npoint_height = 800\noperations = [\"describe\", \"capture\", \"click\"]\n\n[exports.55555555-5555-4555-8555-555555555555.cua.backend]\ncommand = \"/opt/synthetic/cua-backend\"\nworkspace = \"/srv/synthetic-cua\"\naddress_file = \"/srv/synthetic-cua/backend.address\"\n";
 
+    /// Through [`host`], so the fixture's Unix-absolute paths are absolute on
+    /// Windows too; without it the two always-built tests below failed on
+    /// Windows CI (job 108161373996) for a reason unrelated to CUA.
     fn with_cua(table: &str) -> String {
+        let table = host(table);
         format!("{}\n{table}", valid_toml())
     }
 

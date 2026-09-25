@@ -65,10 +65,21 @@ fn settings(
 }
 
 async fn call(export: &CuaExport, binding: &str, operation: &str, params: Value) -> Value {
+    call_with(export, Some(binding), operation, params).await
+}
+
+async fn call_with(
+    export: &CuaExport,
+    binding: Option<&str>,
+    operation: &str,
+    params: Value,
+) -> Value {
     let body = json!({"version": "computer.v1", "operation": operation, "params": params});
-    let request = Request::post("/computer")
-        .header("content-type", "application/json")
-        .header(tunnel_cua::headers::TUNNEL_PRINCIPAL_BINDING, binding)
+    let mut request = Request::post("/computer").header("content-type", "application/json");
+    if let Some(binding) = binding {
+        request = request.header(tunnel_cua::headers::TUNNEL_PRINCIPAL_BINDING, binding);
+    }
+    let request = request
         .body(ChannelBody::full(Bytes::from(body.to_string())))
         .expect("request");
     let response = export.handle(request).await;
@@ -326,4 +337,79 @@ fn codes_are_identifiers_and_carry_no_payload() {
     .unwrap();
     assert_eq!(typo["outcome"], "not_dispatched");
     assert_eq!(typo["operation"], "clik");
+}
+
+/// **A request without a principal binding is refused, not given a shared
+/// session.** Before the fix every such request fell into one `"none"`
+/// session, so a second binding-less caller could use a lease the first had
+/// taken. Nothing reaches the backend, and the backend is not even started.
+#[tokio::test]
+async fn a_request_without_a_principal_binding_is_refused() {
+    let backend = FixtureBackend::start().await.expect("fixture");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = CuaExport::from_settings(&settings(
+        workspace.path(),
+        &backend,
+        Some((u32::from(SCREEN_WIDTH), u32::from(SCREEN_HEIGHT))),
+    ))
+    .expect("export");
+    for (operation, params) in [
+        (LEASE_ACQUIRE, json!({})),
+        ("capture", json!({})),
+        ("press_key", json!({"key": "a"})),
+    ] {
+        let answer = call_with(&export, None, operation, params.clone()).await;
+        assert_eq!(outcome(&answer), "not_dispatched", "{answer}");
+        assert_eq!(answer["error"]["code"], "principal_binding_missing");
+        let empty = call_with(&export, Some(""), operation, params).await;
+        assert_eq!(empty["error"]["code"], "principal_binding_missing");
+    }
+    assert_eq!(export.diagnostics().sessions, 0);
+    assert_eq!(export.diagnostics().backend_starts, 0);
+    assert!(backend.ledger().is_empty());
+    backend.stop();
+}
+
+/// **A stale capture is refused at the export, as the demo relies on.** A
+/// second capture supersedes the first, and a click on the first is
+/// `capture_superseded`, not dispatched, with nothing on the ledger; the same
+/// point on the fresh capture lands.
+#[tokio::test]
+async fn a_click_on_a_superseded_capture_is_refused_at_the_export() {
+    let backend = FixtureBackend::start().await.expect("fixture");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = CuaExport::from_settings(&settings(
+        workspace.path(),
+        &backend,
+        Some((u32::from(SCREEN_WIDTH), u32::from(SCREEN_HEIGHT))),
+    ))
+    .expect("export");
+    call(&export, "agent-a", LEASE_ACQUIRE, json!({})).await;
+    let first = call(&export, "agent-a", "capture", json!({})).await["result"]["capture"]
+        .as_u64()
+        .expect("first identity");
+    let second = call(&export, "agent-a", "capture", json!({})).await["result"]["capture"]
+        .as_u64()
+        .expect("second identity");
+    let stale = call(
+        &export,
+        "agent-a",
+        "click",
+        json!({"capture": first, "x": 10, "y": 10}),
+    )
+    .await;
+    assert_eq!(outcome(&stale), "not_dispatched", "{stale}");
+    assert_eq!(stale["error"]["code"], "capture_superseded");
+    assert_eq!(backend.ledger().pointer_clicks(), 0);
+    let fresh = call(
+        &export,
+        "agent-a",
+        "click",
+        json!({"capture": second, "x": 10, "y": 10}),
+    )
+    .await;
+    assert_eq!(outcome(&fresh), "ok", "{fresh}");
+    assert_eq!(backend.ledger().points(), vec![(10, 10)]);
+    export.shutdown().await;
+    backend.stop();
 }

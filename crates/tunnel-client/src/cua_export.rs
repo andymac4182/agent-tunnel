@@ -293,13 +293,29 @@ impl CuaExport {
     pub async fn handle(&self, request: Request<ChannelBody>) -> Response<HttpBody> {
         self.inner.counters.requests.fetch_add(1, Ordering::Relaxed);
         let (parts, body) = request.into_parts();
-        let binding = parts
+        // **No binding, no session.** The relay ingress always derives one
+        // for a `computer-v1` request, so a request without it did not come
+        // through an authenticating ingress. Folding every such request into
+        // one shared session would let any of them use a lease another took.
+        // Refused before the body is read or the backend started.
+        let Some(binding) = parts
             .headers
             .get(tunnel_cua::headers::TUNNEL_PRINCIPAL_BINDING)
             .and_then(|value| value.to_str().ok())
             .filter(|value| !value.is_empty())
-            .unwrap_or("none")
-            .to_owned();
+            .map(str::to_owned)
+        else {
+            self.inner
+                .counters
+                .not_dispatched
+                .fetch_add(1, Ordering::Relaxed);
+            return self.reply(&CuaResponse::not_dispatched_retryable(
+                "",
+                "principal_binding_missing",
+                "the request carries no relay principal binding",
+                false,
+            ));
+        };
         let Ok(bytes) = collect_limited(body, self.inner.limits.request_body()).await else {
             return self.reply(&CuaResponse::not_dispatched(
                 "",
