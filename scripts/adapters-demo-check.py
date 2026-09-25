@@ -145,8 +145,11 @@ def main() -> int:
     )
     again = calls[4]["output"]
     check(
-        "AI SDK write_file refuses to replace without overwrite, as a model-visible EEXIST",
-        again["ok"] is False and again["code"] == "EEXIST" and again["retrySafe"] is True
+        "AI SDK write_file refuses to replace without overwrite, as a model-visible EEXIST that is not retry-safe",
+        # A failed mutation is a floor ("at least this much", filesystem-api.md),
+        # so only not_started may be marked retry-safe for a write.
+        again["ok"] is False and again["code"] == "EEXIST" and again["outcome"] == "failed"
+        and again["retrySafe"] is False
         and host("/outbox/ai-sdk.txt") == a["writtenText"].encode(),
         f"{again.get('code')} outcome={again.get('outcome')}",
     )

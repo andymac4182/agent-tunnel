@@ -256,6 +256,8 @@ describe('write_file', () => {
     const refused = (await call(tools, 'write_file', { path: '/keep.txt', content: 'x' })) as Record<string, unknown>;
     assert.equal(refused['ok'], false);
     assert.equal(refused['code'], 'EEXIST');
+    assert.equal(refused['outcome'], 'failed');
+    assert.equal(refused['retrySafe'], false, 'a failed mutation is a floor, not proof nothing applied');
     assert.equal(new TextDecoder().decode(wired.provider.read('/keep.txt')), 'original');
 
     const replaced = await call(tools, 'write_file', { path: '/keep.txt', content: 'x', overwrite: true });
@@ -274,6 +276,28 @@ describe('write_file', () => {
     });
     assert.equal(wired.connection.received.length, before);
     assert.equal(wired.provider.has('/x.txt'), false);
+  });
+
+  it('reports a device-refused write as failed and not retry-safe', async () => {
+    // filesystem-api.md: "`failed` on a mutation therefore means 'at least
+    // this much', never 'nothing applied'" — an Rlerror can follow a node the
+    // device already made. Only `not_started` licenses a retry of a write.
+    const { tools, wired } = await toolsOver({}, {}, (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const result = (await call(tools, 'write_file', { path: '/denied.txt', content: 'x' })) as Record<string, unknown>;
+    assert.equal(result['ok'], false);
+    assert.equal(result['code'], 'EACCES');
+    assert.equal(result['outcome'], 'failed', 'one refused request: the wire floor');
+    assert.equal(result['retrySafe'], false);
+    assert.ok(wired.connection.received.some((message) => message.kind === 'Tlcreate'));
+  });
+
+  it('keeps a failed read retry-safe, because a read changes nothing', async () => {
+    const { tools } = await toolsOver({});
+    const result = (await call(tools, 'read_file', { path: '/absent.txt' })) as Record<string, unknown>;
+    assert.equal(result['ok'], false);
+    assert.equal(result['retrySafe'], true);
   });
 
   it('reports an unanswered write as unknown and never retry-safe', async () => {

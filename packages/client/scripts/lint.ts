@@ -74,12 +74,74 @@ lineRule('no-explicit-any', src, /(:\s*any\b|<any>|\bas any\b|\bany\[\])/u);
 // that starts with it; prose that merely names one is not a directive.
 lineRule('no-ts-suppression', everything, /^\s*(\/\/|\/\*+)\s*@ts-(ignore|expect-error|nocheck)\b/u, false);
 // "by type only": a value import of a framework would load it at run time.
-const frameworkValueImport = new RegExp(
-  `^\\s*import\\s+(?!type\\b)[^;]*from\\s+'(${FRAMEWORKS.map((name) => name.replace('/', '\\/')).join('|')})(\\/[^']*)?'`,
-  'u',
-);
-lineRule('framework-import-type-only', src, frameworkValueImport);
-lineRule('no-dynamic-framework-import', src, new RegExp(`import\\(\\s*'(${FRAMEWORKS.join('|')})`, 'u'));
+// Checked over whole files, not line by line, so a multi-line import, an
+// `export … from`, a bare side-effect `import 'ai'`, a dynamic `import()` and
+// a `require()` are all seen. Under `verbatimModuleSyntax` an import whose
+// specifiers are all inline `type` (`import { type X } from 'ai'`) still
+// survives as `import {} from 'ai'`, so only a statement-level `import type` /
+// `export type` passes.
+const FRAMEWORK = `(?:${FRAMEWORKS.map((name) => name.replace(/[/.]/gu, (c) => `\\${c}`)).join('|')})(?:/[^'"]*)?`;
+function frameworkLoads(text: string): { index: number }[] {
+  const hits: { index: number }[] = [];
+  const statements = new RegExp(
+    `(?:^|[;\\n}])\\s*(import|export)\\b(\\s+type\\b)?([^;'"]*?)(?:\\bfrom\\s*)?['"]${FRAMEWORK}['"]`,
+    'gu',
+  );
+  for (const match of text.matchAll(statements)) {
+    if (match[2] === undefined) {
+      hits.push({ index: match.index });
+    }
+  }
+  const calls = new RegExp(`\\b(?:import|require)\\s*\\(\\s*['"\`]${FRAMEWORK}['"\`]`, 'gu');
+  for (const match of text.matchAll(calls)) {
+    hits.push({ index: match.index });
+  }
+  return hits;
+}
+function wholeFileRule(rule: string, paths: string[], find: (text: string) => { index: number }[]): void {
+  scanned.set(rule, (scanned.get(rule) ?? 0) + paths.length);
+  for (const path of paths) {
+    const text = stripBlockComments(readFileSync(path, 'utf8'));
+    for (const hit of find(text)) {
+      const line = text.slice(0, hit.index).split('\n').length + (text[hit.index] === '\n' ? 1 : 0);
+      findings.push({ where: `${relative(root, path)}:${line}`, rule });
+    }
+  }
+}
+/** Blank out comments, keeping newlines so line numbers survive. */
+function stripBlockComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//gu, (comment) => comment.replace(/[^\n]/gu, ' '))
+    .replace(/(^|[^:'"`])\/\/[^\n]*/gu, (_all, lead: string) => lead);
+}
+wholeFileRule('framework-import-type-only', src, frameworkLoads);
+
+// The same rule against what actually ships: the compiled `dist/`, where every
+// type-only import has been erased and anything left is a run-time load.
+// `--dist` makes this mandatory (`npm run check` runs it after `build`).
+if (process.argv.includes('--dist')) {
+  const dist = join(root, 'dist');
+  let built: string[] = [];
+  try {
+    built = jsFiles(dist);
+  } catch {
+    findings.push({ where: 'dist/ (missing: run npm run build first)', rule: 'dist-framework-free' });
+  }
+  wholeFileRule('dist-framework-free', built, frameworkLoads);
+}
+function jsFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) {
+      out.push(...jsFiles(full));
+    } else if (name.endsWith('.js')) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 // "no assertion onto an upstream type".
 lineRule(
   'no-upstream-type-assertion',

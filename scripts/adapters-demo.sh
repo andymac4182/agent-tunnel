@@ -11,10 +11,10 @@
 #       --HTTPS+WSS, bearer token--> tunnel-relay serve
 #       --mTLS WebSocket--> tunnel-client connect --> the exported directory
 #
-# The relay, PKI, Redis and enrolment steps are the same as scripts/fs-demo.sh
-# (the M4-54 filesystem demo); what differs is the grant (read, write, list,
-# delete), the export layout, and the consumer, which drives Files SDK,
-# just-bash, a Mastra Agent and the AI SDK tool loop. The two agents use a
+# The relay, PKI, Redis and enrolment steps were adapted from scripts/fs-demo.sh
+# on branch feat-fs-demo (not yet on main; see task row M4-67); what differs is
+# the grant (read, write, list, delete), the export layout, and the consumer,
+# which drives Files SDK, just-bash, a Mastra Agent and the AI SDK tool loop. The two agents use a
 # scripted model from ai/test: no LLM, no API key, no network beyond loopback.
 #
 # Every check prints `ok <name>` or `FAILED <name>`; the script exits 1 on the
@@ -44,10 +44,20 @@ case "$work/" in "$repo"/*) fail "refusing: work directory $work is inside the r
 relay_pid=""
 client_pid=""
 redis_container=""
+redis_url=""
+redis_ca=""
+namespace=""
 cleanup() {
   status=$?
   [ -n "$client_pid" ] && kill "$client_pid" 2>/dev/null && wait "$client_pid" 2>/dev/null || true
   [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null && wait "$relay_pid" 2>/dev/null || true
+  # Delete this run's catalog keys before the Redis goes away, so a Redis given
+  # through DEMO_REDIS_URL is left as it was found. Runs for the disposable
+  # container too, which is how every run exercises it.
+  if [ -n "$namespace" ] && [ -n "$redis_url" ]; then
+    python3 "$repo/scripts/adapters-demo-redis-cleanup.py" "$redis_url" "$redis_ca" "$namespace" \
+      || echo "cleanup: WARNING could not delete Redis keys for namespace $namespace" >&2
+  fi
   [ -n "$redis_container" ] && docker rm -f "$redis_container" >/dev/null 2>&1 || true
   if [ "${DEMO_KEEP:-0}" = 1 ]; then
     echo "cleanup: kept $work (DEMO_KEEP=1); stopped relay, device and Redis (exit=$status)"
@@ -104,6 +114,11 @@ ok "relay CA and listener certificate (127.0.0.1, localhost), device CA, issuer 
 
 echo "== Redis (TLS only)"
 if [ -n "${DEMO_REDIS_URL:-}" ]; then
+  # 127.0.0.1:63790 is the shared verification Redis other agents' gates use;
+  # this demo must never write its catalog there.
+  case "$DEMO_REDIS_URL" in
+    *:63790|*:63790/*) fail "refusing DEMO_REDIS_URL on port 63790: that is the shared verification Redis" ;;
+  esac
   redis_url=$DEMO_REDIS_URL
   redis_ca=${DEMO_REDIS_CA:?DEMO_REDIS_CA must name the CA of DEMO_REDIS_URL}
   ok "using DEMO_REDIS_URL (its CA from DEMO_REDIS_CA)"
@@ -278,11 +293,16 @@ mint_token() { # SUBJECT SCOPE
 umask 077
 mint_token adapters-demo-user fs:connect > "$work/consumer.token"
 mint_token adapters-demo-stranger fs:connect > "$work/stranger.token"
+# curl reads the header from a mode-600 file (-H @file), so no token is ever
+# on a command line or in a process listing.
+for token_file in "$work/consumer.token" "$work/stranger.token"; do
+  printf 'Authorization: Bearer %s\n' "$(cat "$token_file")" > "$token_file.header"
+done
 umask 022
 endpoint="https://127.0.0.1:$consumer_port/v1/devices/$device/services/$service/fs"
 descriptor() { # TOKEN_FILE -> HTTP status; body in $work/descriptor.json
   curl -sS --max-time 5 --cacert "$pki/relay-ca.pem" -o "$work/descriptor.json" -w '%{http_code}' \
-    -H "Authorization: Bearer $(cat "$1")" "$endpoint" 2>/dev/null || true
+    -H "@$1.header" "$endpoint" 2>/dev/null || true
 }
 online=""
 status=""

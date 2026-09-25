@@ -74,7 +74,12 @@ The script:
    `scripts/adapters-demo-check.py`.
 
 Everything it started — relay, device, Redis container, key directory — is
-stopped and removed on exit. `DEMO_KEEP=1` keeps the work directory
+stopped and removed on exit, and this run's catalog keys (every key containing
+its unique `adapters-demo-<pid>-<time>` namespace) are deleted from Redis first,
+so a Redis supplied through `DEMO_REDIS_URL` is left as it was found. A
+`DEMO_REDIS_URL` on port 63790 is refused: that is the shared verification
+Redis. Bearer tokens reach `curl` through a mode-600 header file (`-H @file`)
+and `node` through a token file, never on a command line. `DEMO_KEEP=1` keeps the work directory
 (`relay.log`, `device.log`, `consumer.out`, `consumer.err`, `result.json`).
 
 ## Expected output
@@ -94,7 +99,7 @@ A transcript per adapter, then one line per check. Abridged from a run at
   tool write_file({"path":"/outbox/ai-sdk.txt","content":"Written by an AI SDK tool call.\n"})
     -> {"ok":true,"path":"/outbox/ai-sdk.txt","bytesWritten":32,"outcome":"applied"}
   tool write_file({"path":"/outbox/ai-sdk.txt","content":"second attempt"})
-    -> {"ok":false,"code":"EEXIST","outcome":"failed","retrySafe":true}
+    -> {"ok":false,"code":"EEXIST","outcome":"failed","retrySafe":false}
   model text: Saw 5 tool results.
 
 == checks against the host directory
@@ -110,7 +115,7 @@ ok device still connected after the consumer closed its session
 adapters-demo: PASS nonce=adapters-demo-…
 ```
 
-There are 28 `ok` checks in all. The last line is `adapters-demo: PASS` and
+There are 28 `ok` checks in all, followed by a `redis cleanup: deleted N key(s)` line. The last line is `adapters-demo: PASS` and
 the exit status is 0.
 
 ### Proving the checks can fail
@@ -166,7 +171,7 @@ the real `generateText` loop and a real Mastra `Agent` with a scripted model.
   filtered `files-sdk/ai-sdk` factories and a `bash-tool` wrapper — are not
   implemented; `createFilesystemTools` is the binding this demo uses.
 
-The relay, PKI, Redis and enrolment steps are the same as the single-adapter
-filesystem demo's `scripts/fs-demo.sh` (task row M4-54, another branch); this
+The relay, PKI, Redis and enrolment steps were adapted from
+`scripts/fs-demo.sh` on branch `feat-fs-demo`, which is not on `main` yet; this
 script differs in the grant, the export and the consumer. Folding the shared
 setup into one helper once both have merged is task row M4-67.

@@ -40,9 +40,13 @@
  * ## Outcomes, and why failures are results rather than throws
  *
  * A filesystem failure is returned as `{ ok: false, code, outcome,
- * retrySafe }` so the model sees it. `outcome` is the shared client's own word;
- * `retrySafe` is `true` only for `not_started` and `failed` — never after a
- * `partial` or `unknown` mutation, which "may have happened". A caller's
+ * retrySafe }` so the model sees it. `outcome` is the shared client's own word.
+ * `retrySafe` depends on whether the tool mutates. For the read tools it is
+ * `true` for `not_started` and `failed`, since a read changes nothing. For
+ * `write_file` it is `true` **only** for `not_started`: `docs/filesystem-api.md`
+ * pins that `failed` on a mutation means "at least this much" may have applied
+ * (a device-side `Rlerror` can follow a node it already made, and no wire field
+ * says so), and `partial`/`unknown` may have happened outright. A caller's
  * cancellation is the one thing re-thrown: `abortSignal` is passed to every
  * request, and an aborted tool call ends the step as the AI SDK expects rather
  * than being reported to the model as a filesystem error.
@@ -85,7 +89,12 @@ export interface ToolFailure {
   /** The shared client's code, or a path rule, or `INVALID_INPUT`. */
   code: string;
   outcome: Outcome;
-  /** `true` only when nothing can have happened. Never after `partial`/`unknown`. */
+  /**
+   * `true` only when a retry cannot repeat an effect: `not_started` for any
+   * tool, and `failed` for a read. Never after a mutation that reached the
+   * device, because `failed` on a mutation is a floor ("at least this much"),
+   * and never after `partial`/`unknown`.
+   */
   retrySafe: boolean;
 }
 
@@ -162,7 +171,7 @@ export function createFilesystemTools(options: FilesystemToolsOptions): Filesyst
       (value) => ({ path: value.path }),
     ),
     execute: async (input, execution) =>
-      await guarded(execution, async (signal) => {
+      await guarded(execution, false, async (signal) => {
         const entries: { name: string; kind: 'file' | 'directory' | 'symlink' }[] = [];
         let truncated = false;
         for await (const entry of remote.readDirectory(input.path, { signal })) {
@@ -201,7 +210,7 @@ export function createFilesystemTools(options: FilesystemToolsOptions): Filesyst
       },
     ),
     execute: async (input, execution) =>
-      await guarded(execution, async (signal) => {
+      await guarded(execution, false, async (signal) => {
         const limit = Math.max(1, Math.min(input.maxBytes ?? maxReadBytes, maxReadBytes));
         const chunks: Uint8Array[] = [];
         let received = 0;
@@ -241,7 +250,7 @@ export function createFilesystemTools(options: FilesystemToolsOptions): Filesyst
       (value) => ({ path: value.path }),
     ),
     execute: async (input, execution) =>
-      await guarded(execution, async (signal) => {
+      await guarded(execution, false, async (signal) => {
         const found: Stat = await remote.stat(input.path, { signal });
         return {
           ok: true,
@@ -284,11 +293,11 @@ export function createFilesystemTools(options: FilesystemToolsOptions): Filesyst
         },
       ),
       execute: async (input, execution) =>
-        await guarded(execution, async (signal) => {
+        await guarded(execution, true, async (signal) => {
           const bytes = new TextEncoder().encode(input.content);
           if (bytes.byteLength > maxWriteBytes) {
             // Refused before dispatch: nothing can have happened.
-            return failure('EFBIG', 'not_started');
+            return failure('EFBIG', 'not_started', true);
           }
           await remote.writeFile(input.path, bytes, { signal, overwrite: input.overwrite ?? false });
           return { ok: true, path: input.path, bytesWritten: bytes.byteLength, outcome: 'applied' };
@@ -312,8 +321,9 @@ function positive(value: number | undefined, fallback: number, name: string): nu
   return value;
 }
 
-function failure(code: string, outcome: Outcome): ToolFailure {
-  return { ok: false, code, outcome, retrySafe: outcome === 'not_started' || outcome === 'failed' };
+function failure(code: string, outcome: Outcome, mutating: boolean): ToolFailure {
+  const retrySafe = outcome === 'not_started' || (outcome === 'failed' && !mutating);
+  return { ok: false, code, outcome, retrySafe };
 }
 
 /**
@@ -322,6 +332,7 @@ function failure(code: string, outcome: Outcome): ToolFailure {
  */
 async function guarded<T>(
   execution: Pick<ToolExecutionOptions<unknown>, 'abortSignal'>,
+  mutating: boolean,
   body: (signal: AbortSignal | undefined) => Promise<T>,
 ): Promise<T | ToolFailure> {
   const signal = execution.abortSignal;
@@ -332,10 +343,10 @@ async function guarded<T>(
       throw error;
     }
     if (error instanceof FilesystemError) {
-      return failure(error.code, error.outcome);
+      return failure(error.code, error.outcome, mutating);
     }
     if (error instanceof PathRefusal) {
-      return failure(error.rule, 'not_started');
+      return failure(error.rule, 'not_started', mutating);
     }
     throw error;
   }

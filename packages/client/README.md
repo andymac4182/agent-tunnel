@@ -340,11 +340,12 @@ this client's own socket path would not be.
 | Script | What it does | Needs an install |
 | --- | --- | --- |
 | `npm test` | The offline suite | no |
-| `npm run lint` | The invariants above, mechanically: no `any`, no suppressed error, framework imports type-only, no `console` in `src/`, zero runtime dependencies, exact pins that the lockfile resolves | no |
+| `npm run lint` | The invariants above, mechanically: no `any`, no suppressed error, framework imports type-only (whole-file scan: multi-line imports, `export … from`, bare and dynamic imports, `require`), no `console` in `src/`, zero runtime dependencies, exact pins that the lockfile resolves | no |
+| `npm run lint:dist` | The type-only rule against the compiled `dist/`: any framework import left after `tsc` erased the types is a run-time load. Fails if `dist/` is missing | yes (after `build`) |
 | `npm run typecheck` | `tsc` over `src/`, `test/`, `demo/`, `fuzz/` and `scripts/` | yes |
 | `npm run build` | `tsconfig.build.json`: `src/` to `dist/` as JavaScript plus declarations, relative `.ts` imports rewritten | yes |
 | `npm run test:peers` | Each adapter handed to its real framework over the loopback harness | yes |
-| `npm run check` | All of the above, in that order | yes |
+| `npm run check` | lint, typecheck, build, lint:dist, test, test:peers | yes |
 | `npm run demo:adapters` | `scripts/adapters-demo.sh`: the four adapters through a local relay and device | yes, plus cargo, docker, openssl |
 
 All fixture values are synthetic, as `fixtures/README.md` records.
