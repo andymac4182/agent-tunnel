@@ -1077,6 +1077,57 @@ mod tests {
         )
     }
 
+    /// Queue [`QUEUED_CALLERS`] pings behind a reply that takes
+    /// [`QUEUED_REPLY_DELAY`] and require that every one succeeds, well
+    /// inside the authority deadline, on the one connection the lane holds.
+    ///
+    /// Run twice by the test below: on the outer-deadline-only startup
+    /// connection, and again on the lane's own reconnected connection, which
+    /// carries the **production** redis-rs response timeout. The second run is
+    /// the review follow-up to M5-C17: the rewrite had moved the whole
+    /// queued-caller phase onto a connection with no redis-rs timeout, so the
+    /// production configuration's queueing was no longer measured.
+    async fn assert_queued_callers_share_one_connection(
+        server: &FakeAuthority,
+        lane: &Arc<AuthorityLane>,
+        context: &str,
+    ) {
+        let accepted = server.accepted();
+        server.set_reply_delay(QUEUED_REPLY_DELAY);
+        let started = tokio::time::Instant::now();
+        let mut callers = JoinSet::new();
+        for _ in 0..QUEUED_CALLERS {
+            let lane = Arc::clone(&lane);
+            callers.spawn(async move { ping(&lane).await });
+        }
+        let mut replies = Vec::with_capacity(QUEUED_CALLERS);
+        while let Some(joined) = callers.join_next().await {
+            replies.push(joined.expect("queued caller task"));
+        }
+        let elapsed = started.elapsed();
+        let failures: Vec<String> = replies
+            .iter()
+            .filter_map(|reply| reply.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{context}: {} of {QUEUED_CALLERS} queued callers failed after {elapsed:?} \
+             although every reply took {QUEUED_REPLY_DELAY:?}: {failures:?}",
+            failures.len()
+        );
+        assert!(
+            elapsed < REDIS_OPERATION_TIMEOUT,
+            "{context}: queued callers took {elapsed:?}; the lane serialized them behind \
+             each other"
+        );
+        assert_eq!(
+            server.accepted(),
+            accepted,
+            "{context}: queueing must not open connections"
+        );
+        server.set_reply_delay(Duration::ZERO);
+    }
+
     /// Drive one stalled command and require that it is reported as a
     /// timeout, is never retried or reconnected in place, and *releases* the
     /// lane: the release is read from the lane itself (the group loss
@@ -1268,32 +1319,12 @@ mod tests {
         let lane = Arc::new(lane_with_outer_deadline_only(&client, "lane-run-a", &group).await);
         assert_eq!(server.accepted(), 1);
 
-        let started = tokio::time::Instant::now();
-        let mut callers = JoinSet::new();
-        for _ in 0..QUEUED_CALLERS {
-            let lane = Arc::clone(&lane);
-            callers.spawn(async move { ping(&lane).await });
-        }
-        let mut replies = Vec::with_capacity(QUEUED_CALLERS);
-        while let Some(joined) = callers.join_next().await {
-            replies.push(joined.expect("queued caller task"));
-        }
-        let elapsed = started.elapsed();
-        let failures: Vec<String> = replies
-            .iter()
-            .filter_map(|reply| reply.as_ref().err().map(ToString::to_string))
-            .collect();
-        assert!(
-            failures.is_empty(),
-            "{} of {QUEUED_CALLERS} queued callers failed after {elapsed:?} although every \
-             reply took {QUEUED_REPLY_DELAY:?}: {failures:?}",
-            failures.len()
-        );
-        assert!(
-            elapsed < REDIS_OPERATION_TIMEOUT,
-            "queued callers took {elapsed:?}; the lane serialized them behind each other"
-        );
-        assert_eq!(server.accepted(), 1, "queueing must not open connections");
+        assert_queued_callers_share_one_connection(
+            &server,
+            &lane,
+            "outer-deadline-only connection",
+        )
+        .await;
 
         // A reply that genuinely exceeds the deadline is a timeout, reported
         // as such rather than as a severed connection.  The stalled command
@@ -1302,6 +1333,10 @@ mod tests {
         assert_stall_times_out_and_releases(&server, &lane, &group, "outer deadline").await;
         assert_eq!(server.accepted(), 2);
         assert_stall_times_out_and_releases(&server, &lane, &group, "production deadlines").await;
+        assert_eq!(server.accepted(), 3);
+        // The lane now holds its own reconnected connection, which carries the
+        // production redis-rs response timeout: queueing is measured there too.
+        assert_queued_callers_share_one_connection(&server, &lane, "production connection").await;
         assert_eq!(server.accepted(), 3);
 
         // A severed connection is a transport loss, never a timeout, and the

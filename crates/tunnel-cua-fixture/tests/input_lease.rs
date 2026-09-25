@@ -784,6 +784,45 @@ async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_le
     backend.stop();
 }
 
+/// **A stale revision changes nothing.** Revisions are monotonic, so a
+/// delivery at or below the recorded one is out of order: it must neither move
+/// the session's belief backwards nor free anything.
+#[tokio::test]
+async fn a_stale_grant_revision_is_ignored_and_frees_nothing() {
+    let backend = FixtureBackend::start().await.unwrap();
+    let (state, mut first, _second) = two_agents(&backend);
+    assert_eq!(
+        first.note_grant_revision(GrantRevision::new(5)),
+        Vec::<TargetSession>::new()
+    );
+    assert_eq!(first.grant_revision(), GrantRevision::new(5));
+    first.acquire_input_lease().unwrap();
+
+    for stale in [4, 5, 0] {
+        assert!(
+            first
+                .note_grant_revision(GrantRevision::new(stale))
+                .is_empty(),
+            "revision {stale} is not an advance"
+        );
+        assert_eq!(
+            first.grant_revision(),
+            GrantRevision::new(5),
+            "revision {stale}"
+        );
+        assert_eq!(state.holder(&target()), Some(first.session()));
+    }
+
+    // The control: an advance still frees the lease, so the ignores above are
+    // the monotonicity rule and not a method that frees nothing.
+    assert_eq!(
+        first.note_grant_revision(GrantRevision::new(6)),
+        vec![target()]
+    );
+    assert_eq!(first.grant_revision(), GrantRevision::new(6));
+    backend.stop();
+}
+
 /// **Ending a device-side session releases its lease** -- the device-local
 /// half of M3-16 option (c), which is what a *revoked* (not merely changed)
 /// grant needs. `DeviceState::end_session` is what a device would call on

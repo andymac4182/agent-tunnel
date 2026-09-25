@@ -63,10 +63,13 @@
 //! a grant moved — that is exactly M3-16, and choosing the signal is a queued
 //! protocol decision — so in the shipped shape the revision the device holds
 //! never advances and nothing ends a revoked session. The relay fences a
-//! revoked principal's traffic (M3-16 measured ~10 ms), so the holder cannot
-//! *use* the lease through the tunnel; what persists until delivery exists is
-//! the entry, which blocks other agents for the life of the device-side
-//! session. `docs/tasks.md` M5-C05 records both halves.
+//! revoked principal's `http-forward/1` traffic (M3-16 measured ~10 ms for
+//! MCP), so once `computer.v1` is routed through the relay the holder should
+//! not be able to *use* the lease through the tunnel -- **but that is not
+//! measured for CUA**: `computer.v1` is not relay-routed yet, so no gate has
+//! revoked a grant while a CUA lease was held. What persists until delivery
+//! exists is the entry, which blocks other agents for the life of the
+//! device-side session. `docs/tasks.md` M5-C05 records both halves.
 //!
 //! Both mechanisms are nonetheless tested here against an explicitly supplied
 //! revision, so that when the signal arrives the behaviour is already pinned —

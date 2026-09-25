@@ -264,9 +264,11 @@ fn the_scroll_sign_convention_is_pinned_and_recorded_for_consumers() {
         [
             "handlers/macos.py",
             "handlers/windows.py",
-            "handlers/vnc.py"
+            "handlers/vnc.py",
+            "handlers/linux.py",
+            "handlers/cua_driver.py",
         ],
-        "the three handlers that state a convention"
+        "the three handlers that state a convention and the two that fix it in code"
     );
     for (file, phrase) in cua_pin::SCROLL_SIGN_CONVENTION {
         assert!(

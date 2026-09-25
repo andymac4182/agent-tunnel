@@ -244,7 +244,15 @@ impl Dispatcher {
     /// future was dropped, and nothing here can tell.
     ///
     /// `cancel` is polled first (`biased`), so a cancellation that is already
-    /// complete wins before the exchange is polled at all and sends nothing.
+    /// complete wins before the exchange is polled at all. **That ordering is
+    /// not what makes an early cancellation safe, and it was measured not to
+    /// be:** with `biased` removed (review follow-up, log nonce
+    /// `e9a087a00d8d`) the cancellation test stays green, because the exchange
+    /// cannot complete on its first poll (the connect is pending) and `began`
+    /// is set only after the connect -- so whichever branch is polled first,
+    /// an already-complete cancellation still finds `began` unset. `began` is
+    /// the guarantee; `biased` only saves a pointless connect attempt. No
+    /// guard case is kept for it, since one could only report `still green`.
     async fn send_until(
         &self,
         payload: &Value,
@@ -674,10 +682,25 @@ impl SessionFacade {
     /// **A revision is not a revocation**, and this does not pretend to tell
     /// them apart: the session may take the lease again under the revision
     /// it now carries, exactly as `release` then `acquire` always allowed.
-    /// A *revoked* principal cannot, because the relay refuses everything it
-    /// sends (M3-16: fenced within ~10 ms). Ending the device-side session of
-    /// a revoked grant is [`DeviceState::end_session`], and delivering that
-    /// signal to a device is the M3-16 option (c) protocol decision.
+    /// A *revoked* principal is expected not to, because the relay fences a
+    /// revoked principal's `http-forward/1` traffic (M3-16 measured ~10 ms for
+    /// MCP) -- **not measured for CUA**, which is not relay-routed yet. Ending
+    /// the device-side session of a revoked grant is
+    /// [`DeviceState::end_session`], and delivering that signal to a device is
+    /// the M3-16 option (c) protocol decision.
+    ///
+    /// **The cost of releasing on a non-revoking change**, stated because it is
+    /// real: if the revision moved because the grant was *changed* rather than
+    /// revoked, the holder loses the lease between two of its operations, and
+    /// another agent may take the target before the holder re-acquires --
+    /// mid-sequence, for example between the `move` and the `click` of a
+    /// composed gesture. Nothing is dispatched on the old holder's behalf once
+    /// it is released, so this is an interleaving hazard, not a
+    /// double-dispatch; `docs/tasks.md` M5-C05 records it.
+    ///
+    /// **A stale revision changes nothing.** Revisions are monotonic, so a
+    /// value at or below the one already recorded is an out-of-order delivery
+    /// and is ignored rather than moving the session's belief backwards.
     ///
     /// Nothing calls this in production yet, because nothing tells a device
     /// that a grant moved. See `docs/tasks.md` M5-C05.
@@ -687,6 +710,9 @@ impl SessionFacade {
             .leases
             .lock()
             .expect("the lease mutex is never poisoned by fixture code");
+        if revision <= self.grant_revision {
+            return Vec::new();
+        }
         self.grant_revision = revision;
         leases.reconcile_grant(self.session, revision)
     }

@@ -1785,7 +1785,7 @@ CASES_C7: list[tuple[str, list[Edit], bool]] = [
         # point to substitute, so the defeat now drops the deltas for
         # constants. The rule it measures is the same -- the payload's `x`/`y`
         # must be the consumer's deltas.
-        "the scroll deltas may be dropped for the cursor point",
+        "the scroll deltas may be dropped for constants",
         [
             (
                 PLAN,
@@ -1943,11 +1943,11 @@ CASES_C9: list[tuple[str, list[Edit], bool]] = [
                 CLIENT,
                 """        self.grant_revision = revision;
         leases.reconcile_grant(self.session, revision)
-""",
+    }""",
                 """        self.grant_revision = revision;
         let _ = &mut leases;
         Vec::new()
-""",
+    }""",
             )
         ],
         False,
@@ -2043,6 +2043,21 @@ CASES_C9: list[tuple[str, list[Edit], bool]] = [
     }
 """,
                 "",
+            )
+        ],
+        False,
+    ),
+    (
+        "M5-C05: ending a session releases the leases it holds",
+        [
+            (
+                CLIENT,
+                """            .release_all_for_session(session)
+    }""",
+                """            .holder(&TargetSession::new(""))
+            .map(|_| Vec::new())
+            .unwrap_or_default()
+    }""",
             )
         ],
         False,
@@ -2300,6 +2315,10 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
         "m5c9",
         "M5-04: a cancellation after writing began is unknown, never not dispatched",
     ): frozenset({"a_cancelled_click_reports_what_is_known_and_is_never_repeated"}),
+    (
+        "m5c9",
+        "M5-C05: ending a session releases the leases it holds",
+    ): frozenset({"ending_a_session_releases_its_lease_and_only_its_lease"}),
 }
 
 #: The pinned ledger, loaded once.

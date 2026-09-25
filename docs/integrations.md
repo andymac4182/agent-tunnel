@@ -294,9 +294,11 @@ against the pinned 0.3.46 source rather than a probe:
   the point and then drop it; it now takes `dx`/`dy` only, and a request naming
   a position is refused. A consumer that wants a position sends `move` first.
   The sign is pinned beside the names: **positive `dy` scrolls up**, as the
-  macOS, Windows and VNC handlers state (`cua_pin::SCROLL_SIGN_CONVENTION`);
-  Linux states no convention and Android maps the amount onto a swipe, so on
-  those two it is inferred, not stated.
+  macOS, Windows and VNC handlers state and the Linux (`scroll_up`/
+  `scroll_down`) and Cua Driver handlers fix in code
+  (`cua_pin::SCROLL_SIGN_CONVENTION`); only Android, which maps the amount
+  onto a swipe, is inferred. On the Cua Driver backend a non-zero `dy`
+  silently drops `dx`, and `dx = dy = 0` is a dispatched failure.
 - **Capture identity from what the server sends (M5-C14).** A released
   `screenshot` answers `{success, image_data, format}` (VNC omits `format`) and
   never sends `width`, `height` or a scale. The device reads the dimensions
