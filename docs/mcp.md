@@ -1,6 +1,6 @@
 # MCP adapter plan
 
-Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) is **verified local at `fc5dde3`, 2026-09-25**, on branch `m3-reliability`: `verify-m3-mcp-isolation` passed in every one of 10 consecutive `scripts/m3-harness-verify.sh` runs at that revision, 10 of 10 standalone on a hosted Linux runner at the same revision, and 20 of 20 standalone under CPU load at two earlier revisions of the branch. The peer-trust flake that held it back is closed on this gate by M7-C89's re-sign pin wait rather than by the M7-C86 retention, which stays an open M7 row; the suite's other intermittents were diagnosed and fixed there (M3-20, M3-21/M3-24, M3-23, M3-27, M3-29, M3-30). The suite was held off hosted CI by M3-31 (the real-path gate's OPEN-journal peak on hosted Linux); branch `m3-features` explains that row (the retained entry was an earlier-phase entry still in flight, not a leak) and adds an `m3-acceptance` job to `ci.yml`. See the M3-04 and M3-25 rows in [tasks.md](tasks.md). Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. Both profiles are proven only against the pinned rmcp 3.4.0 client and the deterministic fixture server — no conformance suite or non-Rust SDK is pinned (M3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
+Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) is **verified local at `fc5dde3`, 2026-09-25**, on branch `m3-reliability`: `verify-m3-mcp-isolation` passed in every one of 10 consecutive `scripts/m3-harness-verify.sh` runs at that revision, 10 of 10 standalone on a hosted Linux runner at the same revision, and 20 of 20 standalone under CPU load at two earlier revisions of the branch. The peer-trust flake that held it back is closed on this gate by M7-C89's re-sign pin wait rather than by the M7-C86 retention, which stays an open M7 row; the suite's other intermittents were diagnosed and fixed there (M3-20, M3-21/M3-24, M3-23, M3-27, M3-29, M3-30). The suite was held off hosted CI by M3-31 (the real-path gate's OPEN-journal peak on hosted Linux); branch `m3-features` explains that row (the retained entry was an earlier-phase entry still in flight, not a leak) and adds an `m3-acceptance` job to `ci.yml`. See the M3-04 and M3-25 rows in [tasks.md](tasks.md). Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. The M3 gates prove both profiles against the pinned rmcp 3.4.0 client and the deterministic fixture server. **M3-17** adds off-the-shelf evidence for the `mcp-2025-11-25` profile: the official TypeScript SDK (1.30.1), the official Python SDK (2.2.0) and the official conformance suite (0.2.0-alpha.11), each pinned in `tests/mcp-sdk-conformance` and run through real local relays by `scripts/m3-sdk-conformance.sh`. See [Off-the-shelf clients (M3-17)](#off-the-shelf-clients-m3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
 
 ## Two explicit compatibility profiles
 
@@ -53,7 +53,7 @@ Recorded 2026-09-16. Each item is pinned in code and covered by the tests named 
 - **Official Rust SDK: `rmcp = "=3.4.0"`.** It was released on crates.io on 2026-09-15 from `modelcontextprotocol/rust-sdk` commit `fd7811fdaa9fefa1c8034534b4d7a31c97204f89` (path `crates/rmcp`). The `Cargo.lock` checksum is `b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb`, and the crate's rust-version is 1.88. Its `ProtocolVersion` knows `2026-07-28`, `2025-11-25` and `2025-06-18`. Its client offers `ClientLifecycleMode::Discover` (the `server/discover` and per-request `_meta` lifecycle), `Initialize` (legacy) and `Auto`. Its Streamable HTTP server serves 2026-07-28 requests statelessly and optional legacy sessions to older versions. The 2026 profile is therefore served natively, not faked: rmcp is both the pinned client and the pinned fixture server for both profiles.
 - **Where rmcp is used.** Only the `tunnel-mcp-fixture` crate uses it: the synthetic server binary (`server` and `transport-io` features) and the end-to-end tests (`client`, `transport-streamable-http-client-unix-socket`, `transport-streamable-http-server`). The relay and the connector do not link rmcp.
 - **Why the export bridge is not built on rmcp.** An rmcp proxy would re-type every message. Its typed params, for example `CallToolRequestParams` (fields `_meta`, `name`, `arguments`, `inputResponses`, `requestState`, with no flatten), silently drop unknown fields when they are deserialized and serialized again. That would break the rule above that unknown methods and metadata are not discarded, and it would re-encode request IDs. The device bridge therefore forwards raw JSON-RPC bytes, and rmcp proves interoperability from both ends.
-- **Fixtures.** `tunnel-mcp-fixture` is a deterministic synthetic server with the tools `echo` (arguments, `_meta` and an image block), `progress`, `sleep` (records its cancellation), `crash` (writes a stderr marker, exits 3), `stderr_flood` and `big`. It writes only to the test's temporary marker directory. No other official client or server artifact, such as the TypeScript SDK or the MCP conformance suite, is pinned or run. That is M3-03 work.
+- **Fixtures.** `tunnel-mcp-fixture` is a deterministic synthetic server with the tools `echo` (arguments, `_meta` and an image block), `progress`, `sleep` (records its cancellation), `crash` (writes a stderr marker, exits 3), `stderr_flood` and `big`. It writes only to the test's temporary marker directory. The M3 gates run no other official client or server. The TypeScript SDK, the Python SDK and the conformance suite are pinned and run separately, as test-only dependencies, by M3-17 (see [Off-the-shelf clients (M3-17)](#off-the-shelf-clients-m3-17)).
 
 ### Profiles (`tunnel-mcp`)
 
@@ -69,7 +69,7 @@ The two profiles are separate `McpProfile` values with separate tables. There is
 | Query | none | none |
 
 - **Header rules.** Every header is a singleton, and each `mcp-param-*` name is a singleton on its own. The prefix rule is a new codec feature (`HeaderPolicy::allow_prefix`): it cannot overlap a forbidden or unsupported name or prefix. The 2026 page requires intermediaries to forward `Mcp-Param-*` headers they do not recognize, so the whole family is allowlisted.
-- **Dropped headers (M6-C58).** The public ingress removes `user-agent`, `accept-encoding`, `accept-language` and `sec-fetch-mode` before the codec sees the request, as it removes `authorization` and `cookie` once it has verified them, unless a profile allowlists them (neither MCP profile does). They are what stock clients add by default: curl and Python `httpx` send the first two, and Node's built-in `fetch` (undici, measured on the wire) sends all four. Refusing them failed a client's first request. Dropping them changes nothing the export can observe: the device always sends `Accept-Encoding: identity` to its backend and `identity` is acceptable to every client, `accept-language` is a negotiation hint no export acts on, and `sec-fetch-mode` is advisory Fetch Metadata. None of them is forwarded. A browser is still refused, because it also sends `origin`.
+- **Dropped headers (M6-C58).** The public ingress removes `user-agent`, `accept-encoding`, `accept-language` and `sec-fetch-mode` before the codec sees the request, as it removes `authorization` and `cookie` once it has verified them, unless a profile allowlists them (neither MCP profile does). **`cache-control` joined the list in M3-46**: the official Python SDK (mcp 2.2.0) sends `Cache-Control: no-store` on the 2025-11-25 standalone GET stream (httpx2's SSE helper), and refusing it failed that stream for every Python client. A request cache directive has no authority, and nothing on the path caches. They are what stock clients add by default: curl and Python `httpx` send the first two, and Node's built-in `fetch` (undici, measured on the wire) sends all four. Refusing them failed a client's first request. Dropping them changes nothing the export can observe: the device always sends `Accept-Encoding: identity` to its backend and `identity` is acceptable to every client, `accept-language` is a negotiation hint no export acts on, and `sec-fetch-mode` is advisory Fetch Metadata. None of them is forwarded. A browser is still refused, because it also sends `origin`.
 - **Refused headers.** Everything else is refused before admission, and the ingress's `400 HTTP_INVALID_HEAD` names the first unlisted header in the error body's `header` field (M6-C58). That includes `origin`, since browser-capable endpoints are deferred and the relay has no CORS or cookie profile, and, in 2026, `mcp-session-id` and `last-event-id`. The 2026 page says a server SHOULD ignore the last two. This profile refuses them instead, because a 2026 client never sends them.
 - **Limits.** Consumer HTTP/1.1 and HTTP/2 are both accepted. The finite body limits are:
 
@@ -383,3 +383,61 @@ session that never existed.
   (M3-16 in [tasks.md](tasks.md)). It no longer outlives the device session:
   the export ends every session it holds when the connector's handler registry
   goes away.
+
+## Off-the-shelf clients (M3-17)
+
+Recorded 2026-09-26. `scripts/m3-sdk-conformance.sh` runs the MCP clients a demo audience would actually use against device-exported servers, through real local relays. The route is `tunnel-relay serve` and `tunnel-client connect`, configured from the shipped examples, with a bearer token from a synthetic issuer. The recipe is [demo/mcp-sdk-conformance.md](demo/mcp-sdk-conformance.md).
+
+### Pins (test-only)
+
+These pins live in `tests/mcp-sdk-conformance` and are never a runtime dependency.
+
+| Artifact | Version | How it is pinned |
+| --- | --- | --- |
+| Official TypeScript SDK `@modelcontextprotocol/sdk` | 1.30.1 (latest protocol `2025-11-25`) | exact version, `package-lock.json` integrity hashes |
+| Official Python SDK `mcp` | 2.2.0 (handshake revisions through `2025-11-25`, plus `2026-07-28`) | `python/requirements.txt`, compiled with `uv pip compile --universal --generate-hashes`, installed with `--require-hashes` |
+| Official conformance suite `@modelcontextprotocol/conformance` | 0.2.0-alpha.11 (gitHead `c321dd32…`) | exact version, lockfile |
+| The suite's reference server `examples/servers/typescript/everything-server.ts` | at `c321dd32035556e6769d3724a8ee97d87c3faaac` | fetched and checked against its SHA-256 on every run; run under `tsx` 4.23.15 |
+
+The device exports three `mcp-2025-11-25` services, each on its own relay and namespace:
+
+- the **reference server** (Streamable HTTP backend on loopback);
+- **`ts-sdk-server.mjs`**, a plain `McpServer` on the pinned TypeScript SDK that uses the reference server's tool, resource and prompt names;
+- the **rmcp fixture** over stdio.
+
+### What passes through the relay
+
+| Case | TypeScript SDK | Python SDK (`legacy` and `auto`) |
+| --- | --- | --- |
+| `initialize`, `Mcp-Session-Id`, protocol `2025-11-25` | reference, SDK server, fixture | SDK server, fixture (not the reference server: M3-47) |
+| `tools/list`, `tools/call` (text, image, `isError`) | reference, SDK server | SDK server |
+| `tools/call` arguments and `_meta` preserved, image block | fixture | fixture |
+| `resources/list`, `resources/read` (text and blob) | reference, SDK server | SDK server |
+| `prompts/list`, `prompts/get` (with arguments) | reference, SDK server | SDK server |
+| Streamed `notifications/progress`, in order | reference, SDK server, fixture | SDK server, fixture |
+| Streamed `notifications/message` after `logging/setLevel` | reference, SDK server | SDK server |
+| Cancellation: an abort **after** the fixture logged the call reaches the device's server (`cancelled-<label>` marker), and the session stays usable | fixture | fixture (the close after it can meet M3-48) |
+| Session `DELETE` | all | all |
+
+The **conformance suite** (`server --spec-version 2025-11-25`) passes **31 of 31 scenarios (73 checks)** directly against the reference server. Through the relay it passes **30 of 31**. The exception is `dns-rebinding-protection` (M3-49). That scenario covers only unauthenticated plain-HTTP localhost servers. Its raw request path cannot carry the bearer token, and it sends `Host: evil.example.com` as the TLS server name. The relay's own answer to a rebinding request is checked instead: a request that carries `Origin` gets `400 HTTP_INVALID_HEAD` with `header: origin`. The suite carries no credential option, so a Node `--import` preload (`preload.mjs`) adds the bearer to `fetch` calls for the relay's origin only.
+
+### Incompatibilities found
+
+| Row | What | Where |
+| --- | --- | --- |
+| M3-46 | The relay refused the Python SDK's `Cache-Control: no-store` on the standalone GET stream. | relay; **fixed** by dropping `cache-control` at the ingress |
+| M3-47 | The reference server refuses the Python SDK's `initialize` with `-32020 Missing MCP-Protocol-Version header`. The SDK sends `_meta: {}`, which that server reads as a 2026 request. Reproduced directly, without the relay. | upstream (conformance reference server); the harness checks that the relay forwards the refusal unchanged |
+| M3-48 | After a forwarded `notifications/cancelled`, the stdio export holds the cancelled request's POST open. It answers `502` only when the session is deleted, and the Python SDK then raises `ClosedResourceError` from `Client.__aexit__`. rmcp's own Streamable HTTP server answers such a POST at once with an empty event stream. | device bridge (stdio, 2025-11-25); open |
+| M3-49 | The conformance suite's `dns-rebinding-protection` scenario cannot run through the relay. | suite scope; the relay refuses `Origin` instead |
+
+Also observed, but not recorded as rows:
+
+- In its default `auto` mode, the Python SDK first probes `server/discover` with the 2026 headers. The `mcp-2025-11-25` profile answers `400 HTTP_INVALID_HEAD` (`header: mcp-method`), and the SDK falls back to `initialize`. That costs one extra round trip and works.
+- Python 3.13 and later verify certificates with `VERIFY_X509_STRICT` and refuse a CA without `keyUsage`, which a bare `openssl req -x509` produces. The harness's synthetic CAs carry `keyUsage`.
+
+### Not proven by M3-17
+
+- The `mcp-2026-07-28` profile with a non-Rust SDK. The TypeScript SDK 1.30.1 does not speak it, and the Python SDK's 2026 mode is not run here.
+- Rotation, crash and isolation with these SDKs. Those stay proven with rmcp by the M3 gates.
+- Sampling, elicitation and other server-to-client requests through an SDK client. The conformance suite drives the reference server's `tools-call-sampling` and `tools-call-elicitation` through the relay, and both pass. No SDK client case does.
+- Hosted CI. The script is wired into the `m3-acceptance` job, and no hosted run has been observed yet.
