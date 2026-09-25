@@ -133,7 +133,7 @@ def _resolve(document, path):
 
 def release_documents(root):
     """The guide and every local document it links, as repository paths."""
-    guide = (root / GUIDE).read_text(encoding="utf-8")
+    guide = (root / GUIDE).read_bytes().decode("utf-8")
     shipped = {GUIDE}
     for link in _LINK_RE.findall(guide):
         local = _local_link(link)
@@ -153,7 +153,9 @@ def staged_document(root, document, shipped, sha):
     """One shipped document's text, with links to unshipped files pinned to `sha`."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("documents are pinned to a full 40-character source commit")
-    text = (root / document).read_text(encoding="utf-8")
+    # Bytes decoded, not `read_text`: text mode translates line endings, and
+    # the guide must ship byte-identical to the checkout it came from.
+    text = (root / document).read_bytes().decode("utf-8")
 
     def pin(match):
         link = match.group(1)
@@ -179,8 +181,7 @@ def stage_documents(root, destination, sha):
     for document in shipped:
         path = destination.joinpath(*document.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Bytes, not text mode: text mode on a Windows runner would write CRLF
-        # and the guide would stop being byte-identical to the repository's.
+        # Bytes, not text mode, for the same reason in the other direction.
         path.write_bytes(staged_document(root, document, set(shipped), sha).encode("utf-8"))
     return shipped
 
@@ -190,7 +191,7 @@ def unresolved_links(bundle):
     problems = []
     for path in sorted((bundle / "docs").rglob("*.md")):
         document = path.relative_to(bundle).as_posix()
-        for link in _LINK_RE.findall(path.read_text(encoding="utf-8")):
+        for link in _LINK_RE.findall(path.read_bytes().decode("utf-8")):
             local = _local_link(link)
             if local is None or not local[0]:
                 continue
