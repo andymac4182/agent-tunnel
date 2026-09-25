@@ -5,21 +5,46 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
+  # A pull request that changes the release path builds, verifies and attests
+  # the complete matrix exactly as main does, and never publishes: `publish`
+  # runs only for `workflow_run` (docs/tasks.md M6-C13).  Fork pull requests
+  # are skipped; they get no OIDC token to attest with.
+  pull_request:
+    paths:
+      - 'scripts/*release*.py'
+      - '.github/workflows/release.yml'
+      - 'docs/operator.md'
+      - 'docs/join-relay.md'
+      - 'examples/**'
+      - 'crates/tunnel-client/src/main.rs'
+      - 'crates/tunnel-relay/src/main.rs'
+      - 'crates/tunnel-deadman/src/**'
 
 permissions:
   contents: read
 
 concurrency:
-  group: main-release-${{ github.event.workflow_run.id }}
-  cancel-in-progress: false
+  group: main-release-${{ github.event.workflow_run.id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The commit and run a release is named after.  For a pull request these
+  # are the merge commit the run checked out and this run, so its archives
+  # are named `...-main.<run>.<sha>` like a release's but name a commit that
+  # is not on main; they are workflow artifacts, never release assets.
+  SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  SOURCE_RUN: ${{ github.event.workflow_run.id || github.run_id }}
 
 jobs:
   build:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
       - name: Install pinned toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --target "${{ matrix.target }}"
@@ -60,18 +85,10 @@ jobs:
             packages+=(-p tunnel-relay)
           fi
           cargo +1.95.0 build --release --locked --target "${{ matrix.target }}" "${packages[@]}" --bins
-      - name: Smoke test native binaries
-        run: |
-          set -euo pipefail
-          target/${{ matrix.target }}/release/tunnel-client --help
-          target/${{ matrix.target }}/release/tunnel-client config check --config examples/m1-client.toml
-          if [[ "${{ matrix.target }}" != *windows* ]]; then
-            target/${{ matrix.target }}/release/tunnel-relay check-serve-config --config examples/m1-relay.toml
-          fi
+      # There is deliberately no smoke test of `target/` here any more: the
+      # `verify` job below runs every probe it ran, and more, against the
+      # unpacked archive on a runner that never built it (M6-C13).
       - name: Package and checksum
-        env:
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          SOURCE_RUN: ${{ github.event.workflow_run.id }}
         run: python3 scripts/package_release.py --target "${{ matrix.target }}" --sha "$SOURCE_SHA" --run "$SOURCE_RUN" --output dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -80,8 +97,106 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
+  # The gate checks, run against the UNPACKED archive on a fresh hosted
+  # runner of the target's own OS and architecture -- not the runner that
+  # built it, and never from `target/` (docs/tasks.md M6-C13, applied by
+  # default pending owner confirmation, 2026-09-25).  The runner labels are
+  # the current `-latest` images, a newer image than the pinned build hosts,
+  # so a binary that only runs where it was built fails here.  The script
+  # refuses to pass on a host whose OS or architecture differs from the
+  # target's, so a label that moves to another architecture goes red rather
+  # than silently verifying nothing natively.  `x86_64-apple-darwin` has no
+  # `-latest` Intel label; `macos-15-intel` is the Intel image.  Windows is
+  # the client-only device half (M6-C83).
+  verify:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Only the verifier and what it imports; no toolchain is installed and
+      # nothing is built on this runner.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            Cargo.toml
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist
+      - name: Verify the unpacked archive natively, with planted-defect controls
+        run: |
+          set -euo pipefail
+          archive=$(find dist -maxdepth 1 -name "agentuplink-*-${{ matrix.target }}.*" ! -name '*.sha256')
+          test "$(printf '%s\n' "$archive" | wc -l)" -eq 1
+          python3 scripts/verify_release_archive.py --archive "$archive" --target "${{ matrix.target }}" \
+            --sha "$SOURCE_SHA" --run "$SOURCE_RUN" --self-test
+
+  # GitHub build-provenance attestation for every archive and checksum file,
+  # after every target has verified (demo-readiness defect D8).  It binds each
+  # file's SHA-256 to this repository, this workflow file, the commit and the
+  # run, signed through Sigstore; `gh attestation verify` checks it.  It is
+  # not code signing: macOS Gatekeeper and Windows SmartScreen still treat
+  # the binaries as unsigned.
+  attest:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+      # Prove the published command works on every file before anything is
+      # published, and that it is bound to this workflow file.
+      - name: Verify each attestation the way a tester will
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count=0
+          for file in dist/*; do
+            gh attestation verify "$file" -R "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" > /dev/null
+            echo "attestation verified: $(basename "$file")"
+            count=$((count + 1))
+          done
+          # publish_release.py separately refuses an incomplete matrix; this
+          # only refuses a run that verified nothing.
+          test "$count" -ge 2
+
+  publish:
+    needs: attest
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -89,7 +204,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -100,6 +215,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          SOURCE_RUN: ${{ github.event.workflow_run.id }}
         run: python3 scripts/publish_release.py --sha "$SOURCE_SHA" --run "$SOURCE_RUN" --directory dist
