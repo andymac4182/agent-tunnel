@@ -13479,9 +13479,10 @@ mod tests {
                 assert!(
                     status.recovery_attempt_started_at_ms.is_none()
                         && status.recovery_attempt_deadline_ms.is_none()
+                        && status.recovery_episode_deadline_ms.is_none()
                         && status.recovery_closed_connection_ids.is_empty(),
-                    "snapshot {index} reported attempt timing or closures without an attempt: \
-                     {status:?}"
+                    "snapshot {index} reported attempt timing, an episode deadline or closures \
+                     without an attempt: {status:?}"
                 );
                 assert!(
                     status.recovery_reset_reason.is_some() || !identity_present,
