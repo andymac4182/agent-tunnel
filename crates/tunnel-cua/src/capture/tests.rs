@@ -270,7 +270,10 @@ fn an_undeclared_scale_is_refused_at_resolution_and_never_defaulted() {
 #[test]
 fn a_point_space_derives_the_scale_of_each_capture() {
     let space = PointSpace::new(1280, 800).unwrap();
-    assert_eq!(space.scale_percent_for(1280, 800), Ok(IDENTITY_SCALE_PERCENT));
+    assert_eq!(
+        space.scale_percent_for(1280, 800),
+        Ok(IDENTITY_SCALE_PERCENT)
+    );
     assert_eq!(space.scale_percent_for(2560, 1600), Ok(200));
 
     let fixture = PointSpace::new(128, 96).unwrap();
@@ -333,11 +336,20 @@ fn a_point_space_that_contradicts_the_capture_is_refused() {
 /// push the last pixels past the edge.
 #[test]
 fn every_pixel_of_a_capture_maps_inside_the_declared_space() {
-    for (pixels, points) in [(1004, 1000), (101, 100), (1005, 1000), (50, 99), (1247, 982), (3, 2)] {
+    for (pixels, points) in [
+        (1004, 1000),
+        (101, 100),
+        (1005, 1000),
+        (50, 99),
+        (1247, 982),
+        (3, 2),
+    ] {
         let space = PointSpace::new(points, points).unwrap();
         let percent = space.scale_percent_for(pixels, pixels).unwrap();
         let mut captures = Captures::new();
-        let identity = captures.record(&target(), 0, pixels, pixels, percent).unwrap();
+        let identity = captures
+            .record(&target(), 0, pixels, pixels, percent)
+            .unwrap();
         let (x, y) = identity
             .to_backend_point(Point::new(pixels - 1, pixels - 1))
             .unwrap();
@@ -347,7 +359,9 @@ fn every_pixel_of_a_capture_maps_inside_the_declared_space() {
         );
     }
     assert_eq!(
-        PointSpace::new(1000, 1000).unwrap().scale_percent_for(1004, 1004),
+        PointSpace::new(1000, 1000)
+            .unwrap()
+            .scale_percent_for(1004, 1004),
         Ok(101)
     );
 }

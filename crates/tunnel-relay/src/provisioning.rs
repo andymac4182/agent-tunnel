@@ -982,9 +982,14 @@ mod tests {
     /// Every pinned `http-forward` profile, as a relay configured to serve
     /// all of them lists it.
     fn served() -> Vec<String> {
-        ["mcp-2025-11-25", "mcp-2026-07-28", "acp-http-v1", "computer-v1"]
-            .map(str::to_owned)
-            .to_vec()
+        [
+            "mcp-2025-11-25",
+            "mcp-2026-07-28",
+            "acp-http-v1",
+            "computer-v1",
+        ]
+        .map(str::to_owned)
+        .to_vec()
     }
 
     fn plan_with(

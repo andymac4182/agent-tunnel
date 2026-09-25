@@ -262,7 +262,9 @@ pub enum ScaleDerivationError {
 impl core::fmt::Display for ScaleDerivationError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
-            Self::AspectMismatch => "the capture's aspect ratio disagrees with the declared point size",
+            Self::AspectMismatch => {
+                "the capture's aspect ratio disagrees with the declared point size"
+            }
             Self::OutOfRange => "the capture-to-point ratio is out of range",
             Self::Geometry => "the capture has a dimension out of range",
         })

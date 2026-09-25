@@ -1167,13 +1167,30 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
         assert_eq!((cua.point_width, cua.point_height), (Some(1280), Some(800)));
         for (broken, reason) in [
             (CUA_EXPORT.replace("computer-v1", "computer-v2"), "profile"),
-            (CUA_EXPORT.replace("point_height = 800\n", ""), "point_width and point_height together"),
-            (CUA_EXPORT.replace("point_width = 1280", "point_width = 0"), "point_width and point_height together"),
-            (CUA_EXPORT.replace("[\"describe\", \"capture\", \"click\"]", "[]"), "at least one operation"),
-            (CUA_EXPORT.replace("\"/opt/synthetic/cua-backend\"", "\"cua-backend\""), "absolute"),
-            (CUA_EXPORT.replace("type = \"http-forward\"", "type = \"echo\""), "http-forward"),
             (
-                format!("{CUA_EXPORT}\n[exports.55555555-5555-4555-8555-555555555555.acp]\nprofile = \"acp-http-v1\"\n\n[exports.55555555-5555-4555-8555-555555555555.acp.agent]\ncommand = \"/opt/a\"\nworkspace = \"/srv/a\"\n"),
+                CUA_EXPORT.replace("point_height = 800\n", ""),
+                "point_width and point_height together",
+            ),
+            (
+                CUA_EXPORT.replace("point_width = 1280", "point_width = 0"),
+                "point_width and point_height together",
+            ),
+            (
+                CUA_EXPORT.replace("[\"describe\", \"capture\", \"click\"]", "[]"),
+                "at least one operation",
+            ),
+            (
+                CUA_EXPORT.replace("\"/opt/synthetic/cua-backend\"", "\"cua-backend\""),
+                "absolute",
+            ),
+            (
+                CUA_EXPORT.replace("type = \"http-forward\"", "type = \"echo\""),
+                "http-forward",
+            ),
+            (
+                format!(
+                    "{CUA_EXPORT}\n[exports.55555555-5555-4555-8555-555555555555.acp]\nprofile = \"acp-http-v1\"\n\n[exports.55555555-5555-4555-8555-555555555555.acp.agent]\ncommand = \"/opt/a\"\nworkspace = \"/srv/a\"\n"
+                ),
                 "never two",
             ),
         ] {
@@ -1192,7 +1209,10 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
         let error = crate::http_forward::HttpHandlers::new()
             .with_cua_exports(&config, true)
             .expect_err("no cua feature");
-        assert!(error.to_string().contains("without the `cua` feature"), "{error}");
+        assert!(
+            error.to_string().contains("without the `cua` feature"),
+            "{error}"
+        );
         let plain = RuntimeConfig::parse(valid_toml()).expect("valid");
         assert!(
             crate::http_forward::HttpHandlers::new()

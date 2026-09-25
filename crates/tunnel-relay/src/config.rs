@@ -1592,7 +1592,11 @@ consumer_tls_private_key = "consumer-key.pem"
             valid_toml()
         );
         let config = ServeConfig::parse(&configured).expect("computer-v1 parses");
-        let exports = config.listener_options().unwrap().http_forward.expect("exports");
+        let exports = config
+            .listener_options()
+            .unwrap()
+            .http_forward
+            .expect("exports");
         assert_eq!(
             exports.profile_ids().collect::<Vec<_>>(),
             vec!["acp-http-v1", "computer-v1"]

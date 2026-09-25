@@ -136,7 +136,13 @@ async fn a_consumer_captures_clicks_and_types_through_the_export() {
     )
     .await;
     assert_eq!(outcome(&clicked), "ok", "{clicked}");
-    let typed = call(&export, "agent-a", "type_text", json!({"text": "synthetic"})).await;
+    let typed = call(
+        &export,
+        "agent-a",
+        "type_text",
+        json!({"text": "synthetic"}),
+    )
+    .await;
     assert_eq!(outcome(&typed), "ok");
 
     // The second principal: reads are shared, input is refused, and nothing
@@ -281,7 +287,10 @@ fn a_lease_request_is_the_bare_envelope_and_nothing_else() {
 #[test]
 fn codes_are_identifiers_and_carry_no_payload() {
     assert_eq!(snake("ScaleUndeclared"), "scale_undeclared");
-    assert_eq!(snake("UnexpectedStatus { status: 418 }"), "unexpected_status");
+    assert_eq!(
+        snake("UnexpectedStatus { status: 418 }"),
+        "unexpected_status"
+    );
     assert_eq!(snake("BackendRejected { status: 400 }"), "backend_rejected");
     let unknown = render(
         "click",

@@ -105,7 +105,10 @@ async fn a_contradicted_or_missing_point_space_refuses_every_coordinate() {
     let swapped = PointSpace::new(u32::from(SCREEN_HEIGHT), u32::from(SCREEN_WIDTH)).unwrap();
     state.declare_point_space(Some(swapped));
     let identity = capture(&agent).await;
-    assert_eq!(agent.handle(&click(identity, 100, 80), LIMIT).await, refused);
+    assert_eq!(
+        agent.handle(&click(identity, 100, 80), LIMIT).await,
+        refused
+    );
     assert_eq!(
         agent
             .handle(
@@ -118,7 +121,10 @@ async fn a_contradicted_or_missing_point_space_refuses_every_coordinate() {
 
     state.declare_point_space(None);
     let undeclared = capture(&agent).await;
-    assert_eq!(agent.handle(&click(undeclared, 100, 80), LIMIT).await, refused);
+    assert_eq!(
+        agent.handle(&click(undeclared, 100, 80), LIMIT).await,
+        refused
+    );
 
     assert!(
         backend.ledger().points().is_empty(),

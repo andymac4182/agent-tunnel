@@ -147,14 +147,11 @@ struct Inner {
     target: TargetSession,
     limits: CuaLimits,
     state: Arc<DeviceState>,
-    backend: tokio::sync::Mutex<Backend>,
+    /// The supervised backend once it has been started, probed and
+    /// negotiated; `None` before the first request and after a shutdown.
+    backend: tokio::sync::Mutex<Option<Ready>>,
     sessions: Mutex<Sessions>,
     counters: Counters,
-}
-
-enum Backend {
-    NotStarted,
-    Ready(Ready),
 }
 
 struct Ready {
@@ -237,7 +234,7 @@ impl CuaExport {
                 target,
                 limits: CuaLimits::default(),
                 state: DeviceState::new(),
-                backend: tokio::sync::Mutex::new(Backend::NotStarted),
+                backend: tokio::sync::Mutex::new(None),
                 sessions: Mutex::new(Sessions::default()),
                 counters: Counters::default(),
             }),
@@ -283,10 +280,9 @@ impl CuaExport {
     /// when the last clone of this export is dropped.
     pub async fn shutdown(&self) {
         let mut backend = self.inner.backend.lock().await;
-        if let Backend::Ready(ready) = &mut *backend {
+        if let Some(mut ready) = backend.take() {
             let _ = ready.supervisor.stop(self.inner.state.as_ref()).await;
         }
-        *backend = Backend::NotStarted;
     }
 
     /// Serve one `POST /computer` exchange.
@@ -330,7 +326,9 @@ impl CuaExport {
         if name == LEASE_ACQUIRE || name == LEASE_RELEASE {
             return self.reply(&self.lease(&binding, &name, &bytes, &facade, lease));
         }
-        let dispatch = facade.handle(&bytes, self.inner.limits.request_body()).await;
+        let dispatch = facade
+            .handle(&bytes, self.inner.limits.request_body())
+            .await;
         let operation = Operation::parse(&name);
         self.count(&dispatch);
         self.reply(&render(&name, operation, &dispatch))
@@ -364,7 +362,7 @@ impl CuaExport {
     /// Start, probe and negotiate the backend once; later requests reuse it.
     async fn ensure_ready(&self) -> Result<Negotiated, &'static str> {
         let mut backend = self.inner.backend.lock().await;
-        if let Backend::Ready(ready) = &*backend {
+        if let Some(ready) = &*backend {
             return Ok(Negotiated {
                 endpoint: ready.endpoint,
                 permitted: ready.permitted.clone(),
@@ -382,7 +380,7 @@ impl CuaExport {
                     permitted: ready.permitted.clone(),
                     epoch: ready.supervisor.lifecycle_epoch(),
                 };
-                *backend = Backend::Ready(ready);
+                *backend = Some(ready);
                 Ok(negotiated)
             }
             Err(reason) => {
@@ -452,10 +450,10 @@ impl CuaExport {
             .inner
             .point_space
             .filter(|space| point_space_agrees(space, &probe));
-        self.inner
-            .counters
-            .point_space_refused
-            .store(self.inner.point_space.is_some() && declared.is_none(), Ordering::Relaxed);
+        self.inner.counters.point_space_refused.store(
+            self.inner.point_space.is_some() && declared.is_none(),
+            Ordering::Relaxed,
+        );
         self.inner.state.declare_point_space(declared);
 
         Ok(Ready {
@@ -470,7 +468,7 @@ impl CuaExport {
         &self,
         binding: &str,
         negotiated: &Negotiated,
-    ) -> Result<(Arc<SessionFacade>, Option<LeaseGrant>), CuaResponse> {
+    ) -> Result<(Arc<SessionFacade>, Option<LeaseGrant>), Box<CuaResponse>> {
         let mut sessions = self
             .inner
             .sessions
@@ -480,11 +478,11 @@ impl CuaExport {
             return Ok((Arc::clone(&entry.facade), entry.grant.clone()));
         }
         if sessions.by_binding.len() >= MAX_SESSIONS {
-            return Err(CuaResponse::not_dispatched(
+            return Err(Box::new(CuaResponse::not_dispatched(
                 "",
                 "session_capacity",
                 "this export tracks no more principals",
-            ));
+            )));
         }
         sessions.next += 1;
         let facade = Arc::new(SessionFacade::new(
@@ -625,7 +623,9 @@ fn is_lease_envelope(bytes: &[u8], name: &str) -> bool {
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(bytes) else {
         return false;
     };
-    object.keys().all(|key| matches!(key.as_str(), "version" | "operation" | "params"))
+    object
+        .keys()
+        .all(|key| matches!(key.as_str(), "version" | "operation" | "params"))
         && object.get("version").and_then(Value::as_str) == Some(tunnel_cua::SCHEMA_VERSION)
         && object.get("operation").and_then(Value::as_str) == Some(name)
         && object
@@ -637,7 +637,12 @@ fn is_lease_envelope(bytes: &[u8], name: &str) -> bool {
 fn operation_name(bytes: &[u8]) -> String {
     serde_json::from_slice::<Value>(bytes)
         .ok()
-        .and_then(|value| value.get("operation").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("operation")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .filter(|name| name.len() <= 64 && name.bytes().all(|byte| byte.is_ascii_graphic()))
         .unwrap_or_default()
 }
