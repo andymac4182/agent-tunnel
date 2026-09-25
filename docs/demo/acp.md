@@ -78,8 +78,8 @@ client's `reqwest` must stay out of the shared build graph, task row M8-C09),
 then runs the ignored test
 `m8_acp_demo_official_client_runs_a_session_through_the_relay`, which brings
 up the relay and the device and runs the client against them. A cold build
-takes several minutes. The session itself took 583 to 788 ms in the three recorded runs
-(`elapsed_ms` in the summary line).
+takes several minutes. The session itself took between 583 and 1,849 ms in the four
+recorded runs since the ordering fix (`elapsed_ms` in the summary line).
 
 ## Expected output
 
