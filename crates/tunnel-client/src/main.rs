@@ -1183,7 +1183,7 @@ type IpcServer = Option<(CancellationToken, tokio::task::JoinHandle<()>)>;
 impl SupervisorPublisher {
     /// Take the profile lock, then bind the profile's supervisor socket.
     ///
-    /// **The lock fails closed** (M6-06 review, task row M6-C136): another
+    /// **The lock fails closed** (M6-06 review, task row M6-C132): another
     /// supervisor holding it is refused `SUPERVISOR_RUNNING`, exit `9`, and
     /// a lock that cannot be taken for any other reason -- a missing
     /// directory, one other users can write, a lock file that is a symlink or

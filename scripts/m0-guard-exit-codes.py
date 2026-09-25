@@ -1194,7 +1194,7 @@ OPS_GATE_CASES: list[Case] = [
         ),
     ),
     Case(
-        # The profile lock fails closed (M6-C136, the M6-06 review): a
+        # The profile lock fails closed (M6-C132, the M6-06 review): a
         # supervisor that cannot take the `flock` must not run unlocked.  The
         # defeat runs it unlocked and without IPC instead -- the "fail open"
         # the review found.  The fixtures bound the second supervisor's run,

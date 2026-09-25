@@ -2,8 +2,9 @@
 //! binaries against a real Redis.
 //!
 //! For each data-socket rotation phase -- `active`, `preparing`,
-//! `quiescing`, `draining`, `committing`, `aborting`, `retiring`,
-//! `recovering` (the last two added by the M6-06 review) -- the client and, in a
+//! `quiescing`, `draining`, `committing`, `aborting`, `retiring` (the last
+//! added by the M6-06 review; `recovering` is not reachable by a hold and is
+//! task row M6-C136) -- the client and, in a
 //! second test, the relay is sent SIGTERM while it **reports** that phase,
 //! and must stop in order:
 //!
@@ -970,7 +971,7 @@ enum Side {
 /// run's relay-draining case, log nonce `m606-shutdown-1790349672-24478`).
 /// A real owner never sends DRAINED before FROZEN on the ordered control
 /// socket, so that is the hook's artefact, not a product defect.
-fn cases(side: Side) -> [(&'static str, &'static str); 8] {
+fn cases(side: Side) -> [(&'static str, &'static str); 7] {
     match side {
         Side::Client => [
             ("active", ""),
@@ -980,7 +981,6 @@ fn cases(side: Side) -> [(&'static str, &'static str); 8] {
             ("committing", "ROTATE_COMMIT"),
             ("aborting", "candidate-dial,ROTATE_ABORTED"),
             ("retiring", "ROTATE_RETIRE"),
-            ("recovering", "ROTATE_FROZEN,ROTATE_DRAINED,RESUME"),
         ],
         Side::Relay => [
             ("active", ""),
@@ -990,7 +990,6 @@ fn cases(side: Side) -> [(&'static str, &'static str); 8] {
             ("committing", "ROTATE_COMMIT"),
             ("aborting", "candidate-dial,ROTATE_ABORT"),
             ("retiring", "ROTATE_RETIRE"),
-            ("recovering", "ROTATE_FROZEN,ROTATE_DRAINED,RESUME"),
         ],
     }
 }
@@ -1003,7 +1002,7 @@ fn witness(
     client: &Client,
 ) -> (Option<String>, Option<String>) {
     // A rotation starts 12 s after ready; an abort needs the 4 s handshake
-    // budget on top, and retained recovery the 10 s overlap deadline.
+    // budget on top.
     // `active` is witnessed before the first rotation.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -1169,7 +1168,7 @@ async fn run_matrix(side: Side) {
     let (status, _) = wait_exit(&mut relay.process, signalled, "serve");
     assert_eq!(status.code(), Some(0));
     println!(
-        "m606-shutdown matrix ok side={label} cases=8 outcomes={outcomes:?} client={} nonce={}",
+        "m606-shutdown matrix ok side={label} cases=7 outcomes={outcomes:?} client={} nonce={}",
         deployment.client_bin.display(),
         deployment.nonce
     );

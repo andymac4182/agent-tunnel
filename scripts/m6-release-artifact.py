@@ -1220,7 +1220,7 @@ def check_assets(bundle: Path) -> Result:
 # its output.  Asserting exit status alone would pass a binary that printed
 # nothing, which is the whole reason these are (command, witness) pairs.
 #: The environment variable only a `--features test-hooks` client reads
-#: (docs/tasks.md M6-C136, the M6-06 review).  Its name is compiled into the
+#: (docs/tasks.md M6-C132, the M6-06 review).  Its name is compiled into the
 #: binary exactly when the hook is, so its absence from every bundled
 #: executable is the observable proof that no shipped binary can have its
 #: rotation held by an environment value.
@@ -1259,7 +1259,7 @@ def check_cli(bundle: Path) -> Result:
                                   f"would be untested",
                           witness="environment-not-scrubbed")
         # Before anything runs: a shipped binary built with the rotation test
-        # hook is refused outright (M6-C136).
+        # hook is refused outright (M6-C132).
         carrying = binaries_carrying_test_hooks(bundle)
         if carrying:
             return Result("cli", False,
@@ -3123,7 +3123,7 @@ def control_cli_content_not_exit_status(bundle: Path) -> tuple[bool, str]:
 
 
 def control_cli_test_hook_in_shipped_binary(bundle: Path) -> tuple[bool, str]:
-    """A client carrying the test-only rotation hook must not pass (M6-C136).
+    """A client carrying the test-only rotation hook must not pass (M6-C132).
 
     Appends the hook's variable name to the bundled client, which is exactly
     what a `--features test-hooks` build adds to the binary's bytes.  The scan

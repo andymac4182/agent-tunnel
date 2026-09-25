@@ -29,7 +29,7 @@
 //! it ends, so a SIGKILLed supervisor never leaves a stale lock. Probing,
 //! unlinking and binding the socket happen only while it is held, so two
 //! supervisors starting together cannot both decide a socket is stale and
-//! both bind (task row M6-C136, the M6-06 review). A second supervisor meets
+//! both bind (task row M6-C132, the M6-06 review). A second supervisor meets
 //! the lock and exits `9` `SUPERVISOR_RUNNING`; one that cannot take the lock
 //! for any other reason refuses to start too (fail closed). A socket file
 //! nobody listens on is a stale leftover of a killed supervisor and is
