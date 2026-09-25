@@ -29,8 +29,9 @@ use tokio::{
 use tunnel_catalog::{DeviceListFilter, OidcError, OidcVerifier, SharedCatalog};
 use tunnel_protocol::{
     CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
-    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, DEVICE_CONTROL_IDLE_TIMEOUT,
-    DEVICE_CONTROL_PING_INTERVAL,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON,
+    CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE, CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON,
+    DEVICE_CONTROL_IDLE_TIMEOUT, DEVICE_CONTROL_PING_INTERVAL,
 };
 use tunnel_transport::{PeerTransportError, TlsIdentity};
 use uuid::Uuid;
@@ -2478,23 +2479,41 @@ fn subprotocol_offered(headers: &HeaderMap, required: &str) -> bool {
         })
 }
 
+/// Why a cluster relay's device ingress could not route a device socket.
+#[derive(Debug)]
+enum DeviceRouteError {
+    /// The catalog holds no active device and credential for this
+    /// certificate's key (task rows M6-C38 and M6-C43).  Unlike every other
+    /// routing failure this one cannot heal by retrying, so the control
+    /// ingress answers it with the typed identity close, as the owner-local
+    /// path does, rather than a dropped socket.
+    UnknownCredential,
+    Peer(PeerRuntimeError),
+}
+
+impl From<PeerRuntimeError> for DeviceRouteError {
+    fn from(error: PeerRuntimeError) -> Self {
+        Self::Peer(error)
+    }
+}
+
 async fn remote_device_route(
     state: &HttpState,
     identity: &TlsIdentity,
     allow_fresh_control: bool,
-) -> Result<Option<(Arc<PeerRuntime>, OwnerRoute)>, PeerRuntimeError> {
+) -> Result<Option<(Arc<PeerRuntime>, OwnerRoute)>, DeviceRouteError> {
     if state.peer.as_ref().is_some_and(|peer| !peer.is_ready()) {
-        return Err(PeerRuntimeError::Membership(
-            "cluster readiness unavailable".to_owned(),
-        ));
+        return Err(
+            PeerRuntimeError::Membership("cluster readiness unavailable".to_owned()).into(),
+        );
     }
     let Some(peer) = state.peer.clone() else {
         return Ok(None);
     };
     let Some(catalog) = state.catalog.as_ref() else {
-        return Err(PeerRuntimeError::Membership(
-            "device owner catalog unavailable".to_owned(),
-        ));
+        return Err(
+            PeerRuntimeError::Membership("device owner catalog unavailable".to_owned()).into(),
+        );
     };
     let device = catalog
         .resolve_device(&identity.spki_sha256().to_hex(), Utc::now())
@@ -2502,9 +2521,7 @@ async fn remote_device_route(
         .map_err(|error| {
             PeerRuntimeError::Routing(crate::routing::OwnerRoutingError::Catalog(error))
         })?
-        .ok_or_else(|| {
-            PeerRuntimeError::Membership("device credential is not active".to_owned())
-        })?;
+        .ok_or(DeviceRouteError::UnknownCredential)?;
     let route = match peer
         .resolve(
             OwnerScope::new(device.tenant_id, device.device_id),
@@ -2514,7 +2531,7 @@ async fn remote_device_route(
     {
         Ok(route) => route,
         Err(error) if allow_fresh_control && is_no_live_owner(&error) => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     match route {
         OwnerRoute::Remote { .. } => Ok(Some((peer, route))),
@@ -2573,13 +2590,14 @@ async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state:
             // transport failure while a local one reported the exact terminal
             // diagnostic, for the same condition.
             let mut socket = socket;
+            let device = identity.role_id().to_owned();
             let forwarded = handle_remote_device_control(&mut socket, identity, peer, route).await;
             if let Err(error) = forwarded {
-                if matches!(
-                    error,
-                    PeerRuntimeError::RemoteStatus(status) if status == StatusCode::CONFLICT
-                ) {
-                    let _ = send_socket(&mut socket, owner_busy_close()).await;
+                // M6-C38/M6-C43: every owner refusal no retry can fix reaches
+                // the device typed, exactly as the owner-local path closes it.
+                if let Some((close, refusal)) = remote_control_refusal_close(&error) {
+                    log_device_refusal("control_forwarded", refusal, &device);
+                    let _ = send_socket(&mut socket, close).await;
                 }
                 tracing::debug!(?error, "remote device control forwarding stopped");
             }
@@ -2601,7 +2619,15 @@ async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state:
             )
             .await;
         }
-        Err(error) => {
+        Err(DeviceRouteError::UnknownCredential) => {
+            // M6-C43: the owner-local path's identity refusal, on the cluster
+            // path.  Before this the socket closed without a reason, which the
+            // device's reconnect loop retried indefinitely.
+            log_device_refusal("control_route", "credential_not_active", identity.role_id());
+            let mut socket = socket;
+            let _ = send_socket(&mut socket, identity_rejected_close()).await;
+        }
+        Err(DeviceRouteError::Peer(error)) => {
             tracing::debug!(?error, "device control owner lookup failed");
             let mut socket = socket;
             let _ = send_socket(&mut socket, Message::Close(None)).await;
@@ -3161,11 +3187,7 @@ async fn handle_peer_device_control(
             // local control path treats that refusal as its own typed outcome
             // rather than folding it in with an unauthorized device.  Neither
             // status carries session, owner, or device detail.
-            let status = if matches!(error, RelayError::OwnerBusy) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::FORBIDDEN
-            };
+            let status = forwarded_control_refusal_status(&error);
             send.respond(status).await?;
             return send.finish().await;
         }
@@ -3805,24 +3827,20 @@ async fn handle_control(
     if let Some(barrier) = control_attach_barrier.as_ref() {
         barrier.wait_before_control_attach(operation_timeout).await;
     }
+    let device = identity.role_id().to_owned();
     let registration = match handle.register_control(identity, hello).await {
         Ok(value) => value,
         Err(error) => {
-            match error {
-                RelayError::OwnerBusy => {
-                    let _ = send_socket(&mut socket, owner_busy_close()).await;
-                }
-                // M6-C32: `register_control` answers `Unauthorized` only for
-                // an identity it will never accept -- a HELLO whose
-                // `connector_id` is not the certificate's device, a
-                // non-device role, or no active catalog device and credential
-                // for this key.  Closing without a frame left the device
-                // reporting a retryable transport loss for a fault no retry
-                // can fix.
-                RelayError::Unauthorized => {
-                    let _ = send_socket(&mut socket, identity_rejected_close()).await;
-                }
-                _ => {}
+            // M6-C32: `register_control` answers `Unauthorized` only for an
+            // identity it will never accept -- a HELLO whose `connector_id` is
+            // not the certificate's device, a non-device role, or no active
+            // catalog device and credential for this key.  M6-C38: a HELLO on
+            // another protocol major is refused typed too.  Closing without a
+            // frame left the device reporting a retryable transport loss for
+            // faults no retry can fix.
+            if let Some((close, refusal)) = control_refusal_close(&error) {
+                log_device_refusal("control_hello", refusal, &device);
+                let _ = send_socket(&mut socket, close).await;
             }
             return;
         }
@@ -4088,6 +4106,81 @@ fn identity_rejected_close() -> Message {
         code: CONTROL_IDENTITY_REJECTED_CLOSE_CODE,
         reason: CONTROL_IDENTITY_REJECTED_CLOSE_REASON.into(),
     }))
+}
+
+fn protocol_unsupported_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE,
+        reason: CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON.into(),
+    }))
+}
+
+/// The typed close, and the bounded refusal label logged with it, for a
+/// control registration the owner-local path refused.  `None` for a refusal
+/// that may heal (catalog, capacity, shutdown), which keeps its untyped close
+/// and is retried by the device.
+fn control_refusal_close(error: &RelayError) -> Option<(Message, &'static str)> {
+    match error {
+        RelayError::OwnerBusy => Some((owner_busy_close(), "owner_busy")),
+        RelayError::Unauthorized => Some((identity_rejected_close(), "identity_rejected")),
+        RelayError::UnsupportedProtocolMajor => {
+            Some((protocol_unsupported_close(), "protocol_major_unsupported"))
+        }
+        _ => None,
+    }
+}
+
+/// The HTTP status an owner answers a forwarded control registration's
+/// refusal with.  The ingress turns exactly these three back into the typed
+/// closes of [`control_refusal_close`] (see [`remote_control_refusal_close`]),
+/// so a device reaching a non-owner relay is told the same thing as one
+/// reaching the owner.  Every other refusal -- catalog, capacity, shutdown --
+/// may heal and is `503`, which the ingress keeps as an untyped close.
+/// Before M6-C38 every non-`OwnerBusy` refusal was `403`, so the ingress
+/// could not tell a refused identity from a transient owner failure.
+fn forwarded_control_refusal_status(error: &RelayError) -> StatusCode {
+    match error {
+        RelayError::OwnerBusy => StatusCode::CONFLICT,
+        RelayError::Unauthorized => StatusCode::FORBIDDEN,
+        RelayError::UnsupportedProtocolMajor => StatusCode::UPGRADE_REQUIRED,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// The ingress half of [`forwarded_control_refusal_status`].
+fn remote_control_refusal_close(error: &PeerRuntimeError) -> Option<(Message, &'static str)> {
+    match error {
+        PeerRuntimeError::RemoteStatus(StatusCode::CONFLICT) => {
+            Some((owner_busy_close(), "owner_busy"))
+        }
+        PeerRuntimeError::RemoteStatus(StatusCode::FORBIDDEN) => {
+            Some((identity_rejected_close(), "identity_rejected"))
+        }
+        PeerRuntimeError::RemoteStatus(StatusCode::UPGRADE_REQUIRED) => {
+            Some((protocol_unsupported_close(), "protocol_major_unsupported"))
+        }
+        _ => None,
+    }
+}
+
+/// Task row M6-C52: one bounded, payload-free line per refused device
+/// session.  `stage` and `refusal` are fixed labels; `certificate_device` is
+/// the identifier in the TLS-verified certificate's role SAN, never anything
+/// the device sent in its HELLO, and nothing else about the device, the
+/// session or its credential is logged.
+fn log_device_refusal(stage: &'static str, refusal: &'static str, certificate_device: &str) {
+    // The role SAN is a bounded identifier the verifier already parsed, but
+    // it is still certificate content: log it only when it is a UUID.
+    let certificate_device = certificate_device
+        .parse::<Uuid>()
+        .map_or_else(|_| "not_a_uuid".to_owned(), |id| id.to_string());
+    tracing::info!(
+        phase = "device_refused",
+        stage,
+        refusal,
+        certificate_device = %certificate_device,
+        "device session refused"
+    );
 }
 
 async fn send_socket(socket: &mut WebSocket, message: Message) -> bool {
@@ -4514,9 +4607,11 @@ mod tests {
 
     use super::{
         ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
-        PeerAdmissionBarrierError, PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner,
+        PeerAdmissionBarrierError, PeerAdmissionScope, control_refusal_close,
+        forwarded_bearer_token, forwarded_control_refusal_status, is_no_live_owner,
         method_not_allowed, owner_busy_close, peer_consumer_diagnostic_outcome,
-        peer_failure_response, service_resolution_response, stream_limit_response,
+        peer_failure_response, remote_control_refusal_close, service_resolution_response,
+        stream_limit_response,
     };
     use crate::{
         peer_runtime::PeerRuntimeError,
@@ -4771,6 +4866,71 @@ mod tests {
                 if frame.code == CONTROL_OWNER_BUSY_CLOSE_CODE
                     && &*frame.reason == CONTROL_OWNER_BUSY_CLOSE_REASON
         ));
+    }
+
+    /// M6-C38/M6-C43: every HELLO refusal no retry can fix closes typed, on
+    /// the owner-local path and -- through the owner's status and the
+    /// ingress's reverse mapping -- on the forwarded path, and each path
+    /// gives the device the same close for the same refusal.  A refusal that
+    /// may heal stays untyped (`None`) so the device retries it, and on the
+    /// forwarded path it is no longer the `403` the ingress now reads as a
+    /// refused identity.
+    #[test]
+    fn control_refusals_close_typed_on_the_local_and_the_forwarded_path() {
+        use crate::actor::RelayError;
+        fn close_of(message: &Message) -> (u16, String) {
+            match message {
+                Message::Close(Some(frame)) => (frame.code, frame.reason.to_string()),
+                other => panic!("not a close frame: {other:?}"),
+            }
+        }
+        let cases = [
+            (
+                RelayError::OwnerBusy,
+                (
+                    CONTROL_OWNER_BUSY_CLOSE_CODE,
+                    CONTROL_OWNER_BUSY_CLOSE_REASON,
+                ),
+            ),
+            (
+                RelayError::Unauthorized,
+                (
+                    tunnel_protocol::CONTROL_IDENTITY_REJECTED_CLOSE_CODE,
+                    tunnel_protocol::CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
+                ),
+            ),
+            (
+                RelayError::UnsupportedProtocolMajor,
+                (
+                    tunnel_protocol::CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE,
+                    tunnel_protocol::CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON,
+                ),
+            ),
+        ];
+        for (error, (code, reason)) in cases {
+            let (local, local_label) = control_refusal_close(&error).expect("typed locally");
+            assert_eq!(close_of(&local), (code, reason.to_owned()), "{error}");
+            let status = forwarded_control_refusal_status(&error);
+            let (remote, remote_label) =
+                remote_control_refusal_close(&PeerRuntimeError::RemoteStatus(status))
+                    .expect("typed through the ingress");
+            assert_eq!(close_of(&remote), (code, reason.to_owned()), "{error}");
+            assert_eq!(local_label, remote_label);
+        }
+        for transient in [
+            RelayError::Catalog("catalog unavailable".to_owned()),
+            RelayError::Overloaded("relay device capacity is exhausted"),
+            RelayError::Shutdown,
+            RelayError::Protocol("cluster session requires owner-fencing-v1".to_owned()),
+        ] {
+            assert!(control_refusal_close(&transient).is_none(), "{transient}");
+            let status = forwarded_control_refusal_status(&transient);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{transient}");
+            assert!(
+                remote_control_refusal_close(&PeerRuntimeError::RemoteStatus(status)).is_none(),
+                "{transient}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,10 @@
 //!   certificate the profile's `server_ca` does not trust, and a relay that
 //!   **refuses the device certificate** with a TLS alert, exit `3`
 //!   `CREDENTIAL_ERROR` after one connection and no backoff;
+//! * a relay that completes the WebSocket upgrade and then closes the
+//!   control socket with the typed `PROTOCOL_UNSUPPORTED` refusal exits `1`
+//!   `PROTOCOL_ERROR` after one connection and no backoff (M6-C38), while an
+//!   untyped close at the same point is still retried;
 //! * a stop request during the backoff wait exits `130` promptly;
 //! * `--no-reconnect` and `[reconnect] enabled = false` restore the old
 //!   exit-at-once behaviour.
@@ -197,6 +201,10 @@ enum Mode {
     /// Run the server side of the TLS handshake with this configuration,
     /// then hold the connection briefly and close it.
     Tls(Arc<rustls::ServerConfig>),
+    /// Complete TLS and the control WebSocket upgrade, read the device's
+    /// first message (its HELLO), then send a close frame with this code and
+    /// reason -- what a relay refusing the HELLO does (M6-C38).
+    ControlClose(Arc<rustls::ServerConfig>, u16, &'static str),
 }
 
 /// A local stand-in for the relay's device listener that counts the
@@ -238,7 +246,7 @@ impl FakeRelay {
                                 Some(error) => {
                                     tls_errors.lock().expect("tls errors").push(error);
                                 }
-                                None if matches!(mode, Mode::Tls(_)) => {
+                                None if matches!(mode, Mode::Tls(_) | Mode::ControlClose(..)) => {
                                     tls_completed.fetch_add(1, Ordering::AcqRel);
                                 }
                                 None => {}
@@ -319,7 +327,118 @@ fn serve(mut stream: TcpStream, mode: &Mode) -> Option<String> {
             thread::sleep(Duration::from_millis(200));
             None
         }
+        Mode::ControlClose(config, code, reason) => {
+            let mut connection =
+                rustls::ServerConnection::new(Arc::clone(config)).expect("relay TLS session");
+            while connection.is_handshaking() {
+                if let Err(error) = connection.complete_io(&mut stream) {
+                    return Some(error.to_string());
+                }
+            }
+            let mut tls = rustls::Stream::new(&mut connection, &mut stream);
+            if let Err(error) = websocket_upgrade(&mut tls) {
+                return Some(error);
+            }
+            // The HELLO: one masked client frame, read and discarded.
+            if let Err(error) = read_client_frame(&mut tls) {
+                return Some(error);
+            }
+            let mut close = vec![0x88, u8::try_from(2 + reason.len()).expect("short reason")];
+            close.extend_from_slice(&code.to_be_bytes());
+            close.extend_from_slice(reason.as_bytes());
+            if let Err(error) = std::io::Write::write_all(&mut tls, &close) {
+                return Some(error.to_string());
+            }
+            let _ = std::io::Write::flush(&mut tls);
+            thread::sleep(Duration::from_millis(200));
+            None
+        }
     }
+}
+
+/// Answer one WebSocket upgrade request (RFC 6455 section 4.2.2), echoing
+/// the subprotocol the client offered.
+fn websocket_upgrade(tls: &mut (impl Read + std::io::Write)) -> Result<(), String> {
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte)
+            .map_err(|error| error.to_string())?;
+        request.push(byte[0]);
+        if request.len() > 16 * 1024 {
+            return Err("upgrade request too large".to_owned());
+        }
+    }
+    let request = String::from_utf8(request).map_err(|error| error.to_string())?;
+    let header = |name: &str| {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    let key = header("sec-websocket-key").ok_or("no Sec-WebSocket-Key")?;
+    let protocol = header("sec-websocket-protocol").ok_or("no Sec-WebSocket-Protocol")?;
+    let digest = ring::digest::digest(
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+    );
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: {protocol}\r\n\r\n",
+        base64(digest.as_ref())
+    );
+    std::io::Write::write_all(tls, response.as_bytes()).map_err(|error| error.to_string())?;
+    std::io::Write::flush(tls).map_err(|error| error.to_string())
+}
+
+/// Read one masked client frame and discard it.
+fn read_client_frame(tls: &mut (impl Read + std::io::Write)) -> Result<(), String> {
+    let mut head = [0_u8; 2];
+    tls.read_exact(&mut head)
+        .map_err(|error| error.to_string())?;
+    let length = match head[1] & 0x7f {
+        126 => {
+            let mut extended = [0_u8; 2];
+            tls.read_exact(&mut extended)
+                .map_err(|error| error.to_string())?;
+            u64::from(u16::from_be_bytes(extended))
+        }
+        127 => {
+            let mut extended = [0_u8; 8];
+            tls.read_exact(&mut extended)
+                .map_err(|error| error.to_string())?;
+            u64::from_be_bytes(extended)
+        }
+        short => u64::from(short),
+    };
+    let mask = if head[1] & 0x80 != 0 { 4 } else { 0 };
+    let mut rest = vec![0_u8; usize::try_from(length).map_err(|error| error.to_string())? + mask];
+    tls.read_exact(&mut rest).map_err(|error| error.to_string())
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let block = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let value = (u32::from(block[0]) << 16) | (u32::from(block[1]) << 8) | u32::from(block[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[((value >> (18 - 6 * index)) & 0x3f) as usize],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A port nothing listens on: bound once to pick it, then released, so a
@@ -735,6 +854,84 @@ fn a_relay_refusing_the_device_certificate_exits_credential_error_without_retryi
     );
     assert!(run.states("backoff").is_empty(), "{context}");
     assert_eq!(relay.accepted(), 1, "exactly one attempt: {context}");
+}
+
+/// M6-C38: a relay that refuses the HELLO because it does not speak this
+/// client's protocol major closes the control socket with the typed
+/// `PROTOCOL_UNSUPPORTED` close.  With reconnect **on**, the process exits
+/// `1` `PROTOCOL_ERROR` naming the cause after exactly one connection and no
+/// `backoff` event.  Before the fix the relay dropped the socket and the loop
+/// retried it indefinitely; here, before the client-side fix, the typed close
+/// was read as a retryable transport loss.
+#[test]
+fn a_protocol_major_refusal_exits_protocol_error_without_retrying() {
+    let pki = Pki::new("relay");
+    let relay = FakeRelay::start(Mode::ControlClose(
+        server_requiring_devices_of(&pki, &pki),
+        1002,
+        "PROTOCOL_UNSUPPORTED",
+    ));
+    let profile = profile(
+        &relay.url(),
+        &pki,
+        &pki,
+        "initial_delay_ms = 100\nmax_delay_ms = 200",
+    );
+    let mut run = Run::start(&profile, &[]);
+    let (status, elapsed) = run.wait_exit(run.started);
+    thread::sleep(Duration::from_millis(400));
+    let context = format!(
+        "accepted={} completed={} relay_errors={:?} elapsed={elapsed:?} {}",
+        relay.accepted(),
+        relay.tls_completed.load(Ordering::Acquire),
+        relay.tls_errors.lock().expect("tls errors"),
+        run.context()
+    );
+    assert_eq!(
+        relay.tls_completed.load(Ordering::Acquire),
+        1,
+        "the stand-in must have upgraded the socket and sent its close: {context}"
+    );
+    assert_eq!(status.code(), Some(1), "{context}");
+    let error = run.final_error();
+    assert_eq!(error["code"], "PROTOCOL_ERROR", "{context}");
+    assert_eq!(error["retryable"], Value::Bool(false), "{context}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refused this client's protocol major"),
+        "{context}"
+    );
+    assert!(run.states("backoff").is_empty(), "{context}");
+    assert_eq!(relay.accepted(), 1, "exactly one attempt: {context}");
+}
+
+/// The control for the case above: the same stand-in closing at the same
+/// point with a close it does not type is still a retryable loss, so the
+/// test above is red for the classification and not for the stand-in.
+#[test]
+fn an_untyped_close_after_the_hello_is_still_retried() {
+    let pki = Pki::new("relay");
+    let relay = FakeRelay::start(Mode::ControlClose(
+        server_requiring_devices_of(&pki, &pki),
+        1011,
+        "internal",
+    ));
+    let profile = profile(
+        &relay.url(),
+        &pki,
+        &pki,
+        "initial_delay_ms = 100\nmax_delay_ms = 200\nmax_attempts = 1",
+    );
+    let mut run = Run::start(&profile, &[]);
+    let (status, _) = run.wait_exit(run.started);
+    thread::sleep(Duration::from_millis(400));
+    let context = format!("accepted={} {}", relay.accepted(), run.context());
+    assert_eq!(run.states("backoff").len(), 1, "{context}");
+    assert_eq!(status.code(), Some(4), "{context}");
+    assert_eq!(run.final_error()["code"], "TRANSPORT_ERROR", "{context}");
+    assert_eq!(relay.accepted(), 2, "{context}");
 }
 
 /// A stop request while the process sleeps in backoff ends it at once with

@@ -825,6 +825,12 @@ pub enum RelayError {
     NotFound,
     Overloaded(&'static str),
     Protocol(String),
+    /// A device HELLO named a protocol major this relay does not speak (task
+    /// row M6-C38).  Kept apart from [`RelayError::Protocol`] because it is
+    /// the one HELLO refusal a well-behaved device can meet, and it must
+    /// reach the device as a typed, terminal close rather than a dropped
+    /// socket its reconnect loop retries.
+    UnsupportedProtocolMajor,
     Transport(String),
     Shutdown,
 }
@@ -845,6 +851,7 @@ impl std::fmt::Display for RelayError {
             Self::NotFound => formatter.write_str("device or service was not found"),
             Self::Overloaded(message) => formatter.write_str(message),
             Self::Shutdown => formatter.write_str("relay is shutting down"),
+            Self::UnsupportedProtocolMajor => formatter.write_str("unsupported protocol major"),
         }
     }
 }
@@ -14616,7 +14623,7 @@ fn enqueue_data(
 
 fn validate_hello(message: &Hello, device_id: Uuid) -> Result<(), RelayError> {
     if message.protocol_major != u16::from(crate::PROTOCOL_MAJOR) {
-        return Err(RelayError::Protocol("unsupported protocol major".into()));
+        return Err(RelayError::UnsupportedProtocolMajor);
     }
     if message.connector_id.parse::<Uuid>().ok() != Some(device_id) {
         return Err(RelayError::Unauthorized);
@@ -15691,6 +15698,26 @@ mod stream_identity_tests {
             spki_a.to_owned(),
             spki_b.to_owned(),
         )
+    }
+
+    /// M6-C38: a HELLO naming another protocol major is refused with its own
+    /// typed error -- checked before the identity, so a device on another
+    /// major is told that and not that its identity is wrong -- and the
+    /// relay's own major is admitted past this check.
+    #[test]
+    fn a_hello_on_another_protocol_major_is_a_typed_refusal() {
+        let device_id = Uuid::new_v4();
+        let mut other = hello(device_id, "m6c38-major");
+        other.protocol_major = u16::from(crate::PROTOCOL_MAJOR) + 1;
+        assert!(matches!(
+            super::validate_hello(&other, device_id),
+            Err(RelayError::UnsupportedProtocolMajor)
+        ));
+        assert!(matches!(
+            super::validate_hello(&other, Uuid::new_v4()),
+            Err(RelayError::UnsupportedProtocolMajor)
+        ));
+        assert!(super::validate_hello(&hello(device_id, "m6c38-same"), device_id).is_ok());
     }
 
     fn hello(device_id: Uuid, message_id: &str) -> tunnel_protocol::Hello {
