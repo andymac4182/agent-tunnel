@@ -989,7 +989,7 @@ HARNESS_CASES: list[Case] = [
         # every status classifies a signal death and a spurious success as
         # interruptions, which is worse than the drift it replaced: the gate
         # would report a clean run through exactly the failures it exists to
-        # catch.  The `Some(9)` and `Some(-1)` assertions are what stop it.
+        # catch.  The `Some(10)` and `Some(-1)` assertions (`Some(9)` until `9` was published, M6-06 review) are what stop it.
         "the exit classifier does not accept every status",
         [
             (
