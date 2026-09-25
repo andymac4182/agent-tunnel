@@ -301,3 +301,70 @@ async fn the_binding_header_is_not_part_of_the_2026_profile() {
     let _ = body_bytes(response).await;
     assert_eq!(export.diagnostics().children_spawned, 0);
 }
+
+/// M3-16: the relay reports that one consumer's authorization ended.  That
+/// consumer's session ends at once -- its child is killed and the session is
+/// an unknown session afterwards -- and every other consumer's session is
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_principal_loses_its_stdio_sessions_and_only_its_own() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let export = stdio_export(LEGACY, workspace.path(), 4);
+    let revoked = open_session(&export, CONSUMER_A).await;
+    let kept = open_session(&export, CONSUMER_B).await;
+    assert_eq!(export.open_stdio_sessions(), Some(2));
+    assert_eq!(export.diagnostics().children_running, 2);
+
+    assert_eq!(export.end_principal_sessions(CONSUMER_A), 1);
+    assert_eq!(export.open_stdio_sessions(), Some(1));
+    assert_eq!(export.diagnostics().sessions_revoked, 1);
+    // The child's slot is released, not merely made unreachable.
+    for _ in 0..500 {
+        if export.diagnostics().children_running == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(export.diagnostics().children_running, 1);
+    let after = session_post(&revoked, Some(CONSUMER_A));
+    let response = within(exchange(&export, post(&refs(&after), LIST))).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = body_bytes(response).await;
+    still_serves_its_own_principal(&export, &kept, CONSUMER_B).await;
+
+    // Idempotent: a second report, or one for a binding holding nothing,
+    // ends nothing.
+    assert_eq!(export.end_principal_sessions(CONSUMER_A), 0);
+    assert_eq!(
+        export.end_principal_sessions("ffffffffffffffffffffffffffffffff"),
+        0
+    );
+    still_serves_its_own_principal(&export, &kept, CONSUMER_B).await;
+}
+
+/// M3-16 for a Streamable HTTP export: the backend sessions issued to the
+/// revoked consumer are forgotten, so they are refused before the backend
+/// is dialled; another consumer's session keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_principal_loses_its_streamable_http_sessions_and_only_its_own() {
+    let markers = tempfile::tempdir().expect("markers");
+    let (url, shutdown) = rmcp_http_backend(true, markers.path()).await;
+    let export = http_export(LEGACY, &url, None);
+    let revoked = open_session(&export, CONSUMER_A).await;
+    let kept = open_session(&export, CONSUMER_B).await;
+
+    assert_eq!(export.end_principal_sessions(CONSUMER_A), 1);
+    assert_eq!(export.diagnostics().sessions_revoked, 1);
+    let dispatched = export.diagnostics().dispatched;
+    let after = session_post(&revoked, Some(CONSUMER_A));
+    let response = within(exchange(&export, post(&refs(&after), LIST))).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = body_bytes(response).await;
+    assert_eq!(
+        export.diagnostics().dispatched,
+        dispatched,
+        "the forgotten session is refused before the backend is dialled"
+    );
+    still_serves_its_own_principal(&export, &kept, CONSUMER_B).await;
+    shutdown.cancel();
+}

@@ -744,6 +744,25 @@ impl StdioExport {
         removed
     }
 
+    /// Remove and kill every legacy session opened with `binding` (M3-16).
+    pub fn end_binding_sessions(&self, binding: &str) -> u64 {
+        let ids: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, session)| session.binding.as_deref() == Some(binding))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut ended = 0;
+        for id in ids {
+            if self.remove_session(&id).is_some() {
+                ended += 1;
+            }
+        }
+        ended
+    }
+
     /// Open legacy sessions.
     #[must_use]
     pub fn open_sessions(&self) -> usize {

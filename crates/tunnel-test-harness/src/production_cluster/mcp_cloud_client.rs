@@ -849,7 +849,9 @@ impl Combo {
             self.marker(&tunnel_mcp_fixture::release_marker(name)),
             b"release",
         )
-        .map_err(HarnessError::Io)
+        .map_err(wire::io_during(
+            "write a release marker in the combination's marker directory",
+        ))
     }
 }
 
@@ -1294,16 +1296,37 @@ impl Gate<'_> {
             polls += 1;
             let recorded_now = snapshot.http_forward.rotations_recorded;
             let recorded_at_start = *recorded_at_start.get_or_insert(recorded_now);
-            let observations = snapshot
+            // M3-22: the relay-wide ring can evict a live stream's
+            // observation within the rotation that recorded it, when that
+            // rotation observed more than 64 streams; the stream's own
+            // retained observations cannot be evicted by other streams.
+            let own = self
+                .session(&snapshot)
+                .ok()
+                .and_then(|session| {
+                    session
+                        .streams
+                        .iter()
+                        .find(|stream| {
+                            stream.stream_id == stream_id && stream.operation_id == operation_id
+                        })
+                        .and_then(|stream| stream.http.as_ref())
+                })
+                .map(|http| http.rotation_observations.clone())
+                .unwrap_or_default();
+            let mut observations = snapshot
                 .http_forward
                 .rotations
                 .iter()
+                .chain(own.iter())
                 .filter(|observation| {
                     observation.stream_id == stream_id
                         && observation.operation_id == operation_id
                         && observation.rotation > after
                 })
                 .collect::<Vec<_>>();
+            observations.sort_by_key(|observation| observation.rotation);
+            observations.dedup_by_key(|observation| observation.rotation);
             if let Some(observation) = observations
                 .iter()
                 .find(|observation| position(observation))

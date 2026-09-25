@@ -1397,6 +1397,18 @@ pub(crate) fn principal_binding_header() -> http::HeaderName {
 ///
 /// Header names are already lowercased by the HTTP parser, so one predicate
 /// covers every spelling, and `HeaderMap::contains_key` covers repeats.
+/// Task row M3-16: whether the owner watches a consumer's authorization on
+/// this export so the device can end its protocol sessions on revocation.
+/// Exactly the profiles that carry a principal binding hold sessions keyed
+/// by one.
+fn watches_principal_sessions(export: &HttpForwardExport) -> bool {
+    export
+        .profile
+        .request
+        .headers
+        .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+}
+
 pub(crate) fn refuse_consumer_principal_binding(headers: &http::HeaderMap) -> Option<Response> {
     headers.contains_key(principal_binding_header()).then(|| {
         error_response(
@@ -1783,6 +1795,8 @@ pub(crate) async fn http_forward_route(
             response.map(axum::body::Body::new)
         }
         _ => {
+            let watch = watches_principal_sessions(&export)
+                .then(|| (validated.consumer.clone(), grant.tenant_id));
             let registration = match timeout(
                 state.limits.operation_timeout,
                 state.handle.open_http_stream(
@@ -1806,6 +1820,14 @@ pub(crate) async fn http_forward_route(
                     );
                 }
             };
+            if let Some((consumer, tenant_id)) = watch {
+                state.handle.watch_principal_sessions(
+                    registration.base.key.clone(),
+                    consumer,
+                    service_id,
+                    tenant_id,
+                );
+            }
             let key = registration.base.key.clone();
             let stream_id = registration.base.stream_id;
             let operation_id = registration.base.operation_id.clone();
@@ -2045,6 +2067,7 @@ pub(crate) async fn handle_peer_http_stream(
     let request_id = request.envelope().request_id.clone();
     let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
+    let watch = watches_principal_sessions(&export).then(|| (consumer.clone(), grant.tenant_id));
     let registration = match handle
         .open_http_stream(
             consumer,
@@ -2084,6 +2107,9 @@ pub(crate) async fn handle_peer_http_stream(
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     let key = registration.base.key.clone();
+    if let Some((consumer, tenant_id)) = watch {
+        handle.watch_principal_sessions(key.clone(), consumer, service_id, tenant_id);
+    }
     let stream_id = registration.base.stream_id;
     let operation_id = registration.base.operation_id.clone();
     let mut cleanup = handle.echo_cleanup_guard(

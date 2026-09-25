@@ -560,6 +560,24 @@ pub fn authorization_invalidated(
     ))
 }
 
+/// Task row M3-16: tell the device to end one consumer's protocol sessions.
+pub fn principal_sessions_end(
+    session_id: &str,
+    epoch: u64,
+    service_id: &str,
+    principal_binding: &str,
+    reason: &str,
+) -> ControlMessage {
+    ControlMessage::PrincipalSessionsEnd(tunnel_protocol::PrincipalSessionsEnd {
+        message_id: random_token(),
+        session_id: session_id.to_owned(),
+        epoch,
+        service_id: service_id.to_owned(),
+        principal_binding: principal_binding.to_owned(),
+        reason: reason.to_owned(),
+    })
+}
+
 pub fn rejected(
     reply_to: &str,
     session_id: &str,

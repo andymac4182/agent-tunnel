@@ -245,6 +245,10 @@ pub struct RelayHttpStreamSnapshot {
     pub reset_deferred_by_freeze: bool,
     /// The owner's writer is frozen for rotation or recovery.
     pub frozen: bool,
+    /// M3-22: this stream's own most recent rotation observations, newest
+    /// last.  Unlike the relay-wide `rotations` ring, these cannot be evicted
+    /// by other streams while this one is live.
+    pub rotation_observations: Vec<HttpRotationObservation>,
 }
 
 /// The owner published `STREAM_FORGET` for an HTTP stream and removed it.
@@ -350,6 +354,11 @@ pub struct HttpForwardDiagnosticSnapshot {
     /// Public requests refused by head normalization before any owner
     /// route, peer stream or tunnel stream was opened.
     pub ingress_rejected_before_admission: u64,
+    /// M3-16: `PRINCIPAL_SESSIONS_END` messages queued to a device after a
+    /// watched consumer's grant was revoked, and those the control queue
+    /// refused.
+    pub principal_sessions_end_sent: u64,
+    pub principal_sessions_end_failed: u64,
     /// Highest HTTP peer-hop bytes this relay had in flight to (sent) and
     /// queued from (received) any one peer across all its streams, and the
     /// per-direction aggregate bound.
@@ -385,6 +394,8 @@ struct Inner {
     rotations_recorded: u64,
     forgotten_recorded: u64,
     ingress_rejected_before_admission: u64,
+    principal_sessions_end_sent: u64,
+    principal_sessions_end_failed: u64,
     hop_aggregate_send_high_water: usize,
     hop_aggregate_receive_high_water: usize,
     live_hops: Vec<LiveHopEntry>,
@@ -439,6 +450,16 @@ impl HttpForwardDiagnostics {
         let mut inner = self.lock();
         push_bounded(&mut inner.forgotten, record);
         inner.forgotten_recorded = inner.forgotten_recorded.saturating_add(1);
+    }
+
+    pub fn record_principal_sessions_end(&self, sent: bool) {
+        let mut inner = self.lock();
+        if sent {
+            inner.principal_sessions_end_sent = inner.principal_sessions_end_sent.saturating_add(1);
+        } else {
+            inner.principal_sessions_end_failed =
+                inner.principal_sessions_end_failed.saturating_add(1);
+        }
     }
 
     pub fn record_ingress_rejection(&self) {
@@ -512,6 +533,8 @@ impl HttpForwardDiagnostics {
             rotations_recorded: inner.rotations_recorded,
             forgotten_recorded: inner.forgotten_recorded,
             ingress_rejected_before_admission: inner.ingress_rejected_before_admission,
+            principal_sessions_end_sent: inner.principal_sessions_end_sent,
+            principal_sessions_end_failed: inner.principal_sessions_end_failed,
             hop_aggregate_send_high_water: inner.hop_aggregate_send_high_water,
             hop_aggregate_receive_high_water: inner.hop_aggregate_receive_high_water,
             hop_aggregate_limit: crate::http::forward::HOP_AGGREGATE_BYTES,

@@ -256,6 +256,18 @@ impl HttpHandlers {
         Self::default()
     }
 
+    /// Task row M3-16: end every MCP protocol session held on the export
+    /// `service_id` for the consumer whose opaque principal binding is
+    /// `binding`, because the relay reported that consumer's authorization
+    /// ended.  Returns how many sessions ended; `0` for an unknown service or
+    /// a service that is not an MCP export.
+    #[must_use]
+    pub fn end_principal_sessions(&self, service_id: &str, binding: &str) -> u64 {
+        self.mcp
+            .get(service_id)
+            .map_or(0, |export| export.end_principal_sessions(binding))
+    }
+
     /// Register the handler for the export whose catalog service identifier
     /// is `service_id`.
     #[must_use]

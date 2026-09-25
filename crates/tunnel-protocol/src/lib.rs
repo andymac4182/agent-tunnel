@@ -21,8 +21,8 @@ pub use control::{
     Control, ControlError, ControlMessage, DEVICE_CONTROL_IDLE_TIMEOUT,
     DEVICE_CONTROL_PING_INTERVAL, DataReady, GoAway, Hello, MAX_AUTHORIZATION_MESSAGE_BYTES,
     MAX_CONTROL_MESSAGE_BYTES, MAX_RESULT_DETAIL_BYTES, Message, Open, Opened, Ping, Pong,
-    Rejected, ResultDetail, ResultStatus, RotationPolicy, ServiceAdvertisement, Welcome,
-    decode_control, encode_control,
+    PrincipalSessionsEnd, Rejected, ResultDetail, ResultStatus, RotationPolicy,
+    ServiceAdvertisement, Welcome, decode_control, encode_control,
 };
 pub use frame::{
     DataContext, Frame, FrameError, FrameKind, HEADER_LEN, MAGIC, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,

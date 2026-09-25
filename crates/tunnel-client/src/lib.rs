@@ -1520,7 +1520,10 @@ impl SessionActor {
             | ControlMessage::Rejected(_)
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
-            | ControlMessage::AuthorizationChallenge(_) => Ok(()),
+            | ControlMessage::AuthorizationChallenge(_)
+            // M3-16: the M1 profile serves no MCP export, so there is no
+            // session to end; the message is advisory and ignored.
+            | ControlMessage::PrincipalSessionsEnd(_) => Ok(()),
             ControlMessage::ResultStatus(_)
             | ControlMessage::RotateRequest(_)
             | ControlMessage::RotatePrepare(_)

@@ -1966,6 +1966,23 @@ enum Command {
         response: oneshot::Sender<EchoOutcome>,
     },
     Tick,
+    /// M3-16: watch one consumer's authorization for one service on this
+    /// device session, so the device can be told to end that consumer's
+    /// protocol sessions when it is revoked.
+    WatchPrincipalSessions {
+        key: SessionKey,
+        consumer: AuthenticatedConsumer,
+        service_id: Uuid,
+        tenant_id: Uuid,
+    },
+    /// M3-16: the catalog answer for one watched consumer.  `Ok(false)`
+    /// means the grant is gone, expired or no longer allows the operation.
+    PrincipalWatchChecked {
+        key: SessionKey,
+        service_id: Uuid,
+        principal_id: Uuid,
+        authorized: Result<bool, ()>,
+    },
     /// Wake one coordinator-owned recovery retry after its immutable policy
     /// delay. The actor rechecks the absolute episode deadline and session
     /// identity before allocating a fresh candidate.
@@ -2123,6 +2140,9 @@ impl Command {
             | Self::ReadHttpStream { key, .. }
             | Self::FinishHttpStream { key, .. }
             | Self::ResetHttpStream { key, .. } => HttpMaintenanceScope::Session(key.scope()),
+            Self::WatchPrincipalSessions { .. } | Self::PrincipalWatchChecked { .. } => {
+                HttpMaintenanceScope::None
+            }
             Self::InboundData { carrier, .. } | Self::DisconnectData(carrier) => {
                 HttpMaintenanceScope::Session(carrier.session.scope())
             }
@@ -2235,6 +2255,7 @@ impl RelayHandle {
             pending_registering: HashSet::new(),
             tickets: HashMap::new(),
             owner_forgets: HashMap::new(),
+            principal_watches: HashMap::new(),
             lifetime_application_dispatches: 0,
             control_registration_conflicts: 0,
             maintenance_cursor: None,
@@ -2538,6 +2559,27 @@ impl RelayHandle {
 
     /// Admit one `http-forward/1` logical stream.  `request_id` is the peer
     /// request identity when the consumer arrived through another relay.
+    /// Task row M3-16: watch `consumer`'s authorization for `service_id` on
+    /// the device session `key`.  When the grant is revoked, the owner sends
+    /// the device `PRINCIPAL_SESSIONS_END` naming that consumer's opaque
+    /// principal binding, so the export ends the consumer's protocol
+    /// sessions instead of leaving them to idle expiry.  Best-effort: a full
+    /// command queue drops the watch, never the exchange.
+    pub(crate) fn watch_principal_sessions(
+        &self,
+        key: SessionKey,
+        consumer: AuthenticatedConsumer,
+        service_id: Uuid,
+        tenant_id: Uuid,
+    ) {
+        let _ = self.tx.try_send(Command::WatchPrincipalSessions {
+            key,
+            consumer,
+            service_id,
+            tenant_id,
+        });
+    }
+
     pub(crate) async fn open_http_stream(
         &self,
         consumer: AuthenticatedConsumer,
@@ -2961,6 +3003,22 @@ struct RegistrationTarget {
     spki: String,
 }
 
+/// M3-16: how often a watched consumer's grant is re-read.
+const PRINCIPAL_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// M3-16: watched consumers per device session.  A consumer that cannot be
+/// watched keeps working; its sessions fall back to the export's idle expiry.
+const MAX_PRINCIPAL_WATCHES_PER_SESSION: usize = 64;
+/// M3-16: the reason `PRINCIPAL_SESSIONS_END` carries.
+pub(crate) const PRINCIPAL_SESSIONS_END_REASON: &str = "AUTHORIZATION_REVOKED";
+
+/// One watched consumer (M3-16).
+struct PrincipalWatch {
+    consumer: AuthenticatedConsumer,
+    tenant_id: Uuid,
+    next_check: Instant,
+    in_flight: bool,
+}
+
 struct RelayActor {
     options: RelayOptions,
     catalog: SharedCatalog,
@@ -2983,6 +3041,11 @@ struct RelayActor {
     /// capacity. The complete SessionKey fences a retry from a successor
     /// owner, and the per-session map is bounded by the retained stream table.
     owner_forgets: HashMap<SessionKey, BTreeMap<u64, PendingOwnerForget>>,
+    /// M3-16: consumers whose authorization this owner re-checks so it can
+    /// end their protocol sessions on the device when it is revoked, by
+    /// device session and then by `(service, principal)`.  Bounded per
+    /// session by [`MAX_PRINCIPAL_WATCHES_PER_SESSION`].
+    principal_watches: HashMap<SessionKey, BTreeMap<(Uuid, Uuid), PrincipalWatch>>,
     /// Monotonic actor lifetime count of application records accepted for
     /// outbound data dispatch.  It intentionally survives session cleanup;
     /// control frames and replay bookkeeping are not counted.
@@ -3278,7 +3341,22 @@ impl RelayActor {
                 })
                 .await;
             }
-            Command::Tick => self.tick().await,
+            Command::Tick => {
+                self.check_principal_watches();
+                self.tick().await;
+            }
+            Command::WatchPrincipalSessions {
+                key,
+                consumer,
+                service_id,
+                tenant_id,
+            } => self.watch_principal(key, consumer, service_id, tenant_id),
+            Command::PrincipalWatchChecked {
+                key,
+                service_id,
+                principal_id,
+                authorized,
+            } => self.finish_principal_watch(&key, service_id, principal_id, authorized),
             Command::RetryRecovery { key } => self.handle_recovery_retry(key).await,
             Command::ChallengeAuthorized {
                 key,
@@ -11651,6 +11729,138 @@ impl RelayActor {
                 reason,
             ),
         );
+    }
+
+    fn watch_principal(
+        &mut self,
+        key: SessionKey,
+        consumer: AuthenticatedConsumer,
+        service_id: Uuid,
+        tenant_id: Uuid,
+    ) {
+        if self.session_for(&key).is_none() {
+            return;
+        }
+        let watches = self.principal_watches.entry(key).or_default();
+        let entry = (service_id, consumer.principal_id);
+        if watches.contains_key(&entry) || watches.len() >= MAX_PRINCIPAL_WATCHES_PER_SESSION {
+            return;
+        }
+        watches.insert(
+            entry,
+            PrincipalWatch {
+                consumer,
+                tenant_id,
+                next_check: Instant::now() + PRINCIPAL_WATCH_INTERVAL,
+                in_flight: false,
+            },
+        );
+    }
+
+    /// Start one bounded catalog re-read for every watch that is due.
+    fn check_principal_watches(&mut self) {
+        let now = Instant::now();
+        let live: HashSet<SessionKey> = self
+            .sessions
+            .values()
+            .map(|session| session.key.clone())
+            .collect();
+        self.principal_watches.retain(|key, _| live.contains(key));
+        let mut due = Vec::new();
+        for (key, watches) in &mut self.principal_watches {
+            for ((service_id, principal_id), watch) in watches.iter_mut() {
+                if !watch.in_flight && now >= watch.next_check {
+                    watch.in_flight = true;
+                    due.push((
+                        key.clone(),
+                        *service_id,
+                        *principal_id,
+                        watch.consumer.clone(),
+                    ));
+                }
+            }
+        }
+        for (key, service_id, principal_id, consumer) in due {
+            let catalog = self.catalog.clone();
+            let command_tx = self.command_tx.clone();
+            let cancel = self.options.shutdown.clone();
+            self.spawn_background(async move {
+                let read_started_at = Utc::now();
+                let authorized = catalog
+                    .authorize(
+                        &consumer,
+                        key.device_id,
+                        service_id,
+                        read_started_at,
+                        Utc::now(),
+                    )
+                    .await
+                    .map(|grant| {
+                        grant.is_some_and(|grant| {
+                            grant.permissions.allows(crate::HTTP_FORWARD_OPERATION)
+                                && grant.valid_until > Utc::now()
+                        })
+                    })
+                    .map_err(|_| ());
+                send_background_command(
+                    &cancel,
+                    &command_tx,
+                    Command::PrincipalWatchChecked {
+                        key,
+                        service_id,
+                        principal_id,
+                        authorized,
+                    },
+                )
+                .await;
+            });
+        }
+    }
+
+    /// A revoked watch sends `PRINCIPAL_SESSIONS_END` once and is dropped.
+    /// An unavailable catalog proves nothing either way, so the watch stays
+    /// and is re-read; the relay still refuses every request meanwhile.
+    fn finish_principal_watch(
+        &mut self,
+        key: &SessionKey,
+        service_id: Uuid,
+        principal_id: Uuid,
+        authorized: Result<bool, ()>,
+    ) {
+        let Some(watches) = self.principal_watches.get_mut(key) else {
+            return;
+        };
+        let entry = (service_id, principal_id);
+        let Some(watch) = watches.get_mut(&entry) else {
+            return;
+        };
+        watch.in_flight = false;
+        watch.next_check = Instant::now() + PRINCIPAL_WATCH_INTERVAL;
+        if authorized != Ok(false) {
+            return;
+        }
+        let tenant_id = watch.tenant_id;
+        watches.remove(&entry);
+        let binding = crate::http::forward::principal_binding(
+            tenant_id,
+            principal_id,
+            key.device_id,
+            service_id,
+        );
+        let sent = self
+            .send_control(
+                key,
+                wire::principal_sessions_end(
+                    &key.session_id,
+                    key.epoch,
+                    &service_id.to_string(),
+                    &binding,
+                    PRINCIPAL_SESSIONS_END_REASON,
+                ),
+            )
+            .is_ok();
+        self.http_forward_diagnostics
+            .record_principal_sessions_end(sent);
     }
 
     fn invalidate_stream_challenge(
