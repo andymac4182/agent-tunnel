@@ -162,6 +162,19 @@ impl LimitField {
         Self::SessionIdleSeconds,
     ];
 
+    /// Whether the descriptor advertises this field.
+    ///
+    /// Every field but `maxQueuedBytes` (task row M4-21, applied by default
+    /// pending owner confirmation, 2026-09-25): nothing enforces it yet, and a
+    /// descriptor that advertised a bound nothing applies would be claiming
+    /// one. The value stays in [`Limits`], where gate 1's cross-field rule
+    /// still checks it against `maxMessageBytes`, so advertising it again is a
+    /// one-line change once something binds it.
+    #[must_use]
+    pub const fn is_advertised(self) -> bool {
+        !matches!(self, Self::MaxQueuedBytes)
+    }
+
     /// The descriptor's exact field spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

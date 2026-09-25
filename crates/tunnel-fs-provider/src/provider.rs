@@ -166,6 +166,17 @@ impl<A: Authority> Provider<A> {
         !self.queue.is_empty()
     }
 
+    /// How many admitted requests are waiting for [`Provider::step`].
+    ///
+    /// The connector reads it around [`Provider::accept`] and
+    /// [`Provider::step`] to keep each request's admission instant beside the
+    /// provider's own queue, because the provider is clockless by design and
+    /// the request deadline (task row M4-21) is the connector's arithmetic.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Whether the reply this dispatcher just produced reports an effect that
     /// has already happened on the host.
     ///

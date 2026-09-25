@@ -193,7 +193,6 @@
         "maxMessageBytes",
         "maxInflightRequests",
         "maxFids",
-        "maxQueuedBytes",
         "maxBufferedFileBytes",
         "maxTotalBufferedBytes",
         "maxPathBytes",
@@ -222,6 +221,7 @@
           "maximum": 256
         },
         "maxQueuedBytes": {
+          "description": "Not advertised while nothing enforces it (task row M4-21, applied by default pending owner confirmation, 2026-09-25). Optional so a later provider that binds it can advertise it again; a client validates it when present.",
           "type": "integer",
           "minimum": 1,
           "maximum": 1048576

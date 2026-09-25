@@ -43,7 +43,6 @@
     "maxMessageBytes": 65536,
     "maxInflightRequests": 64,
     "maxFids": 256,
-    "maxQueuedBytes": 1048576,
     "maxBufferedFileBytes": 16777216,
     "maxTotalBufferedBytes": 33554432,
     "maxPathBytes": 4096,

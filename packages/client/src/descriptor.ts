@@ -85,7 +85,12 @@ export interface Limits {
   maxMessageBytes: number;
   maxInflightRequests: number;
   maxFids: number;
-  maxQueuedBytes: number;
+  /**
+   * Optional: not advertised while nothing enforces it (task row M4-21,
+   * applied by default pending owner confirmation, 2026-09-25). Validated when
+   * present, so a provider that binds it later can advertise it again.
+   */
+  maxQueuedBytes?: number;
   maxBufferedFileBytes: number;
   maxTotalBufferedBytes: number;
   maxPathBytes: number;
@@ -97,6 +102,9 @@ export interface Limits {
   maxOperationTimeoutSeconds: number;
   sessionIdleSeconds: number;
 }
+
+/** Limits a descriptor may omit (task row M4-21). Every other one is required. */
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set(['maxQueuedBytes']);
 
 /** The ceilings of the initial profile. Negotiation may only reduce them. */
 export const LIMIT_CEILINGS: Limits = {
@@ -272,6 +280,9 @@ export function validateDescriptor(value: unknown): Descriptor {
   refuseExtraKeys(limits, Object.keys(LIMIT_CEILINGS), 'limits');
   for (const [name, ceiling] of Object.entries(LIMIT_CEILINGS)) {
     const limit = limits[name];
+    if (limit === undefined && OPTIONAL_LIMITS.has(name)) {
+      continue;
+    }
     if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {
       // Neither zero nor a fraction, so there is no "0 means unlimited"
       // reading to be had on this side either.
@@ -287,7 +298,7 @@ export function validateDescriptor(value: unknown): Descriptor {
   }
   // The cross-field rules gate 1 enforces, checked here for the same reason:
   // a descriptor whose limits contradict one another cannot be honoured.
-  if (typed.limits.maxQueuedBytes < typed.limits.maxMessageBytes) {
+  if (typed.limits.maxQueuedBytes !== undefined && typed.limits.maxQueuedBytes < typed.limits.maxMessageBytes) {
     malformed('limits.maxQueuedBytes');
   }
   if (typed.limits.maxBufferedFileBytes > typed.limits.maxTotalBufferedBytes) {

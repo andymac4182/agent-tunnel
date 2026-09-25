@@ -268,6 +268,10 @@ pub struct FsExchangeReport {
     /// The session was closed because it stayed idle -- nothing queued,
     /// nothing received -- for the export's `sessionIdleSeconds` (M4-21).
     pub idle_timeout: bool,
+    /// The session was closed because a reply did not reach the carrier
+    /// within the export's `requestTimeoutSeconds` of its request's
+    /// admission (M4-21): the consumer stopped taking replies.
+    pub request_timeout: bool,
 }
 
 /// Serve one filesystem stream to completion.
@@ -340,6 +344,23 @@ async fn serve_unix(
     // one place on the device that has both the clock and the knowledge that
     // nothing is queued (task row M4-21). The provider is clockless by design.
     let idle = std::time::Duration::from_secs(export.limits.session_idle_seconds());
+    // The descriptor's `requestTimeoutSeconds`, applied to every reply (task
+    // row M4-21, applied by default pending owner confirmation, 2026-09-25).
+    // A 9P request carries no deadline of its own, so the device applies the
+    // single-request deadline it advertises: each reply must reach the
+    // carrier within that long of its request's admission. The one place a
+    // request can wait without bound on the device is a reply send the
+    // consumer is not taking credit for; without this a consumer that
+    // pipelined requests and stopped reading held the session, its fids and
+    // its root descriptor for as long as it kept the socket open, because
+    // queued work is never idle. `gate 1` keeps this value at or below
+    // `defaultOperationTimeoutSeconds` and `maxOperationTimeoutSeconds`, so
+    // no device-side operation outlives either.
+    let request_timeout = std::time::Duration::from_secs(export.limits.request_timeout_seconds());
+    // The admission instant of each request the provider has queued, oldest
+    // first, kept beside the provider's own FIFO queue by its length.
+    let mut admitted: std::collections::VecDeque<tokio::time::Instant> =
+        std::collections::VecDeque::new();
     // Admitting **every request already available** takes priority over
     // performing a queued one.
     //
@@ -383,7 +404,15 @@ async fn serve_unix(
         let bytes = match ready {
             // Nothing is waiting to be read: perform one queued request.
             None => {
-                if emit(&outbound, provider.step(), &mut provider, &mut report).await {
+                let before = provider.queued();
+                let performed = provider.step();
+                let mut deadline = tokio::time::Instant::now() + request_timeout;
+                for _ in provider.queued()..before {
+                    if let Some(at) = admitted.pop_front() {
+                        deadline = at + request_timeout;
+                    }
+                }
+                if emit(&outbound, performed, &mut provider, &mut report, deadline).await {
                     break 'stream;
                 }
                 continue;
@@ -411,8 +440,21 @@ async fn serve_unix(
             };
             // Only the answers that need no host work — the version handshake
             // and `Tflush` — come back here; everything else is queued.
-            let admitted = provider.accept(&decoded);
-            if emit(&outbound, admitted, &mut provider, &mut report).await {
+            let arrived = tokio::time::Instant::now();
+            let before = provider.queued();
+            let answered = provider.accept(&decoded);
+            for _ in before..provider.queued() {
+                admitted.push_back(arrived);
+            }
+            if emit(
+                &outbound,
+                answered,
+                &mut provider,
+                &mut report,
+                arrived + request_timeout,
+            )
+            .await
+            {
                 break 'stream;
             }
             // The decoder's bound follows the negotiation, reduction only and
@@ -439,6 +481,7 @@ async fn emit(
     outbounds: Vec<Outbound>,
     provider: &mut Provider<SharedAuthority>,
     report: &mut FsExchangeReport,
+    deadline: tokio::time::Instant,
 ) -> bool {
     for out in outbounds {
         match out {
@@ -460,11 +503,26 @@ async fn emit(
                 // rather than guessed either way. Reaching the carrier is all a
                 // device can ever confirm, and the contract is explicit that it
                 // proves neither the side effect nor its delivery.
-                if outbound.send_data(Bytes::from(record)).await.is_err() {
-                    provider.note_effect_undelivered();
-                    return true;
+                match tokio::time::timeout_at(deadline, outbound.send_data(Bytes::from(record)))
+                    .await
+                {
+                    Ok(Ok(())) => provider.confirm_effect_delivered(),
+                    Ok(Err(_)) => {
+                        provider.note_effect_undelivered();
+                        return true;
+                    }
+                    Err(_) => {
+                        // The request deadline passed with the reply still
+                        // outside the carrier (task row M4-21). Its effect,
+                        // if it had one, is `unknown`: it happened and the
+                        // consumer was never told.
+                        provider.note_effect_undelivered();
+                        report.request_timeout = true;
+                        report.closed_with = Some(SessionErrorCode::DeadlineExceeded);
+                        emit_close(outbound, SessionErrorCode::DeadlineExceeded).await;
+                        return true;
+                    }
                 }
-                provider.confirm_effect_delivered();
             }
             Outbound::Close(code) => {
                 report.closed_with = Some(code);
@@ -476,11 +534,18 @@ async fn emit(
     false
 }
 
+/// How long a close record may wait for carrier credit before the session
+/// ends without it. The close is a courtesy the consumer may never read -- a
+/// consumer that stopped taking replies is exactly the one that also withholds
+/// the credit this needs -- so it is bounded rather than awaited (M4-21).
+#[cfg(unix)]
+const CLOSE_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[cfg(unix)]
 async fn emit_close(outbound: &FrameSender, code: SessionErrorCode) {
     let mut record = Vec::with_capacity(6);
     encode_close(code, &mut record);
-    let _ = outbound.send_data(Bytes::from(record)).await;
+    let _ = tokio::time::timeout(CLOSE_RECORD_GRACE, outbound.send_data(Bytes::from(record))).await;
 }
 
 /// The capabilities both the relay's OPEN and the local allowlist name.
@@ -606,6 +671,71 @@ mod tests {
             }
             other => panic!("expected the close record, got {other:?}"),
         }
+    }
+
+    /// Task row M4-21: the descriptor advertises `requestTimeoutSeconds`, and
+    /// until this nothing on the device applied it. A consumer that sends a
+    /// request and then takes no reply credit held the session for ever: a
+    /// session with queued or unsent work is never idle, so the idle limit
+    /// could not end it either. Now the reply must reach the carrier within
+    /// the request deadline of the request's admission, or the device closes
+    /// the session with gate 1's deadline code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reply_the_consumer_never_takes_is_bounded_by_the_request_deadline() {
+        use tunnel_fs_core::{Limits, SessionErrorCode};
+        let root = tempfile::tempdir().expect("synthetic export root");
+        let limits = Limits::new([
+            65_536, 64, 256, 1_048_576, 16_777_216, 33_554_432, 4_096, 256, 10_000, 64,
+            1, // requestTimeoutSeconds: the smallest value gate 1 admits
+            300, 3_600, 300,
+        ])
+        .expect("valid limits");
+        assert_eq!(limits.request_timeout_seconds(), 1);
+        assert_eq!(
+            limits.session_idle_seconds(),
+            300,
+            "idle cannot be what ends it"
+        );
+        let export = super::FsExport {
+            limits,
+            ..super::FsExport::read_only(root.path())
+        };
+        let grant = CapabilitySet::from_slice(&[Capability::Read, Capability::List]);
+        let authority = Arc::new(StreamAuthority::new(1, grant));
+        let (inbound_tx, inbound_rx, _) = tunnel_http_bridge::channel(65_536);
+        // Eight bytes of carrier credit, never replenished: the receiver is
+        // held and never read, so an `Rversion` cannot be sent whole.
+        let (outbound_tx, _outbound_rx, _) = tunnel_http_bridge::channel(8);
+        let mut version = Vec::new();
+        tunnel_fs_ninep::Frame::new(
+            tunnel_fs_ninep::NOTAG,
+            tunnel_fs_ninep::Message::Tversion {
+                msize: 65_536,
+                version: tunnel_fs_ninep::DIALECT.to_owned(),
+            },
+        )
+        .encode(65_536, &mut version)
+        .expect("encode Tversion");
+        inbound_tx
+            .send_data(bytes::Bytes::from(version))
+            .await
+            .expect("queue the request");
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::serve(export, grant, authority, inbound_rx, outbound_tx),
+        )
+        .await
+        .expect("a reply the consumer never takes must end at the request deadline");
+        assert!(report.request_timeout);
+        assert!(!report.idle_timeout);
+        assert_eq!(report.closed_with, Some(SessionErrorCode::DeadlineExceeded));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "not before the deadline"
+        );
+        drop(inbound_tx);
     }
 
     #[test]
