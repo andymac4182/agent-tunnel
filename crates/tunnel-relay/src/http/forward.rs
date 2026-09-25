@@ -2346,6 +2346,33 @@ mod tests {
         }
     }
 
+    /// M6-C58, the ACP profile (HTTP/2 only): the same two stock headers
+    /// are dropped rather than refusing the request.
+    #[test]
+    fn a_stock_clients_default_headers_reach_an_acp_export() {
+        let policies = tunnel_acp::AcpProfile::HttpV1
+            .policies(tunnel_acp::AcpLimits::default())
+            .expect("ACP profile");
+        let stock = || {
+            http::Request::post(tunnel_acp::ACP_ENDPOINT_PATH)
+                .version(http::Version::HTTP_2)
+                .header("user-agent", "stock-client/1.0")
+                .header("accept", "application/json, text/event-stream")
+                .header("accept-encoding", "gzip")
+                .header("content-type", "application/json")
+                .header("content-length", "2")
+                .body(())
+                .expect("request")
+                .into_parts()
+                .0
+        };
+        assert!(tunnel_http_bridge::normalize::request_head(&stock(), &policies.request).is_err());
+        let mut stripped = stock();
+        strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
+        tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
+            .unwrap_or_else(|error| panic!("a stock ACP client's head was refused: {error:?}"));
+    }
+
     /// Gate 5: a service selects its profile only through the catalog
     /// capability, and anything unlisted selects nothing.
     #[test]
