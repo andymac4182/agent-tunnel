@@ -313,6 +313,33 @@ against the pinned 0.3.46 source rather than a probe:
   itself unmeasured). Where a real device
   gets the declaration from is an owner decision that needs a probe (M5-C02).
 
+### The device export (Lane B)
+
+`tunnel-client` serves a `computer-v1` export only in a build with the
+non-default `cua` feature, and only when `AGENT_TUNNEL_CUA_LANE_B=1` is set
+(task row M5-C21); the relay routes the profile like MCP and ACP. The export
+supervises the backend (above), probes it read-only, negotiates the
+intersection of its `[exports.<id>.cua]` operations, the backend's
+`/commands` and the caller's grant, and answers through the device-side
+facade. Three wire-level facts from the first run against the real server:
+`/commands` is an object keyed by command name (M5-C27), `/cmd` over HTTP/1.1
+is `Transfer-Encoding: chunked` (M5-C22), and a stock client's `accept` is
+dropped at the ingress for this profile (M5-C26).
+
+- **Sessions** are keyed by the relay's opaque principal binding, so each
+  authenticated principal has its own input lease and capture identities.
+- **The lease has a wire form** in this export, pending owner confirmation
+  (M5-C20): `acquire_input_lease` and `release_input_lease`, with empty
+  `params`, are answered locally (`answered_locally`) before the schema
+  sees the body.
+- **The display scale** comes from a declared point space (`point_width`,
+  `point_height`; M5-C19 option (b), applied by default pending owner
+  confirmation). Each capture's ratio is derived from its own PNG, and a
+  declaration that the capture or the backend's `get_screen_size`
+  contradicts refuses every coordinate.
+
+The recipe, run against a Linux guest, is [docs/demo/cua.md](demo/cua.md).
+
 ### Authentication and platform limits
 
 Computer Server defaults to `127.0.0.1`. In the inspected `/cmd` and `/ws` paths,
