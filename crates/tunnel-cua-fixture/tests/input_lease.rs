@@ -31,7 +31,7 @@ use tunnel_cua::Operation;
 use tunnel_cua::capture::CaptureRefusal;
 use tunnel_cua::endpoint::BackendEndpoint;
 use tunnel_cua::lease::{GrantRevision, LeaseRefusal, SessionId, TargetSession};
-use tunnel_cua::outcome::{Completion, Dispatch, InputRefusal, NotDispatched};
+use tunnel_cua::outcome::{Completion, Dispatch, InputRefusal, NotDispatched, UnknownReason};
 use tunnel_cua::schema::{Response, ResponseOutcome};
 
 use tunnel_cua_fixture::client::{DeviceState, Dispatcher, SessionFacade, request_body};
@@ -46,8 +46,13 @@ fn target() -> TargetSession {
 /// A device with two sessions on it, both fully granted, both pointed at the
 /// same target OS session. This is the two-agent situation the lease exists
 /// for.
+///
+/// The device is **told** its display scale is 1x, explicitly: the pinned
+/// server reports none, so an undeclared scale refuses every coordinate
+/// (M5-C14). A test that changes the fixture's scale declares the new one too.
 fn two_agents(backend: &FixtureBackend) -> (Arc<DeviceState>, SessionFacade, SessionFacade) {
     let state = DeviceState::new();
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let endpoint = BackendEndpoint::new(backend.address()).expect("the fixture binds loopback");
     let facade = |session| {
         SessionFacade::new(
@@ -98,7 +103,8 @@ fn click(capture: u64, x: u32, y: u32) -> Vec<u8> {
 async fn a_drag_records_the_start_of_its_path_through_the_display_scale() {
     let backend = FixtureBackend::start().await.unwrap();
     backend.capture_scale().set(200);
-    let (_state, agent, _idle) = two_agents(&backend);
+    let (state, agent, _idle) = two_agents(&backend);
+    state.declare_scale_percent(Some(200));
     agent.acquire_input_lease().expect("the target is free");
     let identity = capture(&agent).await;
 
@@ -122,6 +128,7 @@ async fn a_drag_records_the_start_of_its_path_through_the_display_scale() {
     // so the assertion above is reading the path and the scale rather than a
     // constant that happens to match.
     backend.capture_scale().set(100);
+    state.declare_scale_percent(Some(100));
     let unscaled = capture(&agent).await;
     agent
         .handle(
@@ -391,7 +398,8 @@ async fn an_input_operation_that_reached_the_backend_is_never_retryable() {
 async fn a_capture_identity_and_its_display_scale_flow_into_the_click() {
     let backend = FixtureBackend::start().await.unwrap();
     backend.capture_scale().set(200);
-    let (_state, agent, _idle) = two_agents(&backend);
+    let (state, agent, _idle) = two_agents(&backend);
+    state.declare_scale_percent(Some(200));
     agent.acquire_input_lease().unwrap();
 
     let dispatch = agent
@@ -400,9 +408,19 @@ async fn a_capture_identity_and_its_display_scale_flow_into_the_click() {
     let Dispatch::Dispatched(Completion::Ok(result)) = dispatch else {
         panic!("a capture should succeed");
     };
-    assert_eq!(result["width"], json!(u32::from(SCREEN_WIDTH) * 2));
-    assert_eq!(result["height"], json!(u32::from(SCREEN_HEIGHT) * 2));
-    assert_eq!(result["scale_percent"], json!(200));
+    // **The dimensions come from the PNG, because nothing else carries
+    // them** (M5-C14): the response is the released
+    // `{success, image_data, format}` and has no `width`, `height` or scale.
+    assert_eq!(
+        tunnel_cua::image::capture_dimensions(&result),
+        Ok((u32::from(SCREEN_WIDTH) * 2, u32::from(SCREEN_HEIGHT) * 2))
+    );
+    for absent in ["width", "height", "scale_percent"] {
+        assert!(
+            result.get(absent).is_none(),
+            "the released server never sends `{absent}`, so neither may the fixture"
+        );
+    }
     let identity = result["capture"].as_u64().expect("an identity was issued");
 
     agent.handle(&click(identity, 100, 80), LIMIT).await;
@@ -415,9 +433,168 @@ async fn a_capture_identity_and_its_display_scale_flow_into_the_click() {
     // The control: the same pixel through a 1x capture arrives unchanged, so
     // the assertion above is reading the scale and not a constant.
     backend.capture_scale().set(100);
+    state.declare_scale_percent(Some(100));
     let unscaled = capture(&agent).await;
     agent.handle(&click(unscaled, 100, 80), LIMIT).await;
     assert_eq!(backend.ledger().points(), vec![(50, 40), (100, 80)]);
+    backend.stop();
+}
+
+/// **M5-C14: a capture whose scale nobody declared refuses every
+/// coordinate, instead of assuming 1x.**
+///
+/// The fixture serves a 2x capture in the released shape -- a 256x192 PNG and
+/// nothing else, exactly what a real 2x display returns. Before M5-C14 the
+/// device either issued no identity (reading `width` members that do not
+/// exist) or, once it read the PNG, defaulted the scale to 1x and clicked at
+/// (100, 80) instead of (50, 40). Now the identity is issued, the point is
+/// bounds-checked against the real image, and the click is refused by name
+/// with nothing dispatched.
+#[tokio::test]
+async fn a_capture_whose_scale_nobody_declared_refuses_every_coordinate() {
+    let backend = FixtureBackend::start().await.unwrap();
+    backend.capture_scale().set(200);
+    let (state, agent, _idle) = two_agents(&backend);
+    state.declare_scale_percent(None);
+    agent.acquire_input_lease().unwrap();
+    let identity = capture(&agent).await;
+    let clicks = backend.ledger().pointer_clicks();
+
+    for body in [
+        click(identity, 100, 80),
+        request_body("move", json!({"capture": identity, "x": 100, "y": 80})),
+        request_body(
+            "drag",
+            json!({"capture": identity, "x": 100, "y": 80, "to_x": 120, "to_y": 60}),
+        ),
+    ] {
+        assert_eq!(
+            agent.handle(&body, LIMIT).await,
+            Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Capture(
+                CaptureRefusal::ScaleUndeclared
+            )))
+        );
+    }
+    assert_eq!(backend.ledger().pointer_clicks(), clicks);
+    assert!(
+        backend.ledger().points().is_empty(),
+        "no coordinate may reach the backend without a declared scale"
+    );
+
+    // The bounds check still runs first, against the dimensions read from the
+    // PNG: a point outside the 256x192 image is refused as outside, so the
+    // identity really does carry the real geometry.
+    assert_eq!(
+        agent.handle(&click(identity, 256, 0), LIMIT).await,
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Capture(
+            CaptureRefusal::OutsideCapture
+        )))
+    );
+
+    // Keyboard input carries no coordinate and is unaffected.
+    assert!(matches!(
+        agent
+            .handle(&request_body("press_key", json!({"key": "a"})), LIMIT)
+            .await,
+        Dispatch::Dispatched(Completion::Ok(_))
+    ));
+
+    // **The control.** Declare the scale and capture again, and the same
+    // pixel arrives converted, so the refusal above was the missing
+    // declaration and not a device that refuses every click.
+    state.declare_scale_percent(Some(200));
+    let declared = capture(&agent).await;
+    assert!(matches!(
+        agent.handle(&click(declared, 100, 80), LIMIT).await,
+        Dispatch::Dispatched(Completion::Ok(_))
+    ));
+    assert_eq!(backend.ledger().points(), vec![(50, 40)]);
+    backend.stop();
+}
+
+/// **M5-04: a cancelled click says what is known about its effect, and is
+/// never repeated.**
+///
+/// Cancellation abandons the *answer*, not the effect. Three legs, each judged
+/// on the fixture's click counter rather than on what the client believes:
+///
+/// 1. Cancelled **after** the backend performed the click (it is in the
+///    ledger, and the backend never answers): the outcome is `Unknown`, not
+///    retryable, and the counter reads one click.
+/// 2. Nothing sends it again: the counter still reads one click after the
+///    exchange has had every chance to be repeated.
+/// 3. Cancelled **before** anything was written: `NotDispatched`, retryable,
+///    and the counter is unchanged -- the control that the first leg's
+///    `Unknown` is about the stage the cancellation hit, not about
+///    cancellation as such.
+///
+/// The obvious composition -- racing `handle` against the cancellation and
+/// calling a cancelled exchange not dispatched -- reports leg 1 as retryable
+/// while the click has already landed. That is the red this test was written
+/// against.
+#[tokio::test]
+async fn a_cancelled_click_reports_what_is_known_and_is_never_repeated() {
+    let backend = FixtureBackend::start().await.unwrap();
+    let (_state, agent, _idle) = two_agents(&backend);
+    agent.acquire_input_lease().unwrap();
+    let identity = capture(&agent).await;
+    let before = backend.ledger().pointer_clicks();
+
+    // Leg 1: the backend records the click and then never answers, and the
+    // consumer cancels once the click has demonstrably happened.
+    backend.faults().set("left_click", Fault::HangAfterLedger);
+    let ledger = backend.ledger().clone();
+    let landed = async move {
+        while ledger.pointer_clicks() == before {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    };
+    let cancelled_late = agent
+        .handle_until(&click(identity, 3, 4), LIMIT, landed)
+        .await;
+    assert_eq!(
+        cancelled_late,
+        Dispatch::Dispatched(Completion::Unknown(UnknownReason::Cancelled)),
+        "a click cancelled after it reached the backend has an unknown outcome"
+    );
+    assert!(!cancelled_late.retry_is_safe_for(Operation::Click));
+    assert_eq!(
+        Response::not_dispatched_for(Operation::Click, NotDispatched::Cancelled, "x", "y")
+            .error
+            .map(|error| error.retryable),
+        Some(true),
+        "the wire keeps the two cancellations apart"
+    );
+    assert_eq!(backend.ledger().pointer_clicks(), before + 1);
+
+    // Leg 2: nothing repeats it. Give any automatic retry time to happen,
+    // then read the counter again.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        backend.ledger().pointer_clicks(),
+        before + 1,
+        "a cancelled click must never be sent again automatically"
+    );
+
+    // Leg 3, the control: cancelled before a byte is written.
+    backend.faults().set("left_click", Fault::None);
+    let cancelled_early = agent
+        .handle_until(&click(identity, 3, 4), LIMIT, std::future::ready(()))
+        .await;
+    assert_eq!(
+        cancelled_early,
+        Dispatch::NotDispatched(NotDispatched::Cancelled)
+    );
+    assert!(cancelled_early.retry_is_safe_for(Operation::Click));
+    assert_eq!(backend.ledger().pointer_clicks(), before + 1);
+
+    // And an uncancelled click still lands exactly once, so the counter is
+    // live and leg 3's "unchanged" is a measurement.
+    assert!(matches!(
+        agent.handle(&click(identity, 3, 4), LIMIT).await,
+        Dispatch::Dispatched(Completion::Ok(_))
+    ));
+    assert_eq!(backend.ledger().pointer_clicks(), before + 2);
     backend.stop();
 }
 
@@ -494,6 +671,7 @@ async fn a_stale_or_mismatched_capture_coordinate_never_reaches_the_backend() {
 async fn a_capture_from_another_target_does_not_authorize_a_click() {
     let backend = FixtureBackend::start().await.unwrap();
     let state = DeviceState::new();
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
     let here = SessionFacade::new(
         Arc::clone(&state),
@@ -530,15 +708,20 @@ async fn a_capture_from_another_target_does_not_authorize_a_click() {
     backend.stop();
 }
 
-/// **M3-16 end to end: what a revoked grant does to a held lease.**
+/// **M3-16 end to end: what a revoked grant does to a held lease (M5-C05).**
 ///
-/// Both halves, because only one of them is closed. The holder is refused at
-/// the point of use as soon as the device believes the revision advanced; the
-/// target stays blocked until the lease is reconciled away; and nothing in
-/// this repository drives either, because nothing tells a device that a grant
-/// was revoked. See `docs/tasks.md` M5-C05.
+/// The moment the device learns that the grant behind a lease has moved, the
+/// lease stops being honoured -- for **use** and for **exclusion**, in one
+/// step. Before M5-C05 only the first half held: the holder was refused, but
+/// the entry stayed, so the second agent was refused by a lease nobody could
+/// use until something called `reconcile_grant`, and nothing did.
+///
+/// What this does not show, and why: nothing in this repository tells a
+/// device that a grant moved. Delivering that signal is M3-16's option (c), a
+/// protocol addition queued as an owner decision. This pins what a device does
+/// on receipt, so that decision is about delivery alone.
 #[tokio::test]
-async fn a_revoked_grant_refuses_the_holder_but_only_a_reconcile_frees_the_target() {
+async fn a_revoked_grant_stops_the_lease_being_honoured_the_moment_the_device_learns_of_it() {
     let backend = FixtureBackend::start().await.unwrap();
     let (state, mut first, second) = two_agents(&backend);
     first.acquire_input_lease().unwrap();
@@ -549,55 +732,130 @@ async fn a_revoked_grant_refuses_the_holder_but_only_a_reconcile_frees_the_targe
     ));
     let clicks = backend.ledger().pointer_clicks();
 
-    // The device learns that the grant behind the lease has moved on.
-    first.note_grant_revision(GrantRevision::new(1));
-
-    // Half one, closed: the holder is refused, and nothing is dispatched.
-    let refused = first.handle(&click(identity, 1, 1), LIMIT).await;
-    assert_eq!(
-        refused,
-        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
-            LeaseRefusal::GrantRevoked
-        )))
-    );
-    assert_eq!(backend.ledger().pointer_clicks(), clicks);
-
-    // **And the holder cannot lift its own refusal by taking the lease
-    // again**, which is the obvious client response to one and is what review
-    // found this test stopping short of. If it could, the refusal above would
-    // be advisory and the reconcile below would free nothing.
-    assert_eq!(
-        first.acquire_input_lease().map(|_| ()),
-        Err(LeaseRefusal::GrantRevoked)
-    );
-    let still_refused = first.handle(&click(identity, 1, 1), LIMIT).await;
-    assert_eq!(
-        still_refused,
-        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
-            LeaseRefusal::GrantRevoked
-        )))
-    );
-    assert_eq!(backend.ledger().pointer_clicks(), clicks);
-
-    // Half two, open: the target is still blocked, by a lease nobody may use.
+    // **The control.** Before the device learns anything, the lease is
+    // genuinely exclusive: the second agent is refused because the first
+    // holds it, so the release below is a change and not a lease that was
+    // never held.
     assert_eq!(
         second.acquire_input_lease().map(|_| ()),
         Err(LeaseRefusal::HeldByAnotherSession)
     );
     assert_eq!(state.holder(&target()), Some(first.session()));
 
-    // Only an explicit reconcile frees it — and nothing calls this in
-    // production, which is exactly what M5-C05 records.
-    let freed = state.reconcile_grant(first.session(), GrantRevision::new(1));
-    assert_eq!(freed, vec![target()]);
+    // The device learns that the grant behind the lease has moved on, and
+    // the lease it authorized is released in the same step.
+    let freed = first.note_grant_revision(GrantRevision::new(1));
+    assert_eq!(
+        freed,
+        vec![target()],
+        "learning the revision must free the target"
+    );
+    assert_eq!(state.holder(&target()), None);
+
+    // Use: the superseded holder is refused and nothing is dispatched. It is
+    // `NotHeld` now rather than `GrantRevoked`, because there is no holding
+    // left to be revoked.
+    let refused = first.handle(&click(identity, 1, 1), LIMIT).await;
+    assert_eq!(
+        refused,
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
+            LeaseRefusal::NotHeld
+        )))
+    );
+    assert_eq!(backend.ledger().pointer_clicks(), clicks);
+
+    // Exclusion: the second agent takes the target at once, with no
+    // reconcile anywhere in this test, and acts on it.
     second
         .acquire_input_lease()
-        .expect("the target is free now");
+        .expect("the target must be free as soon as the device learned the revision");
     let theirs = capture(&second).await;
     assert!(matches!(
         second.handle(&click(theirs, 1, 1), LIMIT).await,
         Dispatch::Dispatched(Completion::Ok(_))
     ));
+    assert_eq!(backend.ledger().pointer_clicks(), clicks + 1);
+
+    // And the superseded session cannot take it back while it is held.
+    assert_eq!(
+        first.acquire_input_lease().map(|_| ()),
+        Err(LeaseRefusal::HeldByAnotherSession)
+    );
+    backend.stop();
+}
+
+/// **A stale revision changes nothing.** Revisions are monotonic, so a
+/// delivery at or below the recorded one is out of order: it must neither move
+/// the session's belief backwards nor free anything.
+#[tokio::test]
+async fn a_stale_grant_revision_is_ignored_and_frees_nothing() {
+    let backend = FixtureBackend::start().await.unwrap();
+    let (state, mut first, _second) = two_agents(&backend);
+    assert_eq!(
+        first.note_grant_revision(GrantRevision::new(5)),
+        Vec::<TargetSession>::new()
+    );
+    assert_eq!(first.grant_revision(), GrantRevision::new(5));
+    first.acquire_input_lease().unwrap();
+
+    for stale in [4, 5, 0] {
+        assert!(
+            first
+                .note_grant_revision(GrantRevision::new(stale))
+                .is_empty(),
+            "revision {stale} is not an advance"
+        );
+        assert_eq!(
+            first.grant_revision(),
+            GrantRevision::new(5),
+            "revision {stale}"
+        );
+        assert_eq!(state.holder(&target()), Some(first.session()));
+    }
+
+    // The control: an advance still frees the lease, so the ignores above are
+    // the monotonicity rule and not a method that frees nothing.
+    assert_eq!(
+        first.note_grant_revision(GrantRevision::new(6)),
+        vec![target()]
+    );
+    assert_eq!(first.grant_revision(), GrantRevision::new(6));
+    backend.stop();
+}
+
+/// **Ending a device-side session releases its lease** -- the device-local
+/// half of M3-16 option (c), which is what a *revoked* (not merely changed)
+/// grant needs. `DeviceState::end_session` is what a device would call on
+/// receiving the queued control message; this pins its effect.
+#[tokio::test]
+async fn ending_a_session_releases_its_lease_and_only_its_lease() {
+    let backend = FixtureBackend::start().await.unwrap();
+    let (state, first, second) = two_agents(&backend);
+    first.acquire_input_lease().unwrap();
+    let other = TargetSession::new("console:2");
+    let elsewhere = SessionFacade::new(
+        Arc::clone(&state),
+        Dispatcher::new(
+            BackendEndpoint::new(backend.address()).unwrap(),
+            BTreeSet::from(Operation::ALL),
+        ),
+        second.session(),
+        other.clone(),
+    );
+    elsewhere.acquire_input_lease().unwrap();
+
+    // Ending the second session frees only what the second session held.
+    assert_eq!(state.end_session(second.session()), vec![other.clone()]);
+    assert_eq!(state.holder(&other), None);
+    assert_eq!(state.holder(&target()), Some(first.session()));
+
+    // Ending the first frees the target, and a session that held nothing
+    // frees nothing -- so the first call above was a measurement.
+    assert_eq!(state.end_session(first.session()), vec![target()]);
+    assert!(state.end_session(first.session()).is_empty());
+    second
+        .acquire_input_lease()
+        .expect("the target is free once its holder's session ended");
     backend.stop();
 }
 
@@ -662,10 +920,7 @@ async fn the_ledger_agrees_with_the_client_for_every_input_operation() {
             "drag",
             json!({"capture": c, "x": 1, "y": 1, "to_x": 3, "to_y": 3}),
         ),
-        request_body(
-            "scroll",
-            json!({"capture": c, "x": 1, "y": 1, "dx": 0, "dy": -2}),
-        ),
+        request_body("scroll", json!({"dx": 0, "dy": -2})),
         request_body("type_text", json!({"text": "hi"})),
         request_body("press_key", json!({"key": "Return"})),
         request_body("hotkey", json!({"keys": ["cmd", "c"]})),

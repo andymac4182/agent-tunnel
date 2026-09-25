@@ -290,11 +290,20 @@ EXPECTED_MODULE_FILTERS = 9
 #: one.
 EXPECTED_GUARD_ANCHORS = {
     "fs-guard-deletion.py": 485,
-    "acp-guard-deletion.py": 148,
+    # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
+    # `availability()`. Re-measured, not incremented: 150 first, which fails
+    # naming acp ("found 149"), then 149.
+    "acp-guard-deletion.py": 149,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
-    "m5-guard-deletion.py": 100,
+    #
+    # **110** on `m5-code`, measured: the `m5c9` suite (10 cases, one anchor
+    # each) took `--check-anchors` from 100 to 110 across 8 suites, and a floor
+    # left at 100 would have passed with the whole suite deleted (Opus review
+    # of `fc920f8`). Re-measured, not incremented: 111 first, which fails
+    # naming m5 ("found 110"), then 110.
+    "m5-guard-deletion.py": 110,
     # Was 5. Measured at the m6c4 tip: 12 anchors across 3 suites -- the seven
     # M6-C08 resolution rules and the `m6c08-doctor` suite for the surface
     # that reports them. (11 before the Fable review, which added the
@@ -327,7 +336,13 @@ EXPECTED_GUARD_ANCHORS = {
     #
     # Then **27**, for review S2's carrier-loss case in the same suite.
     # Re-measured the same way: 28 first, which fails naming m3, then 27.
-    "m3-guard-deletion.py": 27,
+    #
+    # Then **34**, measured by the M5-C16 worker: `--check-anchors` reported
+    # 34 across 11 suites with the new `m3c09` availability case, so the floor
+    # had been lagging six behind the truth before that case was added (not
+    # attributed here to the suites that landed without raising it). Re-measured the same way:
+    # 35 first, which fails naming m3 ("found 34"), then 34.
+    "m3-guard-deletion.py": 34,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
@@ -339,7 +354,11 @@ EXPECTED_GUARD_ANCHORS = {
     # m6's two is small because most of its cases plant inputs rather than
     # edit code, and that is the honest figure: a floor set to the number of
     # *cases* would pass while the anchored ones rotted.
-    "m0-guard-exit-codes.py": 13,
+    #
+    # m0 raised 13 -> **44** after merging #140, re-measured rather than
+    # carried: `--check-anchors` reports 44 across 3 suites, and 45 fails
+    # naming m0. The floor had gone slack by 31 without anyone noticing.
+    "m0-guard-exit-codes.py": 44,
     "m6-guard-client-bundle-sentinel.py": 2,
 }
 
@@ -1141,6 +1160,10 @@ def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
     #: fs-guard-deletion's gate7, gate8, gate10 and gate11 (127) -> 163;
     #: its gate6-adapters, gate6-e2e, gate12, gate13 and gate14 (160) -> 3.
     #: The 3 left are acp cases that no run could witness (M4-42).
+    #: `m5-code` (#140) independently struck `[m5c7] the scroll deltas may
+    #: be dropped for constants` (renamed from "...for the cursor point"
+    #: after M5-C13) with a measured witness; M4-42 had already witnessed
+    #: it under the old name, so the merged figure stays 3.
     PINNED_WITNESS_DEBT = 3
 
     directory = Path(__file__).resolve().parent

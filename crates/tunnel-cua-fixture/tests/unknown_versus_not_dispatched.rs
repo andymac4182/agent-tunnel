@@ -75,9 +75,12 @@ async fn the_fault_table_agrees_with_the_ledger_row_by_row() {
     let rows = [
         Row {
             fault: Fault::None,
+            // The released `get_screen_size` shape (M5-C14).
             expected: Dispatch::Dispatched(Completion::Ok(json!({
-                "width": tunnel_cua_fixture::SCREEN_WIDTH,
-                "height": tunnel_cua_fixture::SCREEN_HEIGHT,
+                "size": {
+                    "width": tunnel_cua_fixture::SCREEN_WIDTH,
+                    "height": tunnel_cua_fixture::SCREEN_HEIGHT,
+                },
             }))),
             ledger_entries_added: 1,
         },

@@ -2466,6 +2466,31 @@ C7_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    (
+        # Task row M5-C16, the ACP copy of M5-C11's `m5c8` case.  The sentinel
+        # tests in `process_residue.rs` now *skip*, naming themselves, when
+        # `availability()` says the helper is absent -- so an `availability()`
+        # that reported it missing whatever is on disk would skip every one of
+        # them and the coverage would vanish silently.  This defeats it into
+        # exactly that.  `C7_BUILD` is load-bearing here rather than
+        # boilerplate: with no helper beside the tests the control correctly
+        # asserts `false == false` and this case would report `still green`
+        # over a rule that was never exercised.  Its witness is declared in
+        # `WITNESSES` below rather than owed in the debt ledger.
+        "a present ACP sentinel helper cannot be reported as missing",
+        [
+            (
+                DEADMAN_LIB,
+                """    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
+    }""",
+                "    Availability::SentinelMissing",
+            )
+        ],
+        False,
+    ),
 ]
 
 
@@ -2602,6 +2627,11 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: A case not listed here is still owed a witness and is named in
 #: `scripts/guard_witness_debt.json`; the ledger can only shrink, and a case may
 #: not appear in both.
+#:
+#: **One entry predates M4-42's sweep and is not a moved debt (task row
+#: M5-C16).**  `[m8c7] a present ACP sentinel helper cannot be reported as
+#: missing` was added with its witness declared from the start, so it never
+#: entered the ledger; its witness was measured red from this harness.
 WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c1', 'a GET and a DELETE must name their connection'): frozenset({'message::tests::a_delete_must_name_its_connection', 'message::tests::a_get_must_accept_the_event_stream_and_name_its_connection'}),
     ('m8c1', 'a GET must accept text/event-stream'): frozenset({'message::tests::a_get_must_accept_the_event_stream_and_name_its_connection'}),
@@ -2744,6 +2774,9 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c7', 'an orderly ACP shutdown stands the sentinel down rather than letting it fire'): frozenset({'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it'}),
     ('m8c7', 'every ACP stdio child is watched by a parent-death sentinel'): frozenset({'a_setsid_descendant_escapes_even_with_the_sentinel_armed', 'a_sigkilled_supervisor_still_kills_the_group', 'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it'}),
     ('m8c7', "the probe's helper is in the supervised child's group, not a group of its own"): frozenset({'a_sigkilled_supervisor_still_kills_the_group', 'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it', 'the_group_kill_reaches_an_in_group_helper', 'without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group'}),
+    ("m8c7", "a present ACP sentinel helper cannot be reported as missing"): frozenset(
+        {"the_skip_cannot_hide_a_helper_that_is_on_disk"}
+    ),
 }
 
 #: The pinned ledger, loaded once.

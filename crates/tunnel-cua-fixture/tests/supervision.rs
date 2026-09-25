@@ -376,6 +376,8 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     let journal = workspace.path().join(JOURNAL_FILE);
     let mut guard = PidGuard::new();
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
 
     // The backend hangs on `left_click`: it records the effect and then never
@@ -543,6 +545,8 @@ async fn the_same_restart_is_only_named_a_restart_by_a_dispatcher_that_watches()
     let journal = workspace.path().join(JOURNAL_FILE);
     let mut guard = PidGuard::new();
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
 
     guard.watch_workspace(workspace.path());
@@ -610,6 +614,8 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     let journal = workspace.path().join(JOURNAL_FILE);
     let mut guard = PidGuard::new();
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
 
     guard.watch_workspace(workspace.path());
@@ -686,6 +692,8 @@ async fn a_supervised_restart_declares_what_it_cannot_observe_about_the_target()
     let workspace = tempfile::tempdir().expect("workspace");
     let mut guard = PidGuard::new();
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
 
     guard.watch_workspace(workspace.path());
@@ -745,6 +753,8 @@ async fn a_capture_taken_after_a_restart_never_reuses_a_pre_restart_identity() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut guard = PidGuard::new();
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
 
     guard.watch_workspace(workspace.path());
@@ -785,6 +795,8 @@ async fn an_in_process_backend_that_hangs_is_dispatched_and_unknown() {
     backend.faults().set("left_click", Fault::DropAfterLedger);
 
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
     let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
     let (_lease, capture) = capture_then_lease(&session).await;
@@ -824,6 +836,8 @@ async fn the_journal_records_the_same_effects_the_in_memory_ledger_does() {
     let endpoint = BackendEndpoint::new(backend.address()).expect("loopback");
 
     let state = DeviceState::new();
+    // The pinned server reports no scale, so the device is told (M5-C14).
+    state.declare_scale_percent(Some(tunnel_cua::capture::IDENTITY_SCALE_PERCENT));
     let desktop = TargetSession::new("desktop-0");
     let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
     let (_lease, capture) = capture_then_lease(&session).await;

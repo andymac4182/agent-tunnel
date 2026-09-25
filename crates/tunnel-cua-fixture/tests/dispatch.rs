@@ -8,7 +8,7 @@
 //! believed.
 //!
 //! **Proof 4 is here too**: every capture is verified by decoding markers, and
-//! `a_byte_count_would_not_have_caught_the_wrong_display` is the control
+//! `a_byte_count_would_not_have_caught_a_different_screen` is the control
 //! showing that a length comparison could not have.
 //!
 //! Nothing in this file installs, executes or contacts a real
@@ -33,7 +33,8 @@ use tunnel_cua_fixture::client::{
     DeviceState, Dispatcher, SessionFacade, read_commands, request_body,
 };
 use tunnel_cua_fixture::{
-    CURSOR, FixtureBackend, IMAGE_SEED, LedgerEntry, SCREEN_HEIGHT, SCREEN_WIDTH, from_hex,
+    CURSOR, FixtureBackend, IMAGE_SEED, LedgerEntry, SCREEN_HEIGHT, SCREEN_WIDTH,
+    marker_from_image_data,
 };
 
 const LIMIT: u64 = tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT;
@@ -166,6 +167,11 @@ async fn the_ledger_equals_the_commands_that_were_dispatched_and_nothing_more() 
     for (operation, params) in [
         ("describe", json!({})),
         ("cursor_position", json!({})),
+        ("capture", json!({"display": 0})),
+        ("screen_info", json!({})),
+        // M5-C12: a display no pinned backend can select is refused before
+        // dispatch, so it adds nothing to the ledger -- which this equality
+        // measures, rather than a refusal count.
         ("capture", json!({"display": 2})),
         ("screen_info", json!({"display": 1})),
         ("describe", json!({})),
@@ -178,8 +184,8 @@ async fn the_ledger_equals_the_commands_that_were_dispatched_and_nothing_more() 
     let mut expected = discovery_entries();
     expected.extend([
         LedgerEntry::new("get_cursor_position", None),
-        LedgerEntry::new("screenshot", Some(2)),
-        LedgerEntry::new("get_screen_size", Some(1)),
+        LedgerEntry::new("screenshot", Some(0)),
+        LedgerEntry::new("get_screen_size", Some(0)),
     ]);
     assert_eq!(
         backend.ledger().entries(),
@@ -322,7 +328,11 @@ async fn a_capture_is_verified_by_decoding_its_markers() {
     let Dispatch::Dispatched(Completion::Ok(result)) = dispatch else {
         panic!("capture should have succeeded: {dispatch:?}");
     };
-    let image = from_hex(result["image_hex"].as_str().unwrap()).expect("the image decodes as hex");
+    // The released shape: base64 PNG in `image_data`. The marker rides in a
+    // private PNG chunk, so a real capture -- a PNG with no such chunk --
+    // fails here before any marker is compared.
+    let image = marker_from_image_data(result["image_data"].as_str().unwrap())
+        .expect("the capture is a PNG carrying one synthetic marker chunk");
 
     // The check that matters: every marker recomputed from the seed.
     let decoded = marker::verify(&image, SCREEN_WIDTH, SCREEN_HEIGHT, IMAGE_SEED)
@@ -330,40 +340,42 @@ async fn a_capture_is_verified_by_decoding_its_markers() {
     assert_eq!(decoded.width, SCREEN_WIDTH);
     assert_eq!(decoded.height, SCREEN_HEIGHT);
     assert_eq!(
-        result["width"].as_u64(),
-        Some(u64::from(SCREEN_WIDTH)),
-        "the reported dimensions must agree with the decoded ones"
+        tunnel_cua::image::capture_dimensions(&result),
+        Ok((u32::from(SCREEN_WIDTH), u32::from(SCREEN_HEIGHT))),
+        "the PNG header's dimensions must agree with the decoded marker's"
     );
     backend.stop();
 }
 
-/// **The control for proof 4.** Two displays produce images of *identical
-/// length* and different markers, so a byte-count comparison cannot tell them
-/// apart and the marker check can.
+/// **The control for proof 4.** Two captures of the same screen either side
+/// of a content change have *identical length* and different markers, so a
+/// byte-count comparison cannot tell them apart and the marker check can.
+///
+/// It used to vary the **display**. Since M5-C12 a second display is refused
+/// before dispatch -- no pinned backend can select one -- so the content knob
+/// is what changes what is on the screen, with the geometry held fixed.
 #[tokio::test]
-async fn a_byte_count_would_not_have_caught_the_wrong_display() {
+async fn a_byte_count_would_not_have_caught_a_different_screen() {
     let backend = FixtureBackend::start().await.unwrap();
     let dispatcher = negotiated(&backend).await;
 
     let mut images = Vec::new();
-    for display in [0u32, 1] {
+    for content in [0u32, 1] {
+        backend.capture_scale().set_content(content);
         let dispatch = dispatcher
-            .handle(
-                &request_body("capture", json!({ "display": display })),
-                LIMIT,
-            )
+            .handle(&request_body("capture", json!({})), LIMIT)
             .await;
         let Dispatch::Dispatched(Completion::Ok(result)) = dispatch else {
             panic!("capture should have succeeded: {dispatch:?}");
         };
-        images.push(from_hex(result["image_hex"].as_str().unwrap()).unwrap());
+        images.push(marker_from_image_data(result["image_data"].as_str().unwrap()).unwrap());
     }
 
     // The bad evidence: identical lengths.
     assert_eq!(images[0].len(), images[1].len());
 
-    // The good evidence: each verifies against its own display's seed and
-    // fails against the other's.
+    // The good evidence: each verifies against its own seed and fails against
+    // the other's.
     assert!(marker::verify(&images[0], SCREEN_WIDTH, SCREEN_HEIGHT, IMAGE_SEED).is_ok());
     assert!(marker::verify(&images[1], SCREEN_WIDTH, SCREEN_HEIGHT, IMAGE_SEED + 1).is_ok());
     assert!(matches!(
@@ -371,14 +383,13 @@ async fn a_byte_count_would_not_have_caught_the_wrong_display() {
         Err(marker::MarkerError::MarkerMismatch { .. })
     ));
 
-    // And the ledger recorded which display each capture asked for, so "the
-    // right image came back" and "the right image was requested" are separate
-    // facts, both checked.
+    // And the ledger recorded two default-display captures, so the difference
+    // came from the screen and not from a display index.
     assert_eq!(
         backend.ledger().entries()[discovery_entries().len()..],
         [
             LedgerEntry::new("screenshot", Some(0)),
-            LedgerEntry::new("screenshot", Some(1)),
+            LedgerEntry::new("screenshot", Some(0)),
         ]
     );
     backend.stop();
@@ -395,8 +406,15 @@ async fn screen_info_and_cursor_position_return_the_synthetic_values() {
     else {
         panic!("screen_info should have succeeded");
     };
-    assert_eq!(screen["width"].as_u64(), Some(u64::from(SCREEN_WIDTH)));
-    assert_eq!(screen["height"].as_u64(), Some(u64::from(SCREEN_HEIGHT)));
+    // The released shapes (M5-C14): `size` and `position` objects.
+    assert_eq!(
+        screen["size"]["width"].as_u64(),
+        Some(u64::from(SCREEN_WIDTH))
+    );
+    assert_eq!(
+        screen["size"]["height"].as_u64(),
+        Some(u64::from(SCREEN_HEIGHT))
+    );
 
     let Dispatch::Dispatched(Completion::Ok(cursor)) = dispatcher
         .handle(&request_body("cursor_position", json!({})), LIMIT)
@@ -404,8 +422,8 @@ async fn screen_info_and_cursor_position_return_the_synthetic_values() {
     else {
         panic!("cursor_position should have succeeded");
     };
-    assert_eq!(cursor["x"].as_u64(), Some(u64::from(CURSOR.0)));
-    assert_eq!(cursor["y"].as_u64(), Some(u64::from(CURSOR.1)));
+    assert_eq!(cursor["position"]["x"].as_u64(), Some(u64::from(CURSOR.0)));
+    assert_eq!(cursor["position"]["y"].as_u64(), Some(u64::from(CURSOR.1)));
     backend.stop();
 }
 

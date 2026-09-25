@@ -91,7 +91,9 @@ pub struct CaptureIdentity {
     display: u32,
     width: u32,
     height: u32,
-    scale_percent: u32,
+    /// `None` when nothing declared the scale (M5-C14). See
+    /// [`CaptureRefusal::ScaleUndeclared`].
+    scale_percent: Option<u32>,
 }
 
 /// The scale a 1× display reports. Conversion at this value is the identity,
@@ -140,9 +142,18 @@ impl CaptureIdentity {
         self.height
     }
 
-    /// Capture pixels per backend point, as a percentage.
+    /// Capture pixels per backend point, as a percentage, **if anything
+    /// declared it**.
+    ///
+    /// `None` is the ordinary case against a released backend: no pinned
+    /// `screenshot` reports a scale (M5-C14), and on macOS the handler also
+    /// resizes any capture wider than 1,920 px before encoding it, so the
+    /// image's own pixel count is not the point space either. A capture with
+    /// no declared scale still has an identity and still bounds-checks, but
+    /// its coordinates cannot be placed in the backend's space, so
+    /// [`Captures::resolve_point`] refuses them.
     #[must_use]
-    pub const fn scale_percent(&self) -> u32 {
+    pub const fn scale_percent(&self) -> Option<u32> {
         self.scale_percent
     }
 
@@ -174,14 +185,22 @@ impl CaptureIdentity {
     /// magnitude lower — but an arithmetic guard that depends on a bound
     /// somewhere else stops being true when that bound moves, and the wider
     /// intermediate costs nothing.
+    ///
+    /// **`None` when the scale was never declared**, and there is deliberately
+    /// no default: assuming 1x on a 2x display is a click at twice the
+    /// intended position with no error anywhere, which is the failure this
+    /// type exists to make impossible (M5-C14).
     #[must_use]
-    pub const fn to_backend_point(&self, point: Point) -> (u32, u32) {
-        let scale = self.scale_percent as u64;
+    pub const fn to_backend_point(&self, point: Point) -> Option<(u32, u32)> {
+        let Some(scale) = self.scale_percent else {
+            return None;
+        };
+        let scale = scale as u64;
         let identity = IDENTITY_SCALE_PERCENT as u64;
-        (
+        Some((
             (point.x as u64 * identity / scale) as u32,
             (point.y as u64 * identity / scale) as u32,
-        )
+        ))
     }
 }
 
@@ -201,6 +220,15 @@ pub enum CaptureRefusal {
     Superseded,
     /// The point lies outside the capture's dimensions.
     OutsideCapture,
+    /// The capture is known, current and contains the point, but **nothing
+    /// declared its display scale**, so the point cannot be placed in the
+    /// backend's coordinate space (M5-C14).
+    ///
+    /// No pinned backend reports a scale. This used to be defaulted to 1x,
+    /// which on a scaled display is a click at the wrong place with no error;
+    /// it is now a refusal the consumer can see, and the remedy is on the
+    /// device (declare the scale), not a retry.
+    ScaleUndeclared,
 }
 
 impl core::fmt::Display for CaptureRefusal {
@@ -210,6 +238,7 @@ impl core::fmt::Display for CaptureRefusal {
             Self::TargetMismatch => "the capture belongs to a different target session",
             Self::Superseded => "the capture has been superseded by a newer one",
             Self::OutsideCapture => "the coordinates lie outside the capture",
+            Self::ScaleUndeclared => "the capture's display scale was never declared",
         })
     }
 }
@@ -274,6 +303,40 @@ impl Captures {
         {
             return Err(GeometryError);
         }
+        Ok(self.insert(target, display, width, height, Some(scale_percent)))
+    }
+
+    /// Record a capture whose display scale **nobody declared**.
+    ///
+    /// What a device does against a released backend with no configured scale
+    /// (M5-C14): the capture has an identity, is current for its display and
+    /// bounds-checks a point, and every coordinate that refers to it is
+    /// refused with [`CaptureRefusal::ScaleUndeclared`] rather than defaulted.
+    ///
+    /// # Errors
+    /// [`GeometryError`] for a dimension outside `1..=`[`MAX_CAPTURE_DIMENSION`].
+    pub fn record_undeclared_scale(
+        &mut self,
+        target: &TargetSession,
+        display: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<CaptureIdentity, GeometryError> {
+        let bounded = 1..=MAX_CAPTURE_DIMENSION;
+        if !bounded.contains(&width) || !bounded.contains(&height) {
+            return Err(GeometryError);
+        }
+        Ok(self.insert(target, display, width, height, None))
+    }
+
+    fn insert(
+        &mut self,
+        target: &TargetSession,
+        display: u32,
+        width: u32,
+        height: u32,
+        scale_percent: Option<u32>,
+    ) -> CaptureIdentity {
         self.next += 1;
         let identity = CaptureIdentity {
             id: CaptureId(self.next),
@@ -285,7 +348,7 @@ impl Captures {
         };
         self.by_id.insert(identity.id, identity.clone());
         self.current.insert((target.clone(), display), identity.id);
-        Ok(identity)
+        identity
     }
 
     /// Resolve a capture reference for a session driving `target`.
@@ -315,9 +378,14 @@ impl Captures {
 
     /// Resolve a reference and check that a point lies inside it.
     ///
+    /// The scale check runs last: a point outside the image is the more
+    /// specific fact, and "declare the scale" is a device remedy the consumer
+    /// cannot act on.
+    ///
     /// # Errors
     /// Anything [`Captures::resolve`] refuses, plus
-    /// [`CaptureRefusal::OutsideCapture`].
+    /// [`CaptureRefusal::OutsideCapture`] and
+    /// [`CaptureRefusal::ScaleUndeclared`].
     pub fn resolve_point(
         &self,
         id: CaptureId,
@@ -327,6 +395,9 @@ impl Captures {
         let identity = self.resolve(id, target)?;
         if !identity.contains(point) {
             return Err(CaptureRefusal::OutsideCapture);
+        }
+        if identity.scale_percent.is_none() {
+            return Err(CaptureRefusal::ScaleUndeclared);
         }
         Ok(identity)
     }
