@@ -1,0 +1,30 @@
+{
+  "os": "Ubuntu 24.04.4 LTS",
+  "kernel": "7.0.0-30-generic",
+  "arch": "aarch64",
+  "display": {
+    "server": "Xorg (modesetting, virtio-gpu)",
+    "output": "Virtual-1",
+    "dimensions": "1280x800",
+    "resolution_dpi": "96x96",
+    "xft_dpi": "unset",
+    "gdk_scale": "unset",
+    "scale_note": "X11 has no per-output scale; no scaling configured"
+  },
+  "keyboard_layout": "us",
+  "window_manager": "openbox",
+  "packages": {
+    "xserver_xorg_core": "2:21.1.12-1ubuntu1.8",
+    "openbox": "3.6.1-12build5",
+    "x11vnc": "0.9.16-10",
+    "python3_tk": "3.12.3-0ubuntu1",
+    "python": "3.12.3",
+    "cua_computer_server": "0.3.46",
+    "cua_driver": "0.22.2",
+    "vncdotool": "1.4.2",
+    "pillow": "12.3.0",
+    "pynput": "1.8.2"
+  },
+  "requirements_lock_sha256": "9e7dfef61eb48307896dbb47abd4363967ee2e2cd3ec12babfafe110bd88014b",
+  "provisioned": "provisioned 2026-09-25T10:13:34Z"
+}

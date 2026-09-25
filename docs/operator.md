@@ -97,7 +97,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
-| Download, checksum, provenance and licence notices | Supported for `aarch64-apple-darwin` only | M6-01, M6-C13 |
+| Download, checksum, provenance and licence notices | A maintainer bundle passing every release check: `aarch64-apple-darwin` only. CI archives for all four targets are built and smoke-tested on native hosted runners and published as prereleases, without those checks | M6-01, M6-C13 |
 | Device key, CSR, certificate import, local `doctor` | Supported | — |
 | Relay and cluster configuration dry runs, local state initialization | Supported | — |
 | Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
@@ -122,11 +122,12 @@ The declared release targets live in `[workspace.metadata.release]
 advertised-targets` in the root `Cargo.toml`: `aarch64-apple-darwin`,
 `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` and
 `x86_64-unknown-linux-gnu`. **Only `aarch64-apple-darwin` has a bundle that
-passes the release checks.** The other three have no host here that can run
-their checks (M6-C13), so treat any build for them as unverified. The hosted CI
-that would build them has not run since 2026-09-11, and no GitHub release has
-been published, so the only way to get a verified bundle today is from a
-maintainer who built it with `scripts/m6-release-artifact.py bundle`.
+passes the release checks.** Hosted CI builds all four on native runners,
+smoke-tests each build's own binaries there, and publishes the archives as
+GitHub prereleases (for example workflow run 35987957788 at `af23c2f`), but
+none of the checks below has run on the other three (M6-C13), so treat those
+builds as unverified. A verified bundle comes from a maintainer who built it
+with `scripts/m6-release-artifact.py bundle`.
 
 **The Windows bundle has no relay.** The relay runs on Linux and macOS only.
 `x86_64-pc-windows-msvc` ships `tunnel-client` and `tunnel-deadman`, the
@@ -139,11 +140,11 @@ workspace tests there, but the relay and `credentials create`/`credentials
 import` refuse to run on Windows, so the M1 real-socket acceptance is run on
 the Unix targets (Linux and macOS) only.
 
-**The bundle carries no documentation**, not even this guide (M6-C50). Read
-this guide and every document it links from the repository at the `commit`
-line of the bundle's `PROVENANCE.txt`, for example
-`https://github.com/andymac4182/agentuplink/blob/<commit>/docs/operator.md`,
-so the guide and the binaries describe the same code.
+**The bundle carries this guide** as `docs/operator.md`, with every document
+it links beside it in `docs/`, all listed in `SHA256SUMS` (M6-C50). Read the
+copy in the bundle: it describes the same commit as the binaries. A link in
+those documents to a file the bundle does not carry points at that file on
+GitHub at the bundle's `commit` (the `commit` line of `PROVENANCE.txt`).
 
 A bundle is one `.tar.gz` plus a `.sha256` file beside it. This guide calls
 them `agentuplink-bundle.tar.gz` and `agentuplink-bundle.tar.gz.sha256`;
@@ -157,6 +158,8 @@ $ tar -xzf agentuplink-bundle.tar.gz
 $ cd agentuplink-bundle
 $ shasum -a 256 -c --quiet SHA256SUMS; echo "exit=$?"
 exit=0
+$ ls docs/operator.md
+docs/operator.md
 ```
 
 `shasum -c` checks only the files `SHA256SUMS` lists. The release check also
@@ -199,10 +202,18 @@ Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config 
 
 `tunnel-relay` has no `--version`; use `PROVENANCE.txt`.
 
-The public [downloads page](../site/docs/downloads.html) describes a second
-archive format, produced by `scripts/package_release.py` for the release
-workflow. It has no `PROVENANCE.txt` or `SHA256SUMS`, and none of the checks
-above cover it (M6-C11, M6-01).
+`examples/` holds the configurations this guide uses: `m1-client.toml` and
+`m1-relay.toml` are the device and relay starting points, `m6-catalog*.toml`
+are the catalog records of section 2.3, and `m7-cluster-relay.toml` is the
+cluster relay of section 3.3. `client.toml` and `relay.toml` are older
+configuration-only starters that hold rotation settings alone; this guide does
+not use them, and neither connects anything.
+
+The public [downloads page](https://agentuplink.dev/docs/downloads) describes a
+second archive format, produced by `scripts/package_release.py` for the release
+workflow. It carries this guide and the documents it links under `docs/`, but
+no `PROVENANCE.txt` or `SHA256SUMS`, and none of the checks above cover it
+(M6-C11, M6-01).
 
 ## 2. Credential provisioning
 

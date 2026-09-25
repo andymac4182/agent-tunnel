@@ -19,15 +19,34 @@
 # gates, which is the exact thing this split exists to avoid.
 #
 # Usage: m7-gates-parallel.sh <label> [jobs]
+#
+# Every run writes into its own new directory, gates-<label>-<UTC>-<pid>, and
+# stamps it with run.txt (nonce, label, head).  It used to write into
+# gates-<label> and truncate that directory's summary.tsv, so two agents
+# sharing one scratchpad and choosing the same label -- `final`, `check` --
+# overwrote each other's logs, and a gate log left by an earlier run read like
+# this run's.  A result is attributable only if it names the run that wrote it
+# (docs/tasks.md M6-C16).  `M7_GATES_LIST_ONLY=1` stops after the gate lists,
+# which is what scripts/test_scratch_log_names.py uses.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 S=${M7_GATE_OUTPUT_DIR:-${TMPDIR:-/tmp}/m7-gates}
 mkdir -p "$S"
 label=${1:?label}
 jobs=${2:-3}
-out=$S/gates-$label
-mkdir -p "$out"
+nonce=m7-gates-$label-$(date -u '+%Y%m%dT%H%M%SZ')-$$
+out=$S/gates-$nonce
+suffix=0
+# `mkdir` without -p fails on an existing directory, so a name is never reused.
+until mkdir "$out" 2>/dev/null; do
+  suffix=$((suffix + 1))
+  [ "$suffix" -le 100 ] || { echo "cannot create a fresh output directory under $S" >&2; exit 2; }
+  out=$S/gates-$nonce-$suffix
+done
 cd "$REPO" || exit 2
+head=$(git rev-parse --short=12 HEAD)
+printf 'nonce=%s\nlabel=%s\nhead=%s\noutput=%s\n' "$nonce" "$label" "$head" "$out" > "$out/run.txt"
+echo "output=$out nonce=$nonce head=$head"
 export TEST_REDIS_URL=${TEST_REDIS_URL:-redis://127.0.0.1:63790/}
 export TUNNEL_CATALOG_REDIS_URL=${TUNNEL_CATALOG_REDIS_URL:-$TEST_REDIS_URL}
 export RUST_LOG=${RUST_LOG:-info}
@@ -61,6 +80,7 @@ PY
 grep -Ev "$SERIAL" "$out/gates.list" > "$out/parallel.list"
 grep -E "$SERIAL" "$out/gates.list" > "$out/serial.list"
 echo "parallel=$(wc -l < "$out/parallel.list") serial=$(wc -l < "$out/serial.list") jobs=$jobs"
+[ "${M7_GATES_LIST_ONLY:-0}" = 1 ] && exit 0
 
 run_one() {
   glabel=$1; gcmd=$2; idx=$3
@@ -87,4 +107,5 @@ while IFS="$(printf '\t')" read -r glabel gcmd; do
   run_one "$glabel" "$gcmd" "$i"
 done < "$out/serial.list"
 
+echo "run: $out nonce=$nonce head=$head"
 echo "done: $(awk -F'\t' '$1==0' "$out/summary.tsv" | wc -l | tr -d ' ') passed, $(awk -F'\t' '$1!=0' "$out/summary.tsv" | wc -l | tr -d ' ') failed of $i"
