@@ -497,10 +497,16 @@ async fn m6c35_a_redis_error_part_way_is_rolled_back_in_the_same_script() {
         .query_async(&mut connection)
         .await
         .expect("delete the ACL user");
-    assert!(
-        outcome.is_err(),
-        "provisioning without SADD must fail, got {outcome:?}"
-    );
+    // The specific refusal of a write Redis rejected part-way and rolled back
+    // in full, not any error: a connection or ACL failure before the script
+    // ran would also be an `Err` and would prove nothing about the rollback.
+    match &outcome {
+        Err(CatalogError::Conflict(message))
+            if *message == "Redis refused a seed write; nothing was written" => {}
+        other => panic!(
+            "provisioning without SADD must be refused as a rolled-back seed write, got {other:?}"
+        ),
+    }
     assert_eq!(
         keys(&namespace).await,
         activated,

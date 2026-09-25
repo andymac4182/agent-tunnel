@@ -36,6 +36,15 @@ pub(crate) use lane::{
 };
 pub use recovery::DurableCatalogObservation;
 
+/// A seed write Redis refused part-way, rolled back completely in the same
+/// script (task row M6-C35).
+pub(crate) const SEED_WRITE_ROLLED_BACK: &str = "Redis refused a seed write; nothing was written";
+
+/// A seed write that failed part-way and whose in-script rollback stopped at
+/// the scan bound or was refused: some written keys may remain and the
+/// namespace was not reserved (task row M6-C35, PR #158 review).
+pub(crate) const SEED_ROLLBACK_INCOMPLETE: &str = "a seed write failed and its rollback did not complete; keys it wrote may remain, the namespace was not reserved, and it must be inspected or discarded";
+
 /// `serve`'s refusal of an activated namespace that `provision-catalog` has
 /// not run on (task row M6-C34).
 pub(crate) const NAMESPACE_UNPROVISIONED: &str =
@@ -123,6 +132,7 @@ const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
 /// Outcome of the one-shot seed reservation script, mapped to a caller's own
 /// refusal wording by the fixture seed and the operator bootstrap.
+#[derive(Debug)]
 enum NamespaceReservation {
     Reserved,
     AlreadyReserved,
@@ -1266,12 +1276,7 @@ impl RedisCatalog {
         args.extend(ops);
         let reply: Vec<String> = self
             .eval(
-                &format!(
-                    "{LUA_DECIMAL_HELPERS}\n\
-                     local function seed_credential(KEYS, ARGV)\n{SCRIPT_SEED_CREDENTIAL}\nend\n\
-                     local function upsert_grant(KEYS, ARGV)\n{SCRIPT_UPSERT_GRANT_BODY}\nend\n\
-                     {SCRIPT_RESERVE_AND_WRITE_SEED}"
-                ),
+                &seed_script(),
                 &[
                     self.fixture_seed_guard_key(),
                     self.active_incarnation_key(),
@@ -1282,31 +1287,7 @@ impl RedisCatalog {
                 &args,
             )
             .await?;
-        match reply.as_slice() {
-            [status] if status == "ok" => Ok(NamespaceReservation::Reserved),
-            [status] if status == "used" => Ok(NamespaceReservation::AlreadyReserved),
-            [status] if status == "occupied" => Ok(NamespaceReservation::Occupied),
-            [status] if status == "bound" => Ok(NamespaceReservation::ScanBound),
-            [status, step, refusal] if status == "refused" => {
-                Err(match (step.as_str(), refusal.as_str()) {
-                    ("credential", "conflict") => {
-                        CatalogError::Conflict("duplicate SPKI fingerprint")
-                    }
-                    ("grant", "none") => CatalogError::InvalidInput("grant tenant relationship"),
-                    ("grant", "expired") => CatalogError::InvalidInput("grant expiry"),
-                    (_, "overflow") => CatalogError::RevisionOverflow,
-                    _ => CatalogError::Serialization("invalid Redis seed step reply".into()),
-                })
-            }
-            // A Redis error part-way, already rolled back.  Its text is not
-            // returned: it can name keys.
-            [status] if status == "error" => Err(CatalogError::Conflict(
-                "Redis refused a seed write; nothing was written",
-            )),
-            _ => Err(CatalogError::Serialization(
-                "invalid Redis fixture reservation reply".into(),
-            )),
-        }
+        seed_reply(&reply)
     }
 
     async fn ensure_active_incarnation(&self) -> Result<(), CatalogError> {
@@ -3187,6 +3168,48 @@ pub(crate) fn validate_fixture(fixture: &CatalogFixture) -> Result<(), CatalogEr
     Ok(())
 }
 
+/// The one-shot seed script with the sub-script bodies it calls (M6-C35).
+fn seed_script() -> String {
+    format!(
+        "{LUA_DECIMAL_HELPERS}\n\
+         local function seed_credential(KEYS, ARGV)\n{SCRIPT_SEED_CREDENTIAL}\nend\n\
+         local function upsert_grant(KEYS, ARGV)\n{SCRIPT_UPSERT_GRANT_BODY}\nend\n\
+         {SCRIPT_RESERVE_AND_WRITE_SEED}"
+    )
+}
+
+/// Map the seed script's reply (M6-C35).  Only a completed rollback may be
+/// reported as "nothing was written".
+fn seed_reply(reply: &[String]) -> Result<NamespaceReservation, CatalogError> {
+    match reply {
+        [status] if status == "ok" => Ok(NamespaceReservation::Reserved),
+        [status] if status == "used" => Ok(NamespaceReservation::AlreadyReserved),
+        [status] if status == "occupied" => Ok(NamespaceReservation::Occupied),
+        [status] if status == "bound" => Ok(NamespaceReservation::ScanBound),
+        [status, step, refusal] if status == "refused" => {
+            Err(match (step.as_str(), refusal.as_str()) {
+                ("credential", "conflict") => CatalogError::Conflict("duplicate SPKI fingerprint"),
+                ("grant", "none") => CatalogError::InvalidInput("grant tenant relationship"),
+                ("grant", "expired") => CatalogError::InvalidInput("grant expiry"),
+                (_, "overflow") => CatalogError::RevisionOverflow,
+                _ => CatalogError::Serialization("invalid Redis seed step reply".into()),
+            })
+        }
+        // A Redis error part-way, already rolled back.  Its text is not
+        // returned: it can name keys.
+        [status] if status == "error" => Err(CatalogError::Conflict(SEED_WRITE_ROLLED_BACK)),
+        // The rollback itself stopped at the scan bound or was refused: keys
+        // this script wrote may remain.  The reservation was not set, so a
+        // rerun is refused as occupied, never as provisioned.
+        [status] if status == "rollback_bound" || status == "rollback_failed" => {
+            Err(CatalogError::Conflict(SEED_ROLLBACK_INCOMPLETE))
+        }
+        _ => Err(CatalogError::Serialization(
+            "invalid Redis fixture reservation reply".into(),
+        )),
+    }
+}
+
 /// The one-shot seed (task rows M6-C21, M6-C35).  `KEYS`: the reservation,
 /// the active incarnation, the Redis run binding, the continuity token and the
 /// catalog generation.  `ARGV[1]` is the namespace prefix, `ARGV[2]` the scan
@@ -3260,13 +3283,16 @@ if ok and not refusal then
   return {'ok'}
 end
 -- Roll back: every key but the incarnation, run and continuity keys was
--- written by this script.  Bounded by the same scan limit; a rollback that
--- reaches it is reported, not hidden.
-local rollback = scan_namespace(function(key)
+-- written by this script.  Bounded by the same scan limit.  A rollback that
+-- reaches the bound, or that Redis refuses, has its own reply: keys may
+-- remain, so it must never be reported as "nothing was written".  The
+-- reservation is not set in either case.
+local rolled, rollback = pcall(scan_namespace, function(key)
   redis.call('DEL', key)
   return nil
 end)
-if rollback then return {'error'} end
+if not rolled then return {'rollback_failed'} end
+if rollback then return {'rollback_bound'} end
 if not ok then return {'error'} end
 return refusal
 "#;
@@ -4060,6 +4086,104 @@ mod tests {
     };
 
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// PR #158 review: a failed seed whose rollback stops at the scan bound
+    /// leaves keys behind, so it must not be reported as "nothing was
+    /// written".  Driven through the real script with a small bound: five
+    /// plain writes, then a command Redis refuses.  With a bound of 3 the
+    /// rollback deletes three keys and stops; with the real bound it deletes
+    /// all five.  Needs `TUNNEL_CATALOG_REDIS_URL`.
+    #[tokio::test]
+    #[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+    async fn seed_rollback_that_stops_at_the_scan_bound_is_not_reported_as_nothing_written() {
+        let url = std::env::var("TUNNEL_CATALOG_REDIS_URL").expect("TUNNEL_CATALOG_REDIS_URL");
+        let client = redis::Client::open(url).expect("client");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect");
+        for (bound, expected_reply, expected_left) in
+            [("3", "rollback_bound", 2_usize), ("100000", "error", 0)]
+        {
+            let prefix = format!(
+                "tunnel-catalog:m6ops-rollback-{}:",
+                uuid::Uuid::new_v4().simple()
+            );
+            let keys: Vec<String> = [
+                "meta:fixture_seeded",
+                "meta:active_incarnation",
+                "meta:redis_run_id",
+                "meta:continuity",
+                "meta:catalog_generation",
+            ]
+            .iter()
+            .map(|name| format!("{prefix}{name}"))
+            .collect();
+            let mut ops = super::SeedOperations::default();
+            for index in 0..5 {
+                ops.command(&["SET", &format!("{prefix}written:{index}"), "1"]);
+            }
+            ops.command(&["NO-SUCH-COMMAND"]);
+            let mut args = vec![prefix.clone(), bound.to_owned()];
+            args.extend(ops.0);
+            let reply: Vec<String> = super::eval_command(&super::seed_script(), &keys, &args)
+                .query_async(&mut connection)
+                .await
+                .expect("seed script reply");
+            assert_eq!(reply, [expected_reply], "bound {bound}");
+            let left: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("{prefix}*"))
+                .query_async(&mut connection)
+                .await
+                .expect("KEYS");
+            assert_eq!(left.len(), expected_left, "bound {bound}: {left:?}");
+            assert!(
+                !left.iter().any(|key| key.ends_with("meta:fixture_seeded")),
+                "the reservation must never be set after a failed seed"
+            );
+            match super::seed_reply(&reply) {
+                Err(crate::CatalogError::Conflict(message)) if expected_left > 0 => {
+                    assert!(
+                        !message.contains("nothing was written"),
+                        "keys remain, yet the error says nothing was written: {message}"
+                    );
+                    assert_eq!(message, super::SEED_ROLLBACK_INCOMPLETE);
+                }
+                Err(crate::CatalogError::Conflict(message)) => {
+                    assert_eq!(message, super::SEED_WRITE_ROLLED_BACK);
+                }
+                other => panic!("bound {bound}: unexpected mapping {other:?}"),
+            }
+            if !left.is_empty() {
+                let _: () = redis::cmd("DEL")
+                    .arg(&left)
+                    .query_async(&mut connection)
+                    .await
+                    .expect("DEL");
+            }
+        }
+    }
+
+    /// Every rollback reply that can leave keys maps to the incomplete
+    /// message, never to "nothing was written".
+    #[test]
+    fn seed_rollback_replies_map_to_distinct_messages() {
+        for status in ["rollback_bound", "rollback_failed"] {
+            match super::seed_reply(&[status.to_owned()]) {
+                Err(crate::CatalogError::Conflict(message)) => {
+                    assert_eq!(message, super::SEED_ROLLBACK_INCOMPLETE, "{status}");
+                    assert!(!message.contains("nothing was written"), "{status}");
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+        match super::seed_reply(&["error".to_owned()]) {
+            Err(crate::CatalogError::Conflict(message)) => {
+                assert_eq!(message, super::SEED_WRITE_ROLLED_BACK);
+            }
+            other => panic!("error: {other:?}"),
+        }
+    }
 
     /// `examples/m1-relay.toml` shipped `agent-tunnel/m1`, which this rule
     /// refuses: the documented `serve --config` therefore failed at startup.
