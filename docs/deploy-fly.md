@@ -637,7 +637,9 @@ the `721ed2a` relay also worked. On Fly:
 - The image was built by section 6.1 with `--image-label main-af23c2f`
   (`registry.fly.io/agentuplink-relay:main-af23c2f@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`).
 - Section 6.3's `fly deploy --image …main-af23c2f --ha=false` updated the
-  one relay machine in place.
+  one relay machine in place. That relay was **running**. Onto a **stopped**
+  relay the same command replaced the machine with a new ID and left it
+  stopped (M6-C104; section 6.5.1 step 6).
 - The log showed `tunnel-relay listening: consumer=0.0.0.0:8443
   device=0.0.0.0:9443` and then `tunnel-relay Redis restart continuity:
   interval_seconds=5`, and both checks passed.
@@ -706,6 +708,14 @@ fresh VM; and both checks logged failing at 12:51:09Z and passing at
 12:51:10Z. It ends the device sessions like any restart. Change
 `redis_namespace` or `deployment_incarnation` only when section 6.4.1 says so:
 a new value in `relay.toml` needs section 6.2 again.
+
+**Only a running relay is updated in place.** Every in-place update above was
+onto a running relay. On 2026-09-25 the same `fly deploy --image ... --ha=false`
+onto a relay stopped with `fly machine stop` replaced the machine: its ID
+changed (`7819962c1e3de8` became `185e264a927d58`) and the new machine was left
+stopped until `fly machine start` (M6-C104). If you deploy onto a stopped
+relay, follow section 6.5.1 step 6: read the new ID from `fly machine list`,
+start it, and use the new ID from then on.
 
 ### 6.4 After a Redis restart
 
@@ -873,6 +883,26 @@ issuer's signing key and the device's key and certificate, keeps the
 namespace, and ended with 150 of 150 echoes. **The relay was
 unavailable for about two minutes and ten seconds**, from step 2 to step 6.
 
+**Replacing the device CA cuts off every enrolled device at once.** From the
+moment the relay serves the new `AT_DEVICE_CLIENT_CA_B64` (step 6), it refuses
+the TLS handshake of every device whose certificate the old device CA signed:
+`connect` exits `3` with `CREDENTIAL_ERROR` "unknown CA". Renewing a device in
+place is not implemented (M6-C56), so **each enrolled device has to be enrolled
+again** with a new device UUID. For each device, that means:
+- on the device: a new key and certificate request (`credentials create` in a
+  new profile), then importing the certificate and the new `relay-ca.pem`, and
+  restarting `connect` with the new profile;
+- for the operator: signing the request, three day-2 writes (`add-device`,
+  `add-service`, `set-grant`, each after its dry run) and one `revoke-device`
+  for the old UUID, which is eight one-off machines;
+- for every consumer: the new device and service UUIDs in its URLs.
+
+When this was measured, the catalog held one device and no tester. With
+testers enrolled, schedule the rotation with them. The relay CA and the
+consumer signing key are also in every device's and consumer's hands, so
+rotating those needs every device to import the new `relay-ca.pem` and every
+token issuer to switch keys.
+
 0. Copy the whole credentials directory to a dated backup (`cp -Rp`, mode
    `700`) and keep it until the new setup is verified. Generate everything
    new into a fresh subdirectory with section 3.1's commands, a new JWKS kid
@@ -925,9 +955,17 @@ Redis secrets (another restart), re-stage the old relay secrets, and repeat
 steps 5 and 6. If Redis came back without its keys, the only way back is
 section 6.4.1. Do not roll the relay image back to `main-721ed2a` for this: it
 has no M6-C65, so a Redis restart would end the namespace. If a day-2 write
-in step 7 fails, the old device key can instead be signed by the new device
-CA: the catalog matches a device by its key (SPKI), not by its issuer, so no
-catalog write is needed.
+in step 7 fails, a possible fallback is to sign the old device key with the
+new device CA. **This is read from the code, not measured:** the catalog finds
+a device by its key's SPKI fingerprint, not by its issuer (`resolve_device` in
+`crates/tunnel-catalog`), so no catalog write should be needed. But the
+credential record holds the validity window copied from the **original**
+certificate when the device was added, and that record, not the new
+certificate, decides when the credential expires. A re-signed certificate with
+a different window may therefore not match the record: the record's
+`not_after` still ends the credential, whatever the new certificate says.
+Whether the relay rejects a certificate whose window differs from the record's
+was not checked.
 
 ### 6.6 Day-2 catalog changes: onboarding a tester, and revocation
 
