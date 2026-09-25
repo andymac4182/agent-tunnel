@@ -24,8 +24,13 @@ connection gets 10 s. **The relay now runs `main-77bfd28`**, built from
 `77bfd28` (M6-C91's entrypoint) with these deploy files. It replaced
 `main-af23c2f` in place on 2026-09-24, which had replaced `main-721ed2a`
 earlier that day, with no re-provisioning; M6-C65 continuity is on
-(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). A lane reconnect inside a running relay still has
-2 s (M6-C74), which matters after a Redis restart (section 6.4).
+(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). In that image a lane reconnect inside a running relay still
+has only 2 s (M6-C74), which matters after a Redis restart (section 6.4); a
+build with M6-C74 gives it the full 10 s, outside the lane lock.
+**`main-77bfd28` refuses a relay configuration that names `metrics_bind`**
+(M6-C24, unknown field): do not add the key to `relay.toml` until the
+deployed image has M6-C24, and remove it before rolling back to
+`main-77bfd28` or any older image.
 
 Every `fly` command below is one the owner runs, in
 order, and each one that costs money is marked **Costs money**. The prices are
@@ -93,9 +98,15 @@ The decisions, and what each rests on:
 - **Health checks.** The consumer service checks `GET /readyz` over HTTPS on
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
-  measured that a bare connect adds no relay log line. **`/readyz` does not
-  cover Redis on a non-cluster relay:** it stays `200` while Redis is down or
-  has restarted, and every request then fails `503` (measured, M6-C67).
+  measured that a bare connect adds no relay log line. **Images built before
+  M6-C67's fix, including the one deployed when this was written, answer
+  `200` on `/readyz` while Redis is down or has restarted**, and every request
+  then fails `503` (measured). From that fix on, a non-cluster relay answers
+  `503` while its Redis authority is unavailable or refused
+  ([operator.md section 3.2](operator.md#32-health-endpoints-and-load-balancers)),
+  so this check then fails and Fly Proxy stops routing consumer traffic to
+  it until Redis serves again. That is measured locally only; it has not been
+  deployed or measured on Fly.
 - **Stopping.** `kill_signal = "SIGTERM"`, `kill_timeout = 60`. Fly's default
   signal is SIGINT and its default timeout 5 s, at most 300 s
   (<https://fly.io/docs/reference/configuration/>). `serve` handles both
@@ -511,13 +522,15 @@ exits `1` on failure. Read the message before running anything again:
 | 3 | "namespace is not empty" | No. Choose a new namespace. |
 | 4 | fails connecting to Redis, or at `stage=authority_identity` because step 3 has not succeeded | Yes. `provision-catalog` makes the same connection and incarnation check as `serve` before it writes anything (`crates/tunnel-relay/src/provisioning.rs`, `provision_catalog`). |
 | 4 | "invalid provisioning records" or "invalid device certificate" | Yes. These are checked before Redis is contacted. |
-| 4 | "namespace was already provisioned" | No. The one-shot reservation is taken before any record is written, so this means an earlier run got at least that far. If that run printed `Provisioned namespace`, you are done. If its outcome is unknown, or it failed part-way, the namespace may be partly written and nothing shipped repairs it (M6-C35): choose a new namespace. |
-| 4 | "namespace holds records other than its active incarnation" | No. Something wrote the namespace between steps 3 and 4, for example a relay started too early (M6-C34). Choose a new namespace. |
+| 4 | any other refusal, or a Redis error | Yes. The reservation and every record are written by one Redis script, and a refusal or error part-way is rolled back in it, so the namespace is exactly as step 3 left it (M6-C35). Fix the cause and run step 4 again. An image from before M6-C35 wrote in several steps and could leave the namespace partly written: with such an image, choose a new namespace. |
+| 4 | "namespace was already provisioned" | No. The reservation is written in the same script as the records, so an earlier run completed: you are done, even if that run's outcome was unknown. |
+| 4 | "namespace holds records other than its active incarnation" | No. Something wrote the namespace between steps 3 and 4. Since M6-C34 `serve` refuses an activated, unprovisioned namespace (`class=unprovisioned`) before writing anything, so only a relay image from before M6-C34, or another writer, can cause this. Choose a new namespace. |
 
 Stopping a step's machine part-way is also covered by the binary: a writing
 command finishes its current bounded Redis step on the first stop signal and
 exits with its own outcome; a second signal abandons it with exit `130`, and
-the namespace must then be treated as partial ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
+the outcome is unknown. Each step is one Redis script, so rerun the step: its
+own "already" refusal means the abandoned run completed ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
 
 #### 6.2.1 When step 3 or 4 cannot reach Redis
 
@@ -582,8 +595,8 @@ retry after the fix.
 
 `fly ssh console` is not an option at this point: there is no relay machine
 to connect to, because `serve` refuses to start on a namespace with no
-incarnation, and a relay started between steps 3 and 4 can leave the
-namespace unprovisionable (M6-C34).
+incarnation, and on an activated namespace that step 4 has not provisioned
+(`class=unprovisioned`, M6-C34).
 
 Three things here were not measured on Fly. That the one-off machines receive
 the app's secrets rests on Fly's documentation: "An app's secrets are
@@ -648,8 +661,9 @@ curl --cacert ~/agentuplink-fly/relay-ca.pem \
 The reply is the export's `device_canary` followed by `hello`. A tester on
 their own computer follows [join-relay.md](join-relay.md), which shows the
 same call and the other answers it can get. `/readyz`
-answering `200` is not enough on its own: a non-cluster relay answers `200`
-even when Redis is unusable (M6-C67), so the echo is the check.
+answering `200` is not enough on its own: an image built before M6-C67's fix
+answers `200` even when Redis is unusable, and even with the fix readiness
+says nothing about the device or the export, so the echo is the check.
 On the then-live relay (`main-721ed2a`), 150 sequential echoes on one device
 session all returned `200` with the canary, past the old 128-request limit
 (M7-C92; measured by the coordinator on 2026-09-23).
@@ -787,11 +801,15 @@ reconnect by themselves; a reconnect can wait out the previous session's
 owner lease, up to 30 s. Measured locally with `docker restart` and with
 `docker kill` then `docker start` of an AOF Redis and the shipped binaries
 (`scripts/m6-redis-restart-verify.sh`): the echo was served again 0.3 to 54 s
-after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
-the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
-that fails the attempt and the relay tries again on its next token, every
-5 s. While Redis is down or refused, `/readyz` still answers ready (M6-C67)
-and every consumer call gets `503` `AUTHORIZATION_UNAVAILABLE`.
+after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect. With M6-C74 it gets the
+full 10 s connection budget, DNS lookup of `agentuplink-redis.internal`
+included, and runs outside the lane lock, so other callers on that lane
+fail closed after their own 2 s instead of queueing behind it; a reconnect
+that still fails is retried on the next token, every 5 s. The deployed
+`main-77bfd28` predates M6-C74 and gives the whole reconnect only 2 s, so a
+lookup slower than that fails the attempt there. While Redis is down or refused every consumer call gets `503`
+`AUTHORIZATION_UNAVAILABLE`; `/readyz` answers `503` with M6-C67's fix and
+still answers ready on an image built before it.
 
 If the log shows `tunnel-relay: Redis authority continuity check failed;
 stage=authority_identity class=continuity` instead, Redis came back older

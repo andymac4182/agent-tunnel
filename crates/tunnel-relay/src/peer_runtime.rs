@@ -138,6 +138,10 @@ const HEALTH_PATH: &str = "/internal/v1/health";
 const PEER_METHOD: &str = "POST";
 const PEER_ADMISSION_HEADER: &str = "x-agent-tunnel-admission";
 const PEER_ADMISSION_OWNER_NOT_READY: &str = "owner_not_ready";
+/// The owner's scheduled data-rotation freeze outlasted its bounded admission
+/// hold (task row M3-15).  A distinct marker so the ingress can give the
+/// consumer the distinct `ROTATION_FREEZE` answer, not the fault refusal.
+const PEER_ADMISSION_ROTATION_FREEZE: &str = "rotation_freeze";
 const PEER_ADMISSION_CAPACITY: &str = "capacity";
 const PEER_ERROR_EXECUTION_HEADER: &str = "x-agent-tunnel-execution";
 const PEER_ERROR_CODE_HEADER: &str = "x-agent-tunnel-error-code";
@@ -362,6 +366,10 @@ pub enum PeerRuntimeError {
     /// carrier or owner-fence acknowledgement is not ready yet.  This is a
     /// pre-admission condition and is safe to retry after the bounded hint.
     OwnerNotReady { retry_after_ms: u64 },
+    /// The selected owner held the request across a scheduled data-rotation
+    /// freeze and the freeze outlasted the bounded hold, or the hold was full
+    /// (task row M3-15).  Pre-admission; safe to retry after the hint.
+    RotationFreeze { retry_after_ms: u64 },
     /// The authenticated owner refused a consumer stream before any
     /// application record was dispatched because its bounded stream limit is
     /// full.
@@ -392,6 +400,9 @@ impl fmt::Display for PeerRuntimeError {
                 formatter.write_str("peer stream has an invalid first record")
             }
             Self::OwnerNotReady { .. } => formatter.write_str("peer owner is not ready"),
+            Self::RotationFreeze { .. } => {
+                formatter.write_str("peer owner is in a data-rotation freeze")
+            }
             Self::Capacity { .. } => formatter.write_str("peer owner stream capacity is exhausted"),
             Self::MembershipExpired => formatter.write_str("peer membership trust expired"),
             Self::Closed => formatter.write_str("peer stream is closed"),
@@ -492,6 +503,7 @@ fn peer_transport_error(error: PeerRuntimeError) -> PeerTransportError {
         | PeerRuntimeError::RemoteStatus(_)
         | PeerRuntimeError::UnexpectedRecord(_)
         | PeerRuntimeError::OwnerNotReady { .. }
+        | PeerRuntimeError::RotationFreeze { .. }
         | PeerRuntimeError::Capacity { .. } => {
             PeerTransportError::H3("peer ingress rejected".to_owned())
         }
@@ -766,12 +778,22 @@ impl ConsumerUnaryResponse {
 }
 
 fn owner_not_ready_retry_after(response: &Response<()>) -> Option<u64> {
+    retryable_admission_marker(response, PEER_ADMISSION_OWNER_NOT_READY)
+}
+
+fn rotation_freeze_retry_after(response: &Response<()>) -> Option<u64> {
+    retryable_admission_marker(response, PEER_ADMISSION_ROTATION_FREEZE)
+}
+
+/// The retry hint of an exact authenticated `503` pre-admission marker, or
+/// `None` when any field differs.
+fn retryable_admission_marker(response: &Response<()>, marker: &str) -> Option<u64> {
     if response.status() != StatusCode::SERVICE_UNAVAILABLE
         || response
             .headers()
             .get(PEER_ADMISSION_HEADER)
             .and_then(|value| value.to_str().ok())
-            != Some(PEER_ADMISSION_OWNER_NOT_READY)
+            != Some(marker)
         || response
             .headers()
             .get(PEER_ERROR_EXECUTION_HEADER)
@@ -1933,6 +1955,9 @@ impl PeerExchangeRecv {
             if let Some(retry_after_ms) = owner_not_ready_retry_after(&response) {
                 return Err(PeerRuntimeError::OwnerNotReady { retry_after_ms });
             }
+            if let Some(retry_after_ms) = rotation_freeze_retry_after(&response) {
+                return Err(PeerRuntimeError::RotationFreeze { retry_after_ms });
+            }
             if let Some(retry_after_ms) = stream_limit_retry_after(&response) {
                 return Err(PeerRuntimeError::Capacity { retry_after_ms });
             }
@@ -2078,12 +2103,27 @@ impl InboundPeerRequest {
     /// private authenticated headers rather than a body because the caller
     /// has not entered the owner stream yet.
     pub async fn reject_owner_not_ready(self) -> Result<(), PeerRuntimeError> {
+        self.reject_retryable_admission(PEER_ADMISSION_OWNER_NOT_READY)
+            .await
+    }
+
+    /// Reject a request the owner held across a scheduled data-rotation
+    /// freeze once the freeze outlasted the bounded hold, or when the hold was
+    /// full (task row M3-15).  Same shape as
+    /// [`Self::reject_owner_not_ready`], with its own marker, so the ingress
+    /// answers the consumer with the distinct scheduled-freeze reason.
+    pub async fn reject_rotation_freeze(self) -> Result<(), PeerRuntimeError> {
+        self.reject_retryable_admission(PEER_ADMISSION_ROTATION_FREEZE)
+            .await
+    }
+
+    async fn reject_retryable_admission(self, marker: &str) -> Result<(), PeerRuntimeError> {
         let (mut send, mut recv) = self.split();
         recv.cancel();
         let response = Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("content-type", "application/octet-stream")
-            .header(PEER_ADMISSION_HEADER, PEER_ADMISSION_OWNER_NOT_READY)
+            .header(PEER_ADMISSION_HEADER, marker)
             .header(PEER_ERROR_EXECUTION_HEADER, "not_dispatched")
             .header(PEER_RETRYABLE_HEADER, "true")
             .header(
@@ -2952,6 +2992,40 @@ mod tests {
                 maximum: MAX_CONSUMER_RESPONSE_BODY,
             })) if length == MAX_CONSUMER_RESPONSE_BODY + 1
         ));
+    }
+
+    #[test]
+    fn rotation_freeze_marker_is_distinct_from_the_owner_not_ready_marker() {
+        let marked = |marker: &str| {
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(PEER_ADMISSION_HEADER, marker)
+                .header(PEER_ERROR_EXECUTION_HEADER, "not_dispatched")
+                .header(PEER_RETRYABLE_HEADER, "true")
+                .header(PEER_RETRY_AFTER_MS_HEADER, "250")
+                .body(())
+                .expect("valid admission marker response")
+        };
+        let freeze = marked(PEER_ADMISSION_ROTATION_FREEZE);
+        assert_eq!(rotation_freeze_retry_after(&freeze), Some(250));
+        assert_eq!(owner_not_ready_retry_after(&freeze), None);
+        let fault = marked(PEER_ADMISSION_OWNER_NOT_READY);
+        assert_eq!(owner_not_ready_retry_after(&fault), Some(250));
+        assert_eq!(rotation_freeze_retry_after(&fault), None);
+        assert_eq!(PEER_ADMISSION_ROTATION_FREEZE, "rotation_freeze");
+        let unknown = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(PEER_ADMISSION_HEADER, PEER_ADMISSION_ROTATION_FREEZE)
+            .header(PEER_ERROR_EXECUTION_HEADER, "unknown")
+            .header(PEER_RETRYABLE_HEADER, "true")
+            .header(PEER_RETRY_AFTER_MS_HEADER, "250")
+            .body(())
+            .expect("valid response");
+        assert_eq!(
+            rotation_freeze_retry_after(&unknown),
+            None,
+            "only a not_dispatched marker is a freeze refusal"
+        );
     }
 
     #[test]

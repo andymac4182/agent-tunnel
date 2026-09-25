@@ -10,7 +10,9 @@
 #    (`crates/tunnel-catalog/tests/redis_provisioning.rs`), and the Redis
 #    connection stage tests (`redis_connection_stage.rs`, task row M6-C72).
 # 3. Runs the end-to-end gate (`crates/tunnel-relay/tests/m6_provisioning_process.rs`):
-#    empty namespace -> `activate-first-incarnation` -> `provision-catalog` ->
+#    empty namespace -> `activate-first-incarnation` -> a `serve` that must
+#    refuse the unprovisioned namespace with `class=unprovisioned` and write
+#    nothing (M6-C34) -> `provision-catalog` ->
 #    `serve` + `connect` -> one echo through the tunnel, then two identity
 #    refusals (task row M6-C32) that must reach the device as a terminal
 #    CREDENTIAL_ERROR, exit 3, and a not-yet-valid credential that must stay
@@ -47,13 +49,15 @@
 #    call with each refusal, and a single relay's continuity token.  The
 #    M6-C65 process gate restarts a Redis, so it is not run here (it never
 #    touches `TEST_REDIS_URL`); `scripts/m6-redis-restart-verify.sh` runs it
-#    against its own Redis container, and this step skips it by name.
+#    against its own Redis container, and this step skips it by name, as it
+#    skips M6-C67's readiness gate (`m6c67_`), which does the same.
 #
 # Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
-# run because it needs Redis: the 6 catalog provisioning tests (M6-C63's
-# `last_seen_at` among them), the 3 Redis
-# connection stage tests, and the 7 end-to-end tests (M6-C21, M7-C92, M7-C93,
-# the three M6-C57 service gates and M6-C31).  A filtered or skipped test
+# run because it needs Redis: the 8 catalog provisioning tests (M6-C63's
+# `last_seen_at` and M6-C35's two atomic-provisioning tests among them), the 3 Redis
+# connection stage tests, and the 8 end-to-end tests (M6-C21, M7-C92, M7-C93,
+# the three M6-C57 service gates, M6-C31 and M6-C24's private metrics
+# listener, `m6c24-metrics`).  A filtered or skipped test
 # would print `0 passed` and exit 0, so this script requires each run's own
 # pass count and each gate's own `ok` line (`m6c21-e2e`, `m7c92-echo`,
 # `m7c93-rotation`, `m6c57-mcp`, `m6c57-acp`, `m6c57-fs`, each M6-C57 line
@@ -110,8 +114,9 @@ echo "m6-provisioning-verify: catalog first activation and provisioning" >&2
 cargo test -p tunnel-catalog --test redis_provisioning --locked -- --ignored --nocapture --test-threads=1 \
   > "$scratch/catalog.log" 2>&1 || { cat "$scratch/catalog.log" >&2; exit 1; }
 cat "$scratch/catalog.log"
-require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 6 passed" \
-  "m6c65-catalog ok namespace=" "m6c63-last-seen ok namespace="
+require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 8 passed" \
+  "m6c65-catalog ok namespace=" "m6c63-last-seen ok namespace=" \
+  "m6c35-atomic ok namespace=" "m6c35-rollback ok namespace="
 
 echo "m6-provisioning-verify: Redis connection stage, lane and class (M6-C72)" >&2
 cargo test -p tunnel-catalog --test redis_connection_stage --locked -- --ignored --nocapture \
@@ -123,9 +128,10 @@ require "Redis connection stage tests" "$scratch/stage.log" "test result: ok. 3 
 
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  --test-threads=1 --skip m6c65_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 --skip m6c65_ --skip m6c67_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 7 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
+  "m6c34-serve-before-provisioning ok exit=1 class=unprovisioned keys=2" \
   "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
   "backend_invocations=1 stranger_status=401" "stock_client_headers=200 unlisted_header_named=400" \
   "m6c57-acp ok nonce=" "agent_protocol_version=1 connection_id=present stranger_status=401" \
@@ -140,7 +146,8 @@ require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 7 passed" "m6c21-
   "m7c93-rotation ok nonce=" "max=120 sessions=1" \
   "m6c31-catalog ok nonce=" "serve_restarts=0 grant_pickup_ms=" \
   "grant_pickup_attempts=1" "revoke_grant_attempts=1" \
-  "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true"
+  "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true" \
+  "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi

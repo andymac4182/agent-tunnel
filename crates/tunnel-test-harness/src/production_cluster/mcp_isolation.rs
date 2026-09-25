@@ -60,8 +60,8 @@ use tunnel_mcp_export::ExportDiagnostics;
 
 use super::http_forward_real_path::{ConsumerStream, connect_consumer, request};
 use super::mcp_cloud_client::wire::{
-    FreezeWatch, HttpBackend, MAX_RETRY_AFTER, MIN_RETRY_HINT_MS, OWNER_NOT_READY_MESSAGE,
-    RETRY_MARGIN, count_lines, fixture_binary_path, wait_file,
+    FreezeWatch, HttpBackend, MIN_RETRY_HINT_MS, RETRY_MARGIN, count_lines, fixture_binary_path,
+    rotation_freeze_hint, wait_file,
 };
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, STARTUP_TIMEOUT,
@@ -474,11 +474,13 @@ pub struct McpIsolationEvidence {
     /// each session child's process group, whether or not anyone ended the
     /// session first.
     pub children_after_stop: u64,
-    /// Retryable owner-not-ready refusals the consumers received, how many
-    /// were resent because they coincided with an observed rotation freeze,
-    /// and the connector state at the first that did not (M3-30).
-    /// Reported, not asserted: a refusal outside a freeze is returned to its
-    /// case, which fails on it as before.
+    /// Retryable `ROTATION_FREEZE` refusals the consumers received (a
+    /// rotation freeze that outlasted the owner's bounded hold, or a full
+    /// hold; M3-15), how many were resent, and the connector state at the
+    /// first that this gate's own watch did not see as frozen.  Reported, not
+    /// asserted.  Before M3-15 these counted the owner-not-ready body resent
+    /// inside an observed freeze (M3-30); that body now answers only fault
+    /// states and is returned to its case, which fails on it.
     pub freeze_refusals: u64,
     pub freeze_resends: u64,
     pub unexplained_refusal: Option<String>,
@@ -890,28 +892,22 @@ impl Answer {
         (field("code"), field("execution"))
     }
 
-    /// The retry hint of the relay's retryable **owner-not-ready** refusal
-    /// (`retryable_peer_failure_response` in `tunnel-relay/src/http.rs`), or
-    /// `None` for any other answer.
+    /// The retry hint of the relay's retryable **rotation-freeze** refusal
+    /// (`rotation_freeze_response` in `tunnel-relay/src/http.rs`), or `None`
+    /// for any other answer (M3-15).
     ///
-    /// Code, execution and `retryable` alone do not identify it: the
-    /// empty-pin-set refusal (`peer_trust_unavailable_response`, M7-C83)
-    /// carries the same three with its own message and a 5000 ms hint.  So
-    /// the message must be the owner-not-ready one and the hint must be
-    /// present and within `OWNER_NOT_READY_RETRY_AFTER_MS` (250 ms), the
-    /// ceiling that response clamps to (M3-30).
-    fn owner_not_ready_hint(&self) -> Option<Duration> {
+    /// The owner holds a request that lands in a rotation freeze and admits
+    /// it once the freeze ends, so this answer means the freeze outlasted the
+    /// hold or the hold was full.  It is the one refusal the relay itself
+    /// calls the scheduled freeze.  The owner-not-ready body, which before
+    /// M3-15 was resent inside an observed freeze (M3-30), now answers only
+    /// fault states and is never resent; nor is the empty-pin-set refusal
+    /// (M7-C83).
+    fn rotation_freeze_hint(&self) -> Option<Duration> {
         if self.status != 503 {
             return None;
         }
-        let parsed: Value = serde_json::from_slice(&self.body).ok()?;
-        let hint = parsed["retry_after_ms"].as_u64()?;
-        (parsed["code"] == "PEER_UNAVAILABLE"
-            && parsed["execution"] == "not_dispatched"
-            && parsed["retryable"] == true
-            && parsed["message"] == OWNER_NOT_READY_MESSAGE
-            && (1..=MIN_RETRY_HINT_MS).contains(&hint))
-        .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))
+        rotation_freeze_hint(&self.body)
     }
 
     /// A payload-free description of this answer for a failure message: the
@@ -1000,18 +996,16 @@ impl FreezeRefusals {
 impl Consumer {
     /// Send one request and read its whole answer.
     ///
-    /// The relay pauses new stream admission from QUIESCE to COMMIT and
-    /// answers a request that lands there with a retryable `503
-    /// PEER_UNAVAILABLE` `not_dispatched` refusal (docs/protocol.md,
-    /// "Quiesce admission"; M3-15).  Nothing was dispatched, so such a
-    /// refusal is sent again after its hint -- but only while the device
-    /// session is observed frozen, and at most [`FREEZE_RESENDS`] times.  The
-    /// same owner-not-ready body also answers the relay's other owner-not-ready
-    /// conditions (no active carrier, an unfenced owner), and outside a freeze
-    /// it is returned to the case exactly as before.  The empty-pin-set
-    /// refusal (M7-C83) is a *different* body -- its own message and a
-    /// 5000 ms hint -- and is never resent, frozen or not (M3-30; the
-    /// consumer-facing question is M3-15).
+    /// The owner pauses new stream admission from QUIESCE to COMMIT
+    /// (docs/protocol.md, "Quiesce admission") and holds a request that lands
+    /// there until the freeze ends (M3-15).  Only a freeze that outlasts the
+    /// bounded hold, or a full hold, reaches the consumer, as a retryable
+    /// `503 ROTATION_FREEZE` `not_dispatched` refusal.  Nothing was
+    /// dispatched and the relay names the cause itself, so it is sent again
+    /// after its hint, at most [`FREEZE_RESENDS`] times; this gate's own
+    /// freeze watch is only consulted to report one it did not see.  Every
+    /// other refusal, the owner-not-ready fault body and the empty-pin-set
+    /// refusal (M7-C83) included, is returned to its case unchanged.
     async fn send(
         &self,
         method: &str,
@@ -1026,7 +1020,7 @@ impl Consumer {
             let answer = self
                 .send_once(method, uri, headers, replay_frames(&frames))
                 .await?;
-            let Some(hint) = answer.owner_not_ready_hint() else {
+            let Some(hint) = answer.rotation_freeze_hint() else {
                 return Ok(answer);
             };
             self.refusals.refusals.fetch_add(1, Ordering::SeqCst);
@@ -1036,7 +1030,6 @@ impl Consumer {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_or_insert_with(|| self.freeze.unexplained());
-                return Ok(answer);
             }
             if resends >= FREEZE_RESENDS {
                 return Ok(answer);
@@ -3279,7 +3272,7 @@ async fn run(
         evidence.unexplained_refusal,
     ) = refusals.snapshot();
     eprintln!(
-        "MCP isolation gate: owner-not-ready refusals={} resent_in_freeze={} first_unexplained={:?}",
+        "MCP isolation gate: rotation-freeze refusals={} resent={} first_outside_an_observed_freeze={:?}",
         evidence.freeze_refusals, evidence.freeze_resends, evidence.unexplained_refusal
     );
     run_result?;
@@ -3298,46 +3291,43 @@ mod tests {
         }
     }
 
-    /// M3-30: only the relay's retryable owner-not-ready refusal carries a
-    /// resend hint; an `unknown` 503, a non-retryable one and any other
-    /// status do not, so they reach their case unchanged.
+    /// M3-15: only the relay's retryable rotation-freeze refusal carries a
+    /// resend hint.  The owner-not-ready body (resent inside a freeze before
+    /// M3-15, M3-30) now answers only fault states; it, an `unknown` 503, a
+    /// non-retryable one and any other status reach their case unchanged.
     #[test]
-    fn only_the_retryable_owner_not_ready_refusal_is_a_resend_candidate() {
-        // Byte-for-byte the two relay bodies (`tunnel-relay/src/http.rs`):
+    fn only_the_retryable_rotation_freeze_refusal_is_a_resend_candidate() {
+        // Byte-for-byte the relay bodies (`tunnel-relay/src/http.rs`):
+        // `rotation_freeze_response(250)`,
         // `retryable_peer_failure_response(250)` and
         // `peer_trust_unavailable_response()`.
-        let refusal = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#;
+        let refusal = r#"{"code":"ROTATION_FREEZE","execution":"not_dispatched","message":"device data rotation is in progress; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#;
+        let owner_not_ready = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#;
         let empty_pin_set = r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"no approved peer trust evidence is published; retry after the bounded hint","retryable":true,"retry_after_ms":5000}"#;
         assert_eq!(
-            answer(503, refusal).owner_not_ready_hint(),
+            answer(503, refusal).rotation_freeze_hint(),
             Some(Duration::from_millis(250))
         );
         let shorter = refusal.replace(r#""retry_after_ms":250"#, r#""retry_after_ms":40"#);
         assert_eq!(
-            answer(503, &shorter).owner_not_ready_hint(),
+            answer(503, &shorter).rotation_freeze_hint(),
             Some(Duration::from_millis(40))
         );
-        // M7-C83's empty-pin-set refusal shares code, execution and
-        // `retryable`, and must never be resent.
-        assert_eq!(answer(503, empty_pin_set).owner_not_ready_hint(), None);
-        // Each discriminator on its own: the owner-not-ready message with the
-        // pin-set hint, the pin-set message with the owner hint, no hint.
+        assert_eq!(answer(503, owner_not_ready).rotation_freeze_hint(), None);
+        assert_eq!(answer(503, empty_pin_set).rotation_freeze_hint(), None);
         let long = refusal.replace(r#""retry_after_ms":250"#, r#""retry_after_ms":5000"#);
-        let pin_message_short_hint =
-            empty_pin_set.replace(r#""retry_after_ms":5000"#, r#""retry_after_ms":250"#);
         let no_hint = refusal.replace(r#","retry_after_ms":250"#, "");
         for body in [
             long.as_str(),
-            pin_message_short_hint.as_str(),
             no_hint.as_str(),
-            r#"{"code":"PEER_UNAVAILABLE","execution":"unknown","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#,
-            r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched"}"#,
-            r#"{"code":"ADMISSION_LIMIT","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#,
+            r#"{"code":"ROTATION_FREEZE","execution":"unknown","message":"device data rotation is in progress; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#,
+            r#"{"code":"ROTATION_FREEZE","execution":"not_dispatched","retryable":false,"retry_after_ms":250}"#,
+            r#"{"code":"ROTATION_FREEZE","execution":"not_dispatched"}"#,
             "not json",
         ] {
-            assert_eq!(answer(503, body).owner_not_ready_hint(), None, "{body}");
+            assert_eq!(answer(503, body).rotation_freeze_hint(), None, "{body}");
         }
-        assert_eq!(answer(502, refusal).owner_not_ready_hint(), None);
+        assert_eq!(answer(502, refusal).rotation_freeze_hint(), None);
         const { assert!(FREEZE_RESENDS >= 1) };
     }
 

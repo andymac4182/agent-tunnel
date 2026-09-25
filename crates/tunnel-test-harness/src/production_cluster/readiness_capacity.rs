@@ -1672,6 +1672,7 @@ fn peer_admission_harness_error(stage: &str, error: PeerRuntimeError) -> Harness
     let category = match error {
         PeerRuntimeError::Capacity { .. } => "owner_capacity",
         PeerRuntimeError::OwnerNotReady { .. } => "owner_not_ready",
+        PeerRuntimeError::RotationFreeze { .. } => "rotation_freeze",
         PeerRuntimeError::RemoteStatus(status) => {
             return HarnessError::Http(format!(
                 "peer-capacity {stage} failed with owner status {}",

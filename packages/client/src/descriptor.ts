@@ -316,6 +316,7 @@ export function discoveryCode(status: number, body: unknown): DiscoveryErrorCode
     'RESOURCE_EXHAUSTED',
     'DEVICE_OFFLINE',
     'BACKEND_UNAVAILABLE',
+    'ROTATION_FREEZE',
     'METHOD_NOT_ALLOWED',
     'SUBPROTOCOL_REQUIRED',
     'INVALID_UPGRADE',

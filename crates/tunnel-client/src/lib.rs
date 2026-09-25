@@ -1053,6 +1053,12 @@ impl OutboundQueue {
         self.try_send_with_deadline(message, None)
     }
 
+    /// Free frame slots in the writer queue right now.  Best-effort traffic
+    /// uses it to avoid taking a slot that an atomic OPEN pair still needs.
+    fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
     /// Enqueue without waiting for capacity, while retaining the writer-side
     /// deadline used by authorization-bearing control messages. M1 continues
     /// to use [`Self::send`] and its cancellation/deadline-aware backpressure;

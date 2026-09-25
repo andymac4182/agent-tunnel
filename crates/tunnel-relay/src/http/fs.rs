@@ -129,6 +129,45 @@ fn fs_error(status: StatusCode, code: &'static str, message: &'static str) -> Re
     response
 }
 
+/// The filesystem endpoint's answer for a device data-rotation freeze that
+/// outlasted the owner's bounded admission hold (task row M3-15): `503`
+/// `ROTATION_FREEZE` in the contract's own error body, with a `Retry-After`
+/// derived from the same hint as every other route's freeze refusal.
+fn rotation_freeze_fs_error() -> Response {
+    let mut response = fs_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ROTATION_FREEZE_FS_CODE,
+        "the device's data rotation is in progress; retry after the bounded hint",
+    );
+    let seconds = crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS.div_ceil(1_000);
+    if let Ok(value) = header::HeaderValue::from_str(&seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The filesystem endpoint's answer when the owner refused the session.
+///
+/// The device's scheduled data rotation outlasting the owner's bounded
+/// admission hold, or a full hold (task row M3-15), has its own code and a
+/// `Retry-After`: nothing was admitted and the condition is scheduled to
+/// clear.  A client that does not know the code falls back to the status,
+/// which it already treats as a retryable `BACKEND_UNAVAILABLE`.  Every other
+/// refusal keeps that code.
+fn fs_admission_refusal(error: &crate::actor::RelayError) -> Response {
+    if matches!(error, crate::actor::RelayError::RotationFreeze) {
+        return rotation_freeze_fs_error();
+    }
+    fs_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BACKEND_UNAVAILABLE",
+        "the device did not admit a filesystem session",
+    )
+}
+
+/// The filesystem contract's code for [`rotation_freeze_fs_error`].
+pub(crate) const ROTATION_FREEZE_FS_CODE: &str = "ROTATION_FREEZE";
+
 /// The single route for `/v1/devices/{device}/services/{service}/fs`.
 pub(crate) async fn fs_route(
     State(state): State<HttpState>,
@@ -597,13 +636,7 @@ async fn upgrade_session(
     .await
     {
         Ok(Ok(registration)) => registration,
-        Ok(Err(_)) => {
-            return fs_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "BACKEND_UNAVAILABLE",
-                "the device did not admit a filesystem session",
-            );
-        }
+        Ok(Err(error)) => return fs_admission_refusal(&error),
         Err(_) => {
             return fs_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1016,6 +1049,38 @@ mod tests {
             valid_until: chrono::Utc::now(),
             read_started_at: chrono::Utc::now(),
         }
+    }
+
+    /// M3-15: a filesystem upgrade whose rotation freeze outlasted the
+    /// owner's hold answers its own code in the contract's error body, with a
+    /// `Retry-After`, and not the generic `BACKEND_UNAVAILABLE`.
+    #[tokio::test]
+    async fn a_rotation_freeze_answers_its_own_filesystem_code() {
+        let other = super::fs_admission_refusal(&crate::actor::RelayError::OwnerNotReady);
+        let other = axum::body::to_bytes(other.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let other: serde_json::Value = serde_json::from_slice(&other).expect("json");
+        assert_eq!(other["error"]["code"], "BACKEND_UNAVAILABLE");
+        let response = super::fs_admission_refusal(&crate::actor::RelayError::RotationFreeze);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["error"]["code"], "ROTATION_FREEZE");
+        assert_eq!(body["error"]["code"], super::ROTATION_FREEZE_FS_CODE);
+        assert!(
+            body.get("execution").is_none(),
+            "the fs contract has no execution field"
+        );
     }
 
     #[test]

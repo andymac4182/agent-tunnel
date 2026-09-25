@@ -422,6 +422,7 @@ async fn dropping_running_relay_stops_actor_and_maintenance_sender() {
         peer_runtime: None,
         peer_diagnostics: None,
         peer_planned_cancel: None,
+        authority: None,
         consumer_addr: "127.0.0.1:0".parse().expect("consumer address"),
         device_addr: "127.0.0.1:0".parse().expect("device address"),
     };
@@ -493,6 +494,7 @@ async fn shutdown_joins_siblings_after_first_listener_error() {
         peer_runtime: None,
         peer_diagnostics: None,
         peer_planned_cancel: None,
+        authority: None,
         consumer_addr: "127.0.0.1:0".parse().expect("consumer address"),
         device_addr: "127.0.0.1:0".parse().expect("device address"),
     };

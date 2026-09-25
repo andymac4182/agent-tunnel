@@ -846,6 +846,7 @@ pub fn consumer_router_with_peer_and_barrier(
         consumer_upgrade_barrier,
         None,
         None,
+        None,
     )
 }
 
@@ -863,6 +864,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
 ) -> Router {
     let state = HttpState {
         handle,
@@ -881,7 +883,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         http_forward,
     };
     Router::new()
-        .merge(health::router::<HttpState>(state.peer.clone()))
+        .merge(health::router::<HttpState>(state.peer.clone(), authority))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{device}/services", get(list_services))
         .route("/v1/devices/{device}/services/{service}/echo", post(echo))
@@ -1245,7 +1247,7 @@ async fn echo(
             bytes,
         )
             .into_response(),
-        Ok(Ok(EchoOutcome::Failure { code, execution })) => failure_outcome(code, execution),
+        Ok(Ok(EchoOutcome::Failure { code, execution })) => echo_failure_response(code, execution),
         Ok(Err(_)) => failure_outcome("REVERSE_CHANNEL_UNAVAILABLE", "not_dispatched"),
         Err(_) => failure_outcome("REVERSE_CHANNEL_INTERRUPTED", "unknown"),
     }
@@ -2402,6 +2404,7 @@ static CONSUMER_REFUSAL_LOG: std::sync::LazyLock<tunnel_transport::log_limit::Re
 /// a count or an identifier the relay resolved itself; the token, its claims,
 /// the request path and the body are never logged.
 pub(crate) fn log_consumer_refusal(route: &'static str, refusal: &ConsumerRefusal) {
+    crate::metrics::count_consumer_refusal(route, refusal.stage);
     log_consumer_refusal_with(&CONSUMER_REFUSAL_LOG, route, refusal);
 }
 
@@ -2436,6 +2439,7 @@ pub(crate) fn log_consumer_grant_refusal(
     device_id: Uuid,
     service_id: Option<Uuid>,
 ) {
+    crate::metrics::count_consumer_refusal(crate::metrics::route_label(route), "grant");
     tracing::info!(
         phase = "consumer_refused",
         route,
@@ -3576,6 +3580,14 @@ async fn handle_peer_consumer_stream(
             );
             return request.reject_owner_not_ready().await;
         }
+        Err(RelayError::RotationFreeze) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::RotationFreeze,
+            );
+            return request.reject_rotation_freeze().await;
+        }
         Err(RelayError::StreamLimit) => {
             handle.record_peer_fault_tuple(
                 fault,
@@ -4442,6 +4454,17 @@ fn catalog_error(error: tunnel_catalog::CatalogError) -> Response {
     )
 }
 
+/// The unary echo route's answer for an actor failure.  A unary echo held
+/// across a rotation freeze past its bound, or refused because the hold was
+/// full (task row M3-15), answers the same distinct body as a held stream
+/// OPEN; every other failure keeps [`failure_outcome`].
+fn echo_failure_response(code: &'static str, execution: &'static str) -> Response {
+    if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
+        return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
+    }
+    failure_outcome(code, execution)
+}
+
 fn failure_outcome(code: &'static str, execution: &'static str) -> Response {
     let status = if execution == "not_dispatched" && code == "FORBIDDEN" {
         StatusCode::FORBIDDEN
@@ -4505,6 +4528,9 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
         PeerRuntimeError::OwnerNotReady { retry_after_ms } => {
             return retryable_peer_failure_response(retry_after_ms);
         }
+        PeerRuntimeError::RotationFreeze { retry_after_ms } => {
+            return rotation_freeze_response(retry_after_ms);
+        }
         PeerRuntimeError::Capacity { retry_after_ms } => {
             return stream_limit_response(retry_after_ms);
         }
@@ -4529,6 +4555,9 @@ fn local_consumer_admission_response(error: RelayError) -> Response {
     match error {
         RelayError::OwnerNotReady => {
             retryable_peer_failure_response(OWNER_NOT_READY_RETRY_AFTER_MS)
+        }
+        RelayError::RotationFreeze => {
+            rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS)
         }
         RelayError::StreamLimit => stream_limit_response(STREAM_LIMIT_RETRY_AFTER_MS),
         RelayError::Forbidden => error_response(
@@ -4595,6 +4624,41 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
             code: "PEER_UNAVAILABLE",
             execution: "not_dispatched",
             message: "selected owner is not ready; retry after the bounded hint",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The consumer code for a request refused because the device's scheduled
+/// data-rotation freeze outlasted the owner's bounded admission hold, or the
+/// hold was full (task row M3-15).
+pub(crate) const ROTATION_FREEZE_CODE: &str = "ROTATION_FREEZE";
+
+/// The answer for a request the owner held across a scheduled data-rotation
+/// freeze past its bound (task row M3-15).
+///
+/// Deliberately **not** [`retryable_peer_failure_response`]: that body is the
+/// relay's answer to every owner-not-ready fault state (no active carrier, an
+/// unfenced owner, an unknown owner write), during which a consumer cannot
+/// know what an earlier request is doing.  This one is the scheduled case,
+/// with its own code, so a consumer or gateway can retry it and only it.  Its
+/// retry hint and `Retry-After` are derived the same way from the same
+/// owner-not-ready hint.
+fn rotation_freeze_response(retry_after_ms: u64) -> Response {
+    let retry_after_ms = retry_after_ms.clamp(1, OWNER_NOT_READY_RETRY_AFTER_MS.max(1));
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: ROTATION_FREEZE_CODE,
+            execution: "not_dispatched",
+            message: "device data rotation is in progress; retry after the bounded hint",
             retryable: Some(true),
             retry_after_ms: Some(retry_after_ms),
         }),
@@ -4744,13 +4808,14 @@ mod tests {
 
     use super::{
         ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
-        PeerAdmissionBarrierError, PeerAdmissionScope, control_refusal_close,
-        forwarded_bearer_token, forwarded_control_refusal_status, is_no_live_owner,
-        method_not_allowed, owner_busy_close, peer_consumer_diagnostic_outcome,
-        peer_failure_response, remote_control_refusal_close, service_resolution_response,
-        stream_limit_response,
+        PeerAdmissionBarrierError, PeerAdmissionScope, ROTATION_FREEZE_CODE, control_refusal_close,
+        echo_failure_response, forwarded_bearer_token, forwarded_control_refusal_status,
+        is_no_live_owner, local_consumer_admission_response, method_not_allowed, owner_busy_close,
+        peer_consumer_diagnostic_outcome, peer_failure_response, remote_control_refusal_close,
+        service_resolution_response, stream_limit_response,
     };
     use crate::{
+        actor::RelayError,
         peer_runtime::PeerRuntimeError,
         routing::{OwnerRoutingError, OwnerScope, ServiceResolutionError},
     };
@@ -5086,6 +5151,87 @@ mod tests {
                 forwarded_control_refusal_status(&error),
                 StatusCode::FORBIDDEN,
                 "{error}: a new owner never sends the old catch-all"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_freeze_refusal_is_distinct_from_the_owner_not_ready_fault_refusal() {
+        // Task row M3-15.  The fault refusal is pinned byte for byte: its body
+        // must not change when the scheduled freeze gets its own answer.
+        const FAULT_BODY: &str = concat!(
+            r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","#,
+            r#""message":"selected owner is not ready; retry after the bounded hint","#,
+            r#""retryable":true,"retry_after_ms":250}"#,
+        );
+        for (label, fault) in [
+            (
+                "local",
+                local_consumer_admission_response(RelayError::OwnerNotReady),
+            ),
+            (
+                "forwarded",
+                peer_failure_response(PeerRuntimeError::OwnerNotReady {
+                    retry_after_ms: 250,
+                }),
+            ),
+        ] {
+            assert_eq!(fault.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(
+                fault
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1"),
+                "{label}"
+            );
+            let body = axum::body::to_bytes(fault.into_body(), 1024)
+                .await
+                .expect("bounded fault body");
+            assert_eq!(body, FAULT_BODY.as_bytes(), "{label} fault body");
+        }
+
+        // The scheduled freeze: same status, same hint and Retry-After, and a
+        // distinct code, from the local owner, the unary echo route and
+        // through a forwarded hop.
+        for (label, freeze) in [
+            (
+                "local",
+                local_consumer_admission_response(RelayError::RotationFreeze),
+            ),
+            (
+                "unary echo",
+                echo_failure_response(crate::actor::ROTATION_FREEZE_ECHO_CODE, "not_dispatched"),
+            ),
+            (
+                "forwarded",
+                peer_failure_response(PeerRuntimeError::RotationFreeze {
+                    retry_after_ms: crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS,
+                }),
+            ),
+        ] {
+            assert_eq!(freeze.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(
+                freeze
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1"),
+                "{label}: Retry-After is derived from retry_after_ms"
+            );
+            let body = axum::body::to_bytes(freeze.into_body(), 1024)
+                .await
+                .expect("bounded freeze body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("freeze response JSON");
+            assert_eq!(body["code"], ROTATION_FREEZE_CODE, "{label}");
+            assert_eq!(body["code"], "ROTATION_FREEZE", "{label}");
+            assert_eq!(body["execution"], "not_dispatched", "{label}");
+            assert_eq!(body["retryable"], true, "{label}");
+            assert_eq!(body["retry_after_ms"], 250, "{label}");
+            assert_ne!(
+                body["message"], "selected owner is not ready; retry after the bounded hint",
+                "{label}"
             );
         }
     }

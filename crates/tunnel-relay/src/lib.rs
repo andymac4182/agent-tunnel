@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 mod actor;
+mod authority_readiness;
 pub mod catalog_changes;
 mod config;
 mod consumer_framing;
@@ -20,6 +21,7 @@ mod http;
 pub mod http_forward_diagnostics;
 pub mod membership_runtime;
 pub mod membership_version_state;
+mod metrics;
 mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;
 pub mod peer_runtime;
@@ -91,7 +93,8 @@ pub use recovery::{
 pub use runtime::{
     OwnerUnregisterEvent, OwnerUnregisterKind, RelayCarrierSnapshot, RelayRotationSnapshot,
     RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
-    StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent, recovery_reason_name,
+    RotationFreezeHoldSnapshot, StreamTerminalCause, StreamTerminalEvent,
+    StreamTerminalReceiptEvent, recovery_reason_name,
 };
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 
