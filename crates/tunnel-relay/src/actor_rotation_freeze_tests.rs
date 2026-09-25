@@ -3227,6 +3227,49 @@ async fn a_connector_frame_overtaking_committed_on_the_candidate_is_received() {
     assert_eq!(fixture.phase(), RotationPhase::Retiring);
 }
 
+/// Task row M7-C98, found by `verify-m7-concurrent-load` on this branch.  After
+/// the relay has processed COMMITTED the attempt's new carrier is its active
+/// writer, no longer its candidate, while the attempt is still `Retiring` and
+/// the connector's FROZEN fence is still recorded.  The connector now writes
+/// on that carrier as soon as it has sent COMMITTED, so its new sequences
+/// continue above the fence there.  The fence binds only the old carrier:
+/// such a frame must be received, not refused as `FENCE_VIOLATION` (which
+/// closed the whole session in that gate).
+#[tokio::test]
+async fn a_connector_frame_on_the_new_carrier_while_retiring_is_not_a_fence_violation() {
+    let mut fixture = FreezeFixture::new("retiring-new-carrier", false);
+    fixture.quiesce_roster(&[STREAM_ID]);
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+
+    let new_generation = fixture.attempt.new_generation;
+    let new_carrier = fixture.candidate_carrier.clone();
+    fixture
+        .actor
+        .inbound_data(
+            new_carrier,
+            Frame::fin(1, new_generation, STREAM_ID, 1, 0)
+                .encode()
+                .expect("connector FIN encodes"),
+        )
+        .await;
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "a frame above the old fence on the new carrier must not fail the session"
+    );
+    assert_eq!(
+        fixture
+            .stream()
+            .sequence
+            .direction(Direction::ConnectorToRelay)
+            .recv_contiguous(),
+        1
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task row M7-C94: a unary echo that ends by any exit other than completion
 // or its own REJECTED.  Before M7-C94 every such exit removed the entry from

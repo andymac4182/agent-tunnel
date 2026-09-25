@@ -1504,6 +1504,26 @@ M7_CONNECTOR_RELAY_CASES: list[Case] = [
         ),
     ),
 ]
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M7-C98, the relay half: the old carrier's FROZEN fence does not bind
+        # the attempt's new carrier while `Retiring`.
+        "the frozen fence binds the old carrier, not the new one while retiring",
+        [
+            (
+                ACTOR,
+                "                && !on_new_carrier\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "a_connector_frame_on_the_new_carrier_while_retiring_is_not_a_fence_violation"
+            }
+        ),
+    )
+)
 M7_CONNECTOR_CLIENT_CASES: list[Case] = [
     Case(
         # M7-C84: an error raised after the stop's own cancellation is a stop.

@@ -12411,7 +12411,20 @@ impl RelayActor {
             // proof unprovable (`AckAboveFence`), so it is a protocol
             // violation on the retiring carrier, not a late event
             // (docs/m7-edge-cases.md EC-044 post-drain rejection).
+            //
+            // The fence binds the *old* carrier only.  After COMMITTED the
+            // attempt's new carrier is the relay's active writer and no
+            // longer its candidate, and since M7-C98 the connector resumes
+            // its writer there as soon as it has sent COMMITTED, so its new
+            // sequences legitimately continue above the fence on that
+            // carrier while the attempt is still `Retiring`.
+            let on_new_carrier = session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.attempt.as_ref())
+                .is_some_and(|attempt| carrier.connection_id == attempt.new_connection_id);
             if !carrier_is_candidate
+                && !on_new_carrier
                 && matches!(
                     frame.kind,
                     FrameKind::Data | FrameKind::Fin | FrameKind::Reset
