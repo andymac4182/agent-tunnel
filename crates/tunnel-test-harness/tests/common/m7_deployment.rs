@@ -1067,3 +1067,17 @@ where
         }
     }
 }
+
+/// Mark a freshly activated fixture namespace as provisioned (task row
+/// M6-C34): `serve` refuses an activated namespace that `provision-catalog`
+/// (or the fixture seed) has not reserved.  These process gates serve no
+/// catalog records, so an empty seed takes the reservation and nothing else.
+/// Call it right after the activation and before anything else writes the
+/// namespace (the seed requires the namespace to hold only its incarnation).
+pub async fn mark_catalog_provisioned(catalog: &tunnel_catalog::RedisCatalog) -> Result<()> {
+    use tunnel_catalog::Catalog as _;
+    catalog
+        .seed_fixture(&tunnel_catalog::CatalogFixture::default())
+        .await
+        .map_err(|error| HarnessError::Redis(format!("provisioning fixture namespace: {error}")))
+}
