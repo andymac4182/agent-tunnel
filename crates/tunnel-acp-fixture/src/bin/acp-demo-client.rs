@@ -191,10 +191,17 @@ async fn main() -> ExitCode {
                     .collect();
                 let title = serde_json::to_value(&request.tool_call)
                     .ok()
-                    .and_then(|value| value.get("title").and_then(Value::as_str).map(ToOwned::to_owned))
+                    .and_then(|value| {
+                        value
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
                     .unwrap_or_default();
                 println!("demo: permission requested \"{title}\" options={offered:?}");
-                let mode = *callback_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mode = *callback_mode
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match mode {
                     OnPermission::Allow => {
                         // The allow option, chosen by kind rather than by name
@@ -203,9 +210,11 @@ async fn main() -> ExitCode {
                             .options
                             .iter()
                             .find(|option| {
-                                serde_json::to_value(&option.kind)
+                                serde_json::to_value(option.kind)
                                     .ok()
-                                    .and_then(|kind| kind.as_str().map(|kind| kind.starts_with("allow")))
+                                    .and_then(|kind| {
+                                        kind.as_str().map(|kind| kind.starts_with("allow"))
+                                    })
                                     .unwrap_or(false)
                             })
                             .map(|option| option.option_id.clone())
@@ -217,7 +226,9 @@ async fn main() -> ExitCode {
                         };
                         println!("demo: permission answered selected={}", option.0.as_ref());
                         responder.respond(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option)),
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                option,
+                            )),
                         ))
                     }
                     OnPermission::HoldForCancel => {
@@ -255,7 +266,7 @@ async fn main() -> ExitCode {
                 initialized.protocol_version == ProtocolVersion::V1,
                 format!(
                     "protocol={}",
-                    serde_json::to_value(&initialized.protocol_version).unwrap_or(Value::Null)
+                    serde_json::to_value(initialized.protocol_version).unwrap_or(Value::Null)
                 ),
             );
             let session = connection
@@ -283,7 +294,9 @@ async fn main() -> ExitCode {
             let allowed = connection
                 .send_request(PromptRequest::new(
                     id.clone(),
-                    vec![ContentBlock::Text(TextContent::new("permission".to_owned()))],
+                    vec![ContentBlock::Text(TextContent::new(
+                        "permission".to_owned(),
+                    ))],
                 ))
                 .block_task()
                 .await?;
@@ -294,14 +307,21 @@ async fn main() -> ExitCode {
             );
 
             // 4. the same callback, left pending and cancelled.
-            *mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                OnPermission::HoldForCancel;
+            *mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = OnPermission::HoldForCancel;
             let pending = connection.send_request(PromptRequest::new(
                 id.clone(),
-                vec![ContentBlock::Text(TextContent::new("permission".to_owned()))],
+                vec![ContentBlock::Text(TextContent::new(
+                    "permission".to_owned(),
+                ))],
             ));
             if held_rx.recv().await.is_none() {
-                expect("prompt-cancel", false, "no permission callback arrived".to_owned());
+                expect(
+                    "prompt-cancel",
+                    false,
+                    "no permission callback arrived".to_owned(),
+                );
                 return Ok(());
             }
             println!("demo: sending session/cancel");
@@ -330,7 +350,9 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if failures.is_empty() {
-                println!("demo: PASS initialize, session, streaming, permission and cancel through the relay");
+                println!(
+                    "demo: PASS initialize, session, streaming, permission and cancel through the relay"
+                );
                 ExitCode::SUCCESS
             } else {
                 println!("demo: FAILED steps={failures:?}");

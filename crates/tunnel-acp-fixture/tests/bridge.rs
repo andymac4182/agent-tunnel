@@ -796,7 +796,10 @@ async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
                                 value
                                     .pointer("/result/stopReason")
                                     .and_then(Value::as_str)
-                                    .map_or_else(|| "<other>".to_owned(), |stop| format!("result:{stop}"))
+                                    .map_or_else(
+                                        || "<other>".to_owned(),
+                                        |stop| format!("result:{stop}"),
+                                    )
                             },
                             ToOwned::to_owned,
                         )

@@ -1796,7 +1796,9 @@ mod ending_tests {
             counters: Arc::clone(&export.inner.counters),
             shutdown: CancellationToken::new(),
             // No dispatcher in this fixture: a sender that is already gone.
-            outbound: mpsc::channel::<OutboundMessage>(1).0.downgrade(),
+            outbound: tokio::sync::mpsc::channel::<crate::OutboundMessage>(1)
+                .0
+                .downgrade(),
         })
     }
 
