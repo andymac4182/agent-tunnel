@@ -60,8 +60,8 @@ use url::Url;
 use uuid::Uuid;
 
 pub use config::{
-    CredentialConfig, ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig,
-    DEFAULT_SUPERVISOR_SOCKET_NAME, ReconnectConfig, RuntimeConfig as ConnectConfig,
+    CredentialConfig, DEFAULT_SUPERVISOR_SOCKET_NAME, ExportConfig as LocalExport,
+    ExportKind as LocalExportKind, LimitsConfig, ReconnectConfig, RuntimeConfig as ConnectConfig,
     RuntimeConfigError, SupervisorConfig,
 };
 pub use credentials::{CsrOutput, ImportedCredential};

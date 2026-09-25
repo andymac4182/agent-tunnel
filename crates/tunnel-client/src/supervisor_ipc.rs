@@ -100,9 +100,8 @@ impl std::fmt::Display for IpcError {
             Self::Absent => formatter.write_str(
                 "no supervisor is running for this profile (start `tunnel-client connect`)",
             ),
-            Self::Busy => formatter.write_str(
-                "another tunnel-client connect is already supervising this profile",
-            ),
+            Self::Busy => formatter
+                .write_str("another tunnel-client connect is already supervising this profile"),
             Self::Unauthorized(reason) => {
                 write!(formatter, "local supervisor IPC refused: {reason}")
             }
@@ -414,19 +413,16 @@ mod unix {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
-                let authorized = stream
-                    .peer_cred()
-                    .is_ok_and(|credential| peer_is_authorized(credential.uid(), self.expected_uid));
+                let authorized = stream.peer_cred().is_ok_and(|credential| {
+                    peer_is_authorized(credential.uid(), self.expected_uid)
+                });
                 if !authorized {
                     counters.peers_refused = counters.peers_refused.saturating_add(1);
                     drop(stream);
                     continue;
                 }
-                match tokio::time::timeout(
-                    IPC_IO_TIMEOUT,
-                    answer(stream, &status, &mut counters),
-                )
-                .await
+                match tokio::time::timeout(IPC_IO_TIMEOUT, answer(stream, &status, &mut counters))
+                    .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(())) | Err(_) => {
@@ -594,7 +590,11 @@ mod tests {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
         let ipc = SupervisorIpc::bind(&path).expect("bind");
-        let mode = std::fs::metadata(&path).expect("socket").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&path)
+            .expect("socket")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "the socket must be owner-only");
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
@@ -604,7 +604,10 @@ mod tests {
         assert_eq!(status.ipc.requests_served, 1);
         cancel.cancel();
         server.await.expect("server joins");
-        assert!(!path.exists(), "the socket file is removed when the server ends");
+        assert!(
+            !path.exists(),
+            "the socket file is removed when the server ends"
+        );
     }
 
     #[tokio::test]
@@ -633,7 +636,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
         let other = effective_uid().wrapping_add(1);
-        let error = query_status_for_uid(&path, other).await.expect_err("refused");
+        let error = query_status_for_uid(&path, other)
+            .await
+            .expect_err("refused");
         assert!(matches!(error, IpcError::Unauthorized(_)), "{error:?}");
         cancel.cancel();
         server.await.expect("server joins");
@@ -671,7 +676,10 @@ mod tests {
         let dir = private_dir();
         let path = dir.path().join("s.sock");
         let first = SupervisorIpc::bind(&path).expect("bind");
-        assert_eq!(SupervisorIpc::bind(&path).expect_err("busy"), IpcError::Busy);
+        assert_eq!(
+            SupervisorIpc::bind(&path).expect_err("busy"),
+            IpcError::Busy
+        );
         // A killed supervisor leaves its file behind with nobody listening.
         let stale = std::os::unix::net::UnixListener::bind(dir.path().join("t.sock"))
             .expect("stale listener");
@@ -686,7 +694,9 @@ mod tests {
     async fn no_socket_is_absent_and_a_long_path_is_refused() {
         let dir = private_dir();
         assert_eq!(
-            query_status(&dir.path().join("none.sock")).await.expect_err("absent"),
+            query_status(&dir.path().join("none.sock"))
+                .await
+                .expect_err("absent"),
             IpcError::Absent
         );
         let long = dir.path().join("x".repeat(MAX_SOCKET_PATH_BYTES));
@@ -705,7 +715,9 @@ mod tests {
         let (_tx, rx) = watch::channel(snapshot());
         let cancel = CancellationToken::new();
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
-        let mut stream = tokio::net::UnixStream::connect(&path).await.expect("connect");
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
         stream.write_all(b"disconnect\n").await.expect("write");
         let mut answer = String::new();
         stream.read_to_string(&mut answer).await.expect("read");

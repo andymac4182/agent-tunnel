@@ -175,7 +175,8 @@ impl Cause {
             Self::CredentialError | Self::IpcUnauthorized => 3,
             Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
-            Self::OwnerBusy | Self::ResourceExhausted | Self::SupervisorRunning => 7,
+            Self::OwnerBusy | Self::ResourceExhausted => 7,
+            Self::SupervisorRunning => 7,
             Self::SupervisorAbsent => 8,
             Self::Cancelled => 130,
             Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => 1,
@@ -1167,9 +1168,7 @@ impl SupervisorPublisher {
     /// reports no supervisor. The socket is never created somewhere the
     /// same-user checks refuse.
     fn start(config: &ConnectConfig) -> Result<Self, CliError> {
-        use tunnel_client::supervisor_ipc::{
-            ExportStatus, RotationPolicyStatus, SupervisorStatus,
-        };
+        use tunnel_client::supervisor_ipc::{ExportStatus, RotationPolicyStatus, SupervisorStatus};
         let initial = SupervisorStatus {
             pid: std::process::id(),
             state: "starting".to_owned(),
@@ -2528,7 +2527,11 @@ mod tests {
     #[test]
     fn the_cause_list_is_every_cause_exactly_once() {
         for (index, cause) in ALL_CAUSES.iter().enumerate() {
-            assert_eq!(cause_index(*cause), index, "{cause:?} is listed out of place");
+            assert_eq!(
+                cause_index(*cause),
+                index,
+                "{cause:?} is listed out of place"
+            );
         }
     }
 
@@ -2546,7 +2549,11 @@ mod tests {
         }
         let codes: std::collections::BTreeSet<&str> =
             causes.iter().map(|cause| cause.code()).collect();
-        assert_eq!(codes.len(), causes.len(), "every cause publishes a distinct code");
+        assert_eq!(
+            codes.len(),
+            causes.len(),
+            "every cause publishes a distinct code"
+        );
     }
 
     /// One of every `ClientError` variant, for tests that must sweep them.

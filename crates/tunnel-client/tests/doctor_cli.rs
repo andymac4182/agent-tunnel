@@ -184,7 +184,10 @@ fn doctor_binary_reports_private_fixture_success_and_an_absent_supervisor() {
     assert_eq!(report["result"]["expiry"]["status"], "ok");
     assert_eq!(report["result"]["device_identity"]["status"], "ok");
     assert_eq!(report["result"]["supervisor_ipc"]["status"], "not_running");
-    assert_eq!(report["result"]["supervisor_ipc"]["code"], "SUPERVISOR_ABSENT");
+    assert_eq!(
+        report["result"]["supervisor_ipc"]["code"],
+        "SUPERVISOR_ABSENT"
+    );
     assert_redacted(&report, &output);
 }
 

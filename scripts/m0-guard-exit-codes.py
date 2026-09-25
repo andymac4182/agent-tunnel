@@ -1097,10 +1097,154 @@ RECOVERY_DEBUG_CASES: list[Case] = [
     ),
 ]
 
+#: **M6-06, the runtime operations gate.**  The supervisor status IPC
+#: (`crates/tunnel-client/src/supervisor_ipc.rs`, wired in `main.rs`), its
+#: redaction, its same-user authorization and the exit statuses `status` and
+#: a second `connect` select.  Same package and suite as `m0c03-exit-codes`;
+#: a separate list so the M0-03 tally is unchanged.
+SUPERVISOR_IPC = CLIENT / "src" / "supervisor_ipc.rs"
+CANARY_WITNESS = "status_and_doctor_never_print_a_planted_canary"
+OPS_GATE_CASES: list[Case] = [
+    Case(
+        # The snapshot is built from the whole profile, which holds the relay
+        # endpoint; copying it beside the device label is the realistic leak.
+        "a status snapshot that copies the relay endpoint is noticed",
+        [
+            (
+                MAIN,
+                "            device_id: config.device_id.clone(),\n"
+                "            certificate_expires_at_unix:",
+                "            device_id: format!(\"{} {}\", config.device_id, config.relay_url),\n"
+                "            certificate_expires_at_unix:",
+            )
+        ],
+        frozenset({CANARY_WITNESS}),
+    ),
+    Case(
+        # An export's configuration holds its device canary, and an MCP
+        # export's arguments, environment, URL and token file; printing the
+        # export instead of its kind is the other realistic leak.
+        "a status snapshot that copies an export's configuration is noticed",
+        [
+            (
+                MAIN,
+                "                    kind: serde_json::to_value(export.kind)\n"
+                "                        .ok()\n"
+                "                        .and_then(|kind| kind.as_str().map(str::to_owned))\n"
+                "                        .unwrap_or_default(),",
+                "                    kind: format!(\"{export:?}\"),",
+            )
+        ],
+        frozenset({CANARY_WITNESS}),
+    ),
+    Case(
+        # The server-side same-user rule, through the real `peer_cred` path.
+        # Both directions share the rule, so both unit tests redden.
+        "a peer running as another user is answered",
+        [
+            (
+                SUPERVISOR_IPC,
+                "    peer_uid == own_uid\n",
+                "    let _ = (peer_uid, own_uid);\n    true\n",
+            )
+        ],
+        frozenset(
+            {
+                "supervisor_ipc::tests::a_peer_with_another_uid_is_closed_unanswered",
+                "supervisor_ipc::tests::a_reader_refuses_a_supervisor_running_as_another_uid",
+            }
+        ),
+    ),
+    Case(
+        "a supervisor socket left open to other users is noticed",
+        [
+            (
+                SUPERVISOR_IPC,
+                "            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))",
+                "            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))",
+            )
+        ],
+        frozenset(
+            {
+                "supervisor_ipc::tests::a_same_user_reader_gets_the_snapshot_and_the_socket_is_owner_only",
+                "a_live_supervisor_answers_status_and_doctor_and_holds_the_profile",
+            }
+        ),
+    ),
+    Case(
+        # The reader's own check: a planted socket other users can reach must
+        # not be trusted even when a same-user process answers on it.
+        "a reader that trusts a socket open to other users is noticed",
+        [
+            (
+                SUPERVISOR_IPC,
+                "        if metadata.permissions().mode() & 0o077 != 0 {\n"
+                "            return Err(IpcError::Unauthorized(\n"
+                "                \"the supervisor socket is accessible to other users\",",
+                "        if metadata.permissions().mode() & 0o077 == 0o7777 {\n"
+                "            return Err(IpcError::Unauthorized(\n"
+                "                \"the supervisor socket is accessible to other users\",",
+            )
+        ],
+        frozenset(
+            {
+                "supervisor_ipc::tests::a_socket_readable_by_others_is_refused_before_connecting",
+                "a_socket_other_users_could_reach_is_refused",
+            }
+        ),
+    ),
+    Case(
+        # The profile lock: a second supervisor that ignores a live one would
+        # run its own reconnect loop on the same credential.  The fixture
+        # bounds that run, so the defeat reddens rather than hangs.
+        "a second supervisor on a held profile is noticed",
+        [
+            (
+                MAIN,
+                "        Err(IpcError::Busy) => Err(CliError::from_ipc(IpcError::Busy)),",
+                "        Err(IpcError::Busy) => Ok(None),",
+            )
+        ],
+        frozenset({"a_live_supervisor_answers_status_and_doctor_and_holds_the_profile"}),
+    ),
+    Case(
+        "status with no supervisor is its own exit status",
+        [(MAIN, "            Self::SupervisorAbsent => 8,", "            Self::SupervisorAbsent => 4,")],
+        frozenset({"status_without_a_supervisor_exits_eight_and_says_so"}),
+    ),
+    Case(
+        # An orderly stop must not leave a socket behind for the next reader
+        # to find; `Drop` is what removes it on every exit path.
+        "an orderly stop that leaves its socket behind is noticed",
+        [
+            (
+                SUPERVISOR_IPC,
+                "                let _ = std::fs::remove_file(&self.path);",
+                "                let _ = &self.path;",
+            )
+        ],
+        frozenset(
+            {
+                "supervisor_ipc::tests::a_same_user_reader_gets_the_snapshot_and_the_socket_is_owner_only",
+                "a_live_supervisor_answers_status_and_doctor_and_holds_the_profile",
+            }
+        ),
+    ),
+    Case(
+        # M6-C131: the vocabulary sweep's cause list could fall behind the
+        # enum silently.  `cause_index` is exhaustive with no fallback arm,
+        # so dropping a cause from it must not compile.
+        "the vocabulary sweep cannot fall behind the cause enum",
+        [(MAIN, "            Cause::IpcUnauthorized => 16,\n", "")],
+        expect_build_failure=True,
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m0c03-exit-codes", [CLIENT], CARGO_TEST, CASES),
     Suite("m0c03-classifier", [HARNESS], HARNESS_TEST, HARNESS_CASES),
     Suite("m0c06-recovery-debug", [RELAY], RELAY_RECOVERY_TEST, RECOVERY_DEBUG_CASES),
+    Suite("m6-06-ops-gate", [CLIENT], CARGO_TEST, OPS_GATE_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

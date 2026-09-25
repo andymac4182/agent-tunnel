@@ -1123,7 +1123,8 @@ mod tests {
             "device_id = \"bad\"\nrelay_url = \"ws://relay.example.test/v1/tunnel/control\"\nclient_cert = \"secret.pem\"\nprivate_key = \"secret-key.pem\"\nserver_ca = \"secret-ca.pem\"\n",
         )
         .expect("invalid config write");
-        let inspection = inspect_without_supervisor(&config, UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let inspection =
+            inspect_without_supervisor(&config, UNIX_EPOCH + Duration::from_secs(1_800_000_000));
         assert!(!inspection.output.ok);
         assert_eq!(inspection.exit_code, EXIT_INVALID_CONFIG);
         assert_eq!(
