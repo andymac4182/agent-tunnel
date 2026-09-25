@@ -856,3 +856,266 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
         Some(SPKI_SHA256)
     );
 }
+
+// ---- M8-C45, M7-C151..M7-C153: the rotation state machine ------------------
+
+mod rekey {
+    use super::*;
+    use tunnel_relay::peer_rekey::{
+        PeerRekey, PeerRekeyConfig, PeerRekeyError, PeerRekeyPhase, PeerRekeyRetirement,
+    };
+    use tunnel_transport::{PeerIdentityError, RotatingPeerIdentity, StagedPeerIdentity};
+
+    struct Pki {
+        ca: rcgen::Certificate,
+        ca_key: rcgen::KeyPair,
+        ca_pem: String,
+    }
+
+    struct Leaf {
+        chain: String,
+        key: String,
+        spki: String,
+    }
+
+    impl Pki {
+        fn new() -> Self {
+            let ca_key = rcgen::KeyPair::generate().expect("CA key");
+            let mut params = rcgen::CertificateParams::default();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "rekey CA");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+            let ca = params.self_signed(&ca_key).expect("CA");
+            Self {
+                ca_pem: ca.pem(),
+                ca,
+                ca_key,
+            }
+        }
+
+        fn peer(&self, node: &str) -> Leaf {
+            let key = rcgen::KeyPair::generate().expect("leaf key");
+            let mut params =
+                rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+            params.subject_alt_names.push(rcgen::SanType::URI(
+                format!("urn:agent-tunnel:peer:{node}")
+                    .try_into()
+                    .expect("URI"),
+            ));
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            ];
+            let certificate = params
+                .signed_by(&key, &self.ca, &self.ca_key)
+                .expect("leaf");
+            Leaf {
+                chain: format!("{}{}", certificate.pem(), self.ca_pem),
+                key: key.serialize_pem(),
+                spki: tunnel_transport::spki_sha256_from_der(certificate.der())
+                    .expect("SPKI")
+                    .to_hex(),
+            }
+        }
+    }
+
+    /// A record for this node approving `spkis` (in that activation order),
+    /// with `revoked` marking any of them revoked.
+    fn record(
+        fixture: &RuntimeFixture,
+        version: u64,
+        spkis: &[&str],
+        revoked: &[&str],
+    ) -> CatalogMembershipRecord {
+        let now = Utc::now();
+        let keys = spkis
+            .iter()
+            .enumerate()
+            .map(|(index, spki)| RelayKey {
+                key_id: format!("rekey-{index}"),
+                spki_sha256: (*spki).to_owned(),
+                not_before: now - chrono::Duration::seconds(10 - index as i64),
+                expires_at: now + chrono::Duration::seconds(30),
+                revoked: revoked.contains(spki),
+            })
+            .collect();
+        RuntimeFixture::record_with_keys(
+            &fixture.trusted_issuer,
+            version,
+            now - chrono::Duration::seconds(10),
+            now + chrono::Duration::seconds(30),
+            keys,
+        )
+    }
+
+    const HOLD: Duration = Duration::from_millis(300);
+
+    fn machine(fixture: &RuntimeFixture, pki: &Pki, current: &Leaf) -> Arc<PeerRekey> {
+        let identity = RotatingPeerIdentity::from_pem_at_startup(
+            current.chain.as_bytes(),
+            current.key.as_bytes(),
+        )
+        .expect("current identity");
+        PeerRekey::new(
+            identity,
+            Arc::clone(&fixture.runtime),
+            None,
+            pki.ca_pem.as_bytes().to_vec(),
+            PeerRekeyConfig {
+                convergence_hold: HOLD,
+                overlap: Duration::from_secs(600),
+                tick: Duration::from_millis(50),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn m8c45_stage_waits_for_a_continuous_approval_then_switches_and_retires_on_withdrawal() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 1, &[&current.spki], &[])])
+            .await;
+        fixture.runtime.bootstrap().await.expect("ready");
+        let rekey = machine(&fixture, &pki, &current);
+
+        let staged = rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        assert_eq!(staged, next.spki);
+        // Not approved: staged, never served.
+        let snapshot = rekey.tick().await;
+        assert_eq!(snapshot.phase, PeerRekeyPhase::Staged);
+        assert_eq!(snapshot.staged_approval, Some("absent"));
+        assert_eq!(snapshot.serving_spki, current.spki);
+
+        // Approved, but not yet for the hold.
+        fixture
+            .source
+            .replace(vec![record(&fixture, 2, &[&current.spki, &next.spki], &[])])
+            .await;
+        fixture.runtime.reconcile_once().await.expect("overlap");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
+        tokio::time::sleep(HOLD / 2).await;
+        // Approval lost before the hold elapsed: the hold restarts (M7-C152).
+        fixture
+            .source
+            .replace(vec![record(&fixture, 3, &[&current.spki], &[])])
+            .await;
+        fixture.runtime.reconcile_once().await.expect("single key");
+        assert_eq!(rekey.tick().await.staged_approval, Some("absent"));
+        fixture
+            .source
+            .replace(vec![record(&fixture, 4, &[&current.spki, &next.spki], &[])])
+            .await;
+        fixture.runtime.reconcile_once().await.expect("overlap again");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
+        tokio::time::sleep(HOLD / 2).await;
+        assert_eq!(
+            rekey.tick().await.phase,
+            PeerRekeyPhase::Staged,
+            "the hold restarted when approval was lost, so half of it is not enough"
+        );
+        tokio::time::sleep(HOLD).await;
+        let switched = rekey.tick().await;
+        assert_eq!(switched.phase, PeerRekeyPhase::Overlap);
+        assert_eq!(switched.serving_spki, next.spki);
+        assert_eq!(switched.previous_spki.as_deref(), Some(current.spki.as_str()));
+        assert_eq!(
+            fixture.runtime.local_serving_spki().as_deref(),
+            Some(next.spki.as_str())
+        );
+
+        // The publisher withdraws the predecessor: still Ready, and retired.
+        fixture
+            .source
+            .replace(vec![record(&fixture, 5, &[&next.spki], &[])])
+            .await;
+        fixture.runtime.reconcile_once().await.expect("successor only");
+        assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
+        let retired = rekey.tick().await;
+        assert_eq!(retired.phase, PeerRekeyPhase::Stable);
+        assert_eq!(retired.last_retirement, Some(PeerRekeyRetirement::Withdrawn));
+        assert_eq!((retired.stages, retired.switches, retired.retirements), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn m7c151_a_staged_key_the_record_revokes_is_discarded_and_never_served() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        fixture
+            .source
+            .replace(vec![record(
+                &fixture,
+                1,
+                &[&current.spki, &next.spki],
+                &[&next.spki],
+            )])
+            .await;
+        fixture.runtime.bootstrap().await.expect("ready");
+        let rekey = machine(&fixture, &pki, &current);
+        rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        tokio::time::sleep(HOLD * 2).await;
+        let snapshot = rekey.tick().await;
+        assert_eq!(snapshot.phase, PeerRekeyPhase::Stable);
+        assert_eq!(snapshot.serving_spki, current.spki);
+        assert_eq!(snapshot.last_refusal, Some("staged_key_revoked"));
+        assert_eq!(snapshot.switches, 0);
+    }
+
+    #[tokio::test]
+    async fn m7c153_staging_is_refused_while_a_rotation_is_in_progress_or_for_the_wrong_identity() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let another = pki.peer(NODE_ID);
+        let foreign = pki.peer("relay-z");
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 1, &[&current.spki], &[])])
+            .await;
+        fixture.runtime.bootstrap().await.expect("ready");
+        let rekey = machine(&fixture, &pki, &current);
+        assert!(matches!(
+            rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes()),
+            Err(PeerRekeyError::SameKey)
+        ));
+        assert!(matches!(
+            rekey.stage_pem(foreign.chain.as_bytes(), foreign.key.as_bytes()),
+            Err(PeerRekeyError::Identity(PeerIdentityError::DifferentNode))
+        ));
+        assert!(matches!(
+            rekey.stage_pem(next.chain.as_bytes(), another.key.as_bytes()),
+            Err(PeerRekeyError::Identity(PeerIdentityError::KeyMismatch))
+        ));
+        rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        assert!(matches!(
+            rekey.stage_pem(another.chain.as_bytes(), another.key.as_bytes()),
+            Err(PeerRekeyError::InProgress("staged"))
+        ));
+        // A validated candidate that is not staged changes nothing either.
+        let _ = StagedPeerIdentity::from_pem(
+            another.chain.as_bytes(),
+            another.key.as_bytes(),
+            pki.ca_pem.as_bytes(),
+        )
+        .expect("valid candidate");
+        assert_eq!(rekey.snapshot().staged_spki.as_deref(), Some(next.spki.as_str()));
+    }
+}
