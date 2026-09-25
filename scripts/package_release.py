@@ -106,7 +106,7 @@ TARGETS = advertised_targets()
 # copy.
 # --------------------------------------------------------------------------
 GUIDE = "docs/operator.md"
-SOURCE_URL = "https://github.com/andymac4182/agentuplink/blob"
+SOURCE_URL = "https://github.com/andymac4182/agentuplink"
 _LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
 
 
@@ -170,7 +170,9 @@ def staged_document(root, document, shipped, sha):
         if document == GUIDE:
             raise ValueError(f"{GUIDE} links {link!r}, which does not ship")
         fragment = f"#{local[1]}" if local[1] else ""
-        return f"]({SOURCE_URL}/{sha}/{target}{fragment})"
+        # GitHub serves a directory under /tree/ and a file under /blob/.
+        kind = "tree" if (root / target).is_dir() else "blob"
+        return f"]({SOURCE_URL}/{kind}/{sha}/{target}{fragment})"
 
     return _LINK_RE.sub(pin, text)
 

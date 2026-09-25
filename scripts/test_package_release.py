@@ -50,6 +50,7 @@ class PackagingTests(unittest.TestCase):
         (self.root / "docs" / "operator.md").write_text(GUIDE_TEXT)
         (self.root / "docs" / "runtime.md").write_text(RUNTIME_TEXT)
         (self.root / "docs" / "testing.md").write_text("# Testing, not shipped\n")
+        (self.root / "deploy" / "fly").mkdir(parents=True)
         (self.root / "examples").mkdir()
         for name in ("m1-client.toml", "m1-relay.toml"):
             (self.root / "examples" / name).write_text("# template")
@@ -118,8 +119,8 @@ class PackagingTests(unittest.TestCase):
                 )
                 runtime = (unpacked / "docs" / "runtime.md").read_text(encoding="utf-8")
                 self.assertIn("](operator.md#1-download)", runtime)
-                self.assertIn(f"]({SOURCE_URL}/{self.sha}/docs/testing.md#gate)", runtime)
-                self.assertIn(f"]({SOURCE_URL}/{self.sha}/deploy/fly)", runtime)
+                self.assertIn(f"]({SOURCE_URL}/blob/{self.sha}/docs/testing.md#gate)", runtime)
+                self.assertIn(f"]({SOURCE_URL}/tree/{self.sha}/deploy/fly)", runtime)
                 self.assertEqual(unresolved_links(unpacked), [])
                 self.assertFalse((unpacked / "docs" / "testing.md").exists())
 
@@ -150,8 +151,13 @@ class PackagingTests(unittest.TestCase):
             text = (staged / document).read_text(encoding="utf-8")
             for url in package_release._LINK_RE.findall(text):
                 if url.startswith(SOURCE_URL):
-                    target = url[len(SOURCE_URL) + 42:].partition("#")[0]
+                    kind, sha, target = url[len(SOURCE_URL) + 1:].split("/", 2)
+                    self.assertEqual(sha, self.sha, url)
+                    target = target.partition("#")[0]
+                    # A directory is linked as a tree, a file as a blob.
+                    expected = "tree" if (ROOT / target).is_dir() else "blob"
                     self.assertTrue((ROOT / target).exists(), f"{document}: {url}")
+                    self.assertEqual(kind, expected, f"{document}: {url}")
 
     def test_tar_modes_do_not_depend_on_the_build_host(self):
         # A Windows runner's file system has no execute bits, so the release

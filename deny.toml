@@ -41,16 +41,20 @@ feature-depth = 1
 # errors.  RUSTSEC-2026-0285 (`rustls` 0.23.44) was fixed by moving
 # `Cargo.lock` to 0.23.45.  The other two have no patched release and are
 # ignored below, each for a reason that is a property of this workspace, not
-# of the advisory.  cargo-deny reports an ignore that matches nothing as
-# `advisory-not-detected`, so an entry cannot outlive its crate silently.
+# of the advisory.  `unused-ignored-advisory = "deny"` makes an ignore that
+# matches nothing an error (`advisory-not-detected`), so an entry cannot
+# outlive its crate silently; cargo-deny's default for it is only a warning.
+unused-ignored-advisory = "deny"
 ignore = [
     # Marvin attack: timing in RSA *private-key* operations (decryption and
     # signing).  The shipped relay only *verifies* RS256 consumer tokens with
     # public keys (`DecodingKey::from_rsa_components` in
     # crates/tunnel-relay/src/main.rs); no shipped binary holds an RSA private
-    # key.  The one RSA signer, `EncodingKey::from_rsa_pem`, is in
-    # `tunnel-test-harness` and signs with a synthetic fixture key.
-    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken: shipped code only verifies RS256 with public keys; the only RSA private key is a synthetic test-harness fixture (docs/tasks.md M6-C03)" },
+    # key.  RSA signing and private keys appear only in test code: the
+    # `tunnel-test-harness` OIDC fixture (`rsa` is a direct dependency of that
+    # crate) and the tunnel-relay process tests
+    # (tests/m6_provisioning_process.rs, tests/m6_reconnect_process.rs).
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken: shipped code only verifies RS256 with public keys; RSA signing and private keys appear only in test code (tunnel-test-harness, tunnel-relay/tests) (docs/tasks.md M6-C03)" },
     # Unmaintained, not a vulnerability.  The replacement is
     # `rustls_pki_types::pem::PemObject`; migrating touches the TLS
     # credential loaders in tunnel-transport, tunnel-client and tunnel-relay,
