@@ -373,10 +373,16 @@ impl PeerRekey {
                             }
                         }
                         LocalKeyApproval::Revoked => Action::AbandonRevoked,
-                        // Lost approval (or never had it): the hold restarts.
-                        // `NotReady` restarts it too: convergence is measured
-                        // only while this relay can see the record.
-                        _ => {
+                        // A transient unready state (a failed catalog read, a
+                        // checkpoint refresh in flight) is not an observation
+                        // that approval was lost: it neither advances the
+                        // switch nor restarts the hold.  Peers converge on the
+                        // record whether or not this relay can read it right
+                        // now, and the switch itself still requires this relay
+                        // to be Ready with a record approving the key.
+                        LocalKeyApproval::NotReady => Action::None,
+                        // Observed unapproved while Ready: the hold restarts.
+                        LocalKeyApproval::Absent | LocalKeyApproval::OutsideWindow => {
                             staged.approved_since = None;
                             Action::None
                         }
@@ -438,6 +444,7 @@ impl PeerRekey {
         };
         let previous_spki = self.identity.current_spki().to_hex();
         let spki = staged.spki.clone();
+        let approved_since = staged.approved_since;
         let identity = Arc::clone(&self.identity);
         let mut slot = Some(staged.identity);
         let mut generation = 0;
@@ -471,14 +478,19 @@ impl PeerRekey {
                     LocalServingSwitchError::NotApproved(_) => "switch_not_approved",
                     LocalServingSwitchError::Install(_) => "switch_install_failed",
                 };
-                // Put the staged identity back (if install never consumed it)
-                // and restart the convergence hold.
+                // Put the staged identity back (if install never consumed it).
+                // A refusal because the runtime was momentarily not Ready keeps
+                // the hold already served; any other refusal restarts it.
+                let keep_hold = matches!(
+                    error,
+                    LocalServingSwitchError::NotApproved(LocalKeyApproval::NotReady)
+                );
                 if let Some(identity) = slot.take() {
                     *self.lock_state() = RekeyState::Staged(StagedState {
                         identity,
                         spki,
-                        approved_since: None,
-                        last_approval: LocalKeyApproval::Absent,
+                        approved_since: keep_hold.then_some(approved_since).flatten(),
+                        last_approval: LocalKeyApproval::NotReady,
                     });
                 }
                 self.refuse(label);

@@ -1049,6 +1049,45 @@ mod rekey {
     }
 
     #[tokio::test]
+    async fn m7c152_a_transient_unready_state_neither_restarts_the_hold_nor_switches() {
+        // A failed catalog read or checkpoint fetch takes the runtime Unready
+        // for one pass.  That is not an observation that approval was lost:
+        // the hold already served is kept, and nothing switches while Unready.
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 1, &[&current.spki, &next.spki], &[])])
+            .await;
+        fixture.runtime.bootstrap().await.expect("overlap ready");
+        let rekey = machine(&fixture, &pki, &current);
+        rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
+        tokio::time::sleep(HOLD * 3 / 4).await;
+        fixture.authority.set_mode(AuthorityMode::Failed);
+        let _ = fixture.runtime.reconcile_once().await;
+        assert!(!matches!(
+            fixture.runtime.readiness(),
+            MembershipReadiness::Ready
+        ));
+        tokio::time::sleep(HOLD / 2).await;
+        let unready = rekey.tick().await;
+        assert_eq!(unready.phase, PeerRekeyPhase::Staged, "never switch while Unready");
+        assert_eq!(unready.staged_approval, Some("not_ready"));
+        fixture.authority.set_mode(AuthorityMode::Ready);
+        fixture.runtime.reconcile_once().await.expect("ready again");
+        // More than a hold has passed since approval was first seen, and it
+        // was never observed withdrawn: the first Ready tick switches.
+        let switched = rekey.tick().await;
+        assert_eq!(switched.phase, PeerRekeyPhase::Overlap);
+        assert_eq!(switched.serving_spki, next.spki);
+    }
+
+    #[tokio::test]
     async fn m7c151_a_staged_key_the_record_revokes_is_discarded_and_never_served() {
         let pki = Pki::new();
         let current = pki.peer(NODE_ID);

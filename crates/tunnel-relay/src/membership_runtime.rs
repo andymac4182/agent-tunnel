@@ -255,7 +255,14 @@ impl MembershipRecordSource for CatalogMembershipSource {
             self.catalog
                 .read_signed_memberships()
                 .await
-                .map_err(|_| MembershipSourceError::Catalog)
+                .map_err(|error| {
+                    // Name the typed catalog cause once: `Source(Catalog)`
+                    // alone could not be attributed (found while diagnosing
+                    // the M8-C46 process gate).  Catalog errors carry static
+                    // detail strings, never record bytes or credentials.
+                    tracing::warn!(?error, "signed membership directory read failed");
+                    MembershipSourceError::Catalog
+                })
         })
     }
 }

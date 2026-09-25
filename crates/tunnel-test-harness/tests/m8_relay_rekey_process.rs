@@ -62,7 +62,7 @@ use uuid::Uuid;
 #[path = "common/m7_deployment.rs"]
 mod common;
 use common::{
-    CheckpointServer, FixtureFiles, ProcessConfigFixture, RedisTlsProxy, free_tcp_addr,
+    CheckpointServer, FixtureFiles, ProcessConfigFixture, free_tcp_addr,
     health_request, hex_encode, jwks_json, parse_plaintext_upstream, process_diagnostic,
     relay_binary_path, send_sigint, wait_for_exit, wait_for_ports_released, wait_for_ready,
 };
@@ -288,7 +288,7 @@ struct PartialFixture {
     catalog: Option<RedisCatalog>,
     /// One forwarder per relay: the shared helper bounds concurrent
     /// connections, and each configured relay opens its own catalog lanes.
-    redis_proxies: Vec<RedisTlsProxy>,
+    redis_proxies: Vec<LongLivedRedisTlsProxy>,
     checkpoint: Option<CheckpointServer>,
 }
 
@@ -321,7 +321,7 @@ impl PartialFixture {
 struct RekeyFixture {
     _files: FixtureFiles,
     catalog: Option<RedisCatalog>,
-    redis_proxies: Vec<RedisTlsProxy>,
+    redis_proxies: Vec<LongLivedRedisTlsProxy>,
     checkpoint: Option<CheckpointServer>,
     relay_binary: PathBuf,
     upstream_url: String,
@@ -473,10 +473,10 @@ async fn create_fixture_inner(
     .map_err(|error| HarnessError::Pki(format!("building Redis TLS proxy: {error}")))?;
     partial
         .redis_proxies
-        .push(RedisTlsProxy::bind(upstream, redis_tls.clone()).await?);
+        .push(LongLivedRedisTlsProxy::bind(upstream, redis_tls.clone()).await?);
     partial
         .redis_proxies
-        .push(RedisTlsProxy::bind(upstream, redis_tls).await?);
+        .push(LongLivedRedisTlsProxy::bind(upstream, redis_tls).await?);
     let a_redis_url = partial.redis_proxies[0].url();
     let b_redis_url = partial.redis_proxies[1].url();
     let catalog =
@@ -1074,6 +1074,16 @@ impl RekeyFixture {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        // Keep each relay's full, payload-free stderr where the operator asked
+        // for it, so a failed run can be read rather than guessed at.
+        if let Ok(directory) = env::var("M8_REKEY_LOG_DIR") {
+            for slot in &self.processes {
+                let _ = std::fs::write(
+                    Path::new(&directory).join(format!("{}.stderr", slot.label)),
+                    slot.process.stderr(),
+                );
+            }
+        }
         let mut errors = Vec::new();
         if let Some(client) = self.client.take()
             && let Err(error) = client.stop().await
@@ -1744,4 +1754,116 @@ async fn post_echo(probe: EchoProbe<'_>) -> Result<(u16, Vec<u8>)> {
 fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(digest.as_ref())
+}
+
+// ---------------------------------------------------------------------------
+// A Redis TLS forwarder whose connections live as long as the relay keeps them
+// ---------------------------------------------------------------------------
+
+/// The shared `RedisTlsProxy` ends every forwarded connection five seconds
+/// after it is accepted (`AUXILIARY_CONNECTION_DEADLINE`).  A relay's catalog
+/// lanes are long-lived, so behind it every lane breaks with `broken pipe`
+/// every few seconds; each failed membership reconcile takes the relay
+/// Unready and a failed maintenance identity check closes the device session.
+/// That was measured, in this gate, before this forwarder existed: the
+/// relays' directory reads failed with `Database(broken pipe)` on one
+/// reconcile in two and the device owner was lost.  This gate's phases are
+/// longer than `m7_deployment_spki_replacement`'s, so it forwards without a
+/// per-connection deadline, bounded by count and joined on shutdown.
+struct LongLivedRedisTlsProxy {
+    address: SocketAddr,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+    cancellation: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+const LONG_LIVED_PROXY_CONNECTIONS: usize = 64;
+
+impl LongLivedRedisTlsProxy {
+    async fn bind(upstream: SocketAddr, server_config: Arc<rustls::ServerConfig>) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let cancellation = CancellationToken::new();
+        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let task_cancellation = cancellation.clone();
+        let task_handshakes = handshakes.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    () = task_cancellation.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        while connections.try_join_next().is_some() {}
+                        if connections.len() >= LONG_LIVED_PROXY_CONNECTIONS {
+                            drop(stream);
+                            continue;
+                        }
+                        let acceptor = acceptor.clone();
+                        let handshakes = task_handshakes.clone();
+                        let cancellation = task_cancellation.clone();
+                        connections.spawn(async move {
+                            let Ok(mut tls) = acceptor.accept(stream).await else { return };
+                            handshakes.fetch_add(1, std::sync::atomic::Ordering::Release);
+                            let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await
+                            else {
+                                return;
+                            };
+                            tokio::select! {
+                                () = cancellation.cancelled() => {}
+                                _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream) => {}
+                            }
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        Ok(Self {
+            address,
+            handshakes,
+            cancellation,
+            task: Some(task),
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("rediss://localhost:{}/0", self.address.port())
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            timeout(Duration::from_secs(5), task)
+                .await
+                .map_err(|_| HarnessError::Timeout("Redis TLS forwarder shutdown".into()))?
+                .map_err(|error| HarnessError::Proxy(format!("Redis TLS forwarder: {error}")))?;
+        }
+        if self.handshakes.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return Err(HarnessError::Proxy(
+                "relay never completed a Redis TLS handshake".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn shutdown_allow_unused(mut self) -> Result<()> {
+        self.handshakes.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LongLivedRedisTlsProxy {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
