@@ -2735,7 +2735,9 @@ mod tests {
             reason: Arc::new(AtomicU8::new(
                 PeerInvalidationReason::MembershipRevoked.code(),
             )),
-            expires_at: Some(Instant::now() - Duration::from_millis(1)),
+            expires_at: Some(SharedAdmissionExpiry::new(
+                Instant::now() - Duration::from_millis(1),
+            )),
         };
         revoked_after_deadline.token().cancel();
         assert!(!revoked_after_deadline.trust_expired());

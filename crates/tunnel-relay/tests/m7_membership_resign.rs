@@ -257,7 +257,7 @@ fn wired(runtime: &Arc<MembershipRuntime>) -> Wired {
     let peer = Arc::new(PeerRuntime::new_with_readiness(
         client,
         router,
-        Arc::clone(runtime),
+        Arc::clone(runtime) as Arc<dyn tunnel_relay::PeerBindingProvider>,
         NODE_ID,
         BOOT_ID,
         Arc::clone(&readiness),
