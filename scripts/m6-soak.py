@@ -1126,6 +1126,52 @@ async def fairness(args: argparse.Namespace) -> None:
                             "processes": summarize_samples(run_dir / "samples.csv")})
 
 
+async def flood(args: argparse.Namespace) -> None:
+    """Reproduction for M6-C120/M6-C121: one device, N closed-loop echo
+    consumers for a fixed time; report every device session end and whether
+    `connect` exited, and with what."""
+    run_dir, nonce = make_run(args, "flood")
+    stack = base_stack(args, run_dir, nonce, "m6-03-flood", mcp=False)
+    rec = Recorder(run_dir / "requests.csv", nonce)
+    try:
+        stack.start_relay()
+        stack.start_device("a")
+        await wait_serving(stack, rec)
+        rec.phase = f"flood-c{args.workers}"
+        stack.event("flood-start", workers=args.workers, seconds=args.seconds)
+        workers = [Worker(stack, rec, "echo", "a", "a", f"f{i}", payload_size=args.payload)
+                   for i in range(args.workers)]
+        until = time.time() + args.seconds
+        await asyncio.gather(*(w.loop_closed(until) for w in workers))
+        for w in workers:
+            await w.shutdown()
+        rec.phase = "after"
+        await asyncio.sleep(5)
+        probe = Worker(stack, rec, "echo", "a", "a", "after")
+        for _ in range(10):
+            await probe.once()
+            await asyncio.sleep(0.5)
+        await probe.shutdown()
+        proc = stack.devices["a"]["proc"]
+        exit_code = proc.poll()
+        _, _, events = stack.device_sessions("a")
+    finally:
+        rec.close()
+        stack.close()
+    ends = [e["result"] for e in events if isinstance(e.get("result"), dict)
+            and e["result"].get("state") == "disconnected"]
+    terminal = [e["error"] for e in events if e.get("ok") is False and e.get("error")]
+    write_summary(run_dir, {
+        "experiment": "flood", "nonce": nonce, "head": head_sha(), "workers": args.workers,
+        "seconds": args.seconds, "device_exit_code": exit_code,
+        "device_session_ends": [{"code": e.get("code"), "message": e.get("message"),
+                                 "ready_ms": e.get("ready_ms")} for e in ends],
+        "device_terminal_errors": terminal,
+        "flood": summarize_rows(rec.rows, "echo", f"flood-c{args.workers}"),
+        "after": summarize_rows(rec.rows, "echo", "after"),
+    })
+
+
 class DedicatedRedis:
     """A throwaway Redis container this run owns; never the shared one."""
 
@@ -1338,7 +1384,7 @@ def main() -> None:
     fwd.add_argument("--key", required=True)
     fwd.add_argument("--port", type=int, required=True)
     fwd.add_argument("--upstream", required=True)
-    for name in ("soak", "load", "chaos", "fairness"):
+    for name in ("soak", "load", "chaos", "fairness", "flood"):
         p = sub.add_parser(name)
         p.add_argument("--bin-dir", required=True)
         p.add_argument("--logs", required=True)
@@ -1359,6 +1405,10 @@ def main() -> None:
             p.add_argument("--step-seconds", type=float, default=30)
             p.add_argument("--kinds", default="echo,mcp")
             p.add_argument("--payload", type=int, default=1024)
+        if name == "flood":
+            p.add_argument("--workers", type=int, default=128)
+            p.add_argument("--seconds", type=float, default=60)
+            p.add_argument("--payload", type=int, default=1024)
         if name == "chaos":
             p.add_argument("--dedicated-redis", action="store_true",
                            help="start a throwaway Redis container and include the pause fault")
@@ -1377,7 +1427,8 @@ def main() -> None:
         raise SystemExit(f"stopped by signal {signum}")
     signal.signal(signal.SIGTERM, _unwind)
     signal.signal(signal.SIGHUP, _unwind)
-    asyncio.run({"soak": soak, "load": load, "chaos": chaos, "fairness": fairness}[args.cmd](args))
+    asyncio.run({"soak": soak, "load": load, "chaos": chaos, "fairness": fairness,
+                 "flood": flood}[args.cmd](args))
 
 
 if __name__ == "__main__":
