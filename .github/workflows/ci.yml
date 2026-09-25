@@ -379,3 +379,47 @@ jobs:
           node-version: "24"
       - name: Run M4 filesystem harness gates
         run: sh scripts/m4-harness-verify.sh
+      # Task row M4-08's last gap: a real mount inside an export on Linux,
+      # where the boundary is `openat2`'s RESOLVE_NO_XDEV. The runner's sudo
+      # mounts a tmpfs; the test itself takes no privilege. It runs twice:
+      # against the mounted export (must pass, 1 test) and against an export
+      # with no mount (must fail on its own positive control), so a pass
+      # cannot be a test that did not look.
+      - name: Linux mount-point refusal (M4-08)
+        run: |
+          set -euo pipefail
+          base=$(mktemp -d)
+          mkdir -p "$base/export/mnt" "$base/export/plain" "$base/unmounted/mnt" "$base/unmounted/plain"
+          echo synthetic > "$base/export/plain/beside.txt"
+          echo synthetic > "$base/unmounted/plain/beside.txt"
+          echo synthetic > "$base/unmounted/mnt/inside.txt"
+          sudo mount -t tmpfs -o size=1m tmpfs "$base/export/mnt"
+          echo synthetic | sudo tee "$base/export/mnt/inside.txt" > /dev/null
+          sudo chmod 0755 "$base/export/mnt"
+          sudo chmod 0644 "$base/export/mnt/inside.txt"
+          test_cmd() {
+            TUNNEL_FS_LINUX_MOUNT_EXPORT="$1" cargo +1.95.0 test -p tunnel-fs-host --locked \
+              --test special_and_mounts -- --ignored --exact \
+              a_mount_point_inside_the_export_is_not_crossed_on_linux --nocapture
+          }
+          test_cmd "$base/export" > mounted.log 2>&1 || { cat mounted.log; exit 1; }
+          cat mounted.log
+          grep -q "test result: ok. 1 passed" mounted.log
+          grep -q "m4-08-linux-mount ok" mounted.log
+          if test_cmd "$base/unmounted" > unmounted.log 2>&1; then
+            cat unmounted.log; echo "the control without a mount passed"; exit 1
+          fi
+          grep -q "mnt must be a mount point on another device" unmounted.log
+          echo "control without a mount failed on its own positive control, as it must"
+          sudo umount "$base/export/mnt"
+      # Task row M4-54: the filesystem demo (docs/demo/filesystem.md) end to
+      # end -- shipped relay and client, a real shared-client, just-bash,
+      # Mastra and Files SDK consumer, live revocation -- in front of this
+      # job's Redis through the demo's own TLS terminator.
+      - name: Filesystem demo (M4-54)
+        run: |
+          set -euo pipefail
+          (cd packages/client && npm ci)
+          DEMO_PLAINTEXT_REDIS=127.0.0.1:6379 bash scripts/fs-demo.sh > demo.log 2>&1 || { cat demo.log; exit 1; }
+          cat demo.log
+          grep -q "^fs-demo: PASS" demo.log
