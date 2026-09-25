@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "4e568c45778c41f28f15c578313cad4f16a0c990",
-  "lastPublishedOriginMain": "4e568c45778c41f28f15c578313cad4f16a0c990",
-  "lastReviewAt": "2026-09-25T18:03:59+10:00",
-  "lastReviewOutcome": "Reviewed test tooling and M1 admission harness ordering fixes through 4e568c4. Updated support evidence with six hosted M1 passes and three M7 probe passes at 4aab5c4, preserving Windows limitations and newly tracked MCP isolation and fixture-supervision intermittents. Runtime tests not rerun; CI and release gates unchanged by this website update.",
+  "reviewedOriginMain": "f9f7abfc594653bb8bb0e5763a6be348074f447e",
+  "lastPublishedOriginMain": "f9f7abfc594653bb8bb0e5763a6be348074f447e",
+  "lastReviewAt": "2026-09-25T20:04:05+10:00",
+  "lastReviewOutcome": "Reviewed M6 evidence-only changes and client/refusal changes through f9f7abf. Published common MCP/ACP client header handling, doctor identity checks, protocol and cluster refusal boundaries, import crash recovery and consumer error guidance. Runtime tests not rerun; CI and release gates unchanged by this website update.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support page exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T18:03:59+10:00",
-  "deploymentId": "dpl_cheP4qwGpeZH8JYcEh7Lfkbgu6mx"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support, MCP and ACP pages exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-25T20:04:05+10:00",
+  "deploymentId": "dpl_FKxTcXRFraHDtWEXHtpswjGE5qW6"
 }
