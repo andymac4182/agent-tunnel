@@ -16414,6 +16414,7 @@ mod stream_identity_tests {
             pending_registering: Default::default(),
             tickets: Default::default(),
             owner_forgets: Default::default(),
+            principal_watches: Default::default(),
             lifetime_application_dispatches: 0,
             control_registration_conflicts: 0,
             maintenance_cursor: None,
