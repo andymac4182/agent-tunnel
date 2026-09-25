@@ -204,7 +204,11 @@ class Consumer:
                            "params": params or {}})
         started = time.monotonic()
         proc = subprocess.run(
+            # `-H "Accept:"` removes curl's default `accept: */*`: computer-v1
+            # does not allowlist `accept`, and the relay refuses an unlisted
+            # header by name rather than dropping it (task row M5-C26).
             ["curl", "-sS", "--http2", "--max-time", "60", "--cacert", self.args.ca,
+             "-H", "Accept:",
              "-H", f"@{self.header_file}",
              "-H", "content-type: application/json",
              "-w", "\n%{http_code} %{http_version}", "--data-binary", "@-", self.url],
@@ -252,6 +256,8 @@ def cmd_consumer(args) -> int:
     capture = consumer.call("capture")
     if capture.get("outcome") != "ok":
         print("consumer: capture failed; no input will be sent", file=sys.stderr)
+        json.dump({"markers_match_fixture": False, "calls": consumer.log},
+                  open(os.path.join(out, "consumer.json"), "w"), indent=2)
         return 3
     png = capture.pop("_png")
     found = markers(png, state)
