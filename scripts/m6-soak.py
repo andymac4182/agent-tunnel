@@ -1142,15 +1142,24 @@ class DedicatedRedis:
 
 async def chaos(args: argparse.Namespace) -> None:
     run_dir, nonce = make_run(args, "chaos")
-    redis = DedicatedRedis(nonce)
+    # The Redis pause needs a container this run owns.  Without
+    # --dedicated-redis (the default since Docker Desktop was unavailable on
+    # 2026-09-26), every other fault runs against the shared Redis under a
+    # unique namespace, and the pause is recorded as not run.
+    redis = DedicatedRedis(nonce) if args.dedicated_redis else None
     stack = None
     rec = Recorder(run_dir / "requests.csv", nonce)
     faults = []
     sampler = None
     try:
-        stack = base_stack(args, run_dir, nonce, "m6-03-chaos", redis=("127.0.0.1", redis.port),
-                           relay_extra="redis_restart_continuity_seconds = 1\n")
-        stack.event("dedicated-redis", container=redis.name, port=redis.port)
+        if redis:
+            stack = base_stack(args, run_dir, nonce, "m6-03-chaos",
+                               redis=("127.0.0.1", redis.port),
+                               relay_extra="redis_restart_continuity_seconds = 1\n")
+            stack.event("dedicated-redis", container=redis.name, port=redis.port)
+        else:
+            stack = base_stack(args, run_dir, nonce, "m6-03-chaos")
+            stack.event("shared-redis", redis=args.redis)
         stack.start_relay()
         stack.start_device("a")
         sampler = Sampler(stack, interval=5, fd_every=2)
@@ -1262,7 +1271,13 @@ async def chaos(args: argparse.Namespace) -> None:
         await device_fault("device-sigterm", signal.SIGTERM, 1.0)
         for seconds in (10, 40, 70):
             await stop_fault(f"device-sigstop-{seconds}s", seconds)
-        await redis_fault("redis-pause-5s", 5)
+        if redis:
+            await redis_fault("redis-pause-5s", 5)
+        else:
+            faults.append({"fault": "redis-pause-5s",
+                           "not_run": "Docker unavailable (no dedicated container); "
+                                      "the shared Redis is never paused"})
+            stack.event("fault-not-run", fault="redis-pause-5s", reason="Docker unavailable")
         await relay_fault("relay-sigkill")
         await settle("end", 20)
         stop.set()
@@ -1279,7 +1294,8 @@ async def chaos(args: argparse.Namespace) -> None:
         rec.close()
         if stack:
             stack.close()
-        redis.remove()
+        if redis:
+            redis.remove()
     phases = sorted({r[3] for r in rec.rows})
     per_phase = {p: {"echo": summarize_rows(rec.rows, "echo", p),
                      "mcp": summarize_rows(rec.rows, "mcp", p)} for p in phases}
@@ -1326,6 +1342,9 @@ def main() -> None:
             p.add_argument("--step-seconds", type=float, default=30)
             p.add_argument("--kinds", default="echo,mcp")
             p.add_argument("--payload", type=int, default=1024)
+        if name == "chaos":
+            p.add_argument("--dedicated-redis", action="store_true",
+                           help="start a throwaway Redis container and include the pause fault")
         if name == "fairness":
             p.add_argument("--flood-workers", type=int, default=128)
             p.add_argument("--quiet-workers", type=int, default=2)
