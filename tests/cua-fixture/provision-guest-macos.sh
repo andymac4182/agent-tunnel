@@ -164,11 +164,15 @@ install -m 0755 /dev/stdin /usr/local/bin/cua-permcheck <<'EOF'
 #!/opt/cua-server/bin/python
 # Read-only TCC preflight for the identity the server runs as. Launched by
 # launchd so it is its own responsible process; neither call prompts.
-import json, os, sys
+import json, os, subprocess, sys
 from ApplicationServices import AXIsProcessTrusted
 from Quartz import CGPreflightScreenCaptureAccess
 rec = {
-    "executable": os.path.realpath(sys.executable),
+    # The image this process is actually running, which is what TCC judges
+    # (the framework's bin/python3.13 re-executes Python.app's binary).
+    "process_image": subprocess.run(["ps", "-o", "comm=", "-p", str(os.getpid())],
+                                    capture_output=True, text=True).stdout.strip(),
+    "sys_executable": sys.executable,
     "screen_recording_preflight": bool(CGPreflightScreenCaptureAccess()),
     "accessibility_trusted": bool(AXIsProcessTrusted()),
 }
