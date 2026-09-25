@@ -151,6 +151,16 @@ impl Dispatcher {
         &self,
         planned: Result<Planned, Dispatch>,
     ) -> (Option<Planned>, Dispatch) {
+        self.dispatch_planned_until(planned, core::future::pending())
+            .await
+    }
+
+    /// [`Dispatcher::dispatch_planned`], abandoned if `cancel` completes first.
+    async fn dispatch_planned_until(
+        &self,
+        planned: Result<Planned, Dispatch>,
+        cancel: impl core::future::Future<Output = ()>,
+    ) -> (Option<Planned>, Dispatch) {
         // ---- above the dispatch boundary: nothing has been sent -------------
         let planned = match planned {
             Ok(planned) => planned,
@@ -172,7 +182,7 @@ impl Dispatcher {
         // Past this line the backend may have seen the command, so no failure
         // may be reported as `NotDispatched` unless we know the request was
         // never fully written.
-        let dispatch = self.send(&payload).await;
+        let dispatch = self.send_until(&payload, cancel).await;
         (Some(planned), dispatch)
     }
 
@@ -211,17 +221,72 @@ impl Dispatcher {
     }
 
     async fn send(&self, payload: &Value) -> Dispatch {
+        self.send_until(payload, core::future::pending()).await
+    }
+
+    /// One exchange, abandoned if `cancel` completes first (M5-04).
+    ///
+    /// **What a cancellation reports is decided by how far the request got,
+    /// never by the fact of cancelling.** `began` is set immediately before
+    /// the first byte of the request is handed to the socket, so:
+    ///
+    /// * cancelled with `began` unset -- the connection may be open, but not
+    ///   a byte of the command left this process: [`NotDispatched::Cancelled`],
+    ///   retryable;
+    /// * cancelled with `began` set -- the backend may have the whole request
+    ///   and may have acted, and the answer that would have said so is being
+    ///   thrown away: [`UnknownReason::Cancelled`], **not** retryable.
+    ///
+    /// The second rule is deliberately conservative about a *partial* write.
+    /// The transport's own `FailureStage::Writing` may call a failed write
+    /// `NotReached`, because a write that *errored* did not complete; a write
+    /// that was merely *abandoned* may have completed in the kernel before the
+    /// future was dropped, and nothing here can tell.
+    ///
+    /// `cancel` is polled first (`biased`), so a cancellation that is already
+    /// complete wins before the exchange is polled at all. **That ordering is
+    /// not what makes an early cancellation safe, and it was measured not to
+    /// be:** with `biased` removed (review follow-up, log nonce
+    /// `e9a087a00d8d`) the cancellation test stays green, because the exchange
+    /// cannot complete on its first poll (the connect is pending) and `began`
+    /// is set only after the connect -- so whichever branch is polled first,
+    /// an already-complete cancellation still finds `began` unset. `began` is
+    /// the guarantee; `biased` only saves a pointless connect attempt. No
+    /// guard case is kept for it, since one could only report `still green`.
+    async fn send_until(
+        &self,
+        payload: &Value,
+        cancel: impl core::future::Future<Output = ()>,
+    ) -> Dispatch {
         // **Read before a single byte is written**, so the comparison below
         // spans the whole exchange. Reading it after the write would leave the
         // request-writing window unwatched, which is exactly the window a
         // restart-killed click occupies.
         let before = self.epoch.read();
-        let transport = match tokio::time::timeout(self.deadline, self.exchange(payload)).await {
-            // The deadline expired. We had already begun writing, so the
-            // outcome is unknown rather than not dispatched.
-            Err(_) => Dispatch::Dispatched(Completion::Unknown(UnknownReason::DeadlineExpired)),
-            Ok(Err(stage)) => stage.into_dispatch(),
-            Ok(Ok((status, body))) => classify_backend_response(status, &body),
+        let began = std::sync::atomic::AtomicBool::new(false);
+        let exchange = async {
+            match tokio::time::timeout(self.deadline, self.exchange(payload, &began)).await {
+                // The deadline expired. We had already begun writing, so the
+                // outcome is unknown rather than not dispatched.
+                Err(_) => Dispatch::Dispatched(Completion::Unknown(UnknownReason::DeadlineExpired)),
+                Ok(Err(stage)) => stage.into_dispatch(),
+                Ok(Ok((status, body))) => classify_backend_response(status, &body),
+            }
+        };
+        let transport = tokio::select! {
+            biased;
+            () = cancel => {
+                // The consumer abandoned the exchange. The restart attribution
+                // below is not applied: the cancellation is the cause the
+                // consumer needs to hear, and both arms keep their
+                // retryability either way.
+                return if began.load(std::sync::atomic::Ordering::SeqCst) {
+                    Dispatch::Dispatched(Completion::Unknown(UnknownReason::Cancelled))
+                } else {
+                    Dispatch::NotDispatched(NotDispatched::Cancelled)
+                };
+            }
+            transport = exchange => transport,
         };
         // The attribution is a pure function of the two readings and the
         // transport's own answer; this line owns none of the policy. It cannot
@@ -236,7 +301,11 @@ impl Dispatcher {
     /// is precisely what decides `NotDispatched` versus `Unknown`. An error
     /// that merely said "I/O error" would have thrown the distinction away at
     /// the only point where it is recoverable.
-    async fn exchange(&self, payload: &Value) -> Result<(u16, Vec<u8>), FailureStage> {
+    async fn exchange(
+        &self,
+        payload: &Value,
+        began: &std::sync::atomic::AtomicBool,
+    ) -> Result<(u16, Vec<u8>), FailureStage> {
         let mut stream = TcpStream::connect(self.endpoint.address())
             .await
             .map_err(|_| FailureStage::Connecting)?;
@@ -259,6 +328,11 @@ impl Dispatcher {
         // break this, and `/ws` is exactly such a surface. It is deferred
         // (`cua_pin::WEBSOCKET_DEFERRAL_RECORDED_AS`), and a chunk that takes
         // it up must revisit this mapping rather than inherit it.
+        //
+        // `began` is set **before** the write, not after: from here on an
+        // abandoned exchange may have delivered the whole command. See
+        // `send_until`.
+        began.store(true, std::sync::atomic::Ordering::SeqCst);
         stream
             .write_all(request.as_bytes())
             .await
@@ -379,6 +453,9 @@ pub fn operation_of(request: &Request) -> Operation {
 pub struct DeviceState {
     leases: Mutex<InputLeases>,
     captures: Mutex<Captures>,
+    /// The display scale this device has been **told**, as a percentage, or
+    /// `None`. There is no default (M5-C14).
+    declared_scale_percent: Mutex<Option<u32>>,
 }
 
 impl DeviceState {
@@ -397,6 +474,27 @@ impl DeviceState {
             .holder(target)
     }
 
+    /// Declare the display scale of the captures this device will record, as
+    /// a percentage (100 is 1x), or clear it with `None`.
+    ///
+    /// **The only source of a scale, because the pinned server has none**
+    /// (M5-C14). A capture recorded while this is `None` still gets an
+    /// identity, and every coordinate that refers to it is refused with
+    /// `CaptureRefusal::ScaleUndeclared` rather than defaulted to 1x. It
+    /// applies to captures recorded *after* the call: an identity keeps the
+    /// scale it was recorded under, so changing the declaration cannot move a
+    /// coordinate on an image the consumer already looked at.
+    ///
+    /// Where a real device gets this from is an operator decision recorded in
+    /// `docs/tasks.md` M5-C14: only a probe of a real backend (M5-C02) can say
+    /// whether any server output could replace it.
+    pub fn declare_scale_percent(&self, percent: Option<u32>) {
+        *self
+            .declared_scale_percent
+            .lock()
+            .expect("the scale mutex is never poisoned by fixture code") = percent;
+    }
+
     /// Drop the leases of a session whose grant revision has advanced.
     ///
     /// **The M3-16 mechanism, with no production caller.** See
@@ -410,6 +508,25 @@ impl DeviceState {
             .lock()
             .expect("the lease mutex is never poisoned by fixture code")
             .reconcile_grant(session, revision)
+    }
+
+    /// End a device-side session: drop every input lease it holds, whatever
+    /// its revision, and report which targets were freed.
+    ///
+    /// **The device-local half of M3-16 option (c)**, which is the only
+    /// option that closes M5-C05 for a *revoked* grant rather than a changed
+    /// one. That option is a connector control message naming an opaque
+    /// principal binding whose sessions must end; the relay already derives
+    /// the binding, and a device that received the message would map it to
+    /// its sessions and call this for each. The message itself is a protocol
+    /// addition and is queued as an owner decision, so this has no production
+    /// caller -- but the effect is pinned here, so the decision is about the
+    /// delivery and not about what a device does on receipt.
+    pub fn end_session(&self, session: SessionId) -> Vec<TargetSession> {
+        self.leases
+            .lock()
+            .expect("the lease mutex is never poisoned by fixture code")
+            .release_all_for_session(session)
     }
 
     /// How many capture identities this device is holding.
@@ -541,12 +658,63 @@ impl SessionFacade {
         self.carrier_generation
     }
 
-    /// Tell this session what revision the device believes its grant carries.
+    /// Tell this session what revision the device believes its grant carries,
+    /// and **stop honouring every lease it holds under an older one in the
+    /// same step**. Returns the targets that were freed.
     ///
-    /// Nothing calls this in production, because nothing tells a device that a
-    /// grant was revoked. M3-16; see `docs/tasks.md` M5-C05.
-    pub const fn note_grant_revision(&mut self, revision: GrantRevision) {
+    /// # Why learning the revision now frees the target (M5-C05)
+    ///
+    /// This used to record the revision and nothing else. The holder was then
+    /// refused at the point of use -- but the lease entry stayed, so every
+    /// other agent was refused with `HeldByAnotherSession` by a lease nobody
+    /// could use, until something called `reconcile_grant`. Nothing did. So
+    /// the moment the device learned that a grant had moved, the input lease
+    /// it had authorized became a lock with no key, held on behalf of a
+    /// consumer the relay had already fenced.
+    ///
+    /// The reconcile now happens **under the same lease lock, in the same
+    /// call** that records the revision, so there is no window in which the
+    /// device knows a holding is superseded and still honours it for
+    /// exclusion. A superseded holder's next input is refused with
+    /// [`LeaseRefusal::NotHeld`] rather than `GrantRevoked`, because there is
+    /// no holding left to be revoked -- and nothing is dispatched either way.
+    ///
+    /// **A revision is not a revocation**, and this does not pretend to tell
+    /// them apart: the session may take the lease again under the revision
+    /// it now carries, exactly as `release` then `acquire` always allowed.
+    /// A *revoked* principal is expected not to, because the relay fences a
+    /// revoked principal's `http-forward/1` traffic (M3-16 measured ~10 ms for
+    /// MCP) -- **not measured for CUA**, which is not relay-routed yet. Ending
+    /// the device-side session of a revoked grant is
+    /// [`DeviceState::end_session`], and delivering that signal to a device is
+    /// the M3-16 option (c) protocol decision.
+    ///
+    /// **The cost of releasing on a non-revoking change**, stated because it is
+    /// real: if the revision moved because the grant was *changed* rather than
+    /// revoked, the holder loses the lease between two of its operations, and
+    /// another agent may take the target before the holder re-acquires --
+    /// mid-sequence, for example between the `move` and the `click` of a
+    /// composed gesture. Nothing is dispatched on the old holder's behalf once
+    /// it is released, so this is an interleaving hazard, not a
+    /// double-dispatch; `docs/tasks.md` M5-C05 records it.
+    ///
+    /// **A stale revision changes nothing.** Revisions are monotonic, so a
+    /// value at or below the one already recorded is an out-of-order delivery
+    /// and is ignored rather than moving the session's belief backwards.
+    ///
+    /// Nothing calls this in production yet, because nothing tells a device
+    /// that a grant moved. See `docs/tasks.md` M5-C05.
+    pub fn note_grant_revision(&mut self, revision: GrantRevision) -> Vec<TargetSession> {
+        let mut leases = self
+            .state
+            .leases
+            .lock()
+            .expect("the lease mutex is never poisoned by fixture code");
+        if revision <= self.grant_revision {
+            return Vec::new();
+        }
         self.grant_revision = revision;
+        leases.reconcile_grant(self.session, revision)
     }
 
     #[must_use]
@@ -568,7 +736,16 @@ impl SessionFacade {
     /// exchange would make the lease a mutex over the network rather than over
     /// input.
     pub async fn handle(&self, body: &[u8], limit: u64) -> Dispatch {
-        let planned = {
+        let (planned, dispatch) = self
+            .dispatcher
+            .dispatch_planned(self.plan(body, limit))
+            .await;
+        self.issue_capture_identity(planned.as_ref(), dispatch)
+    }
+
+    /// Run the pure planner under the device's locks, and drop them.
+    fn plan(&self, body: &[u8], limit: u64) -> Result<Planned, Dispatch> {
+        {
             let leases = self
                 .state
                 .leases
@@ -587,9 +764,34 @@ impl SessionFacade {
                 captures: &captures,
             };
             plan(body, limit, self.dispatcher.permitted(), &context)
-        };
+        }
+    }
 
-        let (planned, dispatch) = self.dispatcher.dispatch_planned(planned).await;
+    /// [`SessionFacade::handle`], abandoned if `cancel` completes first
+    /// (M5-04).
+    ///
+    /// The consumer-facing half of cancellation. What comes back is decided by
+    /// how far the exchange got, never by the fact of cancelling:
+    /// [`NotDispatched::Cancelled`] (retryable) only if not a byte of the
+    /// command was written, and [`UnknownReason::Cancelled`] (never retryable)
+    /// otherwise. The obvious composition -- racing [`SessionFacade::handle`]
+    /// against `cancel` and calling the loser "not dispatched" -- reports a
+    /// click that has already landed as safe to send again, and
+    /// `a_cancelled_click_reports_what_is_known_and_is_never_repeated` was
+    /// red against exactly that.
+    ///
+    /// Nothing is retried here, automatically or otherwise.
+    pub async fn handle_until(
+        &self,
+        body: &[u8],
+        limit: u64,
+        cancel: impl core::future::Future<Output = ()>,
+    ) -> Dispatch {
+        let planned = self.plan(body, limit);
+        let (planned, dispatch) = self
+            .dispatcher
+            .dispatch_planned_until(planned, cancel)
+            .await;
         self.issue_capture_identity(planned.as_ref(), dispatch)
     }
 
@@ -615,46 +817,49 @@ impl SessionFacade {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(0);
-        let number = |name: &str| {
-            result
-                .get(name)
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-        };
-        let (Some(width), Some(height)) = (number("width"), number("height")) else {
+        // **Dimensions from the image the released server actually sends**
+        // (M5-C14). Every pinned `screenshot` answers
+        // `{success, image_data, format}` (VNC omits `format`) and none sends
+        // `width`, `height` or a scale. This used to read those three members,
+        // which only this fixture emitted -- so against a released backend it
+        // took the early return below and issued no identity at all. The PNG
+        // states its own dimensions in its `IHDR`, and that is what is read.
+        let Ok((width, height)) = tunnel_cua::image::capture_dimensions(result) else {
             // A capture whose dimensions we cannot read is not one a later
             // coordinate may refer to. The capture itself still succeeded, so
             // the outcome is unchanged; what is withheld is the identity.
             return dispatch;
         };
-        // **An absent scale is read as 1x, and the released source has now
-        // been read: 0.3.46 never sends the member.** M5-C06 left this line
-        // saying no source had been read; one has. `scale_percent` appears
-        // nowhere in the pinned sdist, and no backend's `screenshot` returns
-        // it -- macOS, Linux, Windows and Android return
-        // `{success, image_data, format}`, VNC omits `format` too.
+        // **The scale is never read from the response, and never defaulted.**
+        // No pinned backend reports one, and a 1x default on a 2x display is a
+        // click at twice the intended position with no error anywhere -- the
+        // exact failure M5-C06 predicted, which the red run for M5-C14
+        // reproduced once the dimensions became readable. Nor can the scale be
+        // derived from the server: the pinned macOS handler resizes any
+        // capture wider than 1,920 px before encoding it, and its
+        // `get_screen_size` reports the `ImageGrab` pixel size, so "decoded
+        // width over screen width" measures that resize, not the point scale.
         //
-        // That would make this default wrong by a factor of two on a real 2x
-        // display -- except that it is **unreachable against a released
-        // backend**, because `width` and `height` are not returned either and
-        // the `let else` above takes the early return first. No identity is
-        // issued, so every later coordinate is refused rather than landing in
-        // the wrong place: the safe direction, reached by accident. The 1x
-        // default is therefore exercised only against this fixture, which
-        // emits all three members.
-        //
-        // Deriving a real scale needs two commands (decoded image width over
-        // `get_screen_size` width) and must not be built before a real
-        // backend is probed. Recorded as `docs/tasks.md` M5-C14, which
-        // carries the measurement; M5-C06 is closed.
-        let scale = number("scale_percent").unwrap_or(tunnel_cua::capture::IDENTITY_SCALE_PERCENT);
-        let Ok(identity) = self
+        // So the scale is what the device was told
+        // ([`DeviceState::declare_scale_percent`]) or nothing, and with nothing
+        // every coordinate on this capture is refused with
+        // `CaptureRefusal::ScaleUndeclared`.
+        let declared = *self
+            .state
+            .declared_scale_percent
+            .lock()
+            .expect("the scale mutex is never poisoned by fixture code");
+        let mut captures = self
             .state
             .captures
             .lock()
-            .expect("the capture mutex is never poisoned by fixture code")
-            .record(&self.target, display, width, height, scale)
-        else {
+            .expect("the capture mutex is never poisoned by fixture code");
+        let recorded = match declared {
+            Some(percent) => captures.record(&self.target, display, width, height, percent),
+            None => captures.record_undeclared_scale(&self.target, display, width, height),
+        };
+        drop(captures);
+        let Ok(identity) = recorded else {
             return dispatch;
         };
 

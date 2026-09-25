@@ -253,6 +253,35 @@ CASES: list[Case] = [
         # must be refused rather than measured as containment.
         frozenset({"a_setsid_descendant_escapes_the_group_kill"}),
     ),
+    # ------------------------------ the skip cannot hide a present helper
+    Case(
+        # Task row M5-C16, the MCP copy of M5-C11's `m5c8` case.  The sentinel
+        # tests in `process_residue.rs` now *skip*, naming themselves, when
+        # `availability()` says the helper is absent -- so an `availability()`
+        # that reported it missing whatever is on disk would skip every one
+        # of them and the coverage would vanish silently.  This defeats it
+        # into exactly that.  `CARGO_BUILD_BINARIES` is load-bearing here
+        # rather than boilerplate: with no helper beside the tests the control
+        # correctly asserts `false == false` and this case would report
+        # `still green` over a rule that was never exercised.
+        "a present sentinel helper cannot be reported as missing",
+        [
+            (
+                DEADMAN_LIB,
+                """    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
+    }""",
+                "    Availability::SentinelMissing",
+            )
+        ],
+        # The positive control compares the skip's decision against an
+        # independent filesystem read; it is the only test that can notice
+        # a skip taken while the helper is present, because every sentinel
+        # test it guards goes *green* by skipping.
+        frozenset({"the_skip_cannot_hide_a_helper_that_is_on_disk"}),
+    ),
 ]
 
 

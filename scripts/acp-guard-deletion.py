@@ -2466,6 +2466,31 @@ C7_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    (
+        # Task row M5-C16, the ACP copy of M5-C11's `m5c8` case.  The sentinel
+        # tests in `process_residue.rs` now *skip*, naming themselves, when
+        # `availability()` says the helper is absent -- so an `availability()`
+        # that reported it missing whatever is on disk would skip every one of
+        # them and the coverage would vanish silently.  This defeats it into
+        # exactly that.  `C7_BUILD` is load-bearing here rather than
+        # boilerplate: with no helper beside the tests the control correctly
+        # asserts `false == false` and this case would report `still green`
+        # over a rule that was never exercised.  Its witness is declared in
+        # `WITNESSES` below rather than owed in the debt ledger.
+        "a present ACP sentinel helper cannot be reported as missing",
+        [
+            (
+                DEADMAN_LIB,
+                """    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
+    }""",
+                "    Availability::SentinelMissing",
+            )
+        ],
+        False,
+    ),
 ]
 
 
@@ -2588,19 +2613,171 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: The test(s) each case's deleted guard must make redden, keyed by
 #: `(suite, case)`.
 #:
-#: **Empty, and deliberately so (task row M4-23).**  A witness is a
-#: measurement -- the test that actually reddens when *this* guard is deleted,
-#: one `cargo test` per case -- and it cannot be read off the case's text.
-#: Filling this in by writing a plausible test name beside each case would
-#: produce a harness that checks 144 guesses and reports them as attribution,
-#: which is the defect this mechanism exists to remove, with the added harm
-#: that the run would now *claim* to have been attributed.
+#: **Measured, not read off the case text (task row M4-42).**  Every entry
+#: below was taken from a run of this harness in which the case's guard was
+#: deleted: of the tests that reddened, the entry names those whose path names
+#: the mutated file's module (its stem as a `::` segment, or as the test
+#: binary), and every reddened test when none does.  Suites m8c1, m8c2, m8c3, m8c3-relay, m8c4, m8c5 and m8c7 were
+#: measured by run `acpdisc-9e2b` and then re-run in full with these entries in
+#: force by run `acpver-5a70`, in which every case was classified plain `RED` --
+#: its witness reddened again -- and none `RED (wrong witness)`.  A case whose
+#: entry is wrong fails the next run closed, which is the point: an entry is a
+#: claim the harness re-checks every time, not a label.
 #:
-#: So every case here is named in `scripts/guard_witness_debt.json` instead,
-#: keeps the old unattributed classification, and is reported as owing a
-#: witness.  Moving a case out of that ledger and into this table is the unit
-#: of progress; the ledger can only shrink, and a case may not appear in both.
-WITNESSES: dict[tuple[str, str], frozenset[str]] = {}
+#: A case not listed here is still owed a witness and is named in
+#: `scripts/guard_witness_debt.json`; the ledger can only shrink, and a case may
+#: not appear in both.
+#:
+#: **One entry predates M4-42's sweep and is not a moved debt (task row
+#: M5-C16).**  `[m8c7] a present ACP sentinel helper cannot be reported as
+#: missing` was added with its witness declared from the start, so it never
+#: entered the ledger; its witness was measured red from this harness.
+WITNESSES: dict[tuple[str, str], frozenset[str]] = {
+    ('m8c1', 'a GET and a DELETE must name their connection'): frozenset({'message::tests::a_delete_must_name_its_connection', 'message::tests::a_get_must_accept_the_event_stream_and_name_its_connection'}),
+    ('m8c1', 'a GET must accept text/event-stream'): frozenset({'message::tests::a_get_must_accept_the_event_stream_and_name_its_connection'}),
+    ('m8c1', 'a POST must be application/json'): frozenset({'message::tests::a_post_must_be_application_json', 'message::tests::a_rejection_body_carries_no_consumer_data'}),
+    ('m8c1', 'a batch is refused before anything else looks at the body'): frozenset({'message::tests::a_batch_is_refused_as_a_batch_with_501_and_its_own_code', 'message::tests::a_malformed_batch_is_still_refused_for_being_a_batch', 'message::tests::the_three_headline_refusals_have_three_distinct_answers'}),
+    ('m8c1', 'a lone leading surrogate escape is refused, never repaired'): frozenset({'json::tests::the_scanner_refuses_a_lone_surrogate_and_accepts_a_pair'}),
+    ('m8c1', 'a protocol version that is not 1 is refused'): frozenset({'message::tests::an_initialize_negotiates_its_version_in_both_directions', 'message::tests::protocol_version_2_is_refused_by_its_own_rule_with_its_own_code', 'message::tests::the_three_headline_refusals_have_three_distinct_answers'}),
+    ('m8c1', 'a session-scoped method requires the session header'): frozenset({'message::tests::a_session_scoped_post_needs_both_headers_and_a_body_that_agrees'}),
+    ('m8c1', 'a stop reason outside the pinned vocabulary is refused'): frozenset({'message::tests::a_v2_prompt_acknowledgement_is_never_read_as_a_v1_turn_completion'}),
+    ('m8c1', 'a v2 prompt acknowledgement is not a v1 turn completion'): frozenset({'message::tests::a_v2_prompt_acknowledgement_is_never_read_as_a_v1_turn_completion'}),
+    ('m8c1', 'an id must be a string or an integer'): frozenset({'message::tests::an_id_must_be_a_string_or_an_integer'}),
+    ('m8c1', 'an initialize must carry a protocolVersion'): frozenset({'message::tests::an_initialize_negotiates_its_version_in_both_directions'}),
+    ('m8c1', 'an unaccepted method is refused before dispatch'): frozenset({'message::tests::an_unaccepted_method_is_refused_before_anything_is_dispatched'}),
+    ('m8c1', 'duplicate member names, compared after unescaping'): frozenset({'json::tests::the_scanner_refuses_duplicate_names_trailing_data_and_deep_nesting'}),
+    ('m8c1', 'every other POST must name its connection'): frozenset({'message::tests::initialize_opens_a_connection_and_every_other_post_names_one'}),
+    ('m8c1', 'every pinned request header is a singleton'): frozenset({'tests::every_pinned_request_header_rejects_a_repeat', 'tests::the_principal_binding_is_request_only_and_a_singleton'}),
+    ('m8c1', 'initialize must not present a connection header'): frozenset({'message::tests::initialize_opens_a_connection_and_every_other_post_names_one'}),
+    ('m8c1', 'no response may carry acp-session-id'): frozenset({'tests::neighbouring_header_spellings_are_refused_in_both_directions', 'tests::the_session_header_refusal_is_a_disclosed_divergence_from_the_pinned_sdk'}),
+    ('m8c1', 'only POST, GET and DELETE are routed'): frozenset({'tests::exactly_post_get_and_delete_are_routed_at_the_single_endpoint', 'tests::only_http_2_is_accepted_and_http_1_1_is_an_unsupported_feature'}),
+    ('m8c1', 'params must be an object'): frozenset({'message::tests::params_must_be_an_object'}),
+    ('m8c1', 'raw control characters inside a JSON string'): frozenset({'json::tests::the_scanner_refuses_a_raw_control_character_in_a_string'}),
+    ('m8c1', "the RFD's request_permission shorthand is not an accepted method"): frozenset({'message::tests::an_unaccepted_method_is_refused_before_anything_is_dispatched', 'tests::the_method_set_is_exact_and_comes_from_the_pinned_schema', 'tests::the_rfd_shorthand_resolves_but_is_not_itself_an_accepted_method'}),
+    ('m8c1', 'the jsonrpc member must be exactly "2.0"'): frozenset({'message::tests::the_jsonrpc_member_must_be_exactly_2_0'}),
+    ('m8c1', 'the manifest requires the exact version'): frozenset({'the_manifest_requires_the_exact_versions_with_no_default_features'}),
+    ('m8c1', 'the nesting depth bound'): frozenset({'json::tests::the_scanner_refuses_duplicate_names_trailing_data_and_deep_nesting'}),
+    ('m8c1', 'the profile accepts HTTP/2 only'): frozenset({'tests::only_http_2_is_accepted_and_http_1_1_is_an_unsupported_feature'}),
+    ('m8c1', "the recorded checksum is the lockfile's"): frozenset({'each_pinned_crate_is_in_the_lockfile_exactly_once_at_its_recorded_checksum'}),
+    ('m8c1', 'the session header and params.sessionId must agree'): frozenset({'message::tests::a_session_scoped_post_needs_both_headers_and_a_body_that_agrees'}),
+    ('m8c1', 'the shorthand resolves against the normative v1 name'): frozenset({'tests::the_rfd_shorthand_resolves_but_is_not_itself_an_accepted_method'}),
+    ('m8c1', 'the top level classifies `[` as an array'): frozenset({'json::tests::the_top_level_is_classified_from_the_first_non_whitespace_byte'}),
+    ('m8c1', 'trailing data after the top-level value'): frozenset({'json::tests::the_scanner_refuses_duplicate_names_trailing_data_and_deep_nesting'}),
+    ('m8c1', 'unstable_mcp_over_acp stays off'): frozenset({'no_workspace_manifest_enables_a_refused_draft_feature', 'pin::tests::mcp_over_acp_is_not_enabled_in_this_build', 'the_manifest_requires_the_exact_versions_with_no_default_features'}),
+    ('m8c2', 'a JSON-RPC id is scoped by its direction'): frozenset({'tests::the_id_scope_carries_the_direction', 'the_agent_callback_bound_is_exact_at_sixteen_against_a_real_child', 'the_reader_handles_a_callback_while_a_prompt_is_pending'}),
+    ('m8c2', 'a callback resolves exactly once'): frozenset({'lifecycle::tests::a_callback_resolves_exactly_once_and_a_late_response_cannot_repeat_it', 'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered', 'lifecycle::tests::a_string_id_and_a_number_id_are_not_the_same_request', 'lifecycle::tests::an_id_reused_after_completion_is_accepted', 'lifecycle::tests::session_cancel_cancels_that_sessions_permissions_only', 'lifecycle::tests::the_pending_bound_is_exact_at_sixteen_per_direction'}),
+    ('m8c2', 'a child that vanished while admitting work failed, it did not stop'): frozenset({'lifecycle::tests::the_child_lifecycle_is_a_transition_table_not_a_label'}),
+    ('m8c2', 'a duplicate pending id conflicts before dispatch'): frozenset({'lifecycle::tests::a_duplicate_pending_id_conflicts_before_dispatch'}),
+    ('m8c2', 'a new session has no subscriber until one arrives'): frozenset({'lifecycle::tests::a_prompt_before_the_subscriber_is_refused_for_readiness_not_for_the_bound'}),
+    ('m8c2', 'a permission deadline cancels, and never approves'): frozenset({'lifecycle::tests::a_permission_deadline_resolves_as_cancelled_never_approved'}),
+    ('m8c2', 'a refused stdout line is counted'): frozenset({'a_batch_line_from_the_child_is_refused_for_being_a_batch', 'a_malformed_stdout_line_kills_the_child_for_being_malformed', 'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
+    ('m8c2', 'a response must answer the kind of request outstanding'): frozenset({'lifecycle::tests::a_permission_answer_cannot_resolve_a_prompt'}),
+    ('m8c2', 'a second concurrent prompt on one session is refused'): frozenset({'lifecycle::tests::one_active_prompt_per_session'}),
+    ('m8c2', 'a stderr flood is counted'): frozenset({'a_stderr_flood_is_drained_and_counted_without_blocking_child_exit'}),
+    ('m8c2', 'a supervisor that is dropped rather than drained ends its child'): frozenset({'a_supervisor_dropped_without_draining_still_kills_the_group'}),
+    ('m8c2', 'an oversized line is refused before it is reassembled'): frozenset({'an_oversized_stdout_line_kills_the_child_rather_than_being_reassembled'}),
+    ('m8c2', 'draining closes every session'): frozenset({'lifecycle::tests::draining_stops_admission_and_closes_every_session'}),
+    ('m8c2', 'draining stops admission'): frozenset({'lifecycle::tests::draining_stops_admission_and_closes_every_session', 'lifecycle::tests::the_child_lifecycle_is_a_transition_table_not_a_label'}),
+    ('m8c2', "every end of a child's life signals its process group"): frozenset({'a_descendant_that_calls_setsid_survives_the_process_group_kill', 'a_grandchild_dies_when_the_child_exits_by_itself', 'a_malformed_stdout_line_kills_the_child_for_being_malformed', 'a_prompt_runs_a_turn_and_the_lifecycle_drives_it', 'a_setsid_descendant_escapes_even_with_the_sentinel_armed', 'a_wrapper_grandchild_dies_with_the_process_group', 'an_oversized_stdout_line_kills_the_child_rather_than_being_reassembled'}),
+    ('m8c2', 'the cancellation reaches the agent on the wire'): frozenset({'a_permission_timeout_resolves_as_cancelled_never_approved'}),
+    ('m8c2', 'the deadline must be exceeded, not merely reached'): frozenset({'lifecycle::tests::a_permission_deadline_resolves_as_cancelled_never_approved'}),
+    ('m8c2', 'the deadline ticker ends when the child does'): frozenset({'nothing_holds_the_child_handle_once_the_child_is_gone'}),
+    ('m8c2', 'the pending bound is reached at the bound, not one past it'): frozenset({'lifecycle::tests::the_pending_bound_is_exact_at_sixteen_per_direction'}),
+    ('m8c2', 'the session bound is reached at the bound, not one past it'): frozenset({'lifecycle::tests::the_session_bound_is_exact_at_eight_per_connection'}),
+    ('m8c2', 'the stderr sink reports passing its cap'): frozenset({'a_stderr_flood_is_drained_and_counted_without_blocking_child_exit'}),
+    ('m8c3', 'a 202 is followed by the result on the stream (prompt)'): frozenset({'a_prompt_before_its_session_subscriber_is_refused_and_nothing_is_dispatched', 'the_acp_export_serves_a_whole_conversation_with_nothing_listening', 'the_export_classifies_its_terminals_through_the_terminal_rule', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback', 'the_pinned_clients_own_delete_ends_the_child'}),
+    ('m8c3', 'a 202 is followed by the result on the stream (session/new)'): frozenset({'a_lost_established_connection_stream_terminates_the_whole_transport', 'a_lost_established_session_stream_terminates_the_whole_transport', 'a_prompt_before_its_session_subscriber_is_refused_and_nothing_is_dispatched', 'a_second_connection_subscriber_is_refused_409_and_the_first_keeps_the_stream', 'a_second_session_subscriber_is_refused_409', 'a_session_header_that_disagrees_with_the_body_is_refused_with_400', 'a_session_scoped_stream_answers_with_no_session_header', 'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick', 'every_sse_event_is_exactly_data_space_message_newline_newline', 'output_credit_stalls_are_bounded_and_the_event_is_never_skipped', 'the_acp_export_serves_a_whole_conversation_with_nothing_listening', 'the_export_classifies_its_terminals_through_the_terminal_rule', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback', 'the_pinned_clients_own_delete_ends_the_child', 'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
+    ('m8c3', 'a broken stream errors its body rather than ending cleanly'): frozenset({'a_lost_established_connection_stream_terminates_the_whole_transport', 'a_lost_established_session_stream_terminates_the_whole_transport', 'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
+    ('m8c3', 'a child that is gone ends its transport'): frozenset({'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
+    ('m8c3', 'a connection that ends takes its child with it'): frozenset({'a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured_deadline', 'a_lost_established_connection_stream_terminates_the_whole_transport', 'delete_answers_202_and_the_child_is_gone_from_the_process_table', 'the_pinned_clients_own_delete_ends_the_child'}),
+    ('m8c3', 'a second subscriber on one stream is refused'): frozenset({'a_second_connection_subscriber_is_refused_409_and_the_first_keeps_the_stream', 'a_second_session_subscriber_is_refused_409', 'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
+    ('m8c3', 'a session admits its prompt only once its subscriber arrived'): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport', 'a_prompt_before_its_session_subscriber_is_refused_and_nothing_is_dispatched', 'output_credit_stalls_are_bounded_and_the_event_is_never_skipped', 'the_acp_export_serves_a_whole_conversation_with_nothing_listening', 'the_export_classifies_its_terminals_through_the_terminal_rule', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback', 'the_pinned_clients_own_delete_ends_the_child', 'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
+    ('m8c3', 'a session subscription that never arrives expires'): frozenset({'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
+    ('m8c3', "a session-scoped message goes to its own session's stream"): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport', 'output_credit_stalls_are_bounded_and_the_event_is_never_skipped', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback'}),
+    ('m8c3', 'a subscription that never arrives expires'): frozenset({'a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured_deadline', 'the_documented_ten_second_deadline_is_the_one_that_elapses'}),
+    ('m8c3', 'an SSE event begins with `data: `'): frozenset({'sse::tests::one_message_is_one_data_line_and_a_blank_line'}),
+    ('m8c3', 'an SSE event ends with a blank line, not one newline'): frozenset({'sse::tests::one_message_is_one_data_line_and_a_blank_line'}),
+    ('m8c3', 'an expired session window is counted once, not once per watchdog tick'): frozenset({'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
+    ('m8c3', "an expired session's window stays closed"): frozenset({'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
+    ('m8c3', 'no response carries acp-session-id (M8-C05)'): frozenset({'sse::tests::an_sse_response_never_carries_the_session_header'}),
+    ('m8c3', 'the ACP export opens no listener of its own'): frozenset({'the_acp_export_serves_a_whole_conversation_with_nothing_listening'}),
+    ('m8c3', 'the host cannot choose a workspace or attach MCP servers'): frozenset({'a_host_cannot_choose_a_workspace_or_attach_mcp_servers'}),
+    ('m8c3-relay', 'and admits nothing else'): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
+    ('m8c3-relay', "the relay's profile allowlist admits the ACP profile"): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
+    ('m8c4', 'a confirmed cancelled turn is cancelled'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not'}),
+    ('m8c4', 'a lost process after dispatch is outcome_unknown, not a success'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not', 'terminal::tests::a_refusal_before_dispatch_is_failed_and_not_unknown'}),
+    ('m8c4', 'a permission response must name an offered option (M8-C11)'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered', 'lifecycle::tests::an_agent_that_offered_nothing_admits_no_selection'}),
+    ('m8c4', 'a prompt whose child died is classified outcome_unknown by the export'): frozenset({'the_export_classifies_its_terminals_through_the_terminal_rule'}),
+    ('m8c4', 'an established required stream that broke is noticed by the watchdog'): frozenset({'a_lost_established_connection_stream_terminates_the_whole_transport', 'a_lost_established_session_stream_terminates_the_whole_transport'}),
+    ('m8c4', 'an output-credit stall is bounded'): frozenset({'output_credit_stalls_are_bounded_and_the_event_is_never_skipped'}),
+    ('m8c4', 'an unoffered option does not consume the outstanding callback'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered'}),
+    ('m8c4', 'one principal cannot fill the table and deny the rest'): frozenset({'bridge::capacity_tests::both_caps_are_exact_at_the_boundary_and_refuse_one_beyond', 'bridge::capacity_tests::one_principal_cannot_fill_the_table_and_deny_the_rest'}),
+    ('m8c4', 'subscriber loss resolves pending permissions as cancelled'): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport'}),
+    ('m8c4', 'the export classifies a completed turn through the terminal rule'): frozenset({'the_export_classifies_its_terminals_through_the_terminal_rule'}),
+    ('m8c4', 'the export refuses a connection beyond its global cap'): frozenset({'bridge::capacity_tests::a_full_table_has_no_admitting_input', 'bridge::capacity_tests::both_caps_are_exact_at_the_boundary_and_refuse_one_beyond'}),
+    ('m8c4', "the live body's sender is parked so a quiet connection still notices"): frozenset({'a_lost_established_connection_stream_terminates_the_whole_transport', 'a_lost_established_session_stream_terminates_the_whole_transport'}),
+    ('m8c4', 'the supervisor records the options the agent offered'): frozenset({'the_reader_handles_a_callback_while_a_prompt_is_pending'}),
+    ('m8c5', 'a case that did not execute must name itself'): frozenset({'production_cluster::acp_cluster::tests::a_case_that_did_not_run_is_named_rather_than_counted', 'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a cross-tenant foreign id must be refused byte-identically'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a key rotation must never fabricate a stopReason'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a key rotation must produce an explicit interruption'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a live connection id must be inert in the other tenant'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a live stream must still be served while another is parked and stalling'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a message repeated under an id already seen must fail the run'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a permission callback arriving twice across the window is a duplicate'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "a prompt on the revoked principal's own session must be refused"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a same-tenant foreign id must be refused byte-identically'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a stopReason for a turn that never finished must fail the run'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a window shorter than the schedule counted recovery, not rotations'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a withdrawn turn must never acquire a stop reason'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'admission must actually be attempted after revocation'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'an agent process outliving the gate must fail the run'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'an interruption must be explicit, and a fabricated stopReason must fail'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'an uncorrelated rotation-freeze refusal must fail the run (M3-15)'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'at most one candidate data socket'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'both directions of the owner-to-device segment must be loaded at one instant'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "each held turn's side effect is recorded exactly once and never replayed"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "every case must end inside the membership records' lifetime"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'every forged head must be refused before dispatch'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'every reply must be routed to the principal that asked'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'every rotation round must move the device to one new data socket'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'not one forged head may reach the device'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'nothing may be dispatched after revocation'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'revocation must withdraw the admitted exchange'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the control arm must leave the owner ready, or it controls for nothing'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the held turn must complete end_turn, read off the wire'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the key arm must still be an owner self-revocation, as the documents assume'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the key arm's teardown must be attributed to the withdrawn key"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must have counted the rotations independently'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner-to-device segment must have carried measured load'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the peer hop's live publication must have been read with the hop open"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the peer hop's request direction must reach the saturation threshold on the LIVE publication"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the peer hop's two directions must be disclosed as never loaded together"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the probes must not have opened anything on the other tenant's export"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the refusal must be the profile's not-found, not some other error"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the request after revocation must meet the revocation's own typed refusal"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the request direction of the peer hop must reach the enforced saturation threshold of its credit window'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the rotation disclosure must carry this run's own measurement"): frozenset({'production_cluster::acp_cluster::tests::the_rotation_disclosure_carries_the_run_it_describes'}),
+    ('m8c5', 'the rotation window must finish inside one membership record'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the same-key control arm must name the version and nothing else'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the saturating upload must have completed, read off the wire'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the segment must have been sampled while the upload was in flight'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the staged key overlap must have reached every relay's verifier"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the two tenants must really have reused one session id'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the withdrawn exchange must be classified execution: unknown'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the withdrawn key must have left the ingress relay's own verifier"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'these must be rotations rather than a reconnect'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'three completed rotations are required, not recorded'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'two device sockets at every settled steady state'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c7', 'a bare end of file makes the sentinel kill the watched ACP process group'): frozenset({'a_sigkilled_supervisor_still_kills_the_group'}),
+    ('m8c7', 'an ACP descendant that failed to detach is refused, not measured'): frozenset({'a_setsid_descendant_escapes_even_with_the_sentinel_armed'}),
+    ('m8c7', 'an orderly ACP shutdown stands the sentinel down rather than letting it fire'): frozenset({'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it'}),
+    ('m8c7', 'every ACP stdio child is watched by a parent-death sentinel'): frozenset({'a_setsid_descendant_escapes_even_with_the_sentinel_armed', 'a_sigkilled_supervisor_still_kills_the_group', 'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it'}),
+    ('m8c7', "the probe's helper is in the supervised child's group, not a group of its own"): frozenset({'a_sigkilled_supervisor_still_kills_the_group', 'an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it', 'the_group_kill_reaches_an_in_group_helper', 'without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group'}),
+    ("m8c7", "a present ACP sentinel helper cannot be reported as missing"): frozenset(
+        {"the_skip_cannot_hide_a_helper_that_is_on_disk"}
+    ),
+}
 
 #: The pinned ledger, loaded once.
 DEBT = load_witness_debt('acp-guard-deletion')

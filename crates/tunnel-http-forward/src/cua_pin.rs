@@ -334,17 +334,54 @@ pub const PARAMETERS_NEVER_TO_SEND: &[(&str, &str)] = &[
 ///   pinned backend declares `display` on `screenshot` or `get_screen_size`;
 ///   upstream captures whatever `ImageGrab.grab()` returns and reports one
 ///   screen size, with or without the member. Removing the member would not
-///   give the consumer a display selection, so removing it buys nothing —
-///   while the Lane A fixture does vary its synthetic image by display, and
-///   that variation is what `a_byte_count_would_not_have_caught_the_wrong_display`
-///   uses to show a marker check catching what a length check cannot.
+///   give the consumer a display selection, so removing it buys nothing.
 ///
-/// So the member stays on the wire, the gap is named here instead of being
-/// hidden by a silent omission, and the consumer-visible half — that a
-/// non-zero `display` is accepted and cannot be honoured by any pinned
-/// backend — is `docs/tasks.md` M5-C12.
+/// So the member stays on the wire and the gap is named here instead of being
+/// hidden by a silent omission. **The consumer-visible half is closed
+/// (M5-C12):** `tunnel_cua::plan::plan` refuses any index outside
+/// `tunnel_cua::schema::SELECTABLE_DISPLAYS` -- only the default -- before
+/// dispatch, so what is sent is always `0`. The Lane A fixture still varies
+/// its image by display, but a second display is no longer reachable through
+/// the facade; the proof-4 control varies the screen's content instead.
 pub const PARAMETERS_KNOWINGLY_DISCARDED: &[(&str, &str)] =
     &[("screenshot", "display"), ("get_screen_size", "display")];
+
+/// The sign convention of `scroll`'s vertical amount, pinned beside the names
+/// rather than left to a reader (M5-C13): **positive `y` scrolls up.**
+///
+/// Read from the pinned sdist (SHA-256 [`SDIST_SHA256`]). Three handlers
+/// state it: `handlers/macos.py` `scroll` ("positive for up, negative for
+/// down"), `handlers/windows.py` `scroll` ("Positive values scroll up"), and
+/// `handlers/vnc.py` `_VNCConnection.scroll` ("y>0 = up ... matches macOS
+/// native handler convention"). Two more **fix it in code** rather than
+/// prose: `handlers/linux.py`'s `scroll` docstring states no convention, but
+/// its own `scroll_up` calls `self.mouse.scroll(0, abs(clicks))` and
+/// `scroll_down` passes `-abs(clicks)`; and `handlers/cua_driver.py`'s
+/// `scroll` maps `"up" if y > 0 else "down"`. Only Android, which maps the
+/// amount onto a swipe (`end_y = center_y - y`), is left **inferred**, and
+/// only a probe (M5-C02) can confirm it. The adapter passes the consumer's
+/// `dy` through unchanged, so the consumer-facing convention is this one.
+///
+/// **Two further Cua Driver semantics the adapter does not smooth over**
+/// (review follow-up): its `scroll` handles `y` first and returns, so a
+/// non-zero `dy` **silently drops `dx`**; and `scroll(0, 0)` returns
+/// `{"success": false, "error": "Scroll amount must be non-zero"}`, which the
+/// adapter reports as a dispatched failure. The consumer schema still accepts
+/// both shapes, because the other five backends honour them; recorded in
+/// `docs/tasks.md` M5-C13.
+///
+/// Each entry is `(file, the phrase that states it)`; `tests/cua_pin.rs`
+/// requires `docs/integrations.md` to record the convention.
+pub const SCROLL_SIGN_CONVENTION: &[(&str, &str)] = &[
+    ("handlers/macos.py", "positive for up, negative for down"),
+    ("handlers/windows.py", "Positive values scroll up"),
+    ("handlers/vnc.py", "y>0 = up"),
+    (
+        "handlers/linux.py",
+        "scroll_up: self.mouse.scroll(0, abs(clicks))",
+    ),
+    ("handlers/cua_driver.py", "\"up\" if y > 0 else \"down\""),
+];
 
 /// Look up one allowlisted command's pinned parameter schema.
 #[must_use]

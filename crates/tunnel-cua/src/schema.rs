@@ -93,13 +93,17 @@ pub enum Params {
         from: Point,
         to: Point,
     },
-    /// `scroll` takes a capture reference, a point, and a bounded delta.
-    Scroll {
-        capture: CaptureId,
-        point: Point,
-        dx: i32,
-        dy: i32,
-    },
+    /// `scroll` takes a bounded wheel delta, and **no position** (M5-C13).
+    ///
+    /// Every pinned backend scrolls wherever the cursor is; none takes a
+    /// position and a delta together. This used to accept a capture and a
+    /// point, bounds-check the point, and then not send it -- so a consumer
+    /// reading `scroll(capture, point, dy)` as "scroll here" was scrolling
+    /// wherever the cursor happened to be. A consumer that wants a position
+    /// sends `move` first (validated against its capture) and gets an
+    /// explicit outcome for each step. Positive `dy` is up; see
+    /// `tunnel_http_forward::cua_pin::SCROLL_SIGN_CONVENTION`.
+    Scroll { dx: i32, dy: i32 },
     /// `type_text` takes the text. **The text is never rendered by `Debug`;**
     /// see [`Keystrokes`].
     TypeText { text: Keystrokes },
@@ -166,6 +170,22 @@ impl core::fmt::Debug for Keystrokes {
 
 /// The display index used when `params` does not name one.
 pub const DEFAULT_DISPLAY: u32 = 0;
+
+/// The display indices a pinned backend can actually select (M5-C12).
+///
+/// **Only the default**, which means "whatever display the backend captures
+/// when asked for none". Read from the pinned `handlers/*.py` at
+/// `cua_pin::BASE_PY_SHA256`'s release: no handler's `screenshot` or
+/// `get_screen_size` declares a display parameter (macOS, Linux, Windows,
+/// Android and Cua Driver take `(format, quality)` and nothing; VNC takes
+/// nothing), and the released dispatcher discards undeclared members without
+/// an error. A request naming any other index is refused before dispatch with
+/// [`crate::outcome::NotDispatched::DisplayNotSelectable`] rather than being
+/// answered from the default display under the requested label.
+///
+/// A backend that gains a display parameter would widen this set -- and only
+/// a probe of that backend (M5-C02) may do so, never a reading of this crate.
+pub const SELECTABLE_DISPLAYS: &[u32] = &[DEFAULT_DISPLAY];
 
 /// The largest coordinate this profile accepts in a request, before the
 /// capture's own dimensions narrow it further.
@@ -308,7 +328,7 @@ fn validate_params(
         Operation::Click => &["capture", "x", "y", "button"],
         Operation::DoubleClick | Operation::Move => &["capture", "x", "y"],
         Operation::Drag => &["capture", "x", "y", "to_x", "to_y"],
-        Operation::Scroll => &["capture", "x", "y", "dx", "dy"],
+        Operation::Scroll => &["dx", "dy"],
         Operation::TypeText => &["text"],
         Operation::PressKey => &["key"],
         Operation::Hotkey => &["keys"],
@@ -358,8 +378,6 @@ fn validate_params(
             to: point_of(params, "to_x", "to_y")?,
         },
         Operation::Scroll => Params::Scroll {
-            capture: capture_of(params)?,
-            point: point_of(params, "x", "y")?,
             dx: delta_of(params, "dx")?,
             dy: delta_of(params, "dy")?,
         },

@@ -64,6 +64,19 @@ def findings_for(line: str, pins: "set[str]", ancestry=unresolvable) -> "list[st
     return found
 
 
+#: The two commit findings `row_findings` can emit, which are siblings: a hash
+#: git cannot resolve (and sources.md does not pin), and a hash git resolves
+#: to a commit that is not an ancestor.  Every red below names which one it
+#: expects and requires the other to be absent (M4-43), so a finding produced
+#: for the wrong reason cannot satisfy a count.
+UNRESOLVED = "which git cannot resolve to any commit"
+NON_ANCESTOR = "NOT an ancestor of HEAD"
+
+
+def only_finding(found: "list[str]", expected: str, sibling: str) -> bool:
+    return len(found) == 1 and expected in found[0] and sibling not in found[0]
+
+
 def row(body: str) -> str:
     """A verified tasks.md row carrying `body` as its evidence cell."""
     return f"| M8-01 | [x] Pin stable ACP v1. | verified local | m8c1 worker | {body} | — |"
@@ -104,14 +117,18 @@ def main() -> int:
     red = findings_for(
         row(f"upstream pin (recorded, verified) at commit `{UNRECORDED}`."), pins
     )
-    check(len(red) == 1, f"the unrecorded upstream hash must be one finding, got {red}")
+    check(
+        only_finding(red, UNRESOLVED, NON_ANCESTOR),
+        f"the unrecorded upstream hash must be one unresolved-commit finding, got {red}",
+    )
     check(
         "sources.md" in red[0],
         f"the finding must name the record that is missing, got {red[0]}",
     )
+    short = findings_for(row(f"commit `{UNRECORDED[:8]}`."), pins)
     check(
-        len(findings_for(row(f"commit `{UNRECORDED[:8]}`."), pins)) == 1,
-        "the short form of an unrecorded hash must fail as well",
+        only_finding(short, UNRESOLVED, NON_ANCESTOR),
+        f"the short form of an unrecorded hash must fail as well, by the same rule: {short}",
     )
 
     # --- a record that exists but records too little ------------------------
@@ -122,9 +139,10 @@ def main() -> int:
         "path and must not create a pin",
     )
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."),
-                         guard.recorded_upstream_pins(hollow))) == 1,
-        "a row whose sources.md entry lacks the URL must fail",
+        only_finding(findings_for(row(f"at commit `{RFD_COMMIT}`."),
+                                  guard.recorded_upstream_pins(hollow)),
+                     UNRESOLVED, NON_ANCESTOR),
+        "a row whose sources.md entry lacks the URL must fail as an unresolved commit",
     )
 
     no_digest = (
@@ -138,9 +156,10 @@ def main() -> int:
         "artifact contained and must not create a pin",
     )
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."),
-                         guard.recorded_upstream_pins(no_digest))) == 1,
-        "a row whose sources.md entry lacks the digest must fail",
+        only_finding(findings_for(row(f"at commit `{RFD_COMMIT}`."),
+                                  guard.recorded_upstream_pins(no_digest)),
+                     UNRESOLVED, NON_ANCESTOR),
+        "a row whose sources.md entry lacks the digest must fail as an unresolved commit",
     )
 
     unlabelled = no_digest[:-1] + f", `{RFD_DIGEST}`."
@@ -151,11 +170,12 @@ def main() -> int:
     )
 
     # --- what the exemption must NOT launder --------------------------------
+    laundered = findings_for(row(f"at commit `{RFD_COMMIT}`."), pins, resolvable_non_ancestor)
     check(
-        len(findings_for(row(f"at commit `{RFD_COMMIT}`."), pins,
-                         resolvable_non_ancestor)) == 1,
+        only_finding(laundered, NON_ANCESTOR, UNRESOLVED),
         "a hash git DOES resolve is a claim about this repository's history; "
-        "being listed in sources.md must not excuse a non-ancestor commit",
+        "being listed in sources.md must not excuse a non-ancestor commit, and "
+        f"the finding must be the non-ancestor one: {laundered}",
     )
     check(
         guard.is_recorded_pin(RFD_COMMIT[:8], pins),
@@ -239,8 +259,17 @@ def the_status_predicate_is_exercised_in_both_directions() -> None:
     other = "| Milestone | Current state | Gate statement | Completed at |"
     journal = "| At | Item | Event | Evidence or scope |"
     check(guard.status_column(header) == 2, "the task table's Status column is index 2")
-    check(guard.status_column(other) is None, "the milestone table has no Status column")
-    check(guard.status_column(journal) is None, "the journal table has no Status column")
+    # M4-40: the milestone and journal tables name their verdict column in
+    # their own headers too, and that is the only cell read for them.
+    check(guard.status_column(other) == 1, "the milestone table's verdict is `Current state`, index 1")
+    check(guard.status_column(journal) == 2, "the journal table's verdict is `Event`, index 2")
+    check(not guard.verdict_is_exact(header), "a `Status` column uses the substring rule")
+    check(guard.verdict_is_exact(other), "`Current state` keeps the exact rule it had before M4-40")
+    check(guard.verdict_is_exact(journal), "`Event` keeps the exact rule it had before M4-40")
+    check(
+        guard.status_column("| Key | Current source references | Narrow evidence |") is None,
+        "a table whose header names no verdict column has none",
+    )
 
     def status(cell: str) -> str:
         return f"| M0-00 | [x] a task | {cell} | owner | evidence | — |"
@@ -260,15 +289,49 @@ def the_status_predicate_is_exercised_in_both_directions() -> None:
             f"a status not claiming verification must stay out of scope: {cell!r}",
         )
 
-    # The exact-match half still holds a row whose table has no Status column,
-    # which is what keeps the widening from ever removing a row from scope.
+    # --- M4-40: ONLY the verdict column sets scope ---------------------------
+    # Before M4-40 any cell equal to "verified"/"verified local" put a row in
+    # scope, so a `planned` row whose Owner or Evidence cell happened to read
+    # exactly `verified` was judged as a verified row, and a row in a table
+    # with no verdict column at all was in scope by its wording.  Each case
+    # below is in scope under that fallback and must not be now.
+    for label, row, index in (
+        ("an Owner cell reading `verified`",
+         "| M0-00 | [ ] a task | planned | verified | evidence | — |", 2),
+        ("an Evidence cell reading `verified local`",
+         "| M0-00 | [ ] a task | open | owner | verified local | — |", 2),
+        ("a table with no verdict column",
+         "| K-01 | verified | prose |", None),
+        ("a milestone row whose Gate statement reads `verified`",
+         "| M9 / thing | in progress | verified | — |", 1),
+    ):
+        check(
+            not guard.row_is_verified(row, index, index == 1),
+            f"M4-40: {label} must not put a row in scope; only the table's own "
+            f"verdict column may (row {row!r})",
+        )
+    # The rows the fallback used to admit rightly are still admitted, through
+    # their own verdict column, with the exact rule they always had.
     check(
-        guard.row_is_verified("| M1 / tunnel | verified local | prose | — |", None),
-        "the exact-match rule must still hold a row with no Status column",
+        guard.row_is_verified("| M1 / tunnel | verified local | prose | — |", 1, True),
+        "a milestone row whose `Current state` is exactly `verified local` stays in scope",
     )
     check(
-        not guard.row_is_verified("| M1 / tunnel | in progress | prose | — |", None),
-        "a row with no Status column and no exact match stays out of scope",
+        guard.row_is_verified(
+            "| 2026-09-17T18:29:16+10:00 | M4-07 | verified local | evidence |", 2, True
+        ),
+        "a journal row whose `Event` is exactly `verified local` stays in scope",
+    )
+    check(
+        not guard.row_is_verified(
+            "| 2026-09-17T18:29:16+10:00 | M4-07 | first verified local | e |", 2, True
+        ),
+        "the journal keeps its exact rule: widening it is a separate, measured "
+        "decision (EXACT_VERDICT_HEADERS), not a side effect of M4-40",
+    )
+    check(
+        not guard.row_is_verified("| M1 / tunnel | in progress | prose | — |", 1, True),
+        "a milestone row not claiming verification stays out of scope",
     )
 
 

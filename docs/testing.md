@@ -197,11 +197,13 @@ separator at all fails as well — a blank line inside a table ends it, and the
 rows below render as a paragraph of pipe-delimited text rather than as a table.
 Cell boundaries are `|` not preceded by a backslash, which is GFM's rule: a
 pipe inside an inline code span still splits the row, so `` `a | b` `` must be
-written `` `a \| b` ``. `--verbose` reports the rows and tables checked, the
-findings, and the number of rows **exempt** — the `Completion history` log,
-whose mixed bullet/row formatting is tracked as M4-41. An exempt row is one no
-rule examines, so the count is printed on every `--verbose` run and bounded in
-both directions by `scripts/test_table_shape.py`.
+written `` `a \| b` ``. `--verbose` reports the rows and tables checked and the
+findings. No section is exempt: the `Completion history` log was, while it
+mixed bullets with rows, until M4-41 made it one table and deleted the
+exemption. Which rows the gate and ancestry rules apply to is set only by each
+table's own verdict column, named in its header (`Status`, or `Current state`
+and `Event` for the milestone summary and the journal), never by wording in
+another cell (M4-40).
 
 The scan is fatal (exit 2) when it matches no tables, no rows, or no verified
 rows: a guard whose success and whose non-execution look identical is not
@@ -1027,6 +1029,18 @@ leaves every test green is **printed as such** rather than counted among the
 load-bearing ones; several of gate 4's mask one another and are red only in
 combination, and the honest form of that claim is the combination, not the
 single.
+
+**Witnesses, and what they attribute (M4-42).** Every guard case in
+`fs-guard-deletion`, `m5-guard-deletion` and `acp-guard-deletion` except three
+acp cases names the test(s) its deletion must redden (`WITNESSES`), measured by
+a run and re-checked by a full re-run; a red that does not include them is
+`RED (wrong witness)` and fails the run. That proves the red came from the named
+tests and not from anything else in the suite's surface. It does **not** always
+tell cases apart *within* a suite: **300** fs, **14** m5 and **73** acp cases
+share their exact witness set with another case in the same suite, mostly
+because one validator test reddens for every rule it checks. Those cases are
+attributed at suite level only -- their red is the suite's own validator
+noticing *a* defeated rule, not evidence that it noticed *this* one.
 
 **What this gate does not prove, and must not be read as proving.** A filesystem
 session across the relay-to-relay peer hop, because gate 4 admits one only at

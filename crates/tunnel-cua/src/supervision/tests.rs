@@ -428,7 +428,7 @@ fn a_capture_id_from_another_device_is_still_unknown_after_a_restart() {
 
 /// Every `UnknownReason` the transport layer can conclude on its own, so the
 /// attribution cases below are a cross-product rather than one representative.
-const TRANSPORT_UNKNOWNS: [UnknownReason; 8] = [
+const TRANSPORT_UNKNOWNS: [UnknownReason; 9] = [
     UnknownReason::Truncated,
     UnknownReason::FramingAbsent,
     UnknownReason::Unparseable,
@@ -436,6 +436,7 @@ const TRANSPORT_UNKNOWNS: [UnknownReason; 8] = [
     UnknownReason::TransportLost,
     UnknownReason::BackendRestarted,
     UnknownReason::DeadlineExpired,
+    UnknownReason::Cancelled,
     UnknownReason::UnexpectedStatus { status: 500 },
 ];
 
@@ -459,6 +460,10 @@ fn answers_attribution_must_not_rewrite() -> Vec<Dispatch> {
         Dispatch::NotDispatched(NotDispatched::NotPermitted),
         Dispatch::NotDispatched(NotDispatched::EndpointRefused),
         Dispatch::NotDispatched(NotDispatched::PeerUnavailable),
+        // M5-C12 and M5-04: a display no backend can select, and a consumer
+        // cancellation before anything was written.
+        Dispatch::NotDispatched(NotDispatched::DisplayNotSelectable),
+        Dispatch::NotDispatched(NotDispatched::Cancelled),
         Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
             LeaseRefusal::NotHeld,
         ))),
@@ -556,7 +561,7 @@ fn attribution_never_changes_what_a_retry_is_allowed_to_do() {
     // be.** The schema, operation, lease and capture refusals,
     // `AnsweredLocally`, and `Failed { Unsupported }` are absent; every one of
     // them reaches `_ => transport` and is returned untouched, so none can
-    // affect retryability. What the 432 pins is that the set actually measured
+    // affect retryability. What the 504 pins is that the set actually measured
     // did not shrink.
     let before = LifecycleEpoch::INITIAL;
     let mut inputs: Vec<Dispatch> = TRANSPORT_UNKNOWNS
@@ -590,13 +595,13 @@ fn attribution_never_changes_what_a_retry_is_allowed_to_do() {
     // This first read `assert_eq!(checked, 2 * inputs.len() * Operation::ALL
     // .len())`, which is exactly the thing it was written to prevent: empty
     // `inputs` and both sides go to zero together, so the check agrees with
-    // itself over a loop that never ran. 432 is 18 transport answers x 12
+    // itself over a loop that never ran. 504 is 21 transport answers x 12
     // operations x 2 epoch relations, and it is written out so that dropping
     // an input, an operation or the undisturbed arm fails here rather than
     // quietly shrinking the cross-product.
     assert_eq!(
         checked,
-        432,
+        504,
         "the cross-product did not run in full: {} inputs x {} operations x 2",
         inputs.len(),
         Operation::ALL.len()

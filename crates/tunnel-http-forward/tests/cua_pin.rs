@@ -248,3 +248,41 @@ fn the_refetch_script_exists_and_names_both_digests() {
         );
     }
 }
+
+/// **M5-C13: the scroll sign convention is pinned and written down.** Three
+/// pinned handlers state that positive `y` scrolls up; the constant names each
+/// file and phrase, and `docs/integrations.md` must say so to a consumer,
+/// because the adapter passes `dy` through unchanged.
+#[test]
+fn the_scroll_sign_convention_is_pinned_and_recorded_for_consumers() {
+    let files: Vec<&str> = cua_pin::SCROLL_SIGN_CONVENTION
+        .iter()
+        .map(|(file, _)| *file)
+        .collect();
+    assert_eq!(
+        files,
+        [
+            "handlers/macos.py",
+            "handlers/windows.py",
+            "handlers/vnc.py",
+            "handlers/linux.py",
+            "handlers/cua_driver.py",
+        ],
+        "the three handlers that state a convention and the two that fix it in code"
+    );
+    for (file, phrase) in cua_pin::SCROLL_SIGN_CONVENTION {
+        assert!(
+            phrase.to_ascii_lowercase().contains("up"),
+            "{file}: the recorded phrase must be the one that states the direction"
+        );
+    }
+    let integrations = read_doc("integrations.md");
+    assert!(
+        integrations.contains("**positive `dy` scrolls up**"),
+        "docs/integrations.md no longer tells a consumer which way `dy` scrolls"
+    );
+    assert!(
+        integrations.contains("cua_pin::SCROLL_SIGN_CONVENTION"),
+        "docs/integrations.md no longer points at the pinned evidence"
+    );
+}
