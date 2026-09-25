@@ -155,8 +155,12 @@ fn rotation_freeze_fs_error() -> Response {
 /// which it already treats as a retryable `BACKEND_UNAVAILABLE`.  Every other
 /// refusal keeps that code.
 fn fs_admission_refusal(error: &crate::actor::RelayError) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
     if matches!(error, crate::actor::RelayError::RotationFreeze) {
         crate::metrics::count_local_rotation_freeze("fs");
+    }
+    if matches!(error, crate::actor::RelayError::RotationFreeze) {
         return rotation_freeze_fs_error();
     }
     fs_error(

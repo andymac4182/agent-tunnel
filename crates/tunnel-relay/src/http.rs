@@ -4461,8 +4461,12 @@ fn catalog_error(error: tunnel_catalog::CatalogError) -> Response {
 /// The unary echo route's answer for a failure from this relay's own actor.
 /// A `ROTATION_FREEZE` refusal is counted under route `echo`.
 fn echo_failure_response(code: &'static str, execution: &'static str) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
     if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
         crate::metrics::count_local_rotation_freeze("echo");
+    }
+    if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
         return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
     }
     failure_outcome(code, execution)
@@ -4559,12 +4563,16 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
 /// a `ROTATION_FREEZE` refusal is counted under it (M6-C24's
 /// `consumer_refusals_total`, stage `rotation_freeze`).
 fn local_consumer_admission_response(route: &'static str, error: RelayError) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
+    if matches!(error, RelayError::RotationFreeze) {
+        crate::metrics::count_local_rotation_freeze(route);
+    }
     match error {
         RelayError::OwnerNotReady => {
             retryable_peer_failure_response(OWNER_NOT_READY_RETRY_AFTER_MS)
         }
         RelayError::RotationFreeze => {
-            crate::metrics::count_local_rotation_freeze(route);
             rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS)
         }
         RelayError::StreamLimit => stream_limit_response(STREAM_LIMIT_RETRY_AFTER_MS),
