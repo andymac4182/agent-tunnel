@@ -357,7 +357,19 @@ class Stack:
         self.users["a"] = {"id": ids["user"], "subject": subject}
         device_dir = self.new_device_dir("a", ids["device"], {ids["service"]: "echo"})
         (device_dir / "catalog.toml").write_text(records)
-        self.relay_cmd("activate-first-incarnation")
+        # A fresh CI runner's first Redis connection has failed at
+        # connection_establishment (class=io) before any write; retry that
+        # stage only, and record every retry.
+        for attempt in range(1, 6):
+            completed = run([self.bins / "tunnel-relay", "activate-first-incarnation", "--config",
+                             self.relay_config], check=False)
+            if completed.returncode == 0:
+                break
+            stderr = completed.stderr.decode(errors="replace")
+            if "stage=connection_establishment" not in stderr or attempt == 5:
+                raise SystemExit(f"activate-first-incarnation failed: {stderr[-600:]}")
+            self.event("activate-retry", attempt=attempt, stderr=stderr.strip()[-200:])
+            time.sleep(3)
         self.relay_cmd("provision-catalog", "--records", str(device_dir / "catalog.toml"))
         self.devices["a"]["echo"] = ids["service"]
         self.event("provisioned", namespace=self.namespace, device="a")
