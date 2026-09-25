@@ -59,8 +59,9 @@ signed and no build attestation is published, so there is no authenticity
 check beyond trusting that GitHub release (M6-C103).
 
 The archive has **no top-level folder**; it unpacks `LICENSE`, `README.txt`,
-`bin/`, `examples/`, `notices/` and `release.json` into the current directory.
-Unpack it into an empty directory:
+`bin/`, `examples/`, `notices/` and `release.json` into the current directory
+(archives built after M6-C50 also carry `docs/`). Unpack it into an empty
+directory:
 
 ```text
 mkdir release && tar -xzf agentuplink-*.tar.gz -C release && cd release
@@ -72,6 +73,9 @@ run and the `target`. `notices/` holds the third-party licence texts.
 `examples/` holds only `m1-client.toml` and `m1-relay.toml`; every other
 example the documentation mentions is in the repository at `sourceSha`:
 `https://github.com/andymac4182/agentuplink/tree/<sourceSha>/examples`.
+Newer archives' `README.txt` says to start with `docs/operator.md`. That guide
+is for running a relay; as a tester joining one, ignore that pointer and follow
+this page.
 
 **macOS only:** the binaries are not code-signed or notarized. `gh release
 download` does not mark files as quarantined, so they run as they are. An
@@ -158,7 +162,9 @@ tunnel-client doctor --config ~/agentuplink-device/client.toml
 
 Expect `Imported 1 client certificate(s) and 1 server CA certificate(s).`, then
 `Local configuration, credential key match, permissions, and expiry are
-healthy.` and exit `0`. Add `--json` to `doctor` for the detail. `doctor` is
+healthy.` followed by `Supervisor IPC: not implemented in this operations
+slice.`, and exit `0`. The second line is expected, not an error: the alpha has
+no supervisor IPC. Add `--json` to `doctor` for the detail. `doctor` is
 local only; it does not contact the relay.
 
 `credentials import` refuses a certificate that is X.509 v1, has no device-role
