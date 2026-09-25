@@ -549,14 +549,16 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
     // M4-16 the whole column read zero — the refusal is taken by gate 3's
     // session inside `accept`, and nothing there classified it.
     //
-    // The one zero is `Twrite`, and it is a **bound rather than a miss**: this
-    // grant can never open a fid for writing, so the write is refused for its
-    // *fid state* — `EINVAL`, not `EPERM` — before the session decides what
-    // primitives it needs. Nothing decided it was a write, so nothing counts it
-    // as one. Task row M4-20 records that residue. Asserting the zero here is
-    // the point: a counter that moved for this one would be counting the
-    // opcode, which is exactly what it must not do.
-    const COUNTED: [u64; 10] = [1, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+    // `Twrite` is counted too, and **by the grant rather than by its
+    // primitives** (task row M4-20, applied by default pending owner
+    // confirmation, 2026-09-25): this grant can never open a fid for writing,
+    // so the write is refused for its *fid state* — `EINVAL`, not `EPERM` —
+    // before the session decides what primitives it needs, and until M4-20 it
+    // read zero here, so a read-only consumer's every attempted write was
+    // invisible to the operator. The counterpart that keeps this from being a
+    // count of the opcode is
+    // `a_twrite_refused_for_fid_state_under_a_write_grant_is_not_counted`.
+    const COUNTED: [u64; 10] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
     // The two refusals a mutation meets under a `read`+`list` grant, each taken
     // by a different layer and **both of them before the host**, which is what
     // makes every one of them `not_started`:
@@ -623,6 +625,55 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
         assert!(!fixture.inside("hard").exists());
         assert!(!fixture.inside("tree/moved.txt").exists());
     }
+}
+
+#[test]
+fn a_twrite_refused_for_fid_state_under_a_write_grant_is_not_counted() {
+    // Task row M4-20's negative control. The same refusal as the read-only
+    // matrix's `Twrite` — `EINVAL` for a fid not open for writing, taken by
+    // gate 3's session before any primitive is decided — but under a grant
+    // that **does** hold `write`. Here the consumer could have opened the fid
+    // for writing and did not: it is the client's own state error, not a write
+    // the grant stopped, so the ledger must not move. A counter keyed on the
+    // `Twrite` opcode alone would count it, and this is the case that says so.
+    let fixture = Fixture::new();
+    fixture.file("/notes.txt", b"synthetic");
+    let (mut provider, _authority) = fixture.provider(full_grant());
+    handshake(&mut provider, ROOT);
+    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["notes.txt"]));
+    let opened = one_frame(exchange(&mut provider, tlopen(3, 1, O_RDONLY)));
+    assert!(
+        matches!(opened.message, Message::Rlopen { .. }),
+        "the fid opens read-only under this grant: {opened:?}"
+    );
+
+    let reply = one_frame(exchange(
+        &mut provider,
+        tunnel_fs_ninep::Frame::new(
+            4,
+            Message::Twrite {
+                fid: 1,
+                offset: 0,
+                data: b"overwrite".to_vec(),
+            },
+        ),
+    ));
+    assert_eq!(
+        error_code(&reply),
+        FsErrorCode::Einval,
+        "refused for its fid state"
+    );
+    let stats = provider.stats();
+    assert_eq!(stats.errors_sent, 1, "it was refused");
+    assert_eq!(
+        stats.mutations_refused, 0,
+        "a write the grant allowed and the client never opened for is not a refused mutation"
+    );
+    assert_eq!(stats.mutations_dispatched, 0);
+    assert_eq!(
+        std::fs::read(fixture.inside("notes.txt")).expect("the file survives"),
+        b"synthetic"
+    );
 }
 
 /// Refuse one `Tlopen` at admission and report what the ledger did.

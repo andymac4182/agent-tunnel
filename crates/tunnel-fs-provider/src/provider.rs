@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::{Authority, ProviderStats};
 use tunnel_fs_core::{
-    CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Outcome, Primitive, SessionErrorCode,
+    Capability, CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Outcome, Primitive,
+    SessionErrorCode,
 };
 use tunnel_fs_host::{
     DirReader, ExportRoot, FileKind, Handle, HostEntry, Intent, Metadata, TimeChange,
@@ -349,11 +350,17 @@ impl<A: Authority> Provider<A> {
     /// counter that read the opcode alone would report a truncation for an open
     /// that discarded nothing.
     ///
-    /// A frame the session could not classify is **not** counted, and that is
-    /// the honest bound rather than an oversight: a `Twrite` to a fid that is
-    /// not open for writing is refused for its fid state before any primitive
-    /// is decided, so nothing here ever decided it was a write. Task row M4-20
-    /// records that residue.
+    /// A frame the session could not classify is **not** counted, with one
+    /// exception decided by the grant rather than by the frame (task row
+    /// M4-20, applied by default pending owner confirmation, 2026-09-25): a
+    /// `Twrite` refused under a grant that does not hold `write`. Such a grant
+    /// can never open a fid for writing, so every `Twrite` its consumer sends
+    /// is refused for its fid state before the session decides any primitive,
+    /// and without this the operator's ledger never shows the attempt. Under a
+    /// grant that *does* hold `write`, a `Twrite` on a fid opened read-only is
+    /// a client's own state error rather than a write the grant stopped, and
+    /// it stays uncounted. The primitives predicate below is unchanged: every
+    /// other opcode is still classified only from what the session decoded.
     ///
     /// **It counts every refusal, not only a capability refusal.** This runs on
     /// any `Err` from `request`, so a classifiable mutation refused *after* the
@@ -363,13 +370,20 @@ impl<A: Authority> Provider<A> {
     /// was not touched in that case either. It is broader than the capability
     /// refusals M4-16 was filed about, and is deliberate rather than incidental.
     fn note_refused_mutation(&mut self, frame: &Frame) {
-        if self
+        let classified = self
             .session
             .required_primitives(frame)
-            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))
-        {
+            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating));
+        if classified || self.is_a_write_the_grant_forbids(frame) {
             self.stats.mutations_refused += 1;
         }
+    }
+
+    /// Whether `frame` is a `Twrite` under a grant that does not hold `write`
+    /// (task row M4-20). Decided by the live grant, never by the opcode alone.
+    fn is_a_write_the_grant_forbids(&self, frame: &Frame) -> bool {
+        matches!(frame.message, Message::Twrite { .. })
+            && !self.authority.current().grant.allows(Capability::Write)
     }
 
     // ------------------------------------------------------------- answering

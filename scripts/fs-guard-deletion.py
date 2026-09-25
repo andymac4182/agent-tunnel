@@ -1619,14 +1619,42 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 PROVIDER_SRC,
-                """        if self
-            .session
-            .required_primitives(frame)
-            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))
-        {
+                """        if classified || self.is_a_write_the_grant_forbids(frame) {
             self.stats.mutations_refused += 1;
         }""",
-                "        let _ = frame;",
+                "        let _ = (classified, self.is_a_write_the_grant_forbids(frame));",
+            )
+        ],
+    ),
+    (
+        # Task row **M4-20** (applied by default pending owner confirmation,
+        # 2026-09-25).  A `Twrite` under a grant without `write` is refused for
+        # its fid state before gate 3's session decides any primitive, so the
+        # primitives predicate never sees it.  Deleting the grant-decided
+        # clause restores the defect: a read-only consumer's every attempted
+        # write is invisible in `mutations_refused` again.
+        "a Twrite refused under a read-only grant is counted",
+        [
+            (
+                PROVIDER_SRC,
+                "        if classified || self.is_a_write_the_grant_forbids(frame) {",
+                "        if classified {",
+            )
+        ],
+    ),
+    (
+        # The other half of M4-20, and the one a naive fix fails: counting the
+        # `Twrite` opcode whatever the grant says.  Under a grant that holds
+        # `write`, a `Twrite` on a fid opened read-only is the client's own
+        # state error, not a write the grant stopped.  This keeps the clause
+        # compiling and moving while removing the grant test, so only the case
+        # asserting that refusal is **not** counted can catch it.
+        "a Twrite is counted by the grant, never by its opcode",
+        [
+            (
+                PROVIDER_SRC,
+                "            && !self.authority.current().grant.allows(Capability::Write)",
+                "            && Capability::ALL.contains(&Capability::Write)",
             )
         ],
     ),
@@ -6420,6 +6448,8 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('gate4', 'a cookie past the end of a directory is refused'): frozenset({'a_cookie_past_the_end_is_refused'}),
     ('gate4', 'a link is decided before the exportable-kind check'): frozenset({'metadata_of_a_symbolic_link_follows_it_when_the_feature_is_on', 'metadata_of_a_symbolic_link_is_refused_without_the_feature'}),
     ('gate4', 'a mutation refused at admission is counted'): frozenset({'a_refused_open_is_counted_from_its_flags_and_never_from_its_opcode', 'every_mutating_opcode_is_refused_under_a_read_only_grant'}),
+    ('gate4', 'a Twrite refused under a read-only grant is counted'): frozenset({'every_mutating_opcode_is_refused_under_a_read_only_grant'}),
+    ('gate4', 'a Twrite is counted by the grant, never by its opcode'): frozenset({'a_twrite_refused_for_fid_state_under_a_write_grant_is_not_counted'}),
     ('gate4', 'a refusal before the host is counted not-started, never dispatched'): frozenset({'a_narrowed_grant_refuses_a_queued_write_before_the_host_is_touched'}),
     ('gate4', 'a special file is left out of a listing'): frozenset({'a_run_of_unservable_entries_is_bounded_rather_than_walked', 'enumeration_leaves_out_a_special_file'}),
     ('gate4', 'a stale grant revision does not match'): frozenset({'http::fs::tests::a_missing_revision_header_matches_and_a_stale_one_does_not'}),
