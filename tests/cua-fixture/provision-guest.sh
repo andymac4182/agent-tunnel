@@ -86,8 +86,19 @@ EOF
 # Hash-locked server install. --require-hashes makes pip refuse any artifact
 # whose digest is not in the lock, including cua-computer-server itself, whose
 # two hashes are the wheel and sdist digests recorded in cua_pin.rs.
+#
+# Wheels only, with exactly one exception: evdev 2.0.0 (a pynput dependency on
+# Linux) publishes no wheel at all, only an sdist. Every other one of the 109
+# locked packages has an aarch64 or pure-Python wheel (checked against PyPI on
+# 2026-09-25). evdev is built with --no-build-isolation against setuptools from
+# requirements-build-linux-aarch64.lock, itself hash-locked and wheel-only, so
+# no unhashed build dependency is ever fetched.
 python3 -m venv /opt/cua-server
-/opt/cua-server/bin/pip install -q --require-hashes --no-deps -r "${SRC}/requirements-linux-aarch64.lock"
+/opt/cua-server/bin/pip install -q --require-hashes --only-binary :all: \
+  -r "${SRC}/requirements-build-linux-aarch64.lock"
+/opt/cua-server/bin/pip install -q --require-hashes --no-deps --no-build-isolation \
+  --only-binary :all: --no-binary evdev \
+  -r "${SRC}/requirements-linux-aarch64.lock"
 /opt/cua-server/bin/pip check
 
 # Launcher used by the host script. Loopback only; telemetry off.
@@ -111,5 +122,5 @@ exec /opt/cua-server/bin/cua-computer-server \
 EOF
 
 mkdir -p /etc/cua-golden
-cp "${SRC}/requirements-linux-aarch64.lock" /etc/cua-golden/
+cp "${SRC}/requirements-linux-aarch64.lock" "${SRC}/requirements-build-linux-aarch64.lock" /etc/cua-golden/
 echo "provisioned $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/etc/cua-golden/provisioned

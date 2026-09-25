@@ -14,8 +14,11 @@ output=$(x xrandr --current | awk '/ connected/{print $1; exit}')
 xkb=$(x setxkbmap -query | awk '/layout:/{print $2}')
 xft_dpi=$(x xrdb -query 2>/dev/null | awk '/Xft.dpi/{print $2}')
 
+# shellcheck disable=SC1091  # the guest's own file
+os_name="$(. /etc/os-release; echo "$PRETTY_NAME")"
+
 jq -n \
-  --arg os "$(. /etc/os-release; echo "$PRETTY_NAME")" \
+  --arg os "$os_name" \
   --arg kernel "$(uname -r)" --arg arch "$(uname -m)" \
   --arg dims "$dims" --arg dpi "$dpi" --arg output "$output" \
   --arg xft_dpi "${xft_dpi:-unset}" \

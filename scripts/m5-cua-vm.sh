@@ -20,14 +20,21 @@
 #   scripts/m5-cua-vm.sh destroy-golden       delete cua-golden and its cached base image
 #   scripts/m5-cua-vm.sh cycle [NAME]         create, run, probe, stop, destroy; proves disposability
 #
-# Environment: TART (default: tart on PATH), M5_CUA_VM_STATE (default
-# ~/.local/state/agentuplink-m5-cua-vm) for the SSH key, logs and evidence.
+# Environment: TART (default: tart on PATH), TART_HOME (Tart's storage, default
+# ~/.tart; the disk floor is checked on the filesystem holding it),
+# M5_CUA_VM_STATE (default ~/.local/state/agentuplink-m5-cua-vm) for the SSH
+# key, logs and evidence.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURE="${ROOT}/tests/cua-fixture"
 TART="${TART:-tart}"
 STATE="${M5_CUA_VM_STATE:-${HOME}/.local/state/agentuplink-m5-cua-vm}"
+TART_STORAGE="${TART_HOME:-${HOME}/.tart}"
+# The Tart release this was built and verified with: GitHub release asset
+# tart.tar.gz SHA-256 1712be82b687cc27792d5a2bae3f36fcb5e5dea4d5772231f5508dea567999e2,
+# signed "Developer ID Application: Cirrus Labs, Inc." Team ID 9M2P8L4D89.
+TART_VERSION_PINNED="2.38.0"
 
 # Official Cirrus Labs image, pinned by digest. `ubuntu:latest` resolved to
 # this on 2026-09-25 (Ubuntu 24.04.4 LTS, arm64).
@@ -45,8 +52,30 @@ log() { echo "m5-cua-vm: $*" >&2; }
 
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "host must be an Apple Silicon Mac"
 command -v "${TART}" >/dev/null || die "tart not found (see docs/testing.md, 'Disposable Linux CUA VM')"
+tart_version="$("${TART}" --version 2>/dev/null || true)"
+[ "${tart_version}" = "${TART_VERSION_PINNED}" ] \
+  || die "tart ${tart_version:-unknown} is not the pinned ${TART_VERSION_PINNED}"
 
-free_gib() { df -k / | awk 'NR==2 {print int($4 / 1048576)}'; }
+# Free space on the filesystem that holds Tart's storage, where the golden
+# image, clones and the OCI cache live (the nearest existing ancestor if
+# TART_HOME has not been created yet).
+free_gib() {
+  local dir="${TART_STORAGE}"
+  while [ ! -d "${dir}" ]; do dir="$(dirname "${dir}")"; done
+  df -k "${dir}" | awk 'NR==2 {print int($4 / 1048576)}'
+}
+
+# Exit-time cleanup. Functions push commands; they run in reverse order on any
+# exit, success or error, so a failed step never leaves a VM or forward behind.
+CLEANUP=()
+on_exit() {
+  local i
+  for ((i = ${#CLEANUP[@]} - 1; i >= 0; i--)); do
+    # A subshell, so a `die` inside one cleanup cannot skip the rest.
+    ( eval "${CLEANUP[i]}" ) || true
+  done
+}
+trap on_exit EXIT
 
 # disk_check NEED_GIB: abort unless NEED_GIB can be spent and MIN_FREE_GIB remains.
 disk_check() {
@@ -111,7 +140,7 @@ wait_x() {
 copy_fixture() {
   local vm="$1"
   COPYFILE_DISABLE=1 tar -C "${FIXTURE}" -cf - fixture_app.py provision-guest.sh guest-manifest.sh \
-      requirements-linux-aarch64.lock \
+      requirements-linux-aarch64.lock requirements-build-linux-aarch64.lock \
     | gexec_in "${vm}" sudo bash -c 'rm -rf /opt/cua-fixture && mkdir -p /opt/cua-fixture && tar -C /opt/cua-fixture -xf - && chown -R root:root /opt/cua-fixture && chmod -R a+rX /opt/cua-fixture'
 }
 
@@ -140,6 +169,8 @@ cmd_golden() {
   disk_check 12   # ~5 GiB cached base image + ~5 GiB VM disk + packages
   ssh_key
   "${TART}" clone "${BASE_IMAGE}" "${GOLDEN}"
+  # Stop the golden VM on every exit, including a failed provisioning step.
+  CLEANUP+=("cmd_stop $(printf %q "${GOLDEN}")")
   "${TART}" set "${GOLDEN}" --cpu "${VM_CPU}" --memory "${VM_MEM_MB}" --display "${VM_DISPLAY}"
   local disk
   disk="$("${TART}" get "${GOLDEN}" --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Disk"])')"
@@ -177,6 +208,7 @@ cmd_create() {
 cmd_run() {
   local vm="${1:?name}"
   [ "${vm}" != "${GOLDEN}" ] || die "runs use a disposable clone, never ${GOLDEN} itself"
+  disk_check 1   # the guest's writes land in the clone's copy-on-write disk
   boot "${vm}"
   wait_x "${vm}"
   "${TART}" ip "${vm}"
@@ -212,10 +244,11 @@ cmd_probe() {
   local vm="${1:?name}" out="${2:-}"
   [ "${vm}" != "${GOLDEN}" ] || die "probe a disposable clone, never ${GOLDEN} itself"
   vm_running "${vm}" || die "${vm} is not running"
+  disk_check 1
   ssh_key
   [ -n "${out}" ] || out="${STATE}/runs/${vm}-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "${out}"
-  local ip lport=18000
+  local ip lport
   ip="$("${TART}" ip "${vm}")"
   case "${ip}" in 192.168.64.*) ;; *) die "unexpected guest address ${ip}; expected Tart's private NAT network";; esac
 
@@ -224,16 +257,39 @@ cmd_probe() {
     | awk '/dimensions:|resolution:/' >"${out}/xdpyinfo.txt"
   gexec "${vm}" cat /tmp/cua-fixture/state.json >"${out}/fixture-state.json"
 
-  # Forward host 127.0.0.1:lport -> guest 127.0.0.1:SERVER_PORT over SSH.
-  ssh -i "${STATE}/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  # Per-run known_hosts holding the guest's own host key, read over the
+  # hypervisor channel (`tart exec`), so the SSH forward authenticates the
+  # guest instead of trusting whatever answers at that address.
+  local key
+  key="$(gexec "${vm}" cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')"
+  case "${key}" in "ssh-ed25519 "?*) ;; *) die "could not read the guest's ed25519 host key";; esac
+  echo "${ip} ${key}" >"${out}/known_hosts"
+
+  # A free host loopback port, then forward it to guest 127.0.0.1:SERVER_PORT.
+  lport="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  ssh -i "${STATE}/id_ed25519" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${out}/known_hosts" \
+      -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes \
       -o LogLevel=ERROR -o ExitOnForwardFailure=yes -N \
       -L "127.0.0.1:${lport}:127.0.0.1:${SERVER_PORT}" "admin@${ip}" &
   local ssh_pid=$!
-  # shellcheck disable=SC2064  # expand the pid now
-  trap "kill ${ssh_pid} 2>/dev/null || true" EXIT
-  sleep 2
+  CLEANUP+=("kill ${ssh_pid} 2>/dev/null")
 
-  local variant label backend
+  # Before any request: the forward must be alive and must be the ONLY listener
+  # on that port. Anything else there (a race for the port, a stray host
+  # service) would receive the probe instead of the guest.
+  local listeners="" _
+  for _ in $(seq 1 20); do
+    kill -0 "${ssh_pid}" 2>/dev/null || die "ssh forward exited before listening"
+    # lsof exits 1 while nothing listens yet; that is "not yet", not an error.
+    listeners="$({ lsof -nP -iTCP:"${lport}" -sTCP:LISTEN -t 2>/dev/null || true; } | sort -u | tr '\n' ' ')"
+    [ -n "${listeners}" ] && break
+    sleep 0.5
+  done
+  kill -0 "${ssh_pid}" 2>/dev/null || die "ssh forward is not running"
+  [ "${listeners}" = "${ssh_pid} " ] \
+    || die "port ${lport} listeners are '${listeners}', expected only the ssh forward ${ssh_pid}"
+
+  local variant label backend envs sargs failed=0
   # label|backend|env (space separated)|server args
   for variant in \
       "native|native||" \
@@ -251,13 +307,15 @@ cmd_probe() {
       continue
     fi
     python3 "${FIXTURE}/probe.py" --base-url "http://127.0.0.1:${lport}" --label "${label}" \
-      --out-dir "${out}" >"${out}/probe-${label}.json" || log "${label}: probe.py failed"
+      --out-dir "${out}" >"${out}/probe-${label}.json" \
+      || { log "${label}: probe.py failed (exit 3 = frame is not the fixture; nothing kept)"; failed=$((failed + 1)); }
     gexec "${vm}" sudo cat "/tmp/cua-server-${label}.log" >"${out}/server-${label}.log" 2>/dev/null || true
   done
   stop_server "${vm}"
   kill "${ssh_pid}" 2>/dev/null || true
   log "evidence in ${out}"
   echo "${out}"
+  [ "${failed}" -eq 0 ] || die "${failed} probe variant(s) failed"
 }
 
 cmd_manifest() { gexec "${1:?name}" sudo bash /opt/cua-fixture/guest-manifest.sh; }
@@ -283,6 +341,10 @@ cmd_destroy_golden() {
 cmd_cycle() {
   local vm="${1:-cua-run-1}"
   cmd_create "${vm}"
+  # Whatever fails after the clone exists, stop and delete it.
+  local q
+  q="$(printf %q "${vm}")"
+  CLEANUP+=("cmd_stop ${q}; cmd_destroy ${q}")
   cmd_run "${vm}"
   cmd_probe "${vm}"
   cmd_stop "${vm}"

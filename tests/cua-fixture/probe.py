@@ -16,6 +16,7 @@ fixture app.
 import argparse
 import base64
 import json
+import re
 import struct
 import sys
 import urllib.error
@@ -124,6 +125,19 @@ def decode_png(png: bytes):
     return w, h, bpp, rows
 
 
+def fixture_corner_colours() -> tuple[str, ...]:
+    """CORNER_COLOURS read from fixture_app.py, the single source of truth.
+
+    Parsed rather than imported: importing it would pull in tkinter on the host.
+    """
+    src = (Path(__file__).with_name("fixture_app.py")).read_text()
+    m = re.search(r"^CORNER_COLOURS = \(([^)]*)\)", src, re.M)
+    colours = tuple(c.lower() for c in re.findall(r'"(#[0-9a-fA-F]{6})"', m.group(1))) if m else ()
+    if len(colours) != 4:
+        raise SystemExit("probe.py: cannot read CORNER_COLOURS from fixture_app.py")
+    return colours
+
+
 def pixel(rows, bpp, x, y) -> str:
     r, g, b = rows[y][x * bpp:x * bpp + 3]
     return f"#{r:02x}{g:02x}{b:02x}"
@@ -177,9 +191,10 @@ def main() -> int:
         payload["image_data"] = f"<{len(png)} bytes elided>"
         w, h, bpp, rows = decode_png(png)
         info = {"png_width": w, "png_height": h, "png_bytes": len(png)}
+        pixels = None
         if rows is not None:
             m = args.marker_size // 2
-            info["pixels"] = {
+            pixels = {
                 "top_left": pixel(rows, bpp, m, m),
                 "top_right": pixel(rows, bpp, w - 1 - m, m),
                 "bottom_left": pixel(rows, bpp, m, h - 1 - m),
@@ -187,7 +202,24 @@ def main() -> int:
                 # Offset from the exact centre: a VNC capture draws the pointer there.
                 "centre": pixel(rows, bpp, w // 2 - 10, h // 2 - 10),
             }
+        # Only a frame that is provably the synthetic fixture may be kept. If
+        # the four corners are not exactly the fixture's markers, this is not
+        # known to be the guest's fixture screen, so neither the PNG nor any
+        # pixel value is written anywhere, and the run fails.
+        corners = (
+            tuple(pixels[k] for k in ("top_left", "top_right", "bottom_left", "bottom_right"))
+            if pixels else None
+        )
+        info["fixture_markers_verified"] = corners == fixture_corner_colours()
+        if info["fixture_markers_verified"]:
+            info["pixels"] = pixels
         ev["screenshot_image"] = info
+        if not info["fixture_markers_verified"]:
+            ev["results"] = {k: v for k, v in results.items()}
+            print(json.dumps(ev, indent=2, sort_keys=True))
+            print("probe.py: screenshot corners are not the fixture markers; "
+                  "refusing to keep the image or its pixels", file=sys.stderr)
+            return 3
         if args.out_dir:
             Path(args.out_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.out_dir) / f"screenshot-{args.label}.png").write_bytes(png)
