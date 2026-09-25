@@ -2208,6 +2208,19 @@ fn checked_echo_output_len(canary_len: usize, payload_len: usize) -> Option<usiz
 /// (task row M6-C23).
 pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate validity";
 
+/// `Transport` scope of a `STREAM_FORGET` whose terminal proof was still
+/// waiting for the relay's final data-channel ACK when its bounded
+/// revalidation window ended (task row M6-C103). The proof it holds is
+/// consistent; only evidence is missing, and a missing ACK is what a lost or
+/// stalled data carrier produces -- a laptop asleep, a process stopped, a
+/// path gone -- so the session fails retryable and `connect` reconnects.
+/// Evidence that *contradicts* the proof stays `ClientError::Protocol`.
+pub const STREAM_FORGET_PROOF_SCOPE: &str = "stream forget proof";
+
+/// The one detail written under `STREAM_FORGET_PROOF_SCOPE`.
+pub const STREAM_FORGET_PROOF_EXPIRED: &str =
+    "STREAM_FORGET terminal proof did not converge before its deadline";
+
 /// `Transport` scope of a relay certificate this client found expired or not
 /// yet valid on **its own** clock. Retryable: either this host's clock is
 /// wrong or the relay's certificate is due for renewal, and both are fixed
@@ -2499,10 +2512,12 @@ impl ClientError {
             Self::Transport { scope, detail } if *scope == "stream forget barrier" => {
                 format!("{scope} failed: {}", safe_barrier_detail(detail))
             }
-            // Fixed reasons written by `classify_rustls_refusal`.
+            // Fixed reasons written by `classify_rustls_refusal`, and the one
+            // fixed detail of an expired STREAM_FORGET proof.
             Self::Transport { scope, detail }
                 if *scope == DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE
-                    || *scope == RELAY_CERTIFICATE_NOT_CURRENT_SCOPE =>
+                    || *scope == RELAY_CERTIFICATE_NOT_CURRENT_SCOPE
+                    || *scope == STREAM_FORGET_PROOF_SCOPE =>
             {
                 detail.clone()
             }

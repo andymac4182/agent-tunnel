@@ -1331,6 +1331,15 @@ struct PendingStreamForget {
     defer_reclamation: bool,
 }
 
+/// A proof-pending `STREAM_FORGET` ran out of its revalidation window while
+/// its proof was still consistent (see `expired_stream_forget_proof_error`).
+fn stream_forget_proof_expired() -> ClientError {
+    ClientError::Transport {
+        scope: crate::STREAM_FORGET_PROOF_SCOPE,
+        detail: crate::STREAM_FORGET_PROOF_EXPIRED.to_owned(),
+    }
+}
+
 /// The connection id of the stand-in `active` carrier the actor holds while a
 /// retained recovery has no live data socket.  Its sender is closed from the
 /// moment it is made, so it can never carry a frame.
@@ -5424,9 +5433,7 @@ impl M2Actor {
                 continue;
             };
             if deadline.is_none_or(|deadline| now >= deadline) {
-                return Err(ClientError::Protocol(
-                    "STREAM_FORGET terminal proof did not converge before its deadline".to_owned(),
-                ));
+                return Err(self.expired_stream_forget_proof_error(&forget));
             }
             match self.validate_stream_forget(&forget) {
                 Ok(()) => {
@@ -5440,6 +5447,36 @@ impl M2Actor {
             }
         }
         Ok(())
+    }
+
+    /// The error for a proof-pending `STREAM_FORGET` whose absolute deadline
+    /// has passed (task row M6-C103). Expiry is terminal for the proof -- a
+    /// late ACK cannot rescue it -- but its class depends on what the
+    /// connector holds now:
+    ///
+    /// * evidence that **contradicts** the owner's proof (the validator fails
+    ///   and the proof can no longer converge) is the peer's protocol
+    ///   violation, reported as the validator's own non-retryable error;
+    /// * otherwise the proof was consistent and only the relay's final
+    ///   data-channel ACK had not been processed in time. That is what a
+    ///   stall or a loss produces -- a laptop asleep, a process stopped, a
+    ///   data path gone, or the actor's deadline tick running before the
+    ///   buffered ACK after a long pause -- and the connector cannot tell it
+    ///   from a relay that never sent the ACK. It is reported as a retryable
+    ///   transport failure, so `connect` reconnects on a fresh session.
+    ///
+    /// Either way the session ends and nothing it held is carried over: the
+    /// relay fails its still-pending exchanges with an explicit unknown
+    /// outcome, and the successor session's journal starts empty, so no
+    /// request is replayed or reported as succeeded.
+    fn expired_stream_forget_proof_error(
+        &self,
+        forget: &tunnel_protocol::rotation_control::StreamForget,
+    ) -> ClientError {
+        match self.validate_stream_forget(forget) {
+            Err(error) if !self.stream_forget_proof_may_converge(forget) => error,
+            _ => stream_forget_proof_expired(),
+        }
     }
 
     fn retry_pending_forget_barriers(&mut self) -> Result<(), ClientError> {
@@ -5535,11 +5572,14 @@ impl M2Actor {
                 continue;
             };
             if let Err(error) = self.validate_stream_forget(&forget) {
-                let can_retry = proof_pending
-                    && proof_deadline.is_some_and(|deadline| Instant::now() < deadline)
-                    && self.stream_forget_proof_may_converge(&forget);
-                if !can_retry {
+                if !proof_pending || !self.stream_forget_proof_may_converge(&forget) {
                     return Err(error);
+                }
+                // Still only missing evidence: once the window has closed that
+                // is the retryable expiry, never the validator's protocol
+                // error (task row M6-C103).
+                if proof_deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                    return Err(stream_forget_proof_expired());
                 }
                 // The barrier proved the current carrier ordering, but the
                 // independent data event/ACK has not converged yet. Reset the
@@ -10948,11 +10988,10 @@ mod tests {
         let error = actor
             .retry_pending_forget_barriers()
             .expect_err("an expired proof must fail closed");
-        assert!(matches!(
-            error,
-            ClientError::Protocol(message)
-                if message == "STREAM_FORGET terminal proof did not converge before its deadline"
-        ));
+        assert!(
+            is_expired_forget_proof(&error),
+            "a consistent proof that ran out of time is the retryable expiry: {error:?}"
+        );
         assert!(actor.streams.contains_key(&stream_id));
         assert!(actor.pending_forgets.contains_key(&stream_id));
     }
@@ -10996,11 +11035,10 @@ mod tests {
             .handle_frame(key, Frame::ack(1, 1, stream_id, 1))
             .await
             .expect_err("an ACK after the fixed deadline must not rescue the proof");
-        assert!(matches!(
-            error,
-            ClientError::Protocol(message)
-                if message == "STREAM_FORGET terminal proof did not converge before its deadline"
-        ));
+        assert!(
+            is_expired_forget_proof(&error),
+            "a consistent proof that ran out of time is the retryable expiry: {error:?}"
+        );
         let stream = actor
             .streams
             .get(&stream_id)
@@ -11015,6 +11053,145 @@ mod tests {
                 .direction(Direction::ConnectorToRelay)
                 .last_emitted(),
             "the ACK may be observed, but expiry remains terminal"
+        );
+        assert!(actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+    }
+
+    fn is_expired_forget_proof(error: &ClientError) -> bool {
+        matches!(
+            error,
+            ClientError::Transport { scope, detail }
+                if *scope == crate::STREAM_FORGET_PROOF_SCOPE
+                    && detail == crate::STREAM_FORGET_PROOF_EXPIRED
+        )
+    }
+
+    /// Retain a proof-pending FORGET for `stream_id`: the owner's control
+    /// message has arrived, the owner's final data-channel ACK for the
+    /// connector's FIN has not. Returns the actor, the carrier key and the
+    /// held ACK.
+    async fn retained_forget_awaiting_owner_ack(stream_id: u64) -> (M2Actor, CarrierKey, Frame) {
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(stream_id);
+        let (mut actor, key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        actor
+            .handle_control(ControlMessage::StreamForget(
+                tunnel_protocol::rotation_control::StreamForget {
+                    message_id: format!("forget-m6c103-{stream_id}"),
+                    reply_to: String::new(),
+                    session_id: "session".to_owned(),
+                    epoch: 1,
+                    stream_id,
+                    operation_id: "operation".to_owned(),
+                    direction: Direction::RelayToConnector,
+                    final_state,
+                },
+            ))
+            .await
+            .expect("a consistent proof awaiting only the owner ACK is retained");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("initial FORGET barrier is queued"),
+            CarrierCommand::Barrier
+        ));
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| pending.proof_pending && pending.proof_deadline.is_some())
+        );
+        (actor, key, Frame::ack(1, 1, stream_id, 1))
+    }
+
+    /// Task row M6-C103, the live defect: `tunnel-client connect` frozen for
+    /// 40 s (SIGSTOP) with an echo in flight exited 1 with a non-retryable
+    /// `PROTOCOL_ERROR` "STREAM_FORGET terminal proof did not converge before
+    /// its deadline". The owner's FORGET had been retained waiting for the
+    /// owner's final data-channel ACK; the process was stopped for longer
+    /// than the 5 s window (`std::time::Instant` keeps running while a
+    /// process is stopped); on resume the actor's biased select runs the
+    /// deadline tick before the data reader delivers the ACK -- or the relay
+    /// has evicted the session and the ACK never comes. Nothing the peer sent
+    /// was wrong: the expiry must be a retryable transport failure, so the
+    /// reconnect loop starts a fresh session.
+    #[tokio::test]
+    async fn m6c103_a_forget_proof_outlived_by_a_stall_expires_retryable() {
+        let stream_id = 44;
+        let (mut actor, key, held_ack) = retained_forget_awaiting_owner_ack(stream_id).await;
+
+        // The stall: the window passes with the ACK still unread.
+        actor
+            .pending_forgets
+            .get_mut(&stream_id)
+            .expect("proof remains retained")
+            .proof_deadline = Some(Instant::now() - Duration::from_secs(35));
+
+        // What the deadline tick runs first after the resume.
+        let error = actor
+            .retry_pending_forget_barriers()
+            .expect_err("an expired proof still ends the session");
+        assert_eq!(error.code(), "TRANSPORT_ERROR", "{error:?}");
+        assert!(error.retryable(), "a stall is retryable: {error:?}");
+        assert!(is_expired_forget_proof(&error), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "STREAM_FORGET terminal proof did not converge before its deadline"
+        );
+        // Nothing was reclaimed or reported complete by the expiry: the
+        // stream, its FORGET and the watermark are untouched, and the session
+        // ends with them.
+        assert!(actor.streams.contains_key(&stream_id));
+        assert!(actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+
+        // The held ACK read afterwards cannot rescue the proof; the failure
+        // stays the same retryable expiry, not a protocol error.
+        let error = actor
+            .handle_frame(key, held_ack)
+            .await
+            .expect_err("a late ACK cannot rescue an expired proof");
+        assert!(error.retryable(), "{error:?}");
+        assert!(is_expired_forget_proof(&error), "{error:?}");
+        assert!(actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+    }
+
+    /// The other half of M6-C103: an expired proof that the connector's own
+    /// evidence now **contradicts** is the peer's protocol violation, and
+    /// stays the validator's non-retryable error rather than being laundered
+    /// into a retryable expiry.
+    #[tokio::test]
+    async fn m6c103_an_expired_forget_proof_contradicted_by_evidence_stays_a_protocol_error() {
+        let stream_id = 45;
+        let (mut actor, _key, _held_ack) = retained_forget_awaiting_owner_ack(stream_id).await;
+        let pending = actor
+            .pending_forgets
+            .get_mut(&stream_id)
+            .expect("proof remains retained");
+        // The owner's R2C sender evidence no longer matches what this
+        // connector received.
+        pending.forget.final_state.sent_bytes += 1;
+        pending.proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        let error = actor
+            .retry_pending_forget_barriers()
+            .expect_err("contradicting evidence fails closed");
+        assert_eq!(error.code(), "PROTOCOL_ERROR", "{error:?}");
+        assert!(!error.retryable(), "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                ClientError::Protocol(message)
+                    if message == "STREAM_FORGET owner and connector receive evidence mismatch"
+            ),
+            "{error:?}"
         );
         assert!(actor.pending_forgets.contains_key(&stream_id));
         assert_eq!(actor.forgotten_stream_through, 0);

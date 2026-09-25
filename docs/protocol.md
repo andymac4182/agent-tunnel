@@ -188,6 +188,24 @@ allocated by this owner in this session even when the connector never saw it.
 A `STREAM_FORGET` naming an ID **above** the watermark that this session never
 retained remains the protocol error it is.
 
+The control and data sockets are independent, so an owner's `STREAM_FORGET`
+can legally overtake the owner's final data-channel ACK for the connector's
+terminal. A connector whose proof fails **only** because that ACK (or bounded
+carrier-control debt) is still outstanding retains the message for one bounded
+revalidation window (5 s, an absolute deadline that neither a duplicate
+message nor a barrier retry extends) and revalidates it as data progresses.
+Expiry of that window is terminal for the proof -- a late ACK cannot rescue
+it, and nothing is reclaimed -- and it ends the session, but it is **not** a
+protocol violation: missing evidence is what a stalled or lossy device
+produces (a laptop asleep, a process stopped, a data path gone), and the
+connector cannot distinguish it from a relay that never sent the ACK. It is a
+retryable transport failure, and the successor session starts with an empty
+journal, so nothing is replayed; the relay answers exchanges that were still
+in flight with an explicit unknown execution outcome (task row M6-C103).
+Evidence that **contradicts** the proof -- a mismatched cursor, byte count,
+terminal or identity -- stays a non-retryable protocol error, before or after
+the window.
+
 The connector also keeps a bounded monotonic record of reclaimed stream IDs,
 which covers the IDs it refused before journaling them: those can be above the
 watermark, since nothing was ever forgotten for them. That record is held as

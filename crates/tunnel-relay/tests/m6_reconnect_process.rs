@@ -53,6 +53,15 @@
 //!   (`DEVICE_CONTROL_IDLE_TIMEOUT` plus the disconnect hand-off), inside the
 //!   client's 60 s `OWNER_BUSY` window.
 //!
+//! * `m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting`
+//!   -- task row M6-C103: a proxy holds the relay-to-device direction of the
+//!   data socket from the device's answer to an echo onward, so the owner's
+//!   `STREAM_FORGET` arrives and its final ACK does not -- what a stalled or
+//!   lossy device produced live. The session must end `TRANSPORT_ERROR` and
+//!   reconnect (before M6-C103 the client exited `1` `PROTOCOL_ERROR`), and
+//!   an echo in flight meanwhile must be answered `503` with
+//!   `execution: unknown`.
+//!
 //! Every step asserts on the client's `--json` events and on a real echo
 //! through the relay, and each run prints `m6c23-reconnect ok ...` only after
 //! all of it held, so a filtered or skipped run cannot be read as a pass.
@@ -1629,5 +1638,254 @@ async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconn
         quiet.as_millis(),
         reconnect_after_cut.as_millis(),
         CUT_PATH_RECONNECT_BOUND.as_millis()
+    );
+}
+
+/// Task row M6-C103: a TCP proxy that can **hold** the relay-to-device
+/// direction of the data socket while everything else keeps flowing -- the
+/// deterministic form of what a stalled or lossy device produced live
+/// (SIGSTOP for 40 s with an echo in flight): the owner's `STREAM_FORGET`
+/// arrives on the control socket, the owner's final data-channel ACK does
+/// not, and the connector's bounded proof window runs out.
+///
+/// Connections are numbered in accept order; a session opens its control
+/// socket first and its data socket second, so connection `1` is the first
+/// session's data socket. Once `arm` is called, the first bytes the device
+/// sends on that socket -- its answer to the relay's DATA and FIN, which
+/// were forwarded -- latch the hold **before** they are forwarded, so the
+/// relay's ACK for them, and everything after it, is read and never
+/// delivered. Every other connection, and every connection of a later
+/// session, is forwarded normally.
+struct HeldAckProxy {
+    address: SocketAddr,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    holding: Arc<std::sync::atomic::AtomicBool>,
+    held_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HeldAckProxy {
+    const DATA_CONNECTION: usize = 1;
+
+    async fn start(upstream: SocketAddr) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind held-ACK proxy");
+        let address = listener.local_addr().expect("proxy address");
+        let armed = Arc::new(AtomicBool::new(false));
+        let holding = Arc::new(AtomicBool::new(false));
+        let held_bytes = Arc::new(AtomicUsize::new(0));
+        let (accept_armed, accept_holding, accept_held) = (
+            Arc::clone(&armed),
+            Arc::clone(&holding),
+            Arc::clone(&held_bytes),
+        );
+        tokio::spawn(async move {
+            let mut index = 0_usize;
+            loop {
+                let Ok((device, _)) = listener.accept().await else {
+                    return;
+                };
+                let gated = index == Self::DATA_CONNECTION;
+                index += 1;
+                let (armed, holding, held) = (
+                    Arc::clone(&accept_armed),
+                    Arc::clone(&accept_holding),
+                    Arc::clone(&accept_held),
+                );
+                tokio::spawn(async move {
+                    let Ok(relay) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let (mut device_read, mut device_write) = device.into_split();
+                    let (mut relay_read, mut relay_write) = relay.into_split();
+                    let upstream_holding = Arc::clone(&holding);
+                    let to_relay = async move {
+                        let mut buffer = vec![0_u8; 16 * 1024];
+                        loop {
+                            let Ok(read) = device_read.read(&mut buffer).await else {
+                                break;
+                            };
+                            if read == 0 {
+                                break;
+                            }
+                            if gated && armed.load(Ordering::SeqCst) {
+                                upstream_holding.store(true, Ordering::SeqCst);
+                            }
+                            if relay_write.write_all(&buffer[..read]).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = relay_write.shutdown().await;
+                    };
+                    let to_device = async move {
+                        let mut buffer = vec![0_u8; 16 * 1024];
+                        loop {
+                            let Ok(read) = relay_read.read(&mut buffer).await else {
+                                break;
+                            };
+                            if read == 0 {
+                                break;
+                            }
+                            if gated && holding.load(Ordering::SeqCst) {
+                                held.fetch_add(read, Ordering::SeqCst);
+                                continue;
+                            }
+                            if device_write.write_all(&buffer[..read]).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = device_write.shutdown().await;
+                    };
+                    tokio::join!(to_relay, to_device);
+                });
+            }
+        });
+        Self {
+            address,
+            armed,
+            holding,
+            held_bytes,
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn holding(&self) -> bool {
+        self.holding.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn held_bytes(&self) -> usize {
+        self.held_bytes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// How long after the hold the client must have given up the session: the
+/// connector's 5 s `STREAM_FORGET` revalidation window, its 100 ms deadline
+/// poll, and slack. Well inside the relay's 30 s idle eviction, so the relay
+/// cannot be what ends the session.
+const HELD_ACK_LOSS_BOUND: Duration = Duration::from_secs(15);
+const _: () = assert!(HELD_ACK_LOSS_BOUND.as_secs() < DEVICE_CONTROL_IDLE_TIMEOUT.as_secs());
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c103_a_forget_proof_starved_of_its_ack_reconnects_instead_of_exiting() {
+    let deployment = Deployment::provision("held-ack").await;
+    let proxy = HeldAckProxy::start(deployment.device_listener).await;
+    deployment.route_client_through(proxy.address);
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect();
+    let first = session_id(&client.wait_for("session 1", "ready", 1)[0].1);
+    assert!(
+        !proxy.holding(),
+        "nothing may be held before the proxy is armed"
+    );
+
+    // 1. One echo whose FORGET arrives while the owner's final ACK is held.
+    //    The relay answers the consumer on the connector's FIN, which was
+    //    forwarded, so this echo really completed and its 200 is the truth.
+    proxy.arm();
+    let token = access_token(&deployment.issuer_key, &deployment.subject);
+    let payload = format!("m6c103-held-{}", deployment.nonce);
+    let completed = consumer_post(
+        deployment.consumer,
+        &deployment.server_ca_pem,
+        &deployment.echo_path,
+        &token,
+        payload.as_bytes(),
+    )
+    .await;
+    let held_at = Instant::now();
+    assert_eq!(
+        completed
+            .as_ref()
+            .map(|(status, body)| (*status, String::from_utf8_lossy(body).into_owned())),
+        Ok((200, format!("{CANARY}{payload}"))),
+        "the echo whose ACK is held completed: {}",
+        client.context()
+    );
+    assert!(
+        proxy.holding(),
+        "the device's answer latched the hold on the data socket"
+    );
+
+    // 2. A second echo while the hold lasts: its OPEN crosses the control
+    //    socket but its DATA and FIN are held, so it is in flight when the
+    //    session ends. It must end in the relay's explicit unknown outcome --
+    //    not a 200, and not a replay on the next session.
+    let in_flight = {
+        let (consumer, ca, path, token) = (
+            deployment.consumer,
+            deployment.server_ca_pem.clone(),
+            deployment.echo_path.clone(),
+            token.clone(),
+        );
+        let payload = format!("m6c103-in-flight-{}", deployment.nonce);
+        tokio::spawn(async move {
+            consumer_post(consumer, &ca, &path, &token, payload.as_bytes()).await
+        })
+    };
+
+    // 3. The proof window runs out. Before M6-C103 this exited 1 with a
+    //    non-retryable PROTOCOL_ERROR; it must be a retryable end of session
+    //    followed by a fresh one.
+    let lost = client.wait_for_within(
+        "session lost to the held ACK",
+        "lost",
+        1,
+        HELD_ACK_LOSS_BOUND,
+    );
+    let lost_at = lost[0].0;
+    let lost = &lost[0].1["result"];
+    assert_eq!(lost["session_id"], first.as_str(), "{lost}");
+    assert_eq!(lost["code"], "TRANSPORT_ERROR", "{lost}");
+    assert_eq!(
+        lost["message"], "STREAM_FORGET terminal proof did not converge before its deadline",
+        "{lost}"
+    );
+    let reconnected = client.wait_for("reconnect after the held ACK", "reconnected", 1);
+    let readies = client.wait_for("session 2", "ready", 2);
+    let second = session_id(&readies[1].1);
+    assert_ne!(second, first, "a new session, not the old one");
+    assert_eq!(session_id(&reconnected[0].1), second);
+
+    let (status, body) = tokio::time::timeout(STEP_DEADLINE, in_flight)
+        .await
+        .expect("the in-flight echo is answered")
+        .expect("in-flight task")
+        .expect("in-flight echo reached the relay");
+    let body: Value = serde_json::from_slice(&body).expect("typed failure body");
+    // Which code names the interruption depends on which side the relay
+    // hears from first (`DEVICE_RESET` when the connector's shutdown resets
+    // the stream, `REVERSE_CHANNEL_INTERRUPTED` when the session is torn
+    // down under it); the contract is the explicit unknown execution.
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["execution"], "unknown", "{body}");
+    let in_flight_code = body["code"].as_str().unwrap_or("?").to_owned();
+    assert!(
+        matches!(
+            in_flight_code.as_str(),
+            "DEVICE_RESET" | "REVERSE_CHANNEL_INTERRUPTED"
+        ),
+        "{body}"
+    );
+
+    deployment.echo("echo after reconnect", &client).await;
+    let held_bytes = proxy.held_bytes();
+    assert!(
+        held_bytes > 0,
+        "the relay's data after the hold was withheld"
+    );
+    client.stop();
+    drop(relay);
+    println!(
+        "m6c103-held-ack ok label=held-ack nonce={} lost_after_hold_ms={} held_relay_bytes={held_bytes} \
+         in_flight_status={status} in_flight_code={in_flight_code} in_flight_execution=unknown",
+        deployment.nonce,
+        lost_at.duration_since(held_at).as_millis(),
     );
 }

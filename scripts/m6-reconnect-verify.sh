@@ -22,7 +22,11 @@
 #    (M6-C38) a HELLO naming another protocol major, sent by a raw device
 #    socket holding the provisioned certificate, which the relay must close
 #    with 1002 PROTOCOL_UNSUPPORTED and log once (M6-C52); the identity case
-#    must also leave its payload-free relay refusal line.
+#    must also leave its payload-free relay refusal line; and
+#    (M6-C103) a session whose STREAM_FORGET proof is starved of the relay's
+#    final data-channel ACK by a proxy holding that direction, which must end
+#    retryable and reconnect, with the echo in flight answered as an explicit
+#    unknown outcome.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -53,10 +57,10 @@ echo "m6-reconnect-verify: reconnect gates" >&2
 cargo test -p tunnel-relay --test m6_reconnect_process --locked -- --ignored --nocapture --test-threads=1 \
   > "$scratch/reconnect.log" 2>&1 || { cat "$scratch/reconnect.log" >&2; exit 1; }
 cat "$scratch/reconnect.log"
-for needle in "test result: ok. 8 passed" "m6c23-reconnect ok label=restart nonce=" \
+for needle in "test result: ok. 9 passed" "m6c23-reconnect ok label=restart nonce=" \
   "m6c23-reconnect ok label=late-relay nonce=" "m6c23-reconnect ok label=not-yet-valid nonce=" \
   "m6c23-reconnect ok label=expired nonce=" "relay_tls_refusal_logged=true" "m6c23-reconnect ok label=identity nonce=" "relay_refusal_logged=true" "m6c38-protocol ok nonce=" "m6c23-reconnect ok label=issuer nonce=" \
-  "m6c68-liveness ok label=cut-path nonce=" \
+  "m6c68-liveness ok label=cut-path nonce=" "m6c103-held-ack ok label=held-ack nonce=" \
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/reconnect.log"; then
     echo "m6-reconnect-verify: FAILED: output lacks '$needle'" >&2
