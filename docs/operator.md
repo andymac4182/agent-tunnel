@@ -20,10 +20,24 @@ describing a procedure the code does not have.**
 > installed certificate, and the relay's catalog keeps the **first**
 > certificate's expiry, so even a hand-installed renewal stops being accepted
 > at the original expiry. **Re-enrol the device before its certificate
-> expires**: create a new key and CSR in a new profile, have it issued, add
-> it as a new device, with a new device UUID, by `tunnel-relay add-device`
-> (with `add-service` and `set-grant` for its export and grant; section 2.5),
-> switch `connect` to the new profile, then `revoke-device` the old device.
+> expires**, as a new device:
+>
+> 1. Create a new key and CSR in a new profile and have it issued, as in
+>    [section 2.1](#21-device-credentials) (`credentials create`, the
+>    issuer's `openssl x509 -req` step, whose `subjectAltName` must name the
+>    new device UUID, then `credentials import`).
+> 2. Register it with a **new device UUID** by `tunnel-relay add-device`,
+>    with `add-service` and `set-grant` for its export and grant, as in
+>    [section 2.5](#25-day-2-catalog-changes-more-users-and-devices-grants-revocation).
+>    The new profile's `device_id` and its export names must be the **new**
+>    device and service UUIDs, not the old ones.
+> 3. Switch `connect` to the new profile, and switch every cloud caller to
+>    the new device and service IDs: requests addressed to the old ones stop
+>    working once it is revoked.
+> 4. `revoke-device` the old device.
+>
+> [deploy-fly.md section 6.5](deploy-fly.md#65-certificate-expiry-and-rotation)
+> describes the same path on Fly.
 > The earliest expiry this affects is the dogfood credential's catalog
 > expiry, 2026-12-22; renewal must be resolved before certificates issued to
 > testers approach expiry.

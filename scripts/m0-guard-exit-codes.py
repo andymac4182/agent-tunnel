@@ -247,10 +247,14 @@ CASES: list[Case] = [
                 "            Self::AuthorizationStale => 3,",
             )
         ],
-        # Both assertions that pin the number: the separation test's
-        # `assert_eq!(stale, 4, ...)` and the per-variant table's
-        # `AUTHORIZATION_STALE` row.  Neither can be satisfied by any other
-        # status, so a red on either names this rule.
+        # **Only the first witness names this rule.**
+        # `causes_needing_different_actions_do_not_share_an_exit_code` holds
+        # `assert_eq!(stale, 4, "... transport class (M6-C39)")`, so its red
+        # says that a lapsed authorization window left the transport class.
+        # `every_client_error_variant_maps_to_an_actionable_exit_code` is a
+        # per-variant table that goes red on *any* change to *any* mapping;
+        # it is declared too, so that both must be among the failures, but a
+        # red on it alone would not identify this rule.
         frozenset(
             {
                 "tests::causes_needing_different_actions_do_not_share_an_exit_code",
@@ -265,6 +269,11 @@ CASES: list[Case] = [
         # redden **for the reason it names** rather than merely being green:
         # the `ExitCode::from` plumbing between `Cause::exit_code` and the
         # caller's `$?` has no other witness.
+        #
+        # **Since M6-C39 this arm also carries `AUTHORIZATION_STALE`**, so the
+        # defeat moves it to `1` together with the transport causes.  That
+        # does not change what the case measures -- its witness is the
+        # transport process fixture -- but the edit is wider than it was.
         "the chosen exit code reaches the process exit status",
         [
             (
