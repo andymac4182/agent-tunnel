@@ -249,6 +249,23 @@ and sign a token with `openssl`; tokens need `iss`, `aud`, `sub` equal to the
 catalog user's `oidc_subject`, `exp`, and `echo:invoke` in `scope`. Save the
 JWKS as `~/agentuplink-fly/oidc-jwks.json`; section 4 reads it from there.
 
+**A token helper for smoke tests** (M6-C103). The project ships no token tool.
+`local-proof.sh`'s `mint_token` is the pattern to copy into an operator-local
+script. Its RS256 header names the JWKS key's `kid`, and its claims are:
+
+| Claim | Value |
+| --- | --- |
+| `iss` | exactly `oidc_issuer` in `relay.toml`, trailing `/` included |
+| `aud` | one of `oidc_audience` |
+| `sub` | the catalog user's `oidc_subject` |
+| `iat`, `exp` | now, and now plus a short lifetime (the proof uses 300 s); there is no clock leeway |
+| `scope` | the operation the route needs: `echo:invoke` for the echo, `http:invoke` for MCP or ACP, and the `fs:` operations the grant names for a filesystem |
+
+Take the scope as an argument rather than fixing it at `echo:invoke`, so the
+same script mints tokens for every service type. Keep the signing key in
+`~/agentuplink-fly` (mode `0700`), and prefer printing the token to a pipe over
+writing it to a file: a token is a bearer credential until it expires.
+
 ### 3.3 The device, and the catalog records
 
 Create the device key on the Mac and have the device CA sign it, exactly as
@@ -369,12 +386,23 @@ fly deploy . --config deploy/fly/relay/fly.toml \
   --build-only --push --image-label fly-1
 ```
 
-Build from a checkout of `main` at or after `af23c2f`. The live relay's image
-was built that way from `af23c2f`, labelled `main-af23c2f`
-(`registry.fly.io/agentuplink-relay:main-af23c2f@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`,
-32 MB). The previous image, and the rollback target, is `main-721ed2a`
-(`@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`). It has no
-M6-C65 (section 6.4).
+Build from a checkout of `main` at or after `77bfd28`. The live relay's image
+was built that way from `77bfd28`, labelled `main-77bfd28`
+(`registry.fly.io/agentuplink-relay:main-77bfd28@sha256:1ddaa3f9d12779c994d44406a095e05f304448a97fdee9bdbe442a1d98e09ba1`;
+the digest was read with `fly image show -a agentuplink-relay` on 2026-09-25,
+M6-C103). The previous image, and the rollback target, is `main-af23c2f`
+(`@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`,
+32 MB). It has M6-C65 but not M6-C91, so after a rollback the catalog
+commands of section 6.6 are refused. The image before it, `main-721ed2a`
+(`@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`),
+has no M6-C65 either (section 6.4).
+
+**No release exists for `77bfd28`.** The published pre-releases are built from
+other commits, so a device cannot run exactly the relay's version. The
+2026-09-25 smoke check ran clients from the `5c2d907` and `f9f7abf`
+pre-releases against `main-77bfd28` (echo, rotation, reconnect and an orderly
+stop all passed; M6-C103). Tell testers which release to install, and prefer
+deploying an image built from a commit that has a pre-release.
 
 ### 6.2 Activate and provision (before any relay serves)
 
@@ -617,7 +645,9 @@ curl --cacert ~/agentuplink-fly/relay-ca.pem \
   https://agentuplink-relay.fly.dev/v1/devices/<device UUID>/services/<service UUID>/echo
 ```
 
-The reply is the export's `device_canary` followed by `hello`. `/readyz`
+The reply is the export's `device_canary` followed by `hello`. A tester on
+their own computer follows [join-relay.md](join-relay.md), which shows the
+same call and the other answers it can get. `/readyz`
 answering `200` is not enough on its own: a non-cluster relay answers `200`
 even when Redis is unusable (M6-C67), so the echo is the check.
 On the then-live relay (`main-721ed2a`), 150 sequential echoes on one device
@@ -686,8 +716,11 @@ From the coordinator's `fly logs` and `connect --json` output on
   being restarted, and the first echo afterwards returned `200`.
 - With the first run's bundle from `8dad443`, which predates reconnect, the
   device exited `4`, `TRANSPORT_ERROR` "control read failed", and had to be
-  started again. That is the bundle in `~/agentuplink-fly/agentuplink-bundle`;
-  replace it with one built from a release that includes reconnect.
+  started again. That bundle may still be in
+  `~/agentuplink-fly/agentuplink-bundle` (it was on 2026-09-25, M6-C103). Do
+  not run it: download a current pre-release instead, as
+  [join-relay.md section 1](join-relay.md#1-download-and-verify-a-release)
+  shows, and delete the old directory.
 
 **Upgrading the relay image, same namespace.** Build the new image with its
 own label (section 6.1) and deploy it exactly as above with that label. The

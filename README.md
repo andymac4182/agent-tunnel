@@ -16,10 +16,16 @@ Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop mach
 
 The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
+**Testers:** to connect your computer to a relay someone already runs, start
+with [Join an existing relay](docs/join-relay.md): download a release, get a
+device certificate from the operator, `connect`, and call the echo. To run your
+own relay, follow [the operator guide](docs/operator.md). Development builds
+are published as
+[GitHub pre-releases](https://github.com/andymac4182/agentuplink/releases).
+
 **Status: M1, M2 and M7 are locally verified against the gate each declared;
 M3, M4, M8, M5 and M6 are not complete. See [the roadmap](docs/roadmap.md) for
-the current state, which supersedes the historical figures below.** Outside
-testers start with [the operator guide](docs/operator.md). On
+the current state, which supersedes the historical figures below.** On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
@@ -32,7 +38,7 @@ and repeatable commands](docs/m7-verification.md). M3/M4/M5/M8 adapters and
 M6 release packaging remain subsequent milestones.
 The repository is public, on the owner's publication decision (task row M6-C01); it is MIT-licensed.
 
-Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
+Hosted verification: [CI runs on `main`](https://github.com/andymac4182/agentuplink/actions?query=branch%3Amain) and the [pre-releases](https://github.com/andymac4182/agentuplink/releases) they publish. The M1 CI checks were first recorded on [PR #10](https://github.com/andymac4182/agentuplink/pull/10/checks), from before the repository was renamed.
 
 ## What we are building
 
@@ -75,6 +81,7 @@ restoration of arbitrary backups.
 | --- | --- |
 | [Architecture](docs/architecture.md) | Components, users/devices, routing, trust boundaries, scaling |
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
+| [Join an existing relay](docs/join-relay.md) | Testers: download a release, get a device certificate from an operator, connect, and call the echo |
 | [Operator guide](docs/operator.md) | Download, verify, credentials, deployment, readiness and diagnostics, executed by a docs check; what the alpha cannot do yet |
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
 | [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
@@ -92,9 +99,20 @@ restoration of arbitrary backups.
 | [Design decisions](docs/decisions.md) | Initial choices and decisions still to validate |
 | [Sources](docs/sources.md) | Research provenance and immutable upstream references |
 
+## Download a release
+
+A tester does not need to build anything. Each successful `main` CI run
+publishes a [GitHub pre-release](https://github.com/andymac4182/agentuplink/releases)
+with an archive and a `.sha256` file for each of `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+`x86_64-pc-windows-msvc` (device binaries only on Windows). They are
+development builds, unsigned, and not production releases.
+[Join an existing relay](docs/join-relay.md) section 1 shows how to download,
+check and unpack one.
+
 ## Run the starter
 
-Install Rust through rustup; the repository pins Rust 1.95.0. From the repository root:
+To build from source instead, install Rust through rustup; the repository pins Rust 1.95.0. From the repository root:
 
 ```sh
 cargo build --workspace --locked --bins
