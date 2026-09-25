@@ -204,11 +204,9 @@ class Consumer:
                            "params": params or {}})
         started = time.monotonic()
         proc = subprocess.run(
-            # `-H "Accept:"` removes curl's default `accept: */*`: computer-v1
-            # does not allowlist `accept`, and the relay refuses an unlisted
-            # header by name rather than dropping it (task row M5-C26).
+            # curl's stock `accept: */*` is sent on purpose: the relay drops
+            # it for computer-v1, which does not allowlist it (M5-C26).
             ["curl", "-sS", "--http2", "--max-time", "60", "--cacert", self.args.ca,
-             "-H", "Accept:",
              "-H", f"@{self.header_file}",
              "-H", "content-type: application/json",
              "-w", "\n%{http_code} %{http_version}", "--data-binary", "@-", self.url],

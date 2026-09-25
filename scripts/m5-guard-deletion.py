@@ -2135,6 +2135,25 @@ CASES_C20: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
+        "M5-C27: the command listing is read in the released object shape",
+        [
+            (
+                CLIENT,
+                """    let listing = value
+        .get("commands")
+        .and_then(Value::as_object)
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    Ok(listing.keys().cloned().collect())""",
+                """    Ok(value
+        .get("commands")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default())""",
+            )
+        ],
+        False,
+    ),
+    (
         "M5-C22: a chunked /cmd answer is de-chunked before it is classified",
         [
             (
@@ -2603,6 +2622,15 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
         "m5c20",
         "M5-C19: a point space the capture contradicts is never used unguarded",
     ): frozenset({"a_contradicted_or_missing_point_space_refuses_every_coordinate"}),
+    (
+        "m5c20",
+        "M5-C27: the command listing is read in the released object shape",
+    ): frozenset(
+        {
+            "each_read_only_operation_dispatches_exactly_the_command_the_table_names",
+            "screen_info_and_cursor_position_return_the_synthetic_values",
+        }
+    ),
     (
         "m5c20",
         "M5-C22: a chunked /cmd answer is de-chunked before it is classified",

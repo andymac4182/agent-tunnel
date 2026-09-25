@@ -1266,11 +1266,18 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
 /// keep-alive`, `user-agent`; `BaseClient.headers` in `httpx/_client.py`) are
 /// covered by the first two entries, the profiles' own `accept`, and the
 /// bridge's consumption of HTTP/1.1 `connection: keep-alive`.
-const DROPPED_CLIENT_HEADERS: [http::HeaderName; 4] = [
+///
+/// `accept` joins them for the profiles that do not allowlist it (task row
+/// M5-C26): `computer-v1` carries JSON both ways and negotiates nothing, and
+/// every stock client -- curl's `*/*`, httpx's `*/*` -- sends one, so without
+/// this its first request was refused `HTTP_INVALID_HEAD`. MCP and ACP
+/// allowlist `accept` and still receive it unchanged.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 5] = [
     header::USER_AGENT,
     header::ACCEPT_ENCODING,
     header::ACCEPT_LANGUAGE,
     http::HeaderName::from_static("sec-fetch-mode"),
+    header::ACCEPT,
 ];
 
 /// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
@@ -2375,6 +2382,47 @@ mod tests {
         assert_eq!(
             first_unlisted_request_header(&headers, &policies.request.headers).as_deref(),
             Some("x-short")
+        );
+    }
+
+    /// M5-C26: a stock client's default `accept` reaches `computer-v1`, which
+    /// does not allowlist it, as a dropped header rather than a refusal --
+    /// and MCP, which does allowlist it, still receives it.
+    #[test]
+    fn a_stock_accept_is_dropped_for_computer_v1_and_kept_where_allowlisted() {
+        let cua = tunnel_cua::CuaProfile::ComputerV1
+            .policies(tunnel_cua::CuaLimits::default())
+            .expect("computer-v1 profile");
+        let stock = || {
+            http::Request::post("/computer")
+                .version(http::Version::HTTP_2)
+                .header("user-agent", "curl/8.7.1")
+                .header("accept", "*/*")
+                .header("content-type", "application/json")
+                .header("content-length", "2")
+                .body(())
+                .expect("request")
+                .into_parts()
+                .0
+        };
+        assert!(
+            tunnel_http_bridge::normalize::request_head(&stock(), &cua.request).is_err(),
+            "the codec refuses an unlisted accept itself"
+        );
+        let mut stripped = stock();
+        strip_default_client_headers(&mut stripped.headers, &cua.request.headers);
+        assert!(!stripped.headers.contains_key("accept"));
+        tunnel_http_bridge::normalize::request_head(&stripped, &cua.request)
+            .unwrap_or_else(|error| panic!("a stock client's head was refused: {error:?}"));
+
+        let mcp = tunnel_mcp::McpProfile::ALL[0]
+            .policies(tunnel_mcp::McpLimits::default())
+            .expect("MCP profile");
+        let mut kept = stock();
+        strip_default_client_headers(&mut kept.headers, &mcp.request.headers);
+        assert!(
+            kept.headers.contains_key("accept"),
+            "a profile that allowlists accept still receives it"
         );
     }
 
