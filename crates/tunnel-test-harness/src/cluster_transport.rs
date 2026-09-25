@@ -1432,9 +1432,10 @@ async fn run_body_budget_reclamation_case(
             if echoed != payload.as_ref() {
                 eprintln!(
                     "M7 body-budget: stream-budget echo {index} of 6 differed: sent {} bytes, \
-                     received {} bytes",
+                     received {} bytes, connection charge {} of 16 bytes",
                     payload.len(),
-                    echoed.len()
+                    echoed.len(),
+                    connection.body_bytes_charged()
                 );
                 return Ok::<_, HarnessError>(false);
             }
@@ -1479,9 +1480,10 @@ async fn run_body_budget_reclamation_case(
             if echoed != payload.as_ref() {
                 eprintln!(
                     "M7 body-budget: connection-budget echo on stream {index} of 5 differed: \
-                     sent {} bytes, received {} bytes",
+                     sent {} bytes, received {} bytes, connection charge {} of 16 bytes",
                     payload.len(),
-                    echoed.len()
+                    echoed.len(),
+                    connection.body_bytes_charged()
                 );
                 return Ok(false);
             }

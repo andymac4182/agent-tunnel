@@ -2080,6 +2080,15 @@ impl PeerConnectionHandle {
         &self.inner.identity
     }
 
+    /// Body bytes currently charged against this connection's budget:
+    /// in-flight sends and received chunks not yet dropped.  A payload-free
+    /// diagnostic (task row M7-C120): it reads the same counter the budget
+    /// enforces.
+    #[must_use]
+    pub fn body_bytes_charged(&self) -> usize {
+        self.inner.connection_bytes.load(Ordering::Acquire)
+    }
+
     /// Open one request stream on this reusable connection.
     pub async fn open(&self, request: Request<()>) -> Result<PeerClientStream, PeerTransportError> {
         self.inner.open(request).await
