@@ -37,7 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use tunnel_cua::capability::{CallerGrant, LocalConfiguration, UpstreamSupport};
-use tunnel_cua::capture::Captures;
+use tunnel_cua::capture::{Captures, PointSpace};
 use tunnel_cua::endpoint::BackendEndpoint;
 use tunnel_cua::lease::{
     GrantRevision, InputLeases, LeaseGrant, LeaseRefusal, SessionId, TargetSession,
@@ -377,17 +377,54 @@ impl FailureStage {
 }
 
 /// Split an HTTP/1.1 response into its status and body.
+///
+/// **A chunked body is de-chunked, and a malformed one is not a body.** The
+/// released server answers `/cmd` with a Starlette `StreamingResponse`, which
+/// has no `Content-Length`, so uvicorn frames it with
+/// `Transfer-Encoding: chunked` on an HTTP/1.1 request -- observed in the
+/// Linux guest on 2026-09-25 (task row M5-03). The fixture writes an
+/// identity-framed body, which is why the Lane A tests never needed this.
+/// A chunked body that does not end in its terminating zero-size chunk was
+/// cut off after the request was written, so it returns `None` and the
+/// exchange is reported as dispatched with an unknown outcome, never
+/// classified from a prefix.
 fn parse_response(bytes: &[u8]) -> Option<(u16, Vec<u8>)> {
     let separator = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
     let head = core::str::from_utf8(&bytes[..separator]).ok()?;
-    let status = head
-        .split("\r\n")
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some((status, bytes[separator + 4..].to_vec()))
+    let mut lines = head.split("\r\n");
+    let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let chunked = lines.any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+        })
+    });
+    let body = &bytes[separator + 4..];
+    if chunked {
+        return Some((status, dechunk(body)?));
+    }
+    Some((status, body.to_vec()))
+}
+
+/// Decode an HTTP/1.1 chunked body; `None` unless it is complete and
+/// well-formed. Chunk extensions are ignored; trailers are not accepted.
+fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body.windows(2).position(|window| window == b"\r\n")?;
+        let size_text = core::str::from_utf8(&body[..line_end]).ok()?;
+        let size_text = size_text.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return (body == b"\r\n").then_some(out);
+        }
+        if body.len() < size + 2 || &body[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
 }
 
 /// Read the backend's `/commands` listing.
@@ -456,6 +493,10 @@ pub struct DeviceState {
     /// The display scale this device has been **told**, as a percentage, or
     /// `None`. There is no default (M5-C14).
     declared_scale_percent: Mutex<Option<u32>>,
+    /// The display's size in input point space, if an operator declared one
+    /// (M5-C19 option (b)). When set, each capture's scale is **derived**
+    /// from it rather than read from [`DeviceState::declare_scale_percent`].
+    declared_point_space: Mutex<Option<PointSpace>>,
 }
 
 impl DeviceState {
@@ -493,6 +534,24 @@ impl DeviceState {
             .declared_scale_percent
             .lock()
             .expect("the scale mutex is never poisoned by fixture code") = percent;
+    }
+
+    /// Declare the target display's size in input point space, or clear it.
+    ///
+    /// **M5-C19 option (b), applied by default pending owner confirmation
+    /// (2026-09-25).** While a point space is declared, every capture's scale
+    /// is derived from it and from that capture's own PNG dimensions
+    /// ([`PointSpace::scale_percent_for`]); a capture the declaration
+    /// contradicts is recorded with **no** scale, so every coordinate on it is
+    /// refused with `CaptureRefusal::ScaleUndeclared` rather than placed
+    /// somewhere else. A declared point space takes precedence over a
+    /// declared percentage. Like the percentage, it applies to captures
+    /// recorded after the call.
+    pub fn declare_point_space(&self, space: Option<PointSpace>) {
+        *self
+            .declared_point_space
+            .lock()
+            .expect("the scale mutex is never poisoned by fixture code") = space;
     }
 
     /// Drop the leases of a session whose grant revision has advanced.
@@ -844,11 +903,21 @@ impl SessionFacade {
         // ([`DeviceState::declare_scale_percent`]) or nothing, and with nothing
         // every coordinate on this capture is refused with
         // `CaptureRefusal::ScaleUndeclared`.
-        let declared = *self
+        let point_space = *self
             .state
-            .declared_scale_percent
+            .declared_point_space
             .lock()
             .expect("the scale mutex is never poisoned by fixture code");
+        let declared = match point_space {
+            // M5-C19 option (b): the ratio is derived per capture, and a
+            // capture the declaration contradicts gets no scale at all.
+            Some(space) => space.scale_percent_for(width, height).ok(),
+            None => *self
+                .state
+                .declared_scale_percent
+                .lock()
+                .expect("the scale mutex is never poisoned by fixture code"),
+        };
         let mut captures = self
             .state
             .captures
@@ -869,5 +938,42 @@ impl SessionFacade {
             object.insert("display".to_owned(), json!(display));
         }
         Dispatch::Dispatched(Completion::Ok(annotated))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response;
+
+    /// The shape uvicorn gives the released server's `StreamingResponse`.
+    #[test]
+    fn a_chunked_response_is_dechunked() {
+        let body = b"data: {\"success\": true}\n\n";
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .to_vec();
+        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        response.extend_from_slice(body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(parse_response(&response), Some((200, body.to_vec())));
+    }
+
+    /// Cut off before the terminating chunk: the answer was lost, so there is
+    /// no body to classify, and the caller reports an unknown outcome.
+    #[test]
+    fn a_truncated_chunked_response_is_not_a_body() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\ndata:\r\n";
+        assert_eq!(parse_response(response), None);
+        let short = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata:\r\n0\r\n\r\n";
+        assert_eq!(parse_response(short), None);
+    }
+
+    /// An identity-framed body, as the fixture writes, is unchanged.
+    #[test]
+    fn an_identity_body_is_returned_as_is() {
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+            Some((200, b"ok".to_vec()))
+        );
     }
 }
