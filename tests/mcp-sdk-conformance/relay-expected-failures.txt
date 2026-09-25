@@ -1,0 +1,5 @@
+# Conformance scenarios (0.2.0-alpha.11, --spec-version 2025-11-25) that pass
+# directly against the reference server but fail through the relay, one per
+# line as `<scenario> <task row>`.  scripts/m3-sdk-conformance.sh fails if a
+# scenario fails through the relay without a line here, or if a listed one
+# passes (a stale entry).
