@@ -1097,7 +1097,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let mut callers = JoinSet::new();
         for _ in 0..QUEUED_CALLERS {
-            let lane = Arc::clone(&lane);
+            let lane = Arc::clone(lane);
             callers.spawn(async move { ping(&lane).await });
         }
         let mut replies = Vec::with_capacity(QUEUED_CALLERS);
