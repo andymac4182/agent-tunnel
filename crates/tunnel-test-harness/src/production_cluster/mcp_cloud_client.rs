@@ -855,6 +855,10 @@ impl Combo {
     }
 }
 
+/// M3-43: how long a stopped device's export children may take to be
+/// reaped before one counts as having outlived its session.
+const CHILD_REAP_BOUND: Duration = Duration::from_secs(10);
+
 type Client = RunningService<RoleClient, GateClient>;
 
 struct Gate<'a> {
@@ -2351,7 +2355,19 @@ async fn run(
             combo_evidence.highest_call_stream_id = highest_stream;
             evidence.rotations_completed += rotations;
             gate.stop_device().await?;
-            last_combo(&mut evidence)?.children_running_after_stop = gate.children_running();
+            // M3-43: the export kills its children when the connector stops,
+            // but each supervisor decrements `children_running` only after it
+            // has reaped its child, asynchronously.  Read at once, a child
+            // being reaped counted as one that outlived the session.  Wait,
+            // bounded, for the count to settle; a child that really
+            // survives still fails the check.
+            let settle = Instant::now() + CHILD_REAP_BOUND;
+            let mut running = gate.children_running();
+            while running > 0 && Instant::now() < settle {
+                sleep(POLL).await;
+                running = gate.children_running();
+            }
+            last_combo(&mut evidence)?.children_running_after_stop = running;
         }
         evidence.device_session_stable =
             !evidence.combos.is_empty() && evidence.combos.iter().all(|combo| combo.session_stable);
