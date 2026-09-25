@@ -309,9 +309,12 @@ fn check_device_identity(config: &ConnectConfig) -> Check {
     let Some(leaf) = certificates.first() else {
         return not_run();
     };
+    // The binding is named `refusal`, not `error`, so this arm stays textually
+    // distinct from `check_key_match`'s, which `scripts/m0-guard-exit-codes.py`
+    // anchors on exactly once.
     match verify_device_role(leaf, &config.device_id) {
         Ok(()) => ok(),
-        Err(error) => failed(credential_code(&error)),
+        Err(refusal) => failed(credential_code(&refusal)),
     }
 }
 
