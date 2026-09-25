@@ -193,6 +193,7 @@
         "maxMessageBytes",
         "maxInflightRequests",
         "maxFids",
+        "maxQueuedBytes",
         "maxBufferedFileBytes",
         "maxTotalBufferedBytes",
         "maxPathBytes",
@@ -221,7 +222,7 @@
           "maximum": 256
         },
         "maxQueuedBytes": {
-          "description": "Not advertised while nothing enforces it (task row M4-21, applied by default pending owner confirmation, 2026-09-25). Optional so a later provider that binds it can advertise it again; a client validates it when present.",
+          "description": "Advertised but NOT enforced by the current provider (task row M4-21): the relay's stream window and the connector's session budget bound a consumer's queued bytes more tightly. Kept required because the v0.1.0 tester release's client rejects a descriptor without it; clients from task row M4-21 onward accept its absence, and it may be dropped once no older client is supported.",
           "type": "integer",
           "minimum": 1,
           "maximum": 1048576

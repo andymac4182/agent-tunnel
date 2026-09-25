@@ -389,6 +389,7 @@ jobs:
         run: |
           set -euo pipefail
           base=$(mktemp -d)
+          trap 'sudo umount "$base/export/mnt" 2>/dev/null || true' EXIT
           mkdir -p "$base/export/mnt" "$base/export/plain" "$base/unmounted/mnt" "$base/unmounted/plain"
           echo synthetic > "$base/export/plain/beside.txt"
           echo synthetic > "$base/unmounted/plain/beside.txt"
@@ -402,16 +403,15 @@ jobs:
               --test special_and_mounts -- --ignored --exact \
               a_mount_point_inside_the_export_is_not_crossed_on_linux --nocapture
           }
-          test_cmd "$base/export" > mounted.log 2>&1 || { cat mounted.log; exit 1; }
-          cat mounted.log
-          grep -q "test result: ok. 1 passed" mounted.log
-          grep -q "m4-08-linux-mount ok" mounted.log
-          if test_cmd "$base/unmounted" > unmounted.log 2>&1; then
-            cat unmounted.log; echo "the control without a mount passed"; exit 1
+          test_cmd "$base/export" > "$base/mounted.log" 2>&1 || { cat "$base/mounted.log"; exit 1; }
+          cat "$base/mounted.log"
+          grep -q "test result: ok. 1 passed" "$base/mounted.log"
+          grep -q "m4-08-linux-mount ok" "$base/mounted.log"
+          if test_cmd "$base/unmounted" > "$base/unmounted.log" 2>&1; then
+            cat "$base/unmounted.log"; echo "the control without a mount passed"; exit 1
           fi
-          grep -q "mnt must be a mount point on another device" unmounted.log
+          grep -q "mnt must be a mount point on another device" "$base/unmounted.log"
           echo "control without a mount failed on its own positive control, as it must"
-          sudo umount "$base/export/mnt"
       # Task row M4-54: the filesystem demo (docs/demo/filesystem.md) end to
       # end -- shipped relay and client, a real shared-client, just-bash,
       # Mastra and Files SDK consumer, live revocation -- in front of this
@@ -420,6 +420,8 @@ jobs:
         run: |
           set -euo pipefail
           (cd packages/client && npm ci)
-          DEMO_PLAINTEXT_REDIS=127.0.0.1:6379 bash scripts/fs-demo.sh > demo.log 2>&1 || { cat demo.log; exit 1; }
-          cat demo.log
-          grep -q "^fs-demo: PASS" demo.log
+          log=$(mktemp)
+          DEMO_PLAINTEXT_REDIS=127.0.0.1:6379 bash scripts/fs-demo.sh > "$log" 2>&1 || { cat "$log"; exit 1; }
+          cat "$log"
+          grep -q "^fs-demo: PASS" "$log"
+          grep -q "^cleanup: deleted [1-9][0-9]* keys of namespace" "$log"

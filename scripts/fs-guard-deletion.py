@@ -1959,17 +1959,57 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
     ),
     (
         # Task row **M4-21** (applied by default pending owner confirmation,
-        # 2026-09-25).  Every reply must reach the carrier within the
-        # advertised `requestTimeoutSeconds` of its request's admission.
-        # Pushing the deadline a day out restores the defect: a consumer that
-        # sent a request and took no reply credit holds the session for ever,
-        # because queued or unsent work is never idle.
-        "a reply the consumer never takes is bounded by the request deadline",
+        # 2026-09-25; narrowed on review).  A reply that waits with no carrier
+        # credit for `requestTimeoutSeconds` ends the session.  Pushing the
+        # stall clock a day out restores the defect: a consumer that stopped
+        # taking replies holds the session for ever, because queued or unsent
+        # work is never idle.
+        "a reply the consumer never takes is bounded by the stall deadline",
         [
             (
                 CLIENT_FS,
-                "                match tokio::time::timeout_at(deadline, outbound.send_data(Bytes::from(record)))",
-                "                match tokio::time::timeout_at(deadline + std::time::Duration::from_secs(86_400), outbound.send_data(Bytes::from(record)))",
+                "        let stall_at = out.progress_at + stall_limit;",
+                "        let stall_at = out.progress_at + stall_limit + std::time::Duration::from_secs(86_400);",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: every credit grant restarts the stall clock, so a
+        # slow but steady consumer keeps its session.  Without it the deadline
+        # measures the whole transfer again.
+        "credit progress restarts the stall clock",
+        [
+            (
+                CLIENT_FS,
+                """    fn advance(&mut self, sent: usize) -> Advanced {
+        self.progress_at = tokio::time::Instant::now();""",
+                """    fn advance(&mut self, sent: usize) -> Advanced {""",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: input -- a `Tflush` above all -- is read while a
+        # reply waits for credit.  Reading only once nothing is waiting is the
+        # first implementation's behaviour, under which a flush for a request
+        # queued behind a parked reply could never be read in time.
+        "input is read while a reply waits for credit",
+        [
+            (
+                CLIENT_FS,
+                "        let reading = !out.terminal && out.bytes < PENDING_CAP;",
+                "        let reading = !out.terminal && out.records.is_empty();",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: a stall after part of a reply is out resets the
+        # stream; a close record there would be spliced into the reply.
+        "a partial reply is reset, never spliced with a close record",
+        [
+            (
+                CLIENT_FS,
+                "                if out.front_sent() == 0 {",
+                "                if out.front_sent() < usize::MAX {",
             )
         ],
     ),
@@ -6486,7 +6526,10 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('gate4', 'return the bytes the invalidation discarded to the session budget'): frozenset({'actor::stream_identity_tests::an_invalidated_fs_stream_challenge_returns_its_discarded_bytes'}),
     ('gate4', 'the case behaviour is parsed and never guessed'): frozenset({'http::fs::tests::the_case_behaviour_is_parsed_and_never_guessed'}),
     ('gate4', "the connector's allowlist narrows the relay's capabilities"): frozenset({'fs_export::tests::the_local_allowlist_narrows_and_never_widens'}),
-    ('gate4', 'a reply the consumer never takes is bounded by the request deadline'): frozenset({'fs_export::tests::a_reply_the_consumer_never_takes_is_bounded_by_the_request_deadline'}),
+    ('gate4', 'a reply the consumer never takes is bounded by the stall deadline'): frozenset({'fs_export::tests::a_consumer_that_stops_taking_replies_is_reset_at_the_stall_deadline'}),
+    ('gate4', 'credit progress restarts the stall clock'): frozenset({'fs_export::tests::a_slow_but_steady_consumer_keeps_its_session'}),
+    ('gate4', 'input is read while a reply waits for credit'): frozenset({'fs_export::tests::a_flush_is_read_while_a_reply_waits_for_credit'}),
+    ('gate4', 'a partial reply is reset, never spliced with a close record'): frozenset({'fs_export::tests::a_consumer_that_stops_taking_replies_is_reset_at_the_stall_deadline'}),
     ('gate4', 'the flush mark is per queue entry, not per tag number'): frozenset({'a_tag_re_issued_and_flushed_again_drops_both_and_keeps_the_session'}),
     ('gate4', 'the record decoder bounds a declared length before allocating'): frozenset({'record::tests::a_declared_length_above_the_ceiling_is_refused_before_any_copy'}),
     ('gate4', 'the record decoder latches its first violation'): frozenset({'record::tests::the_first_violation_is_latched_and_a_valid_record_after_it_is_not_decoded'}),

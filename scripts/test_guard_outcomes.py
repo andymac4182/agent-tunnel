@@ -292,9 +292,11 @@ EXPECTED_MODULE_FILTERS = 9
 #: **487** after task row M4-20 added two gate-4 cases (a `Twrite` refused
 #: under a read-only grant is counted; it is counted by the grant, never by
 #: its opcode), measured by `--check-anchors` on `feat-fs-demo`; **488**
-#: after M4-21 added the gate-4 request-deadline case.
+#: after M4-21 added the gate-4 request-deadline case; **491** after M4-21's
+#: review replaced it with four stall-bound cases, measured by
+#: `--check-anchors`.
 EXPECTED_GUARD_ANCHORS = {
-    "fs-guard-deletion.py": 488,
+    "fs-guard-deletion.py": 491,
     # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
     # `availability()`. Re-measured, not incremented: 150 first, which fails
     # naming acp ("found 149"), then 149.

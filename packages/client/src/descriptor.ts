@@ -86,9 +86,10 @@ export interface Limits {
   maxInflightRequests: number;
   maxFids: number;
   /**
-   * Optional: not advertised while nothing enforces it (task row M4-21,
-   * applied by default pending owner confirmation, 2026-09-25). Validated when
-   * present, so a provider that binds it later can advertise it again.
+   * Advertised by every current provider but **not enforced** by it (task row
+   * M4-21). Accepted when absent, so a later provider can stop advertising it
+   * once no client older than this one (the v0.1.0 tester release requires
+   * it) needs to be served; validated when present.
    */
   maxQueuedBytes?: number;
   maxBufferedFileBytes: number;
@@ -103,7 +104,11 @@ export interface Limits {
   sessionIdleSeconds: number;
 }
 
-/** Limits a descriptor may omit (task row M4-21). Every other one is required. */
+/**
+ * Limits a descriptor may omit (task row M4-21). Every other one is required.
+ * Providers still send `maxQueuedBytes`; accepting its absence is what lets
+ * one stop, once older clients are no longer served.
+ */
 const OPTIONAL_LIMITS: ReadonlySet<string> = new Set(['maxQueuedBytes']);
 
 /** The ceilings of the initial profile. Negotiation may only reduce them. */

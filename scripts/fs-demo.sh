@@ -65,8 +65,10 @@ cleanup() {
   [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null && wait "$relay_pid" 2>/dev/null || true
   [ -n "$redis_container" ] && docker rm -f "$redis_container" >/dev/null 2>&1 || true
   if [ -n "${DEMO_PLAINTEXT_REDIS:-}" ] && [ -n "$namespace" ]; then
-    # Delete this run's namespace from the shared plaintext Redis.
-    python3 - "$DEMO_PLAINTEXT_REDIS" "$namespace" <<'PY' || true
+    # Delete this run's namespace -- every `tunnel-catalog:<namespace>:*` key
+    # -- from the shared plaintext Redis. A cleanup that fails, or that finds
+    # nothing to delete after provisioning wrote the namespace, fails the run.
+    python3 - "$DEMO_PLAINTEXT_REDIS" "$namespace" <<'PY' || { echo "FAILED cleanup of namespace $namespace" >&2; status=1; }
 import socket, sys
 host, _, port = sys.argv[1].rpartition(":")
 s = socket.create_connection((host, int(port)), timeout=5)
@@ -83,14 +85,18 @@ def read():
         return None if n < 0 else f.read(n + 2)[:-2]
     return rest
 cursor, deleted = b"0", 0
+pattern = b"tunnel-catalog:" + sys.argv[2].encode() + b":*"
 while True:
-    cmd(b"SCAN", cursor, b"MATCH", b"*" + sys.argv[2].encode() + b"*", b"COUNT", b"1000")
+    cmd(b"SCAN", cursor, b"MATCH", pattern, b"COUNT", b"1000")
     cursor, keys = read()
     for key in keys:
         cmd(b"DEL", key); read(); deleted += 1
     if cursor == b"0":
         break
-print(f"cleanup: deleted {deleted} keys of namespace {sys.argv[2]}")
+cmd(b"SCAN", b"0", b"MATCH", pattern, b"COUNT", b"1000")
+_, left = read()
+print(f"cleanup: deleted {deleted} keys of namespace {sys.argv[2]} ({len(left)} left)")
+sys.exit(0 if deleted > 0 and not left else 1)
 PY
   fi
   [ -n "$redis_tls_pid" ] && kill "$redis_tls_pid" 2>/dev/null || true
@@ -100,6 +106,7 @@ PY
     rm -rf "$work"
     echo "cleanup: stopped relay, device and Redis; removed $work (exit=$status)"
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 

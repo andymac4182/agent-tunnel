@@ -49,7 +49,9 @@ packages/client (node)                 tunnel-relay serve              tunnel-cl
   ways, in this order of preference:
   - `DEMO_PLAINTEXT_REDIS=127.0.0.1:6379` — a local plaintext Redis you already
     run; the script fronts it with a small TLS terminator of its own (no
-    Docker) and deletes its namespace's keys on exit;
+    Docker) and deletes its namespace's `tunnel-catalog:<namespace>:*` keys on
+    exit, printing how many. If that cleanup fails, deletes nothing or leaves a
+    key behind, the run exits 1;
   - nothing set — Docker starts a disposable TLS-only `redis:8.4.0-alpine`;
   - `DEMO_REDIS_URL=rediss://host:port/db` with `DEMO_REDIS_CA=/path/to/ca.pem`
     — your own TLS Redis.
@@ -192,6 +194,7 @@ ok the descriptor reports a read-only root
 ok the host export is unchanged by the refused writes
 ok device still connected after the consumer closed its session
 fs-demo: PASS nonce=...
+cleanup: deleted 23 keys of namespace fs-demo-... (0 left)      (DEMO_PLAINTEXT_REDIS only)
 cleanup: stopped relay, device and Redis; removed ... (exit=0)
 ```
 

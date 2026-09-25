@@ -401,12 +401,8 @@ impl Descriptor {
         out.push_str("  },\n");
 
         out.push_str("  \"limits\": {\n");
-        let advertised: Vec<LimitField> = LimitField::ALL
-            .into_iter()
-            .filter(|field| field.is_advertised())
-            .collect();
-        for (index, field) in advertised.iter().copied().enumerate() {
-            let comma = if index + 1 == advertised.len() {
+        for (index, field) in LimitField::ALL.into_iter().enumerate() {
+            let comma = if index + 1 == LimitField::ALL.len() {
                 ""
             } else {
                 ","
