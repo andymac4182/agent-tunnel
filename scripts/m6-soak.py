@@ -216,11 +216,11 @@ class Stack:
         self.token_lock = threading.Lock()
 
     # -- events
-    def event(self, kind: str, **fields) -> None:
-        record = {"t": round(time.time(), 3), "at": now_iso(), "event": kind,
+    def event(self, name: str, /, **fields) -> None:
+        record = {"t": round(time.time(), 3), "at": now_iso(), "event": name,
                   "load1": round(os.getloadavg()[0], 2), **fields}
         self.events.write(json.dumps(record) + "\n")
-        print(f"[{record['at']}] {kind} {json.dumps(fields)}", flush=True)
+        print(f"[{record['at']}] {name} {json.dumps(fields)}", flush=True)
 
     # -- PKI and issuer
     def pki(self) -> None:

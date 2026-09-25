@@ -9,6 +9,7 @@
 # through the shared throttle gate when M6_SOAK_GATE names it; the 2-hour soak
 # does not hold a gate slot.  M6_SOAK_CHAOS_ARGS adds chaos arguments (the
 # hosted workflow passes --dedicated-redis); M6_SOAK_DURATION sets the soak;
+# M6_SOAK_EXPERIMENTS selects a subset (default "chaos load fairness soak");
 # M6_SOAK_REDIS names the plaintext Redis (default 127.0.0.1:63790).
 set -u
 bins=$1 head=$2 logs=$3
@@ -23,7 +24,8 @@ quiet() {  # wait outside any gate slot, so a waiting run holds nothing
   done
 }
 host() { echo "uptime=$(uptime) nproc=$(getconf _NPROCESSORS_ONLN)"; }
-for experiment in chaos load fairness; do
+for experiment in ${M6_SOAK_EXPERIMENTS:-chaos load fairness soak}; do
+  [ "$experiment" = soak ] && continue
   quiet
   extra=""
   [ "$experiment" = chaos ] && extra=${M6_SOAK_CHAOS_ARGS:-}
@@ -38,6 +40,7 @@ for experiment in chaos load fairness; do
   fi
   echo "m6-soak-all: $experiment exit=$? $(date +%Y-%m-%dT%H:%M:%S%z) $(host)"
 done
+case " ${M6_SOAK_EXPERIMENTS:-chaos load fairness soak} " in *" soak "*) ;; *) exit 0;; esac
 quiet
 echo "m6-soak-all: soak start $(date +%Y-%m-%dT%H:%M:%S%z) $(host)"
 nice -n 10 python3 "$here/m6-soak.py" soak --bin-dir "$bins" --bin-head "$head" --logs "$logs" \

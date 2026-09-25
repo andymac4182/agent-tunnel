@@ -12,6 +12,9 @@ on:
       soak_seconds:
         description: Soak duration in seconds
         default: "7260"
+      experiments:
+        description: Experiments to run, space separated
+        default: "chaos load fairness soak"
 
 permissions:
   contents: read
@@ -59,12 +62,13 @@ jobs:
           M6_SOAK_CHAOS_ARGS: "--dedicated-redis"
           M6_SOAK_REDIS: "127.0.0.1:6379"
           M6_SOAK_DURATION: ${{ inputs.soak_seconds || '7260' }}
+          M6_SOAK_EXPERIMENTS: ${{ inputs.experiments || 'chaos load fairness soak' }}
         run: |
           mkdir -p "$RUNNER_TEMP/logs"
           { echo "uptime=$(uptime)"; echo "nproc=$(nproc)"; echo "head=$GITHUB_SHA"; \
             echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"; } > "$RUNNER_TEMP/logs/host.txt"
           sh scripts/m6-soak-all.sh "$RUNNER_TEMP/bin" "$GITHUB_SHA" "$RUNNER_TEMP/logs" | tee "$RUNNER_TEMP/logs/all.log"
-          for d in chaos load fairness soak; do
+          for d in $M6_SOAK_EXPERIMENTS; do
             grep -q "m6-soak-all: $d exit=0" "$RUNNER_TEMP/logs/all.log" || echo "::warning::$d did not exit 0"
           done
       - name: Collect synthetic metrics only
@@ -79,10 +83,13 @@ jobs:
               [ -f "$run/$f" ] && cp "$run/$f" "$out/$name/"
             done
           done
-          # Driver output carries only the harness's own event lines and summaries.
+          # Driver output: the harness's own event lines, summaries and failure
+          # messages.  The harness never prints a token or payload; anything
+          # shaped like a JWT or PEM block is redacted as a second line of defence.
           for d in chaos load fairness soak; do
             f="$RUNNER_TEMP/logs/$d-driver.log"
-            [ -f "$f" ] && grep -E '^\[|^\{|^ |^\}|Traceback|Error|exit' "$f" > "$out/$d-driver.log" || true
+            [ -f "$f" ] && sed -E -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/<redacted-jwt>/g' \
+              -e '/-----BEGIN/,/-----END/d' "$f" > "$out/$d-driver.log" || true
           done
           ls -lR "$out"
       - uses: actions/upload-artifact@v4
