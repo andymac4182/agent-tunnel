@@ -49,6 +49,8 @@ pub struct RuntimeConfig {
     /// `tunnel-client connect`'s reconnect policy (M6-C23).  Only the CLI's
     /// supervisor loop reads it; the library's `connect` makes one attempt.
     pub reconnect: ReconnectConfig,
+    /// The local supervisor status IPC endpoint (M6-06).
+    pub supervisor: SupervisorConfig,
 }
 
 impl<'de> Deserialize<'de> for RuntimeConfig {
@@ -123,6 +125,16 @@ impl RuntimeConfig {
             .validate()
             .map_err(RuntimeConfigError::Rotation)?;
         self.reconnect.validate()?;
+        if self
+            .supervisor
+            .ipc_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(RuntimeConfigError::Invalid(
+                "supervisor.ipc_path must not be empty",
+            ));
+        }
         if self.exports.is_empty() {
             return Err(RuntimeConfigError::Invalid(
                 "at least one local export must be configured",
@@ -238,8 +250,48 @@ impl RuntimeConfig {
         let base = base.as_ref();
         let mut resolved = self.clone();
         resolved.credentials = self.credentials.resolve_relative_to(base);
+        resolved.supervisor.ipc_path = self.supervisor.ipc_path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                base.join(path)
+            }
+        });
         resolved
     }
+
+    /// The local supervisor socket `connect` listens on and `status` and
+    /// `doctor` read (M6-06).
+    ///
+    /// `[supervisor] ipc_path` when set; otherwise `supervisor.sock` in the
+    /// directory holding the client private key, which `credentials create`
+    /// makes owner-only (`0700`) and `doctor` checks. That default is the
+    /// recommendation recorded in task row M0-03 (options (c) with (a)),
+    /// applied by default pending owner confirmation (2026-09-25).
+    #[must_use]
+    pub fn supervisor_socket_path(&self) -> PathBuf {
+        match &self.supervisor.ipc_path {
+            Some(path) => path.clone(),
+            None => self
+                .credentials
+                .client_key
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(DEFAULT_SUPERVISOR_SOCKET_NAME),
+        }
+    }
+}
+
+/// File name of the default supervisor socket, beside the client key.
+pub const DEFAULT_SUPERVISOR_SOCKET_NAME: &str = "supervisor.sock";
+
+/// `[supervisor]`: where `connect` publishes its read-only status (M6-06).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SupervisorConfig {
+    /// Explicit socket path; relative paths resolve from the profile's
+    /// directory. Unset means `supervisor.sock` beside the client key.
+    pub ipc_path: Option<PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -254,6 +306,7 @@ impl Default for RuntimeConfig {
             limits: LimitsConfig::default(),
             rotation: RotationConfig::default(),
             reconnect: ReconnectConfig::default(),
+            supervisor: SupervisorConfig::default(),
         }
     }
 }
@@ -543,6 +596,8 @@ struct RawRuntimeConfig {
     rotation: RotationConfig,
     #[serde(default)]
     reconnect: ReconnectConfig,
+    #[serde(default)]
+    supervisor: SupervisorConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,6 +663,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             limits: raw.limits,
             rotation: raw.rotation,
             reconnect: raw.reconnect,
+            supervisor: raw.supervisor,
         })
     }
 }

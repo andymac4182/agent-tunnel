@@ -45,6 +45,10 @@ tunnel-fs-provider = { path = "../tunnel-fs-provider" }
 # compiles to that declaration alone and this connector serves no session.
 [target.'cfg(unix)'.dependencies]
 tunnel-fs-host = { path = "../tunnel-fs-host" }
+# M6-06: the supervisor IPC compares a peer's UID with this process's
+# effective UID; `rustix::process::geteuid` is the safe call (the crate is
+# already locked, as a dev-dependency below).
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
 
 [dev-dependencies]
 tempfile = "3.21"

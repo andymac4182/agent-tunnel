@@ -1003,6 +1003,7 @@ fn write_client_config(
         limits: LimitsConfig::default(),
         rotation: RotationConfig::default(),
         reconnect: Default::default(),
+        supervisor: Default::default(),
     };
     config
         .validate()

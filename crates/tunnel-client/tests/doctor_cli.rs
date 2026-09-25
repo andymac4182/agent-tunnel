@@ -151,9 +151,14 @@ fn assert_capabilities_reported(report: &Value) {
         report["result"].is_object(),
         "a failing doctor run must still report its checks: {report}"
     );
-    assert_eq!(
-        report["result"]["supervisor_ipc"]["code"],
-        "SUPERVISOR_IPC_NOT_IMPLEMENTED"
+    // M6-06: no supervisor runs in these fixtures, so the IPC check reports
+    // it absent, or not run when the configuration cannot name the socket.
+    let ipc = report["result"]["supervisor_ipc"]["code"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        ipc == "SUPERVISOR_ABSENT" || ipc == "SUPERVISOR_IPC_NOT_RUN",
+        "the supervisor IPC check must be reported on a failing run, got {ipc:?}"
     );
     let containment = report["result"]["process_containment"]["code"]
         .as_str()
@@ -165,7 +170,7 @@ fn assert_capabilities_reported(report: &Value) {
 }
 
 #[test]
-fn doctor_binary_reports_private_fixture_success_and_pending_supervisor_ipc() {
+fn doctor_binary_reports_private_fixture_success_and_an_absent_supervisor() {
     let fixture = Fixture::valid();
     let output = run_doctor(&fixture.config);
     assert_eq!(output.status.code(), Some(0));
@@ -178,10 +183,8 @@ fn doctor_binary_reports_private_fixture_success_and_pending_supervisor_ipc() {
     assert_eq!(report["result"]["permissions"]["status"], "ok");
     assert_eq!(report["result"]["expiry"]["status"], "ok");
     assert_eq!(report["result"]["device_identity"]["status"], "ok");
-    assert_eq!(
-        report["result"]["supervisor_ipc"]["status"],
-        "not_implemented"
-    );
+    assert_eq!(report["result"]["supervisor_ipc"]["status"], "not_running");
+    assert_eq!(report["result"]["supervisor_ipc"]["code"], "SUPERVISOR_ABSENT");
     assert_redacted(&report, &output);
 }
 

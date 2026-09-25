@@ -1,9 +1,13 @@
 //! Deterministic, local-only connector diagnostics.
 //!
-//! The doctor deliberately stops at files owned by the configured profile. It
-//! never opens a socket, starts the connector, invokes an export, or contacts
-//! a supervisor. The supervisor IPC field is reported explicitly as pending so
-//! this command cannot be mistaken for the future full operations surface.
+//! The doctor deliberately stops at files owned by the configured profile and
+//! the profile's local supervisor socket. It never opens a network socket,
+//! starts the connector or invokes an export. Since M6-06 it reads the
+//! running supervisor's status through the same owner-only, same-UID IPC
+//! `tunnel-client status` uses (`main.rs`, `doctor_supervisor_ipc`), and
+//! reports only a status and a closed code for it: a supervisor that is not
+//! running is `not_running`, never a failure, and the check never changes
+//! `ok` or the exit status.
 
 use std::{
     io,
@@ -169,11 +173,11 @@ pub(crate) struct CertificateBundleCheck {
 /// `now` is an explicit input so tests can exercise expiry deterministically.
 /// The function only reads local files and does not expose any path, endpoint,
 /// certificate body, private key material, or other secret in its output.
-pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
-    let supervisor_ipc = CapabilityCheck {
-        status: "not_implemented",
-        code: "SUPERVISOR_IPC_NOT_IMPLEMENTED",
-    };
+pub(crate) fn inspect(
+    path: &Path,
+    now: SystemTime,
+    supervisor_ipc: CapabilityCheck,
+) -> DoctorInspection {
     let process_containment = process_containment_check();
 
     let config = match ConnectConfig::load(path) {
@@ -863,17 +867,30 @@ mod tests {
         Fixture { directory, config }
     }
 
+    /// `inspect` with the supervisor check a machine with no running
+    /// `connect` produces; the IPC read itself is `main.rs`'s.
+    fn inspect_without_supervisor(path: &Path, now: SystemTime) -> DoctorInspection {
+        inspect(
+            path,
+            now,
+            CapabilityCheck {
+                status: "not_running",
+                code: "SUPERVISOR_ABSENT",
+            },
+        )
+    }
+
     #[test]
-    fn valid_fixture_is_local_and_reports_pending_supervisor_ipc() {
+    fn valid_fixture_is_local_and_reports_the_supervisor_ipc_check() {
         let fixture = fixture(false);
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
         assert!(inspection.output.ok);
         assert_eq!(inspection.exit_code, 0);
         let result = &inspection.output.result;
-        assert_eq!(result.supervisor_ipc.status, "not_implemented");
+        assert_eq!(result.supervisor_ipc.status, "not_running");
         assert_eq!(result.credential_key_match.status, "ok");
         assert_eq!(result.device_identity.status, "ok");
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
@@ -925,7 +942,7 @@ mod tests {
         // against a result that actually carries the degraded check, so the
         // claim holds on a host where the sentinel is present.
         let fixture = fixture(false);
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -952,7 +969,7 @@ mod tests {
         fs::write(&key_path, other_key.serialize_pem()).expect("replace fixture key");
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
             .expect("reapply key permissions");
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -980,7 +997,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n",
         )
         .expect("replace fixture certificate");
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -999,7 +1016,7 @@ mod tests {
     fn a_device_id_that_is_not_the_certificates_device_fails_the_doctor() {
         let fixture = fixture(false);
         set_device_id(&fixture, "44444444-4444-4444-8444-444444444444");
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -1035,7 +1052,7 @@ mod tests {
             FIXTURE_DEVICE.replace('-', ""),
         ] {
             set_device_id(&fixture, &spelling);
-            let inspection = inspect(
+            let inspection = inspect_without_supervisor(
                 &fixture.config,
                 UNIX_EPOCH + Duration::from_secs(1_800_000_000),
             );
@@ -1047,7 +1064,7 @@ mod tests {
             set_device_id_back(&fixture, &spelling);
         }
         set_device_id(&fixture, "doctor-fixture");
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -1071,7 +1088,7 @@ mod tests {
     #[test]
     fn expired_certificate_and_insecure_key_permissions_are_reported() {
         let fixture = fixture(true);
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -1085,7 +1102,7 @@ mod tests {
         let key_path = fixture.directory.path().join("client-key.pem");
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644))
             .expect("insecure key permissions");
-        let inspection = inspect(
+        let inspection = inspect_without_supervisor(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
@@ -1106,7 +1123,7 @@ mod tests {
             "device_id = \"bad\"\nrelay_url = \"ws://relay.example.test/v1/tunnel/control\"\nclient_cert = \"secret.pem\"\nprivate_key = \"secret-key.pem\"\nserver_ca = \"secret-ca.pem\"\n",
         )
         .expect("invalid config write");
-        let inspection = inspect(&config, UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let inspection = inspect_without_supervisor(&config, UNIX_EPOCH + Duration::from_secs(1_800_000_000));
         assert!(!inspection.output.ok);
         assert_eq!(inspection.exit_code, EXIT_INVALID_CONFIG);
         assert_eq!(
@@ -1135,7 +1152,7 @@ mod tests {
         // The capability checks are about the host, not the configuration, so
         // an unparseable configuration is no reason to withhold them -- and
         // an unprovisioned machine is exactly where an operator needs them.
-        assert_eq!(result.supervisor_ipc.code, "SUPERVISOR_IPC_NOT_IMPLEMENTED");
+        assert_eq!(result.supervisor_ipc.code, "SUPERVISOR_ABSENT");
         assert!(
             result
                 .process_containment

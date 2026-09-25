@@ -15,6 +15,8 @@ pub mod credentials;
 pub mod fs_export;
 pub mod http_forward;
 mod m2_runtime;
+/// Local, read-only supervisor status IPC (M6-06).
+pub mod supervisor_ipc;
 
 pub use config::FsExportSettings;
 use config::{ExportConfig, ExportKind, RuntimeConfig};
@@ -59,7 +61,8 @@ use uuid::Uuid;
 
 pub use config::{
     CredentialConfig, ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig,
-    ReconnectConfig, RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    DEFAULT_SUPERVISOR_SOCKET_NAME, ReconnectConfig, RuntimeConfig as ConnectConfig,
+    RuntimeConfigError, SupervisorConfig,
 };
 pub use credentials::{CsrOutput, ImportedCredential};
 pub use tokio_util::sync::CancellationToken as ConnectCancellation;
@@ -83,7 +86,10 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 /// `docs/runtime.md`. Listing it is safe in the direction that matters: this
 /// is the set a classifier may *accept*, so an unreachable member costs
 /// nothing, while a missing member misclassifies a real exit.
-pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 130];
+///
+/// `8` is `status` finding no supervisor for the profile (`SUPERVISOR_ABSENT`,
+/// M6-06); `connect` never produces it.
+pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 130];
 
 /// The M1 failure policy. A later caller can explicitly create a fresh
 /// session; the library never reconnects or replays an operation itself.
