@@ -93,9 +93,15 @@ The decisions, and what each rests on:
 - **Health checks.** The consumer service checks `GET /readyz` over HTTPS on
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
-  measured that a bare connect adds no relay log line. **`/readyz` does not
-  cover Redis on a non-cluster relay:** it stays `200` while Redis is down or
-  has restarted, and every request then fails `503` (measured, M6-C67).
+  measured that a bare connect adds no relay log line. **Images built before
+  M6-C67's fix, including the one deployed when this was written, answer
+  `200` on `/readyz` while Redis is down or has restarted**, and every request
+  then fails `503` (measured). From that fix on, a non-cluster relay answers
+  `503` while its Redis authority is unavailable or refused
+  ([operator.md section 3.2](operator.md#32-health-endpoints-and-load-balancers)),
+  so this check then fails and Fly Proxy stops routing consumer traffic to
+  it until Redis serves again. That is measured locally only; it has not been
+  deployed or measured on Fly.
 - **Stopping.** `kill_signal = "SIGTERM"`, `kill_timeout = 60`. Fly's default
   signal is SIGINT and its default timeout 5 s, at most 300 s
   (<https://fly.io/docs/reference/configuration/>). `serve` handles both
@@ -620,8 +626,9 @@ curl --cacert ~/agentuplink-fly/relay-ca.pem \
 ```
 
 The reply is the export's `device_canary` followed by `hello`. `/readyz`
-answering `200` is not enough on its own: a non-cluster relay answers `200`
-even when Redis is unusable (M6-C67), so the echo is the check.
+answering `200` is not enough on its own: an image built before M6-C67's fix
+answers `200` even when Redis is unusable, and even with the fix readiness
+says nothing about the device or the export, so the echo is the check.
 On the then-live relay (`main-721ed2a`), 150 sequential echoes on one device
 session all returned `200` with the canary, past the old 128-request limit
 (M7-C92; measured by the coordinator on 2026-09-23).
@@ -746,8 +753,9 @@ owner lease, up to 30 s. Measured locally with `docker restart` and with
 after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
 the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
 that fails the attempt and the relay tries again on its next token, every
-5 s. While Redis is down or refused, `/readyz` still answers ready (M6-C67)
-and every consumer call gets `503` `AUTHORIZATION_UNAVAILABLE`.
+5 s. While Redis is down or refused every consumer call gets `503`
+`AUTHORIZATION_UNAVAILABLE`; `/readyz` answers `503` with M6-C67's fix and
+still answers ready on an image built before it.
 
 If the log shows `tunnel-relay: Redis authority continuity check failed;
 stage=authority_identity class=continuity` instead, Redis came back older

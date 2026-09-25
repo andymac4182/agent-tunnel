@@ -1,9 +1,12 @@
 //! Bounded, redacted relay health endpoints.
 //!
 //! Liveness answers whether the HTTP process can answer a request. Readiness
-//! is owned by the cluster membership provider and is allowed to fail closed
+//! is owned by the cluster membership provider on a cluster relay, and by the
+//! cached Redis authority state ([`crate::authority_readiness`], task row
+//! M6-C67) on a relay without `[cluster]`; either is allowed to fail closed
 //! while liveness remains available. Neither endpoint exposes membership
-//! records, endpoints, pins, tenant identifiers, or backend error details.
+//! records, endpoints, pins, tenant identifiers, or backend error details, and
+//! neither reaches Redis while answering.
 
 use std::sync::Arc;
 
@@ -15,7 +18,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::peer_runtime::PeerRuntime;
+use crate::{authority_readiness::AuthorityReadiness, peer_runtime::PeerRuntime};
 
 const LIVE_STATUS: &str = "live";
 const READY_STATUS: &str = "ready";
@@ -28,10 +31,15 @@ struct HealthBody {
 
 /// Build the public, bounded liveness/readiness endpoints.
 ///
-/// The optional peer runtime is the existing cluster startup seam. A relay
-/// without a private peer runtime is the local M1/M2 profile and is ready once
-/// its HTTP actor is serving.
-pub(crate) fn router<S>(peer: Option<Arc<PeerRuntime>>) -> Router<S>
+/// The optional peer runtime is the existing cluster startup seam. The
+/// optional authority state is a single relay's (`serve` without `[cluster]`,
+/// M6-C67): it is ready only while its last bounded Redis authority check
+/// succeeded recently.  A library relay with neither is ready once its HTTP
+/// actor is serving.
+pub(crate) fn router<S>(
+    peer: Option<Arc<PeerRuntime>>,
+    authority: Option<Arc<AuthorityReadiness>>,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -42,8 +50,10 @@ where
             "/readyz",
             get(move || {
                 let peer = readiness_peer.clone();
+                let authority = authority.clone();
                 async move {
-                    let ready = peer.as_ref().is_none_or(|runtime| runtime.is_ready());
+                    let ready = peer.as_ref().is_none_or(|runtime| runtime.is_ready())
+                        && authority.as_ref().is_none_or(|state| state.is_ready());
                     ready_response(ready)
                 }
             }),

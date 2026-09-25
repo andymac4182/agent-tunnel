@@ -5898,6 +5898,7 @@ async fn start_relay(
                 consumer_peer_admission_barrier,
                 device_control_attach_barrier,
                 http_forward: harness.http_forward.clone(),
+                authority_readiness: false,
             },
         )
         .await

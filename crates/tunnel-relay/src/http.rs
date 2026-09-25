@@ -846,6 +846,7 @@ pub fn consumer_router_with_peer_and_barrier(
         consumer_upgrade_barrier,
         None,
         None,
+        None,
     )
 }
 
@@ -863,6 +864,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
     http_forward: Option<crate::http::forward::HttpForwardExports>,
+    authority: Option<Arc<crate::authority_readiness::AuthorityReadiness>>,
 ) -> Router {
     let state = HttpState {
         handle,
@@ -881,7 +883,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         http_forward,
     };
     Router::new()
-        .merge(health::router::<HttpState>(state.peer.clone()))
+        .merge(health::router::<HttpState>(state.peer.clone(), authority))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{device}/services", get(list_services))
         .route("/v1/devices/{device}/services/{service}/echo", post(echo))

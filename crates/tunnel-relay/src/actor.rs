@@ -14873,6 +14873,13 @@ pub struct ListenerSocketOptions {
     /// validated on the owner relay (gate 5).  `ServeConfig` fills it from
     /// its `[http_forward]` table; `None` answers 404.
     pub http_forward: Option<crate::http::forward::HttpForwardExports>,
+    /// Task row M6-C67: follow the Redis authority in `/readyz` on a relay
+    /// without a peer runtime.  A bounded background check
+    /// ([`crate::authority_readiness`]) publishes the authority's state and
+    /// `/readyz` reads it.  `ServeConfig` sets it for every relay without
+    /// `[cluster]`; a relay with a peer runtime ignores it, so cluster
+    /// readiness is unchanged.  Library callers default to `false`.
+    pub authority_readiness: bool,
 }
 
 impl Relay {
@@ -15087,6 +15094,13 @@ impl Relay {
             } else {
                 (None, None, None, None)
             };
+        let authority =
+            (listener_options.authority_readiness && peer_runtime.is_none()).then(|| {
+                crate::authority_readiness::AuthorityReadiness::spawn(
+                    catalog.clone(),
+                    cancel.child_token(),
+                )
+            });
         let consumer_router = http::consumer_router_with_peer_and_barriers(
             handle.clone(),
             catalog.clone(),
@@ -15096,6 +15110,7 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
             listener_options.http_forward.clone(),
+            authority,
         );
         let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),

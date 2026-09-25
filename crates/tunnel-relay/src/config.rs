@@ -932,6 +932,10 @@ impl ServeConfig {
                 .as_ref()
                 .map(HttpForwardServeConfig::exports)
                 .transpose()?,
+            // M6-C67: a relay without `[cluster]` follows its Redis
+            // authority in `/readyz`; a cluster relay's readiness is its
+            // membership and peer readiness, unchanged.
+            authority_readiness: self.cluster.is_none(),
             ..crate::ListenerSocketOptions::default()
         })
     }

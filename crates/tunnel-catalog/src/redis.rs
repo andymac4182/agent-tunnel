@@ -2702,6 +2702,34 @@ impl Catalog for RedisCatalog {
             .into_iter()
             .collect())
     }
+
+    /// The startup active-incarnation and Redis-run check (read-only), on the
+    /// catalog lane (M6-C67).  A catalog without a configured incarnation
+    /// (library callers) checks the lane with `PING` instead.  Each is one
+    /// bounded lane command: the lane's own verification and reply deadlines
+    /// apply, and a refused restarted run surfaces as the lane's refusal.
+    async fn check_authority(&self) -> Result<(), CatalogError> {
+        if self.deployment_incarnation.is_some() {
+            // Keep the refusal's class (`unbound`, `run_changed`) visible to
+            // `CatalogConnectionFailure::classify`.
+            return self
+                .ensure_active_incarnation_classified()
+                .await
+                .map_err(|(error, class)| match class {
+                    Some(CatalogConnectionFailure::Unbound) => {
+                        CatalogError::Conflict(NAMESPACE_UNBOUND)
+                    }
+                    Some(CatalogConnectionFailure::RunChanged) => {
+                        CatalogError::Conflict(RUN_BINDING_CHANGED)
+                    }
+                    _ => error,
+                });
+        }
+        self.connection
+            .query::<String>(&redis::cmd("PING"))
+            .await
+            .map(drop)
+    }
 }
 
 /// The authoritative Redis namespace rule, applied without opening a

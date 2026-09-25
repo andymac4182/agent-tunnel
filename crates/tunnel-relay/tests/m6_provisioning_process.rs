@@ -3123,6 +3123,8 @@ const M6C65_RECOVERY_DEADLINE: Duration = Duration::from_secs(75);
 /// touched.
 struct DockerRedis {
     label: String,
+    /// Container name prefix; each container is `{prefix}-{nonce}-{generation}`.
+    prefix: &'static str,
     name: String,
     port: u16,
     generation: u32,
@@ -3146,9 +3148,15 @@ impl DockerRedis {
     /// Start the first container: AOF on, `appendfsync always`,
     /// `aof-load-truncated no`, as `deploy/fly/redis/entrypoint.sh` does.
     fn start(nonce: &str) -> Self {
+        Self::start_named("agent-tunnel-m6c65", "agent-tunnel.m6c65-owner", nonce)
+    }
+
+    /// [`Self::start`] under a gate's own container name prefix and label.
+    fn start_named(prefix: &'static str, label: &str, nonce: &str) -> Self {
         let port = free_port().port();
         let mut redis = Self {
-            label: format!("agent-tunnel.m6c65-owner={nonce}"),
+            label: format!("{label}={nonce}"),
+            prefix,
             name: String::new(),
             port,
             generation: 0,
@@ -3168,7 +3176,8 @@ impl DockerRedis {
     fn create(&mut self, redis_args: &[&str]) {
         self.generation += 1;
         self.name = format!(
-            "agent-tunnel-m6c65-{}-{}",
+            "{}-{}-{}",
+            self.prefix,
             self.label.rsplit('=').next().unwrap_or("run"),
             self.generation
         );
@@ -3303,6 +3312,23 @@ impl DockerRedis {
     }
 
     /// Stop and remove the current container with its volume.
+    /// `docker stop`: SIGTERM, Redis writes its AOF and exits; the container
+    /// and its volume stay, so [`Self::start_current`] brings the same data
+    /// back under a new `run_id` (M6-C67).
+    fn stop(&self) {
+        Self::docker(&["stop", "--time", "30", &self.name]);
+    }
+
+    /// `docker pause`: Redis keeps its sockets but answers nothing (M6-C67).
+    fn pause(&self) {
+        Self::docker(&["pause", &self.name]);
+    }
+
+    fn unpause(&self) {
+        Self::docker(&["unpause", &self.name]);
+        self.wait_ready();
+    }
+
     fn remove_current(&self) {
         Self::docker(&["rm", "--force", "--volumes", &self.name]);
     }
@@ -4074,6 +4100,172 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
         device.spawns
     );
     drop(device);
+    drop(fixture);
+    drop(redis);
+}
+
+// ---------------------------------------------------------------------------
+// Task row M6-C67: a single relay's `/readyz` follows its Redis authority.
+// ---------------------------------------------------------------------------
+
+/// The longest `/readyz` may take to follow the authority: one check interval
+/// (1 s) plus one check's deadline (5 s), plus scheduling margin.
+const M6C67_READINESS_BOUND: Duration = Duration::from_secs(10);
+
+/// `GET` on the consumer listener: `(status, body)`, or status 0 when the
+/// listener did not answer.
+async fn m6c67_get(fixture: &Provisioned, path: &str) -> (u16, String) {
+    match consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "GET",
+        path,
+        "",
+        &[],
+        b"",
+    )
+    .await
+    {
+        Ok((status, _, body)) => (status, String::from_utf8_lossy(&body).into_owned()),
+        Err(error) => (0, error),
+    }
+}
+
+/// Poll `/readyz` until it answers `status`; returns how long that took.
+async fn m6c67_until_readyz(step: &str, fixture: &Provisioned, status: u16) -> Duration {
+    let started = Instant::now();
+    loop {
+        let (got, body) = m6c67_get(fixture, "/readyz").await;
+        if got == status {
+            let expected = if status == 200 {
+                r#"{"status":"ready"}"#
+            } else {
+                r#"{"status":"unready"}"#
+            };
+            assert_eq!(body, expected, "step {step}: fixed words only");
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < M6C67_READINESS_BOUND,
+            "step {step}: /readyz answered {got} {body} for {M6C67_READINESS_BOUND:?}, \
+             expected {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `/readyz` must keep answering `503` for `duration`, while `/livez` stays
+/// `200`: a refused namespace is not ready, and the process is alive.
+async fn m6c67_stays_unready(step: &str, fixture: &Provisioned, duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        let (got, body) = m6c67_get(fixture, "/readyz").await;
+        assert_eq!(got, 503, "step {step}: /readyz answered {got} {body}");
+        let (live, body) = m6c67_get(fixture, "/livez").await;
+        assert_eq!(live, 200, "step {step}: /livez answered {live} {body}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A single relay (no `[cluster]`, no continuity witness) against a Redis
+/// container this gate owns (`m6ops-c67-<nonce>-<n>`): `/readyz` is `200`
+/// while Redis serves, `503` within [`M6C67_READINESS_BOUND`] when Redis is
+/// paused (no reply) or stopped, `200` again when a paused Redis resumes, and
+/// stays `503` after Redis restarts under a new `run_id` (the namespace is
+/// refused as `run_changed`) until an operator re-attests it with
+/// `rebind-redis-run`, after which the same relay process is ready again.  An
+/// empty Redis is refused as `unbound` and stays not ready.  Before M6-C67
+/// every step after the first answered `200`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and TUNNEL_CLIENT_BIN; run by scripts/m6-redis-restart-verify.sh"]
+async fn m6c67_single_relay_readyz_follows_the_redis_authority() {
+    let nonce = Uuid::new_v4().simple().to_string();
+    let mut redis = DockerRedis::start_named("m6ops-c67", "agent-tunnel.m6ops-c67-owner", &nonce);
+    let fixture = provision_and_serve_with(
+        "m6c67-readyz",
+        None,
+        ServiceKind::Echo,
+        ProvisionOptions {
+            redis_url: Some(redis.url()),
+            relay_top_level: String::new(),
+            skip_stage_cases: true,
+        },
+    )
+    .await;
+    assert_eq!(fixture.upstream, redis.upstream());
+    let relay_pid = fixture.relay.0.id();
+    let mut relay_lines = Vec::new();
+
+    // --- 1. Serving: ready. ---
+    m6c67_until_readyz("serving", &fixture, 200).await;
+
+    // --- 2. Redis stalls (paused): not ready within the bound, then ready
+    //        again on the same run once it answers. ---
+    let run_1 = redis.run_id();
+    redis.pause();
+    let paused = m6c67_until_readyz("paused", &fixture, 503).await;
+    redis.unpause();
+    assert_eq!(redis.run_id(), run_1, "a pause keeps the Redis run");
+    let resumed = m6c67_until_readyz("resumed", &fixture, 200).await;
+    println!(
+        "m6c67-paused ok nonce={nonce} unready_after_ms={} ready_after_ms={}",
+        paused.as_millis(),
+        resumed.as_millis()
+    );
+
+    // --- 3. Redis stopped: not ready. ---
+    redis.stop();
+    let stopped = m6c67_until_readyz("stopped", &fixture, 503).await;
+    // --- 3b. Redis back under a new run: refused (`run_changed`), so the
+    //         relay stays not ready and says why in fixed words. ---
+    redis.start_current();
+    let run_2 = redis.run_id();
+    assert_ne!(run_1, run_2, "a Redis restart must draw a new run_id");
+    let refused = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "run_changed",
+        STEP_DEADLINE,
+    );
+    assert!(
+        refused.contains("relay Redis authority unavailable; not ready"),
+        "{refused}"
+    );
+    m6c67_stays_unready("run-changed", &fixture, Duration::from_secs(5)).await;
+    assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_1);
+    // --- 3c. The operator re-attests the restarted run: the same process is
+    //         ready again without a restart. ---
+    let rebind = stdout(&step(
+        "rebind-redis-run",
+        Command::new(&fixture.relay_bin)
+            .args(["rebind-redis-run", "--config"])
+            .arg(&fixture.relay_config)
+            .arg("--redis-restarted-in-place"),
+    ));
+    assert!(
+        rebind.contains(&format!("from Redis run {run_1} to {run_2}")),
+        "{rebind}"
+    );
+    let reattested = m6c67_until_readyz("re-attested", &fixture, 200).await;
+    assert_eq!(fixture.relay.0.id(), relay_pid);
+    println!(
+        "m6c67-restart ok nonce={nonce} unready_after_ms={} refused={refused:?} \
+         ready_after_rebind_ms={} relay_restarts=0",
+        stopped.as_millis(),
+        reattested.as_millis()
+    );
+
+    // --- 4. Redis came back empty: refused (`unbound`), never ready. ---
+    redis.replace_empty();
+    m6c67_until_readyz("empty", &fixture, 503).await;
+    let unbound = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "unbound",
+        STEP_DEADLINE,
+    );
+    m6c67_stays_unready("unbound", &fixture, Duration::from_secs(5)).await;
+    println!("m6c67-empty ok nonce={nonce} line={unbound:?}");
     drop(fixture);
     drop(redis);
 }

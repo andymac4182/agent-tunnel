@@ -30,6 +30,14 @@
 #    Redis with an empty one: refused as
 #    `class=unbound` by the serving relay, a fresh `serve` and
 #    `rebind-redis-run`, with nothing written into it.
+# 3. Runs `m6c67_single_relay_readyz_follows_the_redis_authority` (task row
+#    M6-C67), against its own container named `m6ops-c67-<nonce>-<n>`: a
+#    single relay without a continuity witness answers `/readyz` `200` while
+#    Redis serves; `503` within 10 s when Redis is paused and `200` again
+#    when it resumes; `503` when Redis is stopped and, once it is back under a
+#    new `run_id`, still `503` (`class=run_changed`) until `rebind-redis-run`,
+#    then `200` from the same process; `503` for an empty Redis
+#    (`class=unbound`).
 #
 # The test is `#[ignore]`d in the ordinary workspace run because it needs
 # Docker.  A filtered or skipped test would print `0 passed` and exit 0, so
@@ -70,6 +78,20 @@ for needle in "test result: ok. 1 passed" "m6c65-unattended ok nonce=" "relay_re
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/restart.log"; then
     echo "m6-redis-restart-verify: FAILED: output lacks '$needle'" >&2
+    exit 1
+  fi
+done
+
+echo "m6-redis-restart-verify: single-relay readiness gate (M6-C67)" >&2
+cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
+  --test-threads=1 --exact m6c67_single_relay_readyz_follows_the_redis_authority \
+  > "$scratch/readyz.log" 2>&1 || { cat "$scratch/readyz.log" >&2; exit 1; }
+cat "$scratch/readyz.log"
+for needle in "test result: ok. 1 passed" "m6c67-paused ok nonce=" \
+  "m6c67-restart ok nonce=" "run_changed" "relay_restarts=0" \
+  "m6c67-empty ok nonce=" "unbound" "client=$TUNNEL_CLIENT_BIN"; do
+  if ! grep -q -- "$needle" "$scratch/readyz.log"; then
+    echo "m6-redis-restart-verify: FAILED: readiness output lacks '$needle'" >&2
     exit 1
   fi
 done

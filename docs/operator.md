@@ -909,10 +909,25 @@ deliberately minimal:
 | `GET /livez` | `200 {"status":"live"}` | The process answers HTTP. It consults nothing else. |
 | `GET /readyz` | `200 {"status":"ready"}` or `503 {"status":"unready"}` | Whether this relay should receive new public work |
 
-A relay without `[cluster]` is always ready once it is serving, even while
-its Redis authority is unavailable: after a Redis restart it answered `200`
-on `/readyz` while every request got `503` `AUTHORIZATION_UNAVAILABLE`
-(M6-C67). A cluster relay
+A relay without `[cluster]` is ready only while its Redis authority can
+serve (M6-C67). A background check runs once a second: the same read-only
+active-incarnation and Redis-run check `serve` makes at startup, on the
+relay's ordinary Redis connection, bounded at 5 s. `/readyz` only reads the
+last result and never reaches Redis itself. The relay answers `503
+{"status":"unready"}` within one check (at most about 6 s) of Redis stopping
+answering, being stopped, or coming back refused, and `200` again after the
+first check that succeeds. A refused namespace stays `503`:
+`class=run_changed` (Redis restarted and nothing re-attested it: run
+`rebind-redis-run`, section 4, and the same process is ready again within
+about a second; a relay with `redis_restart_continuity_seconds` re-binds by
+itself when it may), `class=unbound` (Redis came back without its data),
+`class=continuity` or `class=persistence`. Each change to not ready is logged
+once, in fixed words, as `relay Redis authority unavailable; not ready` with
+that `class`, at `warn`. Before M6-C67 such a relay answered `200` on
+`/readyz` while every request got `503` `AUTHORIZATION_UNAVAILABLE`, and
+builds without that fix still do. Measured locally with the shipped binaries
+and a Redis container paused, stopped, restarted and replaced by an empty
+one (`scripts/m6-redis-restart-verify.sh`). A cluster relay
 is ready only while its membership is current, its required peer routes are
 probed reachable, it has capacity, **and its set of approved peer keys is not
 empty** (M7-C89). Before M7-C89, a relay whose membership went unready had the
@@ -930,7 +945,9 @@ What a load balancer should do:
 - Route new public traffic only to relays that answer `200` on `/readyz`.
   Leave `/livez` to the process supervisor for restart decisions. Do not use
   it for routing.
-- Expect short `503` episodes during ordinary operation. After a membership
+- Expect short `503` episodes during ordinary operation. A single relay goes
+  `503` for as long as its Redis authority is unavailable, which is exactly
+  when it could serve nothing. After a membership
   change, readiness can stay `503` until the next peer refresh tick
   (`min(membership_reconcile_seconds, 5 s)` plus any probe pass in flight);
   M7-C91 would shorten this. Mark a relay down only after several consecutive
