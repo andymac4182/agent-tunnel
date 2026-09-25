@@ -3539,6 +3539,11 @@ impl M2Actor {
     }
 
     async fn handle_control(&mut self, message: ControlMessage) -> Result<(), ClientError> {
+        // M6-06: a `test-hooks` build can drop a named inbound rotation step
+        // so the shutdown gate can pin a phase; a constant `false` otherwise.
+        if crate::rotation_hooks::holds(message.kind_name()) {
+            return Ok(());
+        }
         if self.is_recovery_rotation_message(&message) {
             return self.handle_recovery_rotation_control(message).await;
         }
@@ -7069,6 +7074,12 @@ impl M2Actor {
         let cancellation = self.cancellation.clone();
         let dial_timeout = Duration::from_millis(candidate_deadline_ms.saturating_sub(now).max(1));
         let dial = tokio::spawn(async move {
+            // M6-06: `candidate-dial` withholds the candidate in a
+            // `test-hooks` build, pinning `preparing` until the owner aborts.
+            if crate::rotation_hooks::holds("candidate-dial") {
+                cancellation.cancelled().await;
+                return;
+            }
             let tls = match super::load_client_config(&config.credentials) {
                 Ok(tls) => tls,
                 Err(_) => {

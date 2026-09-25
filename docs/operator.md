@@ -1420,7 +1420,10 @@ shipped path handles typed text. Treat logs as sensitive regardless.
 
 `doctor` checks the local profile: the configuration, whether the certificate
 matches the key, owner-only permissions, certificate expiry, and whether
-`tunnel-deadman` is beside the client. It opens no network connection. **It
+`tunnel-deadman` is beside the client. It opens no network connection. Since
+M6-06 it also asks the profile's running `connect`, if any, through the local
+supervisor socket (`supervisor_ipc`: `ok`, `not_running`, or `failed` with a
+code); that never changes its exit status. **It
 always prints its full `result`, even when it fails** (M6-C07), so a
 half-provisioned machine can still see which checks passed. `not_run` means a
 check could not be attempted, which is different from `failed`. Since M6-C44
@@ -1440,13 +1443,21 @@ earlier runs in section 2.1). `PROCESS_CONTAINMENT_SENTINEL_MISSING` or
 `..._UNUSABLE` means `tunnel-deadman` is absent or unusable. That degrades
 cleanup of supervised child processes but does not change the exit status.
 
-**`status` is not implemented in this alpha**, and neither is `doctor
---network`. Both are refused rather than ignored:
+**`status`** (M6-06) reads the running `connect`'s redacted status through
+an owner-only Unix socket beside the client key (`[supervisor] ipc_path`
+moves it): state, session and rotation phase, generations, queue and drain
+counters, certificate expiry, export names. It only reads; it starts nothing.
+With no `connect` running for the profile it exits `8`
+(`SUPERVISOR_ABSENT`); a socket other users could reach is refused with `3`
+(`IPC_UNAUTHORIZED`); and a second `connect` on a profile whose supervisor is
+running exits `7` (`SUPERVISOR_RUNNING`). [runtime.md](runtime.md#supervisor-status-ipc)
+has the fields and the authorization. `doctor --network` is not implemented
+and is refused rather than ignored:
 
 ```console
 $ tunnel-client status --config trial/client.toml; echo "exit=$?"
-tunnel-client: unknown command
-exit=2
+tunnel-client: no supervisor is running for this profile (start `tunnel-client connect`)
+exit=8
 $ tunnel-client doctor --config trial/client.toml --network; echo "exit=$?"
 tunnel-client: usage: tunnel-client doctor --config PATH
 exit=2
@@ -1455,7 +1466,7 @@ exit=2
 **Client exit codes** are in the table in
 [runtime.md](runtime.md#client-exit-codes). That table is checked against the
 code by this guide's check. This guide runs real processes that exit `0`, `2`,
-`3` and `4`. Exit `7` (`OWNER_BUSY`, `RESOURCE_EXHAUSTED`) and `130`
+`3`, `4` and `8`. Exit `7` (`OWNER_BUSY`, `RESOURCE_EXHAUSTED`) and `130`
 (`CANCELLED`) need a live relay, so this guide's check does not run them.
 `OWNER_BUSY`, exit `7`, was measured by hand against a live relay: a second
 `connect` for a device that already has a live session (M6-C60). Exit `6`

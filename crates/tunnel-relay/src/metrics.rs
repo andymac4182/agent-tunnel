@@ -204,6 +204,19 @@ fn counter(out: &mut Writer, name: &str, help: &str, value: u64) {
     out.sample(name, &[], value);
 }
 
+/// Every label `runtime::phase_name` can produce, in protocol order.
+const ROTATION_PHASES: [&str; 9] = [
+    "active",
+    "preparing",
+    "quiescing",
+    "draining",
+    "committing",
+    "retiring",
+    "aborting",
+    "recovering",
+    "closed",
+];
+
 fn usize_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -281,6 +294,21 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         "Live sessions whose data socket is in a rotation phase other than active.",
         usize_u64(sessions.iter().filter(|s| s.phase != "active").count()),
     );
+    // M6-06: which phase, not only "not active". Nine fixed labels, every
+    // one always present, so a scrape can watch a session enter and leave a
+    // phase and the series set never depends on state.
+    out.family(
+        "tunnel_relay_sessions_by_rotation_phase",
+        "gauge",
+        "Live sessions by data-socket rotation phase.",
+    );
+    for phase in ROTATION_PHASES {
+        out.sample(
+            "tunnel_relay_sessions_by_rotation_phase",
+            &[("phase", phase)],
+            usize_u64(sessions.iter().filter(|s| s.phase == phase).count()),
+        );
+    }
     gauge(
         &mut out,
         "tunnel_relay_sessions_owner_write_unknown",

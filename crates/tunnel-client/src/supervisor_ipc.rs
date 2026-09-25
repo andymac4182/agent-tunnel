@@ -489,13 +489,20 @@ mod unix {
         query_status_for_uid(path, effective_uid()).await
     }
 
+    /// Read the status, authorizing a listening peer whose UID is
+    /// `expected_peer_uid`. The socket file is always checked against this
+    /// process's own UID; only tests pass anything but [`effective_uid`]
+    /// here, to exercise the peer check on its own -- a file check against
+    /// the shifted UID would refuse first and leave the peer check untested
+    /// (measured: the first version of that test stayed green with the peer
+    /// check deleted).
     #[doc(hidden)]
     pub async fn query_status_for_uid(
         path: &Path,
-        expected_uid: u32,
+        expected_peer_uid: u32,
     ) -> Result<SupervisorStatus, IpcError> {
         check_path_length(path)?;
-        check_socket_file(path, expected_uid)?;
+        check_socket_file(path, effective_uid())?;
         let mut stream = match tokio::time::timeout(IPC_IO_TIMEOUT, UnixStream::connect(path)).await
         {
             Err(_) => return Err(IpcError::Timeout),
@@ -513,7 +520,7 @@ mod unix {
         let peer = stream
             .peer_cred()
             .map_err(|_| IpcError::Io("the supervisor's credentials could not be read"))?;
-        if !peer_is_authorized(peer.uid(), expected_uid) {
+        if !peer_is_authorized(peer.uid(), expected_peer_uid) {
             return Err(IpcError::Unauthorized(
                 "the process listening on the supervisor socket is another user",
             ));
@@ -639,7 +646,12 @@ mod tests {
         let error = query_status_for_uid(&path, other)
             .await
             .expect_err("refused");
-        assert!(matches!(error, IpcError::Unauthorized(_)), "{error:?}");
+        assert_eq!(
+            error,
+            IpcError::Unauthorized(
+                "the process listening on the supervisor socket is another user"
+            )
+        );
         cancel.cancel();
         server.await.expect("server joins");
     }
