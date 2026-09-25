@@ -634,7 +634,14 @@ pub async fn verify() -> Result<FsDataRecoveryEvidence> {
     };
     let scenario = match timeout(SCENARIO_TIMEOUT, run(&mut cluster, &harness)).await {
         Ok(result) => result.and_then(|evidence| {
-            validate_fs_data_recovery_evidence(&evidence)?;
+            if let Err(error) = validate_fs_data_recovery_evidence(&evidence) {
+                // Payload-free: identifiers, labels and counters only.  A
+                // violated rule is otherwise named without the evidence that
+                // violated it, and the conjunctive same-owner rule cannot say
+                // which of its qualifiers failed (M4-29).
+                eprintln!("fs data recovery rejected evidence: {evidence:?}");
+                return Err(error);
+            }
             Ok(evidence)
         }),
         Err(_) => Err(HarnessError::Timeout(
@@ -775,8 +782,34 @@ async fn run(
             client.status_snapshot()
         );
         eprintln!("fs data recovery partial evidence: {evidence:?}");
+        // Why the owner ended any device session, from its bounded terminal
+        // latch: reason labels, identifiers and monotonic times only.
+        if let Ok(snapshot) = owner_snapshot(cluster).await {
+            for event in &snapshot.session_terminal_events {
+                eprintln!(
+                    "fs data recovery owner session terminal: session={} epoch={} reason={} \
+                     active_generation={} candidate_generation={:?} closed_at_ms={}",
+                    event.session_id,
+                    event.epoch,
+                    event.reason,
+                    event.active_generation,
+                    event.candidate_generation,
+                    event.closed_at_ms
+                );
+            }
+        }
     }
     let stop = timeout(CLEANUP_TIMEOUT, client.stop()).await;
+    if scenario.is_err() {
+        // The connector's own terminal error, which a failed recovery (M4-29
+        // mode A, M4-48) otherwise leaves unstated: `phase="failed"` names that
+        // it ended, not why. `ClientError` renders bounded protocol text only.
+        match &stop {
+            Ok(Err(error)) => eprintln!("fs data recovery device terminal error: {error}"),
+            Ok(Ok(())) => eprintln!("fs data recovery device terminal error: none"),
+            Err(_) => eprintln!("fs data recovery device terminal error: stop timed out"),
+        }
+    }
     scenario?;
     match stop {
         Ok(Ok(())) => Ok(evidence),
@@ -1071,7 +1104,9 @@ async fn exercise(
             if evidence.owner_recovery_reason.is_none()
                 && let Ok(snapshot) = owner_snapshot(cluster).await
                 && let Ok(owner) = session_of(&snapshot, session_id)
-                && let Some(reason) = owner.rotation_recovery_reason
+                && let Some(reason) = owner
+                    .rotation_recovery_reason
+                    .or(owner.last_activated_recovery_reason)
             {
                 evidence.owner_recovery_reason = Some(reason.to_owned());
             }

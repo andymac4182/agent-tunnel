@@ -265,6 +265,9 @@ pub struct FsExchangeReport {
     pub root_unavailable: bool,
     /// The grant named no capability this device serves.
     pub empty_grant: bool,
+    /// The session was closed because it stayed idle -- nothing queued,
+    /// nothing received -- for the export's `sessionIdleSeconds` (M4-21).
+    pub idle_timeout: bool,
 }
 
 /// Serve one filesystem stream to completion.
@@ -333,6 +336,10 @@ async fn serve_unix(
 
     let mut decoder = FrameDecoder::new();
     let mut applied_msize = MAX_MESSAGE_BYTES;
+    // The descriptor's `sessionIdleSeconds`, applied here because this is the
+    // one place on the device that has both the clock and the knowledge that
+    // nothing is queued (task row M4-21). The provider is clockless by design.
+    let idle = std::time::Duration::from_secs(export.limits.session_idle_seconds());
     // Admitting **every request already available** takes priority over
     // performing a queued one.
     //
@@ -357,7 +364,20 @@ async fn serve_unix(
                 () = std::future::ready(()) => None,
             }
         } else {
-            Some(inbound.recv().await)
+            // Nothing queued and nothing performing: the session is idle for
+            // exactly as long as this wait lasts. The contract's "Idle session
+            // timeout with no requests or operations" ends it here, with gate
+            // 1's own deadline code, rather than holding a device-side session
+            // and its fids for as long as a consumer cares to keep a socket.
+            match tokio::time::timeout(idle, inbound.recv()).await {
+                Ok(frame) => Some(frame),
+                Err(_) => {
+                    report.idle_timeout = true;
+                    report.closed_with = Some(SessionErrorCode::DeadlineExceeded);
+                    emit_close(&outbound, SessionErrorCode::DeadlineExceeded).await;
+                    break 'stream;
+                }
+            }
         };
 
         let bytes = match ready {
@@ -536,6 +556,55 @@ mod tests {
                 }
             }
             assert_eq!(unpack(pack(set)), set);
+        }
+    }
+
+    /// Task row M4-21: the descriptor advertises `sessionIdleSeconds`, and
+    /// until this nothing applied it -- a consumer could hold a device-side
+    /// session, its fids and its root descriptor for as long as it kept a
+    /// socket open. A session with nothing queued and nothing received for
+    /// that long is now closed by the device with gate 1's deadline code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_session_is_closed_at_the_advertised_idle_limit() {
+        use tunnel_fs_core::{Limits, SessionErrorCode};
+        let root = tempfile::tempdir().expect("synthetic export root");
+        let limits = Limits::new([
+            65_536, 64, 256, 1_048_576, 16_777_216, 33_554_432, 4_096, 256, 10_000, 64, 30, 300,
+            3_600, 1, // sessionIdleSeconds: the smallest value gate 1 admits
+        ])
+        .expect("valid limits");
+        assert_eq!(limits.session_idle_seconds(), 1);
+        let export = super::FsExport {
+            limits,
+            ..super::FsExport::read_only(root.path())
+        };
+        let grant = CapabilitySet::from_slice(&[Capability::Read, Capability::List]);
+        let authority = Arc::new(StreamAuthority::new(1, grant));
+        // The inbound sender is held for the whole test: the consumer is
+        // connected and silent, not gone.
+        let (_inbound_tx, inbound_rx, _) = tunnel_http_bridge::channel(65_536);
+        let (outbound_tx, mut outbound_rx, _) = tunnel_http_bridge::channel(65_536);
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::serve(export, grant, authority, inbound_rx, outbound_tx),
+        )
+        .await
+        .expect("an idle session must end at its advertised idle limit");
+        assert!(report.idle_timeout);
+        assert_eq!(report.closed_with, Some(SessionErrorCode::DeadlineExceeded));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "not before the limit"
+        );
+        let mut expected = Vec::new();
+        tunnel_fs_provider::encode_close(SessionErrorCode::DeadlineExceeded, &mut expected);
+        match outbound_rx.recv().await {
+            Some(tunnel_http_bridge::Frame::Data(bytes)) => {
+                assert_eq!(bytes.as_ref(), expected.as_slice(), "the close record");
+            }
+            other => panic!("expected the close record, got {other:?}"),
         }
     }
 

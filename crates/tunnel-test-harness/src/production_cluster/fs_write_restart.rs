@@ -1100,9 +1100,22 @@ async fn open_session(
 ) -> Result<(NinepClient, u32, String)> {
     let mut session = match NinepClient::connect(target, ca, token, Some(SUBPROTOCOL)).await {
         Ok(session) => session,
-        Err(UpgradeFailure::Status { status, .. }) => {
+        Err(UpgradeFailure::Status { status, body }) => {
+            // The contract's error `code` is a closed, payload-free label;
+            // naming it tells a 503 for an unowned device from one for an
+            // offline one (M4-51).
+            let code = body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|value| {
+                    value
+                        .pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
             return Err(HarnessError::Http(format!(
-                "the filesystem upgrade was refused with HTTP status {status}"
+                "the filesystem upgrade was refused with HTTP status {status} ({code})"
             )));
         }
         Err(UpgradeFailure::Harness(error)) => return Err(error),
@@ -1180,6 +1193,33 @@ async fn wait_owner_epoch_above(
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(
                 "no owner claim took an epoch above the one held before the restart".into(),
+            ));
+        }
+        sleep(POLL).await;
+    }
+}
+
+/// Wait until the owner holds this device session **with its data carrier
+/// attached**.
+///
+/// An owner claim is written when the control socket is admitted, before the
+/// connector's data socket attaches, and an upgrade in that window is correctly
+/// refused 503: the contract admits a filesystem session only for an online
+/// device. On macOS the window was always shorter than this gate's first
+/// upgrade took to arrive; on hosted x86_64 Linux the first upgrade landed in
+/// it in 3 of 3 runs (task row M4-51), so the gate raced its own fixture.
+async fn wait_data_attached(cluster: &ProductionCluster, session_id: &str) -> Result<()> {
+    let deadline = Instant::now() + OWNER_WAIT;
+    loop {
+        if let Ok(snapshot) = owner_snapshot(cluster).await
+            && let Ok(session) = session_of(&snapshot, session_id)
+            && session.data_queue_capacity.is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(
+                "the owner never reported this device session's data carrier attached".into(),
             ));
         }
         sleep(POLL).await;
@@ -1413,6 +1453,7 @@ async fn exercise(
         evidence.epoch_before = epoch;
         evidence.session_id_before = owner_session_id;
     }
+    wait_data_attached(cluster, session_id).await?;
     let owner_addr = cluster.relay("relay-a")?.consumer_addr()?;
     let ca = harness.pki.server_ca.certificate_der.clone();
     let token = harness.oidc.issue_with(
@@ -1784,6 +1825,7 @@ async fn exercise(
                 .into(),
         ));
     }
+    wait_data_attached(cluster, &replacement_session_id).await?;
 
     // **The bytes the kill left behind, sampled before any 9P traffic reaches
     // the replacement process.**  Whatever state they are in, the restart may

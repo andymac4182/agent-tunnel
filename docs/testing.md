@@ -961,6 +961,15 @@ a real device connector and real sockets. Its evidence struct is payload-free,
 its validator is one array of named rules, and a single-mutation unit test
 requires every one of those rules to notice a field weakened on its own.
 
+**Case (s), a live session across its grant deadline (M4-22).** After the read,
+listing, flush, fid-reuse and mutation cases, the same attached session is held
+idle for 12 s, more than two whole grant windows, while the owner's snapshot is
+polled. Three rules require the owner's own monotonic clock to pass the stream's
+initial admission deadline, at least one later admission deadline to be
+confirmed during the hold, and a `Tgetattr` afterwards to be answered. With the
+connector's refresh guards reverted to omit the filesystem operation, the gate
+fails with the session closed 1008 where a reply was expected.
+
 **What the gate must observe, and where each rule comes from.** The
 authorization matrix of
 [filesystem-api.md](filesystem-api.md#confinement-and-capability-model) is
@@ -1909,10 +1918,10 @@ giving it a close code would still be a fix without evidence. See M4-35.
 ### Implementation gate 11: a 9P session across a failed data socket's replacement (`verify-m4-fs-data-recovery`)
 
 The gate is `verify-m4-fs-data-recovery`, implemented in
-`crates/tunnel-test-harness/src/production_cluster/fs_data_recovery.rs` and run
-by hand. It is deliberately **not** registered in
-[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh): it is red,
-and what it reproduces is filed as **M4-29**. It runs on the same real
+`crates/tunnel-test-harness/src/production_cluster/fs_data_recovery.rs` and
+**registered** in [`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh)
+since M4-29 was fixed; until then it was run by hand because it was red. It
+runs on the same real
 three-relay production cluster, the same authoritative Redis catalog and the
 same consumer WSS sockets, on its own seeded `data-recovery` export.
 
@@ -2001,6 +2010,29 @@ counted from the stream table's length so the two are orthogonal. And
 `stream_not_terminal` is new, because a present-but-terminal stream satisfies
 every other ordered-state conjunct; on a mode B run it reads **true**, which is
 what rules a dead stream out as that mode's explanation.
+
+**What mode B was, and what closed it (M4-29).** Measured with temporary
+instrumentation, not inferred: the consumer read the held reply while the owner
+had **no active data carrier**, so the owner could not queue the WINDOW_UPDATE
+that read released and left the credit owed; a consumer read was the only
+event that ever advertised it, and the connector's next `Rread` was parked five
+bytes short of credit while the consumer waited for exactly that reply. The
+owner now pays owed credit when recovery activates its successor and on every
+actor tick. Fixing it unmasked an instrument race the gate had predicted in its
+own comment: the owner's `rotation_recovery_reason` is live state that clears
+when the episode closes, and a working recovery closes inside one poll. The
+owner now latches `last_activated_recovery_reason` into its session snapshot,
+the gate reads either, and a rejected run prints its payload-free evidence so a
+conjunctive rule can be attributed. Mode A was not reproduced at the fixing
+base; it reappeared once mode B was fixed and is **M4-48**: the connector's
+retained replay (candidate data socket) overtook its own snapshot (control
+socket), and the relay refused a frame it could not yet classify. On hosted
+x86_64 Linux the gate then exposed two more: the connector flushed recovery-
+window credit into its closed recovery stand-in and dropped it at activation
+(**M4-50**), and credit the owner had queued on the dead socket was never
+reissued (**M4-52**). With all four fixed the gate is green on both hosts and
+runs in the `m4-acceptance` CI job. When it fails it prints the connector's
+terminal error and the owner's session terminal reasons, both payload-free.
 
 ### Shared dataset and native semantics
 

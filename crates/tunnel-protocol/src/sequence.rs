@@ -1395,13 +1395,17 @@ impl StreamState {
                 received: local.recv_contiguous,
             });
         }
-        if remote.receive_credit < local.send_credit {
-            return Err(SequenceError::RecoveryCreditConflict {
-                direction,
-                local: local.send_credit,
-                peer: remote.receive_credit,
-            });
-        }
+        // A peer snapshot whose advertised receive credit trails the send
+        // credit this side already holds is **not** a conflict (task row
+        // M4-50, review follow-up). Send credit only ever comes from the
+        // peer's own WINDOW_UPDATEs, which are absolute and monotonic, and an
+        // update rides the data socket while the snapshot rides control, so an
+        // update the peer issued after taking its snapshot can arrive first.
+        // The snapshot is then merely older than credit the peer really
+        // granted; nothing here adopts the lower figure. What the monotonic
+        // rules do forbid is refused below: a peer claiming more send credit
+        // than this side ever granted, and (in `validate_snapshot_invariants`)
+        // a snapshot that sent or received beyond its own credit.
         if local.receive_credit < remote.send_credit {
             return Err(SequenceError::RecoveryCreditConflict {
                 direction,
@@ -2304,6 +2308,33 @@ mod tests {
                 .expect("peer replay range"),
             SequenceRange::new(1, 2).expect("range")
         );
+    }
+
+    /// M4-50 review follow-up: a WINDOW_UPDATE the peer issued after its
+    /// recovery snapshot can overtake the snapshot (data socket versus
+    /// control), so this side holds more send credit than the snapshot
+    /// advertises. That is a stale snapshot, not a conflict; before this it
+    /// failed the recovery as `RecoveryCreditConflict`
+    /// (`RECOVERY_READY_CONFLICT` on the relay).
+    #[test]
+    fn recovery_tolerates_a_peer_snapshot_overtaken_by_its_own_credit_update() {
+        let mut local = StreamState::new(7, 16).expect("valid stream");
+        let stale = local.snapshot();
+        local
+            .apply_window_update(Direction::RelayToConnector, 32)
+            .expect("the peer's later update");
+        assert!(
+            local.reconcile(&stale).is_ok(),
+            "credit the peer granted after its snapshot is not a conflict"
+        );
+        // The forbidden direction is still refused: a peer claiming send
+        // credit this side never granted.
+        let mut greedy = local.snapshot();
+        greedy.directions[Direction::RelayToConnector.index()].send_credit = 64;
+        assert!(matches!(
+            local.reconcile(&greedy),
+            Err(SequenceError::RecoveryCreditConflict { .. })
+        ));
     }
 
     #[test]

@@ -133,14 +133,24 @@ const CONTROL_CLOSED_REASON: &str = "CONTROL_CLOSED";
 ///
 /// Named for the same reason as `CONTROL_CLOSED_REASON` and used with more
 /// care, because **this string does not by itself mean the device went away**.
-/// `queue_data` returns the same failure for two unrelated events: the
+/// `queue_data` used to return the same failure for two unrelated events: the
 /// session's own queue budget refused the bytes, which is the *relay*
 /// declining to buffer more while the device is perfectly healthy; and the
 /// carrier's receiver is gone, which is the device's data socket having
-/// ended. Only the second is a backend that went away, and `close_session`
+/// ended. Since M4-37 it says which (`QueueRefusal`), and the flow-control
+/// sites close with this reason only for `QueueRefusal::Closed`; a
+/// backpressure refusal closes as `FLOW_CONTROL_UNDELIVERABLE`. Only the
+/// second event is a backend that went away, and `close_session`
 /// separates them by asking the sender directly rather than by reading this
 /// string. See M4-35.
 const REVERSE_CHANNEL_UNAVAILABLE_REASON: &str = "REVERSE_CHANNEL_UNAVAILABLE";
+/// Typed session close reason when a relay flow-control frame (`ACK`,
+/// `WINDOW_UPDATE`, or the `RESET` answering a connector `RESET`) cannot enter
+/// a **live** data carrier's queue even from the reserved capacity: the relay's
+/// own backpressure, not a lost device.  Distinct from
+/// `REVERSE_CHANNEL_UNAVAILABLE`, which at those sites now means only that the
+/// carrier's receiver is gone (task row M4-37).
+const FLOW_CONTROL_UNDELIVERABLE: &str = "FLOW_CONTROL_UNDELIVERABLE";
 /// Typed session close reason when a CANCEL for a pending operation cannot
 /// enter the bounded control queue.  docs/protocol.md: failure to deliver a
 /// cancellation fences the session (EC-038).
@@ -1113,9 +1123,18 @@ fn data_occupancy(sender: &mpsc::Sender<DataOutbound>) -> ChannelOccupancy {
 ///
 /// A rotation enqueues two control messages back to back (`RECOVERY_BEGIN`
 /// plus `RECOVERY_CLOSED`); a cancellation and a revocation close each need
-/// one.  Four slots of the 32 KiB control bound therefore cover rotation,
+/// one.  Four slots of the 32 KiB control bound cover rotation,
 /// cancellation and revocation simultaneously while data is saturated, with
 /// the fourth left for a control reply.
+///
+/// **Not quite four whole slots any more (M4-37).** Relay flow-control frames
+/// on the data carrier -- `ACK`, `WINDOW_UPDATE` and the answering `RESET` --
+/// are charged against the full budget, as control is, so they may occupy
+/// part of this reservation: at most one data channel's worth of header-only
+/// frames (`max_queue_messages` slots of 64 bytes, 8 KiB at the default 128),
+/// released as the socket task takes each one. The guarantee is therefore
+/// the reservation less that bound, still more than three full control
+/// messages.
 pub(crate) const RESERVED_CONTROL_SLOTS: usize = 4;
 
 /// Bytes of the shared session budget reserved for control messages:
@@ -1533,6 +1552,12 @@ struct M2Stream {
     /// being treated as unsolicited (`INVALID_SEQUENCE`).  Any further record
     /// is still a protocol failure.
     orphaned_response_records: usize,
+    /// This stream's whole connector-to-relay receive credit must be
+    /// advertised again on the active carrier: set when a retained recovery
+    /// activates (the WINDOW_UPDATE that last carried it may have died with
+    /// the old socket, M4-52), cleared only once the reissue is queued, and
+    /// retried from the actor tick until then.
+    credit_reissue_pending: bool,
     /// Late response records discarded through the orphan allowance.
     late_response_records: u64,
     send_bytes: usize,
@@ -1807,6 +1832,12 @@ struct RecoveryRuntime {
     ready_sent: [bool; 2],
     deferred_frames: VecDeque<(CarrierKey, Frame, usize)>,
     deferred_bytes: usize,
+    /// Candidate DATA/FIN/RESET that arrived before the connector's
+    /// connector-to-relay `RESUMED` snapshot, and so could not yet be told
+    /// apart as in-range replay or a premature new write (task row M4-48).
+    /// Held, charged and bounded with `deferred_frames`, and classified the
+    /// moment that snapshot arrives.
+    unclassified_frames: VecDeque<(CarrierKey, Frame, usize)>,
     activated: bool,
     /// Candidate-loss retries are scheduled by the relay coordinator.  The
     /// client receives the authenticated RECOVERY_BEGIN immediately when this
@@ -1860,6 +1891,12 @@ struct DeviceSession {
     last_rotation: Instant,
     rotations_completed: u64,
     total_replayed_frames: u64,
+    /// Why the most recent retained recovery of this session was entered,
+    /// latched when that recovery **activated** its successor carrier.  The
+    /// rotation machine's own reason is live state cleared with the episode,
+    /// so an episode shorter than a diagnostic poll would otherwise leave no
+    /// record of having happened at all (M4-29).
+    last_activated_recovery_reason: Option<&'static str>,
     queued_bytes: usize,
     queue_budget: QueueBudget,
     last_lease_renewal: Instant,
@@ -4088,6 +4125,7 @@ impl RelayActor {
                 last_rotation: Instant::now(),
                 rotations_completed: 0,
                 total_replayed_frames: 0,
+                last_activated_recovery_reason: None,
                 queued_bytes: 0,
                 queue_budget: queue_budget.clone(),
                 last_lease_renewal: Instant::now(),
@@ -5031,6 +5069,7 @@ impl RelayActor {
                 response_bytes: Vec::new(),
                 response_records: VecDeque::new(),
                 orphaned_response_records: 0,
+                credit_reissue_pending: false,
                 late_response_records: 0,
                 send_bytes: 0,
                 receive_bytes: 0,
@@ -7246,6 +7285,7 @@ impl RelayActor {
                 ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
+                unclassified_frames: VecDeque::new(),
                 activated: false,
                 retry_not_before_ms: None,
                 retry_failed_connection_id: None,
@@ -7582,6 +7622,7 @@ impl RelayActor {
                 ready_sent: [false, false],
                 deferred_frames: VecDeque::new(),
                 deferred_bytes: 0,
+                unclassified_frames: VecDeque::new(),
                 activated: false,
                 retry_not_before_ms: None,
                 retry_failed_connection_id: None,
@@ -9597,6 +9638,13 @@ impl RelayActor {
             recovery.remote_ready = [false, false];
             recovery.local_plans.clear();
             recovery.ready_sent = [false, false];
+            // Frames held for an earlier attempt's snapshot arrived on a
+            // candidate that attempt has released; return their charge.
+            for (_, frame, charged) in std::mem::take(&mut recovery.unclassified_frames) {
+                if let Some(stream) = session.streams.get_mut(&frame.stream_id) {
+                    release_m2_bytes(&session.queue_budget, stream, charged);
+                }
+            }
             rotation.last_message_id = messages[1].0.clone();
             rotation.snapshot_id = roster.snapshot_id;
         }
@@ -9819,6 +9867,9 @@ impl RelayActor {
                 {
                     recovery.remote_snapshots[index] = entries;
                     recovery.snapshot_reply_ids[index] = Some(reply_id);
+                }
+                if resumed.direction == Direction::ConnectorToRelay {
+                    self.classify_unclassified_recovery_frames(key).await;
                 }
                 let snapshot_ready = self.session_for(key).is_some_and(|session| {
                     session
@@ -10071,6 +10122,13 @@ impl RelayActor {
                 return;
             }
             recovery.activated = true;
+            // Latched before `reconcile_validated` below, which closes the
+            // episode and clears the machine's own live reason.
+            session.last_activated_recovery_reason = rotation
+                .state
+                .status()
+                .recovery_reason
+                .map(runtime::recovery_reason_name);
             deferred = std::mem::take(&mut recovery.deferred_frames);
             recovery.deferred_bytes = 0;
             for (stream_id, stream) in &mut session.streams {
@@ -10143,6 +10201,55 @@ impl RelayActor {
             self.inbound_m2_stream_data(carrier, frame, false).await;
         }
         self.flush_recovered_records(key);
+        // A consumer read taken while no carrier was active could not
+        // advertise the credit it released (M4-29), and an update queued on
+        // the carrier that died was lost with it (M4-52): reissue each live
+        // stream's whole credit, owed debt included, on the successor, or the
+        // connector's next write waits for it forever.
+        self.reissue_receive_credit_after_recovery(key);
+    }
+
+    /// Re-run every candidate frame held for the connector's
+    /// connector-to-relay snapshot through the ordinary receive path, in
+    /// arrival order, now that the snapshot can classify it (M4-48).  Each
+    /// frame's hold charge is returned first, because the receive path
+    /// charges it again.
+    async fn classify_unclassified_recovery_frames(&mut self, key: &SessionKey) {
+        let held = {
+            let Some(session) = self.session_mut(key) else {
+                return;
+            };
+            let Some(recovery) = session
+                .rotation
+                .as_mut()
+                .and_then(|rotation| rotation.recovery.as_mut())
+            else {
+                return;
+            };
+            let held = std::mem::take(&mut recovery.unclassified_frames);
+            for (_, frame, charged) in &held {
+                if let Some(stream) = session.streams.get_mut(&frame.stream_id) {
+                    release_m2_bytes(&session.queue_budget, stream, *charged);
+                }
+            }
+            held
+        };
+        for (carrier, frame, _) in held {
+            // Held frames arrived on a recovery candidate. Re-drive them as
+            // candidate frames only while that carrier still is the
+            // candidate; a frame from a candidate since released is stale and
+            // is dropped, as a late frame from a closed carrier would be.
+            let still_candidate = self.session_for(key).is_some_and(|session| {
+                session
+                    .rotation
+                    .as_ref()
+                    .and_then(|rotation| rotation.candidate.as_ref())
+                    .is_some_and(|candidate| candidate.context == carrier.context())
+            });
+            if still_candidate {
+                self.inbound_m2_stream_data(carrier, frame, true).await;
+            }
+        }
     }
 
     fn flush_recovered_records(&mut self, key: &SessionKey) {
@@ -11751,14 +11858,17 @@ impl RelayActor {
                     self.protocol_failure(&key, "FRAME_LIMIT").await;
                     return;
                 };
-                if queue_data(&data_tx, &queue_budget, ack).is_err() {
+                if let Err(refusal) = queue_flow_control(&data_tx, &queue_budget, ack) {
                     if let ResponseFrameUpdate::Complete(_, response) = update {
+                        // The consumer is told the same thing the device is:
+                        // a dead carrier, or the relay's own backpressure
+                        // (M4-37 review follow-up).
                         let _ = response.send(EchoOutcome::Failure {
-                            code: "REVERSE_CHANNEL_UNAVAILABLE",
+                            code: refusal.flow_control_close_reason(),
                             execution: "unknown",
                         });
                     }
-                    self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
+                    self.protocol_failure(&key, refusal.flow_control_close_reason())
                         .await;
                     return;
                 }
@@ -11965,6 +12075,59 @@ impl RelayActor {
                             && recovery.ready_sent != [true, true]
                     })
             {
+                // Replay rides the candidate data socket and the connector's
+                // snapshot rides the control socket, so nothing orders them:
+                // the connector queues its retained replay when the relay's
+                // SNAPSHOT arrives, and that replay can reach this relay
+                // before the connector's own RESUMED does.  Until it has, an
+                // in-range replay frame cannot be told from a premature new
+                // write, and refusing it fenced the whole session as
+                // RECOVERY_QUEUE_LIMIT (task row M4-48, measured: sequence 11
+                // of a two-frame replay, `remote_snapshots` still empty,
+                // `ready_sent == [false, false]`).  docs/protocol.md requires
+                // in-range replay to "remain processable before activation",
+                // so such a frame is held, bounded and charged, and
+                // classified when the snapshot arrives.  A frame the snapshot
+                // then shows to be beyond the fence is refused exactly as
+                // before.
+                let snapshot_pending = session
+                    .rotation
+                    .as_ref()
+                    .and_then(|rotation| rotation.recovery.as_ref())
+                    .is_some_and(|recovery| {
+                        recovery.snapshot_reply_ids[direction_index(Direction::ConnectorToRelay)]
+                            .is_none()
+                    });
+                if snapshot_pending {
+                    let queue_budget = session.queue_budget.clone();
+                    let input_bytes = frame.payload.len();
+                    let held_available = session
+                        .rotation
+                        .as_ref()
+                        .and_then(|rotation| rotation.recovery.as_ref())
+                        .is_some_and(|recovery| {
+                            recovery
+                                .deferred_frames
+                                .len()
+                                .saturating_add(recovery.unclassified_frames.len())
+                                < deferred_limit
+                        });
+                    let Some(stream) = session.streams.get_mut(&frame.stream_id) else {
+                        return;
+                    };
+                    if held_available && reserve_m2_bytes(&queue_budget, stream, input_bytes) {
+                        if let Some(rotation) = session.rotation.as_mut()
+                            && let Some(recovery) = rotation.recovery.as_mut()
+                        {
+                            recovery.unclassified_frames.push_back((
+                                carrier.clone(),
+                                frame,
+                                input_bytes,
+                            ));
+                        }
+                        return;
+                    }
+                }
                 deferred_rejected = true;
                 break 'data;
             }
@@ -12441,23 +12604,26 @@ impl RelayActor {
             }
             session.total_replayed_frames = session.total_replayed_frames.saturating_add(1);
         }
+        // ACK, WINDOW_UPDATE and the answering RESET are flow control: they
+        // draw on the reserved capacity, and a refusal is fenced under the
+        // reason that says which of the three events it was (M4-37).
         if let Some((data_tx, budget, bytes)) = queue
-            && queue_data(&data_tx, &budget, bytes).is_err()
+            && let Err(refusal) = queue_flow_control(&data_tx, &budget, bytes)
         {
-            self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
+            self.protocol_failure(&key, refusal.flow_control_close_reason())
                 .await;
             return;
         }
         if let Some((data_tx, budget, bytes)) = window_queue
-            && queue_data(&data_tx, &budget, bytes).is_err()
+            && let Err(refusal) = queue_flow_control(&data_tx, &budget, bytes)
         {
-            self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
+            self.protocol_failure(&key, refusal.flow_control_close_reason())
                 .await;
             return;
         }
         if let Some((data_tx, budget, bytes)) = reset_queue {
-            if queue_data(&data_tx, &budget, bytes).is_err() {
-                self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
+            if let Err(refusal) = queue_flow_control(&data_tx, &budget, bytes) {
+                self.protocol_failure(&key, refusal.flow_control_close_reason())
                     .await;
                 return;
             }
@@ -12630,6 +12796,9 @@ impl RelayActor {
                 self.begin_rotation_quiesce(&key);
             }
             self.retry_failed_terminals(&key);
+            // Credit a refused WINDOW_UPDATE left owed is otherwise paid only
+            // by the next consumer read, which may never come (M4-29).
+            self.redrive_owed_http_credit(&key);
             let terminal_fin_failure_expired = self.session_for(&key).is_some_and(|session| {
                 session
                     .terminal_fin_failure_deadline
@@ -13380,7 +13549,32 @@ impl RelayActor {
                 .is_some_and(|session| session.profile.supports_rotation())
             && !self.begin_recovery_after_loss(&key, &carrier.connection_id)
         {
-            self.close_session(&key, "RECOVERY_START_FAILED").await;
+            // Retained recovery is coordinated over the control socket, so it
+            // cannot start once that socket is gone -- and a control sender
+            // that is closed means the socket task holding its receiver has
+            // finished. The device's transport has then ended on **both**
+            // sockets, which is `disconnect_control`'s event reached in the
+            // other order: close it as that, so an ingress reports the backend
+            // that went away (task row M4-49, a fourth teardown ordering first
+            // seen on hosted Linux, where the data socket's loss is processed
+            // before the control socket's). Any other refusal to start
+            // recovery keeps its own reason.
+            let control_gone = self
+                .session_for(&key)
+                .is_some_and(|session| session.control_tx.is_closed());
+            let reason = if control_gone {
+                CONTROL_CLOSED_REASON
+            } else {
+                "RECOVERY_START_FAILED"
+            };
+            tracing::info!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                control_gone,
+                stage = "recovery_start_failed",
+            );
+            self.close_session(&key, reason).await;
         }
         if recovery_candidate_lost
             && self
@@ -13968,6 +14162,7 @@ impl RelayActor {
                 rotation_started_at_ms,
                 rotation_deadline_ms,
                 rotation_recovery_reason,
+                last_activated_recovery_reason: session.last_activated_recovery_reason,
                 rotation_deadline_forced_retirement,
                 rotation_connector_retirement_missing,
                 rotation_diagnostics,
@@ -14320,25 +14515,98 @@ fn queue_control(
     Ok(())
 }
 
+/// Why a frame could not be put on a data carrier's bounded queue.
+///
+/// Three different events, and only one of them is the device going away
+/// (task row M4-37).  Before this they were one bare `Err(())`, and every
+/// flow-control call site tore the whole device session down as
+/// `REVERSE_CHANNEL_UNAVAILABLE` for all three -- so the relay fenced a
+/// healthy device for backpressure it had applied itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueRefusal {
+    /// The session's byte budget refused the charge: the **relay** declining
+    /// to buffer more.  The carrier may be perfectly healthy.
+    Budget,
+    /// The carrier's bounded channel had no free slot: its writer is behind.
+    /// Also backpressure; the carrier may be perfectly healthy.
+    Full,
+    /// The carrier's receiver is gone: the socket task that owned it has
+    /// finished, so the device's data transport is provably gone.
+    Closed,
+}
+
+impl QueueRefusal {
+    /// The session close reason a flow-control frame refused this way earns.
+    ///
+    /// `REVERSE_CHANNEL_UNAVAILABLE` is kept for exactly the event its name
+    /// states.  Backpressure that even the reserved capacity cannot absorb is
+    /// fenced under its own typed reason, following `CANCEL_UNDELIVERABLE`'s
+    /// precedent in docs/protocol.md: a refusal that cannot be dropped safely
+    /// is surfaced, never discarded, and never dressed as a dead device.
+    const fn flow_control_close_reason(self) -> &'static str {
+        match self {
+            Self::Closed => REVERSE_CHANNEL_UNAVAILABLE_REASON,
+            Self::Budget | Self::Full => FLOW_CONTROL_UNDELIVERABLE,
+        }
+    }
+}
+
 fn queue_data(
     sender: &mpsc::Sender<DataOutbound>,
     budget: &QueueBudget,
     bytes: Vec<u8>,
-) -> Result<(), ()> {
-    let length = bytes.len();
-    if !budget.reserve_data(length) {
+) -> Result<(), QueueRefusal> {
+    if !budget.reserve_data(bytes.len()) {
         budget.pressure().record_data_refusal();
-        return Err(());
+        return Err(QueueRefusal::Budget);
     }
-    if sender
-        .try_send(DataOutbound::Binary(QueuedBytes::new(
-            bytes,
-            budget.clone(),
-        )))
-        .is_err()
-    {
+    enqueue_data(sender, budget, bytes)
+}
+
+/// Queue a relay **flow-control** frame -- an `ACK`, a `WINDOW_UPDATE`, or the
+/// `RESET` that answers a connector's `RESET` -- on a data carrier.
+///
+/// docs/protocol.md, "Flow control and fairness": "Pausing data admission
+/// during drain must not pause reserved bounded capacity for ACKs,
+/// cancellation and rotation control."  These frames are charged as control
+/// is, up to the full `max_queue_bytes`, rather than to the data lane, which
+/// the relay's own buffering can saturate while the device is healthy.  They
+/// are what *releases* that pressure: refusing an ACK because the data lane
+/// is full turned backpressure into a fence (task row M4-37).
+///
+/// The cost to the control reservation is bounded and small: at most one
+/// data channel's worth of slots, each holding one fixed-size 64-byte
+/// header-only frame (8 KiB at the default 128 slots), released as the socket
+/// task takes it. See `RESERVED_CONTROL_SLOTS`.
+fn queue_flow_control(
+    sender: &mpsc::Sender<DataOutbound>,
+    budget: &QueueBudget,
+    bytes: Vec<u8>,
+) -> Result<(), QueueRefusal> {
+    if !budget.reserve_control(bytes.len()) {
         budget.pressure().record_data_refusal();
-        return Err(());
+        return Err(QueueRefusal::Budget);
+    }
+    enqueue_data(sender, budget, bytes)
+}
+
+/// Put already-charged bytes on a data carrier's bounded channel, saying
+/// which refusal it was when it is refused.  A refused item's charge is
+/// returned by the `QueuedBytes` the channel hands back and drops.
+fn enqueue_data(
+    sender: &mpsc::Sender<DataOutbound>,
+    budget: &QueueBudget,
+    bytes: Vec<u8>,
+) -> Result<(), QueueRefusal> {
+    if let Err(error) = sender.try_send(DataOutbound::Binary(QueuedBytes::new(
+        bytes,
+        budget.clone(),
+    ))) {
+        budget.pressure().record_data_refusal();
+        return Err(match error {
+            mpsc::error::TrySendError::Full(_) => QueueRefusal::Full,
+            mpsc::error::TrySendError::Closed(_) => QueueRefusal::Closed,
+        });
     }
     let pressure = budget.pressure();
     pressure.record_data_enqueue();
@@ -15016,6 +15284,7 @@ mod stream_identity_tests {
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
                     orphaned_response_records: 0,
+                    credit_reissue_pending: false,
                     late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
@@ -15173,6 +15442,7 @@ mod stream_identity_tests {
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
                     orphaned_response_records: 0,
+                    credit_reissue_pending: false,
                     late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
@@ -15700,6 +15970,7 @@ mod stream_identity_tests {
             last_rotation: std::time::Instant::now(),
             rotations_completed: 0,
             total_replayed_frames: 0,
+            last_activated_recovery_reason: None,
             queued_bytes: 0,
             queue_budget: queue_budget.clone(),
             last_lease_renewal: std::time::Instant::now(),
@@ -17572,6 +17843,7 @@ mod stream_identity_tests {
                     last_rotation: std::time::Instant::now(),
                     rotations_completed: 0,
                     total_replayed_frames: 0,
+                    last_activated_recovery_reason: None,
                     queued_bytes: 0,
                     queue_budget: queue_budget.clone(),
                     last_lease_renewal: std::time::Instant::now(),
@@ -18767,6 +19039,302 @@ mod stream_identity_tests {
         );
     }
 
+    /// Task row M4-29: receive credit a consumer read released while the
+    /// session had no active data carrier -- a failed data socket awaiting its
+    /// retained recovery -- must still reach the connector once a carrier is
+    /// writable again.  Before the fix only the *next* read advertised it, so
+    /// a connector whose next write needed that credit parked forever while
+    /// the consumer waited for the reply the write carried.
+    #[tokio::test]
+    async fn fs_credit_released_without_a_carrier_is_advertised_once_one_returns() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(641);
+        let device_id = Uuid::from_u128(642);
+        let principal_id = Uuid::from_u128(643);
+        let service_id = Uuid::from_u128(644);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(645),
+            spki_fingerprint: "fs-owed-credit-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from([crate::FS_SESSION_OPERATION.to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "fs-owed-credit".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "fs-owed-credit-data".to_owned(),
+            ),
+            tx: data_tx.clone(),
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_consumer_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            now + Duration::minutes(1),
+            None,
+            super::StreamAdmissionReply::Fs {
+                response: open_tx,
+                capabilities: "read,list".to_owned(),
+            },
+        );
+        let registration = open_rx
+            .await
+            .expect("open response")
+            .expect("fs stream admitted");
+        if let ControlOutbound::Text(mut text) = control.rx.try_recv().expect("OPEN queued") {
+            text.release();
+        }
+        let stream_id = registration.base.stream_id;
+        let operation_id = registration.base.operation_id.clone();
+        // A 9P reply the device sent before its data socket failed, received
+        // and charged, waiting for the consumer.
+        const REPLY: &[u8] = b"an-rread-held-across-a-failed-data-socket";
+        let credit_before = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            let stream = session
+                .streams
+                .get_mut(&stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            assert!(
+                stream
+                    .http
+                    .as_mut()
+                    .expect("an fs stream carries raw bidirectional state")
+                    .accept_data(REPLY, super::wire::M2_INITIAL_WINDOW_BYTES)
+            );
+            assert!(session.queue_budget.reserve_data(REPLY.len()));
+            stream.budget_bytes = stream.budget_bytes.saturating_add(REPLY.len());
+            let credit = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit();
+            // The data socket failed: no active carrier until recovery
+            // activates its successor.
+            session.data_tx = None;
+            session.active_carrier = None;
+            credit
+        };
+        let (read_tx, read_rx) = oneshot::channel();
+        actor.read_http_stream(&key, stream_id, &operation_id, read_tx);
+        assert_eq!(
+            read_rx.await.expect("read answered"),
+            super::HttpRead::Data(REPLY.to_vec()),
+            "the consumer receives the held reply"
+        );
+        let owed = |actor: &RelayActor| {
+            actor.sessions[&key.scope()].streams[&stream_id]
+                .http
+                .as_ref()
+                .expect("fs state")
+                .credit_owed()
+        };
+        assert_eq!(
+            owed(&actor),
+            REPLY.len() as u64,
+            "with no carrier the released credit can only be owed"
+        );
+        assert!(data_rx.try_recv().is_err(), "nothing was queued anywhere");
+
+        // Recovery installs the successor carrier.
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: CarrierContext::new(
+                    key.session_id.clone(),
+                    key.epoch,
+                    1,
+                    "fs-owed-credit-data".to_owned(),
+                ),
+                tx: data_tx,
+            });
+        }
+        actor.tick().await;
+        let mut advertised = None;
+        while let Ok(outbound) = data_rx.try_recv() {
+            if let DataOutbound::Binary(mut bytes) = outbound {
+                let frame = Frame::decode(bytes.as_slice()).expect("frame decodes");
+                bytes.release();
+                if frame.kind == FrameKind::WindowUpdate && frame.stream_id == stream_id {
+                    advertised = Some(frame.window);
+                }
+            }
+        }
+        assert_eq!(
+            advertised,
+            Some(credit_before + REPLY.len() as u64),
+            "the owed credit must reach the connector without another read"
+        );
+        assert_eq!(owed(&actor), 0, "and the debt is settled");
+        assert!(actor.sessions.contains_key(&key.scope()));
+        drop(registration);
+    }
+
+    /// Task row M4-52, measured on hosted x86_64 Linux: a WINDOW_UPDATE the
+    /// owner queued on the data socket that then died was recorded as
+    /// advertised and lost with the socket; recovery reconciles cursors but
+    /// not credit, so the connector parked a 65,536-byte `Rread` for credit
+    /// the owner believed it had granted. Activation must reissue each live
+    /// stream's whole credit on the successor, not only a debt it knows of.
+    #[tokio::test]
+    async fn recovery_activation_reissues_credit_a_dead_carrier_swallowed() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_521, "m4-52-lost-credit").await;
+        let stream_id = registration.stream_id;
+        let granted = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let stream = session.streams.get_mut(&stream_id).expect("stream");
+            let current = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit();
+            // An update the owner queued and recorded, then lost with the
+            // socket: the sequence says advertised, the connector never saw it.
+            let lost =
+                Frame::window_update(key.epoch, carrier.generation, stream_id, current + 4_096);
+            stream
+                .sequence
+                .send_frame(Direction::RelayToConnector, &lost)
+                .expect("recorded as advertised");
+            current + 4_096
+        };
+        while data_rx.try_recv().is_ok() {}
+        actor.reissue_receive_credit_after_recovery(&key);
+        let mut reissued = None;
+        while let Ok(outbound) = data_rx.try_recv() {
+            if let DataOutbound::Binary(mut bytes) = outbound {
+                let frame = Frame::decode(bytes.as_slice()).expect("frame decodes");
+                bytes.release();
+                if frame.kind == FrameKind::WindowUpdate && frame.stream_id == stream_id {
+                    reissued = Some(frame.window);
+                }
+            }
+        }
+        assert_eq!(
+            reissued,
+            Some(granted),
+            "the successor carries the whole advertised credit again"
+        );
+        drop(registration);
+    }
+
+    /// Review of M4-52: the reissue at activation competes for the
+    /// successor's bounded channel with the re-driven held frames, and a
+    /// refusal must not lose it. With the channel full, nothing is queued and
+    /// the stream stays marked; once room returns the actor tick delivers
+    /// the whole credit. On an echo stream, which has no read path of its own
+    /// to pay a debt later.
+    #[tokio::test]
+    async fn a_refused_recovery_credit_reissue_is_retried_from_the_tick() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_531, "m4-52-refused-reissue").await;
+        let stream_id = registration.stream_id;
+        let granted = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let stream = session.streams.get_mut(&stream_id).expect("stream");
+            let current = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit();
+            let lost =
+                Frame::window_update(key.epoch, carrier.generation, stream_id, current + 4_096);
+            stream
+                .sequence
+                .send_frame(Direction::RelayToConnector, &lost)
+                .expect("recorded as advertised");
+            current + 4_096
+        };
+        let drain = |rx: &mut mpsc::Receiver<DataOutbound>| {
+            let mut window = None;
+            while let Ok(outbound) = rx.try_recv() {
+                if let DataOutbound::Binary(mut bytes) = outbound {
+                    // The 1-byte filler items below are not frames.
+                    let frame = Frame::decode(bytes.as_slice()).ok();
+                    bytes.release();
+                    if let Some(frame) = frame
+                        && frame.kind == FrameKind::WindowUpdate
+                        && frame.stream_id == stream_id
+                    {
+                        window = Some(frame.window);
+                    }
+                }
+            }
+            window
+        };
+        drain(&mut data_rx);
+        // The successor's channel is full at activation.
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        while data_tx.capacity() > 0 {
+            assert!(budget.reserve_data(1));
+            data_tx
+                .try_send(DataOutbound::Binary(super::QueuedBytes::new(
+                    vec![0_u8; 1],
+                    budget.clone(),
+                )))
+                .expect("a free slot");
+        }
+        actor.reissue_receive_credit_after_recovery(&key);
+        assert!(
+            actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending,
+            "a refused reissue stays pending"
+        );
+        assert_eq!(drain(&mut data_rx), None, "nothing fitted");
+        // Room returns; the tick pays the reissue.
+        actor.tick().await;
+        assert_eq!(
+            drain(&mut data_rx),
+            Some(granted),
+            "the whole credit reaches the connector once the queue has room"
+        );
+        assert!(!actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending);
+        drop(registration);
+    }
+
     #[tokio::test]
     async fn close_echo_stream_reclaims_when_writer_is_missing_or_closed() {
         let now = Utc::now();
@@ -19620,6 +20188,497 @@ mod stream_identity_tests {
         drop(registration);
     }
 
+    /// An M2 echo stream opened on a live data carrier, for the M4-37 cases.
+    /// Returns the actor, its control registration, the carrier's receiver,
+    /// the carrier, the session key and the registration.
+    async fn m4_37_opened_echo_stream(
+        seed: u128,
+        label: &str,
+    ) -> (
+        RelayActor,
+        ControlRegistration,
+        mpsc::Receiver<DataOutbound>,
+        CarrierKey,
+        SessionKey,
+        super::ConsumerStreamRegistration,
+    ) {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(seed);
+        let device_id = Uuid::from_u128(seed + 1);
+        let principal_id = Uuid::from_u128(seed + 2);
+        let service_id = Uuid::from_u128(seed + 3);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(seed + 4),
+            spki_fingerprint: format!("{label}-spki"),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: label.to_owned(),
+            epoch: 1,
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: 1,
+            connection_id: format!("{label}-data"),
+        };
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.profile = super::RuntimeProfile::M2;
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: carrier.context(),
+                tx: data_tx,
+            });
+        }
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            now + Duration::minutes(1),
+            open_tx,
+        );
+        let registration = open_rx
+            .await
+            .expect("echo registration response")
+            .expect("echo stream admitted");
+        registration.claim_admission();
+        let Some(ControlOutbound::Text(mut open)) = control.rx.recv().await else {
+            panic!("echo OPEN was not queued");
+        };
+        let open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&registration.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("OPEN correlation");
+        open.release();
+        actor
+            .inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    format!("{label}-opened"),
+                    open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    registration.stream_id,
+                    registration.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            )
+            .await;
+        (actor, control, data_rx, carrier, key, registration)
+    }
+
+    /// The typed close reason a torn-down session sent its device, if any.
+    fn m4_37_session_close_code(control: &mut ControlRegistration) -> Option<String> {
+        let mut code = None;
+        while let Ok(outbound) = control.rx.try_recv() {
+            if let ControlOutbound::Text(mut text) = outbound {
+                if let Ok(ControlMessage::Rejected(rejected)) =
+                    super::wire::parse_control(text.as_bytes())
+                {
+                    code = Some(rejected.code);
+                }
+                text.release();
+            }
+        }
+        code
+    }
+
+    /// Task row M4-37, the case its acceptance names: the **budget** branch
+    /// driven with a **live** carrier.  The relay's own buffering has
+    /// saturated the data lane -- received bytes held for a slow consumer --
+    /// and the connector finishes a stream.  The relay's ACK is flow
+    /// control; protocol.md reserves capacity for exactly it
+    /// ("must not pause reserved bounded capacity for ACKs, cancellation and
+    /// rotation control").  Before the fix it was charged to the saturated
+    /// data lane, the refusal became `protocol_failure(REVERSE_CHANNEL_
+    /// UNAVAILABLE)`, and the whole device session -- every stream, every
+    /// pending call -- was torn down over backpressure the relay applied to
+    /// itself.
+    #[tokio::test]
+    async fn a_data_lane_budget_refusal_does_not_fence_a_live_device_session() {
+        let (mut actor, mut control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_371, "m4-37-budget").await;
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        let room = budget.data_limit().saturating_sub(budget.used());
+        assert!(budget.reserve_data(room), "saturate the data lane");
+        assert!(budget.data_exhausted(), "no data-lane headroom remains");
+        assert!(
+            !data_rx.is_closed(),
+            "the carrier is live: its receiver is held"
+        );
+
+        // A FIN carries no payload, so its own receive charge is zero and
+        // the only thing the saturated lane can refuse is the relay's ACK.
+        // (A RESET's reason payload is charged to the data lane on receipt
+        // and is refused as `INVALID_SEQUENCE` first -- task row M4-47.)
+        let fin = Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 0);
+        actor.inbound_m2_stream_data(carrier, fin, false).await;
+
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "backpressure the relay applied itself must not fence the device session \
+             (it closed as {close:?})"
+        );
+        assert_eq!(close, None, "no session close was sent to the device");
+        let mut kinds = Vec::new();
+        while let Ok(outbound) = data_rx.try_recv() {
+            if let DataOutbound::Binary(mut bytes) = outbound {
+                kinds.push(Frame::decode(bytes.as_slice()).expect("frame decodes").kind);
+                bytes.release();
+            }
+        }
+        assert_eq!(
+            kinds.first(),
+            Some(&FrameKind::Ack),
+            "the ACK reached the live carrier"
+        );
+        assert!(
+            budget.data_exhausted(),
+            "and they drew on the reserved capacity, not the saturated data lane"
+        );
+        budget.release(room);
+        drop(registration);
+    }
+
+    /// Task row M4-37: a flow-control frame refused because the live
+    /// carrier's bounded channel is **full** is backpressure too.  It still
+    /// fences -- an ACK cannot be dropped safely, and docs/protocol.md fences
+    /// an undeliverable CANCEL the same way -- but under its own typed reason,
+    /// never as `REVERSE_CHANNEL_UNAVAILABLE`, which an ingress may read as
+    /// the device having gone (M4-35).
+    #[tokio::test]
+    async fn a_full_live_carrier_fences_as_flow_control_undeliverable() {
+        let (mut actor, mut control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_381, "m4-37-full").await;
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        let mut filler = 0_usize;
+        // Each filler item is charged before it is queued, as `queue_data`
+        // does, so its release on drain balances.
+        while data_tx.capacity() > 0 {
+            assert!(budget.reserve_data(1));
+            data_tx
+                .try_send(DataOutbound::Binary(super::QueuedBytes::new(
+                    vec![0_u8; 1],
+                    budget.clone(),
+                )))
+                .expect("a free slot");
+            filler += 1;
+        }
+        assert!(filler > 0 && !data_rx.is_closed(), "full, and live");
+
+        let reset = Frame::reset(
+            key.epoch,
+            carrier.generation,
+            registration.stream_id,
+            1,
+            0,
+            4_002,
+        );
+        actor.inbound_m2_stream_data(carrier, reset, false).await;
+
+        assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
+        assert_eq!(
+            m4_37_session_close_code(&mut control).as_deref(),
+            Some(super::FLOW_CONTROL_UNDELIVERABLE),
+            "a full live carrier is backpressure, not a lost device"
+        );
+        while let Ok(outbound) = data_rx.try_recv() {
+            if let DataOutbound::Binary(mut bytes) = outbound {
+                bytes.release();
+            }
+        }
+        drop(registration);
+    }
+
+    /// Task row M4-37, the control: a carrier whose receiver is gone is the
+    /// one event `REVERSE_CHANNEL_UNAVAILABLE` names, and it keeps that
+    /// reason.  Green before and after the fix; it pins that the split did not
+    /// move the dead-carrier case.
+    #[tokio::test]
+    async fn a_closed_carrier_still_fences_as_reverse_channel_unavailable() {
+        let (mut actor, mut control, data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_391, "m4-37-closed").await;
+        drop(data_rx);
+
+        let reset = Frame::reset(
+            key.epoch,
+            carrier.generation,
+            registration.stream_id,
+            1,
+            0,
+            4_002,
+        );
+        actor.inbound_m2_stream_data(carrier, reset, false).await;
+
+        assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
+        assert_eq!(
+            m4_37_session_close_code(&mut control).as_deref(),
+            Some(super::REVERSE_CHANNEL_UNAVAILABLE_REASON)
+        );
+        drop(registration);
+    }
+
+    /// Task row M4-37: the three refusals are three values.
+    #[test]
+    fn queue_data_names_which_of_the_three_refusals_it_was() {
+        let budget = QueueBudget::new(262_144);
+        let (data_tx, data_rx) = mpsc::channel(1);
+        assert_eq!(super::queue_data(&data_tx, &budget, vec![0; 8]), Ok(()));
+        assert_eq!(
+            super::queue_data(&data_tx, &budget, vec![0; 8]),
+            Err(super::QueueRefusal::Full)
+        );
+        let room = budget.data_limit().saturating_sub(budget.used());
+        assert!(budget.reserve_data(room));
+        assert_eq!(
+            super::queue_data(&data_tx, &budget, vec![0; 1]),
+            Err(super::QueueRefusal::Budget)
+        );
+        budget.release(room);
+        drop(data_rx);
+        assert_eq!(
+            super::queue_data(&data_tx, &budget, vec![0; 1]),
+            Err(super::QueueRefusal::Closed)
+        );
+        assert_eq!(
+            super::QueueRefusal::Closed.flow_control_close_reason(),
+            super::REVERSE_CHANNEL_UNAVAILABLE_REASON
+        );
+        for refusal in [super::QueueRefusal::Budget, super::QueueRefusal::Full] {
+            assert_eq!(
+                refusal.flow_control_close_reason(),
+                super::FLOW_CONTROL_UNDELIVERABLE
+            );
+        }
+    }
+
+    /// Task row M4-48 (M4-29's mode A), measured before it was fixed: the
+    /// connector queues its retained replay on the recovery candidate when the
+    /// relay's SNAPSHOT arrives, and replay (data socket) can overtake the
+    /// connector's own `RESUMED` (control socket). The relay refused an
+    /// in-range replay frame it could not yet classify and fenced the session
+    /// as `RECOVERY_QUEUE_LIMIT`. It must hold the frame until the snapshot
+    /// arrives, then process it as replay -- and still refuse a frame the
+    /// snapshot shows to be a premature new write.
+    #[tokio::test]
+    async fn replay_that_overtakes_the_connector_snapshot_is_held_then_classified() {
+        let (mut actor, mut control, _data_rx, _carrier, key, registration) =
+            m4_37_opened_echo_stream(4_481, "m4-48-replay-first").await;
+        let stream_id = registration.stream_id;
+        let now_ms = super::monotonic_millis();
+        let candidate = CarrierKey {
+            session: key.clone(),
+            generation: 2,
+            connection_id: "m4-48-candidate".to_owned(),
+        };
+        let (candidate_tx, mut candidate_rx) =
+            mpsc::channel(actor.options.limits.max_queue_messages);
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            // The active data socket failed; a recovery candidate is attached
+            // and no RESUMED has arrived from the connector yet.
+            session.data_tx = None;
+            session.active_carrier = None;
+            let mut rotation = test_rotation_runtime(
+                now_ms,
+                session_attempt(&key, "owner", "m4-48", 1),
+                now_ms.saturating_add(20_000),
+            );
+            rotation.recovery = Some(test_recovery_runtime(now_ms, stream_id));
+            rotation.candidate = Some(DataCarrier {
+                context: candidate.context(),
+                tx: candidate_tx,
+            });
+            session.rotation = Some(rotation);
+        }
+        let c2r = super::direction_index(Direction::ConnectorToRelay);
+
+        // Sequence 1 of the connector's retained replay, ahead of its RESUMED.
+        actor
+            .inbound_m2_stream_data(
+                candidate.clone(),
+                Frame::data(key.epoch, 2, stream_id, 1, 0, vec![0, 0, 0, 16, 1, 2, 3, 4]),
+                true,
+            )
+            .await;
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "replay that overtook the connector's snapshot must be held, not fenced \
+             (it closed as {close:?})"
+        );
+        assert_eq!(
+            actor.sessions[&key.scope()]
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .map(|recovery| recovery.unclassified_frames.len()),
+            Some(1),
+            "held for classification"
+        );
+
+        // The connector's connector-to-relay snapshot arrives: its immutable
+        // fence covers sequence 1, so the held frame is in-range replay.
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let recovery = session
+                .rotation
+                .as_mut()
+                .and_then(|rotation| rotation.recovery.as_mut())
+                .expect("recovery");
+            recovery.snapshot_reply_ids[c2r] = Some("m4-48-resumed".to_owned());
+            recovery.remote_snapshots[c2r].insert(
+                stream_id,
+                tunnel_protocol::rotation_control::ResumeDirectionState {
+                    stream_id,
+                    last_emitted: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        actor.classify_unclassified_recovery_frames(&key).await;
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "still live ({close:?})"
+        );
+        let session = &actor.sessions[&key.scope()];
+        assert_eq!(
+            session.streams[&stream_id]
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .recv_contiguous(),
+            1,
+            "the held replay was received"
+        );
+        assert!(
+            session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .is_some_and(|recovery| recovery.unclassified_frames.is_empty())
+        );
+        let Ok(DataOutbound::Binary(mut ack)) = candidate_rx.try_recv() else {
+            panic!("the replay is acknowledged on the candidate");
+        };
+        assert_eq!(
+            Frame::decode(ack.as_slice()).expect("ack").kind,
+            FrameKind::Ack
+        );
+        ack.release();
+
+        // Control: with the snapshot known, a frame beyond its fence before
+        // READY is still an unaccounted write and is still refused.
+        actor
+            .inbound_m2_stream_data(
+                candidate,
+                Frame::data(key.epoch, 2, stream_id, 2, 0, b"premature".to_vec()),
+                true,
+            )
+            .await;
+        assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
+        assert_eq!(
+            m4_37_session_close_code(&mut control).as_deref(),
+            Some("RECOVERY_QUEUE_LIMIT")
+        );
+        drop(registration);
+    }
+
+    /// Task row M4-49: a connector that stops closes both sockets, and on
+    /// hosted Linux the relay can process the data socket's loss first. It
+    /// then tries to start retained recovery, which needs the control socket
+    /// that is also gone, and closed the session as `RECOVERY_START_FAILED` --
+    /// a reason that publishes no `DeviceGone`, so the consumer's close lost
+    /// its 1012 (`verify-m4-fs-epoch-change`, 2 of 5 hosted runs). With the
+    /// control sender closed that is the device going away, and it must
+    /// close as `CONTROL_CLOSED`.
+    #[tokio::test]
+    async fn data_loss_after_the_control_socket_ended_closes_as_control_closed() {
+        let (mut actor, control, _data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_491, "m4-49-order").await;
+        let now_ms = super::monotonic_millis();
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let attempt = RotationAttemptIdentity::new(
+                key.session_id.clone(),
+                key.epoch,
+                "owner",
+                "rotation-m4-49",
+                carrier.generation,
+                carrier.generation + 1,
+                carrier.connection_id.clone(),
+                "m4-49-next",
+            );
+            let mut rotation =
+                test_rotation_runtime(now_ms, attempt, now_ms.saturating_add(20_000));
+            rotation.attempt = None;
+            rotation.attempt_deadline_ms = None;
+            session.rotation = Some(rotation);
+        }
+        // The control socket's task has finished: its receiver is gone.
+        drop(control);
+        assert!(actor.sessions[&key.scope()].control_tx.is_closed());
+
+        actor.disconnect_data(carrier).await;
+
+        assert!(
+            !actor.sessions.contains_key(&key.scope()),
+            "the session ended"
+        );
+        let reason = actor
+            .session_terminal_events
+            .iter()
+            .rev()
+            .find(|event| event.session_id == key.session_id)
+            .map(|event| event.reason);
+        assert_eq!(
+            reason,
+            Some(super::CONTROL_CLOSED_REASON),
+            "with both sockets gone this is the device going away"
+        );
+        drop(registration);
+    }
+
     #[tokio::test]
     async fn connector_stream_forget_cannot_reclaim_failed_relay_fin() {
         let now = Utc::now();
@@ -20017,6 +21076,7 @@ mod stream_identity_tests {
             last_rotation: std::time::Instant::now(),
             rotations_completed: 0,
             total_replayed_frames: 0,
+            last_activated_recovery_reason: None,
             queued_bytes: 0,
             queue_budget,
             last_lease_renewal: std::time::Instant::now(),
@@ -20326,6 +21386,7 @@ mod stream_identity_tests {
             ready_sent: [false, false],
             deferred_frames: VecDeque::new(),
             deferred_bytes: 0,
+            unclassified_frames: VecDeque::new(),
             activated: false,
             retry_not_before_ms: None,
             retry_failed_connection_id: None,

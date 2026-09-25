@@ -215,6 +215,10 @@ pub struct RelaySessionSnapshot {
     pub rotation_deadline_ms: Option<u64>,
     /// Closed recovery reason retained by the rotation state machine.
     pub rotation_recovery_reason: Option<&'static str>,
+    /// Why the most recent retained recovery was entered, latched when it
+    /// activated its successor carrier and kept after the episode closes.
+    /// `rotation_recovery_reason` above is live and clears with the episode.
+    pub last_activated_recovery_reason: Option<&'static str>,
     /// Whether the old carrier was retired after the configured overlap
     /// deadline and therefore forced the state machine into recovery.
     pub rotation_deadline_forced_retirement: bool,
@@ -517,6 +521,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "OWNER_FENCE_MISSING",
         "STREAM_CLOSED",
         "CANCEL_UNDELIVERABLE",
+        "FLOW_CONTROL_UNDELIVERABLE",
     ];
     ALLOWED
         .iter()

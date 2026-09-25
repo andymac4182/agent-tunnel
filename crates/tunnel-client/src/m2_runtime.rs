@@ -1331,7 +1331,43 @@ struct PendingStreamForget {
     defer_reclamation: bool,
 }
 
+/// The connection id of the stand-in `active` carrier the actor holds while a
+/// retained recovery has no live data socket.  Its sender is closed from the
+/// moment it is made, so it can never carry a frame.
+const RECOVERY_PLACEHOLDER_CONNECTION_ID: &str = "recovery-placeholder";
+
+/// A stand-in active carrier for the recovery window, carrying the receive
+/// debts of the carrier it replaces so they survive to the successor (task
+/// row M4-50).
+fn recovery_placeholder(pending_controls: BTreeMap<u64, PendingCarrierControl>) -> Carrier {
+    Carrier {
+        key: CarrierKey::new(0, RECOVERY_PLACEHOLDER_CONNECTION_ID),
+        local_addr: None,
+        tx: mpsc::channel(1).0,
+        pending_controls,
+        reader_cancel: CancellationToken::new(),
+        reader: None,
+        writer: None,
+    }
+}
+
+fn is_recovery_placeholder(key: &CarrierKey) -> bool {
+    key.matches(0, RECOVERY_PLACEHOLDER_CONNECTION_ID)
+}
+
 impl PendingCarrierControl {
+    /// Fold another carrier's outstanding receive controls into this one.
+    fn absorb(&mut self, other: Self) -> Result<(), ClientError> {
+        if let Some(acknowledged) = other.acknowledged {
+            self.record_ack(acknowledged);
+        }
+        self.record_window(other.released_window_bytes)?;
+        if let Some(limit) = other.window_limit {
+            self.record_window_limit(limit);
+        }
+        Ok(())
+    }
+
     fn record_ack(&mut self, acknowledged: u64) {
         self.acknowledged = Some(
             self.acknowledged
@@ -6062,6 +6098,24 @@ impl M2Actor {
         Ok(snapshot)
     }
 
+    /// Make a recovery candidate the active carrier and return the carrier
+    /// it replaces.  Receive credit and acknowledgements released while no
+    /// data socket was live were recorded on the stand-in; they move to the
+    /// successor here so the `reissue_active_receive_controls` that follows
+    /// activation sends them, or the relay never learns of that credit (task
+    /// row M4-50, the connector's half of M4-29).
+    fn install_recovery_successor(&mut self, successor: Carrier) -> Result<Carrier, ClientError> {
+        let mut old = std::mem::replace(&mut self.active, successor);
+        for (stream_id, control) in std::mem::take(&mut old.pending_controls) {
+            self.active
+                .pending_controls
+                .entry(stream_id)
+                .or_default()
+                .absorb(control)?;
+        }
+        Ok(old)
+    }
+
     fn reissue_active_receive_controls(&mut self) -> Result<(), ClientError> {
         let snapshot = self.snapshot_receive_controls()?;
         let stream_ids = snapshot.keys().copied().collect::<Vec<_>>();
@@ -6127,6 +6181,15 @@ impl M2Actor {
         &mut self,
         key: &CarrierKey,
     ) -> Result<(), ClientError> {
+        // The recovery stand-in has no socket: its sender is closed by
+        // construction, so flushing to it is not a transport failure but a
+        // category error, and treating the refusal as fatal ended a healthy
+        // session whenever a consumer read released credit mid-recovery (task
+        // row M4-50, measured on hosted x86_64 Linux). Its debts wait on it and
+        // move to the successor when recovery activates.
+        if is_recovery_placeholder(key) {
+            return Ok(());
+        }
         let stream_ids = self
             .carrier_for_key(key)
             .map(|carrier| carrier.pending_controls.keys().copied().collect::<Vec<_>>())
@@ -8210,12 +8273,6 @@ impl M2Actor {
             .recovery
             .as_ref()
             .map(|recovery| recovery.begin.attempt_no);
-        let frozen_snapshots = self.local_resume_snapshots(&roster)?;
-        self.rotation
-            .reconcile_validated(&attempt, verdicts, self.now_ms())
-            .map_err(|error| {
-                ClientError::Protocol(format!("recovery activation rejected: {error}"))
-            })?;
         let candidate = self
             .candidate
             .take()
@@ -8228,7 +8285,7 @@ impl M2Actor {
                 "recovery candidate identity mismatch".to_owned(),
             ));
         }
-        let old = std::mem::replace(&mut self.active, candidate);
+        let old = self.install_recovery_successor(candidate)?;
         if old.reader.is_some() || old.writer.is_some() {
             let evidence = close_carrier(old).await;
             if !evidence.is_complete() {
@@ -8238,6 +8295,21 @@ impl M2Actor {
                 });
             }
         }
+        // Reissued **before** the READY snapshot is taken, and the order is
+        // load-bearing (M4-50): the relay validates READY against the credit
+        // it has already applied, and the update below travels on the data
+        // socket while READY travels on control, so either may arrive first.
+        // Taken after, a READY carrying less credit than an update the relay
+        // had already applied was refused as `RECOVERY_READY_CONFLICT`
+        // (measured on hosted Linux).  Taken after the reissue, READY carries
+        // at least what any update does.
+        self.reissue_active_receive_controls()?;
+        let frozen_snapshots = self.local_resume_snapshots(&roster)?;
+        self.rotation
+            .reconcile_validated(&attempt, verdicts, self.now_ms())
+            .map_err(|error| {
+                ClientError::Protocol(format!("recovery activation rejected: {error}"))
+            })?;
         let mut ready_messages = Vec::new();
         for direction in [Direction::RelayToConnector, Direction::ConnectorToRelay] {
             let index = direction_index(direction);
@@ -8442,18 +8514,8 @@ impl M2Actor {
             }
             evidence.insert(closed.connection_id.clone(), closed);
         }
-        let active = std::mem::replace(
-            &mut self.active,
-            Carrier {
-                key: CarrierKey::new(0, "recovery-placeholder"),
-                local_addr: None,
-                tx: mpsc::channel(1).0,
-                pending_controls: BTreeMap::new(),
-                reader_cancel: CancellationToken::new(),
-                reader: None,
-                writer: None,
-            },
-        );
+        let carried_controls = std::mem::take(&mut self.active.pending_controls);
+        let active = std::mem::replace(&mut self.active, recovery_placeholder(carried_controls));
         if active.reader.is_some() || active.writer.is_some() {
             let closed = close_carrier(active).await;
             if !closed.is_complete() {
@@ -8631,18 +8693,9 @@ impl M2Actor {
             return self.defer_candidate_abort(attempt, evidence);
         }
         if self.active.key == *key {
-            let active = std::mem::replace(
-                &mut self.active,
-                Carrier {
-                    key: CarrierKey::new(0, "recovery-placeholder"),
-                    local_addr: None,
-                    tx: mpsc::channel(1).0,
-                    pending_controls: BTreeMap::new(),
-                    reader_cancel: CancellationToken::new(),
-                    reader: None,
-                    writer: None,
-                },
-            );
+            let carried_controls = std::mem::take(&mut self.active.pending_controls);
+            let active =
+                std::mem::replace(&mut self.active, recovery_placeholder(carried_controls));
             let evidence = close_carrier(active).await;
             if !evidence.is_complete() {
                 return Err(ClientError::Transport {
@@ -9630,6 +9683,95 @@ mod tests {
                 .auth
                 .refresh_in_flight,
             "the filesystem stream must be marked in flight once its challenge queued"
+        );
+    }
+
+    /// Task row M4-50, measured on hosted x86_64 Linux with an instrumented
+    /// connector: a consumer read released receive credit while a retained
+    /// recovery had no data socket, the credit was deferred onto the
+    /// recovery stand-in, and flushing it met the stand-in's closed sender --
+    /// a `data writer` transport error that ended a healthy session (gate 11,
+    /// 10 of 10 hosted runs). The stand-in has no socket to fail; its debts
+    /// must wait, on the timer's flush too.
+    #[tokio::test]
+    async fn credit_released_during_recovery_waits_on_the_stand_in() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+        actor.streams.insert(1, stream);
+        // The data socket failed: the stand-in replaces the active carrier.
+        drop(std::mem::replace(
+            &mut actor.active,
+            recovery_placeholder(BTreeMap::new()),
+        ));
+        let key = actor.active.key.clone();
+        assert!(is_recovery_placeholder(&key));
+        actor
+            .defer_window_update(&key, 1, 64)
+            .expect("the debt is recorded");
+        actor
+            .flush_pending_carrier_controls_for_key(&key)
+            .expect("a flush to the stand-in is not a transport failure");
+        actor
+            .flush_pending_carrier_controls()
+            .expect("nor is the timer's flush of every carrier");
+        assert_eq!(
+            actor.active.pending_controls[&1].released_window_bytes, 64,
+            "the debt waits on the stand-in"
+        );
+    }
+
+    /// Task row M4-50, the other half: when recovery activates, the stand-in's
+    /// debts move to the successor and the cumulative credit is reissued
+    /// there. Before this the stand-in was dropped with its debts, so credit
+    /// released mid-recovery never reached the relay.
+    #[tokio::test]
+    async fn the_recovery_successor_inherits_and_reissues_the_stand_ins_credit() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+        actor.streams.insert(1, stream);
+        let mut debts = BTreeMap::new();
+        let mut debt = PendingCarrierControl::default();
+        debt.record_window(64).expect("bounded");
+        debts.insert(1, debt);
+        drop(std::mem::replace(
+            &mut actor.active,
+            recovery_placeholder(debts),
+        ));
+
+        let (successor_tx, mut successor_rx) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        let successor = Carrier {
+            key: CarrierKey::new(2, "recovery-successor"),
+            local_addr: None,
+            tx: successor_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        };
+        let stand_in = actor
+            .install_recovery_successor(successor)
+            .expect("the successor installs");
+        assert!(is_recovery_placeholder(&stand_in.key));
+        actor
+            .reissue_active_receive_controls()
+            .expect("the successor accepts the reissued credit");
+        let mut window = None;
+        while let Ok(command) = successor_rx.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                let decoded = Frame::decode(&frame.bytes).expect("frame decodes");
+                if decoded.kind == FrameKind::WindowUpdate {
+                    window = Some(decoded.window);
+                }
+            }
+        }
+        assert_eq!(
+            window,
+            Some(1_024 + 64),
+            "the credit released during recovery reaches the relay on the successor"
         );
     }
 

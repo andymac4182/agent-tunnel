@@ -83,11 +83,12 @@ pub(crate) enum StreamTeardownCause {
     /// `CONTROL_CLOSED`, from `disconnect_control`.  Data first is a frame
     /// that fails to queue, which tears the session down as
     /// `REVERSE_CHANNEL_UNAVAILABLE` — but **only** with the carrier's sender
-    /// actually closed, because that same reason is how a queue budget
-    /// refusal arrives, and a budget refusal is the relay declining to buffer
-    /// while the device is fine.  Reading the reason string alone would put
-    /// that refusal in here; reading the sender does not.  M4-35 measured the
-    /// race at 7 red in 24 gate-9 runs on the measuring host.
+    /// actually closed.  That same reason used to be how a queue budget
+    /// refusal arrived too, and a budget refusal is the relay declining to
+    /// buffer while the device is fine; since M4-37 a backpressure refusal of
+    /// a flow-control frame closes as `FLOW_CONTROL_UNDELIVERABLE` instead, and
+    /// the sender check is kept as defence in depth.  M4-35 measured the race
+    /// at 7 red in 24 gate-9 runs on the measuring host.
     DeviceGone,
 }
 
@@ -550,37 +551,173 @@ impl RelayActor {
             ReadStep::Park => http.park_reader(response),
             ReadStep::Chunk(chunk) => {
                 let len = chunk.len();
-                let owed = http.credit_owed();
                 release_m2_bytes(&queue_budget, stream, len);
                 stream.receive_bytes = stream.receive_bytes.saturating_add(len);
                 // Advertise the released credit.  The update is applied to
                 // the sequence only once it is queued, so a refused queue
-                // slot keeps the debt for the next read instead of recording
-                // credit the connector never learns about.
+                // slot -- or no active carrier at all -- keeps the debt
+                // instead of recording credit the connector never learns
+                // about.  `redrive_owed_http_credit` pays that debt when a
+                // carrier is writable again (M4-29).
                 if let Some(data_tx) = data_tx {
-                    let current = stream
-                        .sequence
-                        .direction(Direction::ConnectorToRelay)
-                        .receive_credit();
-                    if let Some(limit) = current.checked_add(owed) {
-                        let update = Frame::window_update(epoch, generation, stream_id, limit);
-                        let mut candidate = stream.sequence.clone();
-                        if candidate
-                            .send_frame(Direction::RelayToConnector, &update)
-                            .is_ok()
-                            && let Ok(encoded) = update.encode()
-                            && queue_data(&data_tx, &queue_budget, encoded).is_ok()
-                        {
-                            stream.sequence = candidate;
-                            if let Some(http) = stream.http.as_mut() {
-                                http.settle_credit();
-                            }
-                        }
-                    }
+                    Self::advertise_owed_http_credit(
+                        stream,
+                        stream_id,
+                        &data_tx,
+                        &queue_budget,
+                        epoch,
+                        generation,
+                    );
                 }
                 let _ = response.send(HttpRead::Data(chunk));
             }
         }
+    }
+
+    /// Queue one WINDOW_UPDATE carrying every byte of receive credit this
+    /// stream's reads have released and not yet advertised.  Returns whether
+    /// nothing is owed any more.
+    ///
+    /// The debt is settled only once the update is queued; the sequence's
+    /// advertised credit moves in the same step, so a refusal leaves both the
+    /// debt and the credit exactly as they were.
+    fn advertise_owed_http_credit(
+        stream: &mut M2Stream,
+        stream_id: u64,
+        data_tx: &mpsc::Sender<DataOutbound>,
+        queue_budget: &QueueBudget,
+        epoch: u64,
+        generation: u64,
+    ) -> bool {
+        let owed = stream.http.as_ref().map_or(0, HttpStreamState::credit_owed);
+        if owed == 0 {
+            return true;
+        }
+        Self::advertise_receive_credit(
+            stream,
+            stream_id,
+            owed,
+            data_tx,
+            queue_budget,
+            epoch,
+            generation,
+        )
+    }
+
+    /// Queue one WINDOW_UPDATE carrying the stream's whole advertised
+    /// connector-to-relay credit plus `owed`, and settle any HTTP debt once
+    /// it is queued.  The update is absolute and only ever increases, so
+    /// resending credit the connector already has is harmless on the wire.
+    fn advertise_receive_credit(
+        stream: &mut M2Stream,
+        stream_id: u64,
+        owed: u64,
+        data_tx: &mpsc::Sender<DataOutbound>,
+        queue_budget: &QueueBudget,
+        epoch: u64,
+        generation: u64,
+    ) -> bool {
+        let current = stream
+            .sequence
+            .direction(Direction::ConnectorToRelay)
+            .receive_credit();
+        let Some(limit) = current.checked_add(owed) else {
+            return false;
+        };
+        let update = Frame::window_update(epoch, generation, stream_id, limit);
+        let mut candidate = stream.sequence.clone();
+        if candidate
+            .send_frame(Direction::RelayToConnector, &update)
+            .is_ok()
+            && let Ok(encoded) = update.encode()
+            && queue_flow_control(data_tx, queue_budget, encoded).is_ok()
+        {
+            stream.sequence = candidate;
+            if let Some(http) = stream.http.as_mut() {
+                http.settle_credit();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Pay every receive-credit debt this session's streams hold: credit a
+    /// consumer read released but could not advertise (M4-29), and a whole
+    /// stream's credit marked for reissue after a retained recovery (M4-52).
+    ///
+    /// A consumer read is the only event that advertises released credit, so
+    /// a read taken while the session had **no active data carrier** — the
+    /// window between a failed data socket and its retained recovery's
+    /// activation — or while the data queue refused the update left a debt
+    /// that nothing else would ever pay: the connector parks its next write
+    /// for want of it and the consumer waits for the reply that write
+    /// carries. Measured in `verify-m4-fs-data-recovery`: 65,541 bytes owed
+    /// at activation, and a 65,536-byte `Rread` parked five bytes short.
+    ///
+    /// Each debt is cleared only when its update is queued. A refusal stops
+    /// this pass and leaves every unpaid debt for the next call, so the actor
+    /// tick retries until the successor's queue has room (review of M4-52:
+    /// the first pass after activation competes with the re-driven held
+    /// frames for the same bounded channel). Echo and filesystem streams are
+    /// covered alike. A no-op without an active carrier.
+    pub(super) fn redrive_owed_http_credit(&mut self, key: &SessionKey) {
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let Some(data_tx) = session.data_tx.clone() else {
+            return;
+        };
+        let queue_budget = session.queue_budget.clone();
+        let generation = session.generation;
+        let epoch = session.key.epoch;
+        for (&stream_id, stream) in &mut session.streams {
+            if stream.terminal {
+                stream.credit_reissue_pending = false;
+                continue;
+            }
+            let owed = stream.http.as_ref().map_or(0, HttpStreamState::credit_owed);
+            if owed == 0 && !stream.credit_reissue_pending {
+                continue;
+            }
+            if !Self::advertise_receive_credit(
+                stream,
+                stream_id,
+                owed,
+                &data_tx,
+                &queue_budget,
+                epoch,
+                generation,
+            ) {
+                break;
+            }
+            stream.credit_reissue_pending = false;
+        }
+    }
+
+    /// Mark every live stream's whole connector-to-relay receive credit for
+    /// reissue on the carrier a retained recovery has just activated, and
+    /// pay what the successor's queue will take now (task row M4-52).
+    ///
+    /// The relay records credit as advertised the moment its WINDOW_UPDATE is
+    /// queued, and a data socket that dies with that update still queued
+    /// takes it with it. Recovery reconciles cursors and acknowledgements but
+    /// never credit, so the connector could be left short of credit the relay
+    /// believes it granted -- measured on hosted x86_64 Linux as a
+    /// 65,536-byte `Rread` parked on the connector after recovery completed.
+    /// The connector does the same for its own direction. What the queue
+    /// refuses now stays marked and is retried from the tick.
+    pub(super) fn reissue_receive_credit_after_recovery(&mut self, key: &SessionKey) {
+        if let Some(session) = self.session_mut(key) {
+            for stream in session.streams.values_mut() {
+                stream.credit_reissue_pending = !stream.terminal
+                    && stream
+                        .sequence
+                        .direction(Direction::ConnectorToRelay)
+                        .receive_credit()
+                        > 0;
+            }
+        }
+        self.redrive_owed_http_credit(key);
     }
 
     /// Queue the owner's FIN after every sequenced or parked DATA chunk.
