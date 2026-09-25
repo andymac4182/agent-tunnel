@@ -65,7 +65,7 @@ use tunnel_relay::{
 };
 use tunnel_transport::{
     AcceptedSocketDiagnostics, AcceptedSocketOptions, PeerClient, PeerServerStats,
-    PeerTransportLimits, SharedPeerPins, SpkiSha256, load_peer_client_config_from_pem,
+    PeerTransportLimits, SharedPeerPins, load_peer_client_config_from_pem,
     load_peer_server_config_from_pem, load_server_config_from_pem,
 };
 use uuid::Uuid;
@@ -6394,7 +6394,6 @@ async fn peer_refresh_loop(
         }
     }
 }
-
 
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";

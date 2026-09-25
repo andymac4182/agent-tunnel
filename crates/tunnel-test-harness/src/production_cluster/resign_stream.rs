@@ -407,7 +407,8 @@ mod tests {
     #[test]
     fn the_validator_accepts_the_complete_shape_and_rejects_each_failure() {
         validate_resign_stream_evidence(&valid()).expect("complete evidence");
-        let cases: [(&str, fn(&mut ResignStreamEvidence)); 5] = [
+        type Mutation = fn(&mut ResignStreamEvidence);
+        let cases: [(&str, Mutation); 5] = [
             ("same_stream_survived", |e| e.same_stream_survived = false),
             ("membership_changed_invalidations", |e| {
                 e.membership_changed_invalidations = 1;

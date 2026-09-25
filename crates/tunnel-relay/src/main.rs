@@ -28,8 +28,7 @@ use tunnel_core::RelayConfig;
 use tunnel_relay::{
     MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
     MembershipUnreadyReason, MembershipVersionStateIdentity, MembershipVersionStateStore,
-    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRuntime,
-    RelayOptions, ServeConfig,
+    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRuntime, RelayOptions, ServeConfig,
     peer_pins::{
         PeerPinPublisher, PeerTrustTick, decode_hex_digest, peer_trust_tick,
         publish_membership_pins, required_peer_routes,
