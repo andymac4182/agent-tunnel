@@ -1651,6 +1651,22 @@ C4_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    # ------------------------------------ a turn's result behind its updates
+    (
+        # M8-C27: the prompt's result travels the supervisor's transport
+        # channel, behind every update the agent wrote before it.  Without
+        # the ordered sender it goes straight to the session target and
+        # overtakes updates still queued at the dispatcher.
+        "a turn's result is queued behind its own updates (M8-C27)",
+        [
+            (
+                BRIDGE,
+                """        let ordered = connection.outbound.upgrade();""",
+                """        let ordered: Option<mpsc::Sender<OutboundMessage>> = None;""",
+            )
+        ],
+        False,
+    ),
 ]
 
 RELAY_CRATE = REPO / "crates" / "tunnel-relay"
@@ -2704,6 +2720,7 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c3', 'the host cannot choose a workspace or attach MCP servers'): frozenset({'a_host_cannot_choose_a_workspace_or_attach_mcp_servers'}),
     ('m8c3-relay', 'and admits nothing else'): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
     ('m8c3-relay', "the relay's profile allowlist admits the ACP profile"): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
+    ('m8c4', "a turn's result is queued behind its own updates (M8-C27)"): frozenset({'a_turns_result_is_never_delivered_ahead_of_its_own_updates'}),
     ('m8c4', 'a confirmed cancelled turn is cancelled'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not'}),
     ('m8c4', 'a lost process after dispatch is outcome_unknown, not a success'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not', 'terminal::tests::a_refusal_before_dispatch_is_failed_and_not_unknown'}),
     ('m8c4', 'a permission response must name an offered option (M8-C11)'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered', 'lifecycle::tests::an_agent_that_offered_nothing_admits_no_selection'}),
