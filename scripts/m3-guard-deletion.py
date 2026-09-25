@@ -834,12 +834,10 @@ UNARY_ECHO_CASES: list[Case] = [
         [
             (
                 ACTOR,
-                "                let last_emitted = if pending.dispatched {\n"
-                "                    pending.send_sequence.saturating_add(1)\n"
-                "                } else {\n"
-                "                    0\n"
-                "                };",
-                "                let last_emitted = pending.send_sequence;",
+                "                let last_emitted = pending.relay_last_emitted();\n"
+                "                entries.push(StreamFence::new(*stream_id, direction, last_emitted));",
+                "                let last_emitted = pending.send_sequence;\n"
+                "                entries.push(StreamFence::new(*stream_id, direction, last_emitted));",
             )
         ],
         frozenset(
@@ -908,11 +906,8 @@ RETIRING_ADMISSION_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "        self.accepting = matches!(\n"
-                "            self.rotation.phase(),\n"
-                "            RotationPhase::Active | RotationPhase::Retiring\n"
-                "        );",
-                "        self.accepting = can_resume;",
+                "        self.accepting = resumed;\n",
+                "        self.accepting = self.rotation.phase() == RotationPhase::Active;\n",
             )
         ],
         frozenset(
@@ -930,9 +925,11 @@ RETIRING_ADMISSION_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n"
-                "            self.accepting = false;\n",
-                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n",
+                "            self.accepting = false;\n"
+                "            self.writes_frozen = true;\n"
+                "            if !self.recovery_requested",
+                "            self.writes_frozen = true;\n"
+                "            if !self.recovery_requested",
             )
         ],
         frozenset(
