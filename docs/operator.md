@@ -8,7 +8,9 @@ against `da2a24d`; section 2.3 extended to MCP, ACP and filesystem services for
 M6-C57 on 2026-09-23 against `721ed2a`; section 2.5 (day-2 catalog changes)
 added for M6-C31 on 2026-09-24 against `6091f4c` and merged forward to
 `8f486bf`. This is the guide
-an outside tester follows first. It covers what to download and verify, device
+an outside tester follows to **run a relay**. A tester who only connects a
+computer to a relay someone else runs follows
+[Join an existing relay](join-relay.md) instead (M6-C103). This guide covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
 this guide says "not supported in this alpha" and names the task row, instead of
@@ -117,6 +119,22 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
 
 ## 1. Download and verify
+
+**There are two archive formats, and this section executes only one.** The
+archives most testers download are the CI archives on the GitHub
+pre-releases, `https://github.com/andymac4182/agentuplink/releases`:
+`agentuplink-<tag>-<target>.tar.gz` (`.zip` for Windows) with a `.sha256` file
+beside it. A CI archive unpacks **flat, with no top-level folder**, into
+`LICENSE`, `README.txt`, `bin/`, `examples/`, `notices/` and `release.json`
+(archives built after M6-C50 also carry `docs/`). It has no `SHA256SUMS`,
+`PROVENANCE.txt`, `NOTICE` or `Cargo.lock`: `release.json` names the source
+commit (`sourceSha`), CI run and target, and `notices/` holds the licence
+texts. So the `cd agentuplink-bundle`, `SHA256SUMS`, `PROVENANCE.txt` and
+`NOTICE` steps below do not apply to it. Download, check and unpack a CI
+archive with section 1 of [Join an existing relay](join-relay.md), put its
+`bin/` on your `PATH`, and continue at section 2 here. The rest of this
+section is the **maintainer bundle**, the format the docs check runs
+(M6-C103).
 
 The declared release targets live in `[workspace.metadata.release]
 advertised-targets` in the root `Cargo.toml`: `aarch64-apple-darwin`,
