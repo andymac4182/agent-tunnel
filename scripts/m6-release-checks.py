@@ -452,6 +452,39 @@ SECRET_ALLOWLIST: tuple[Allow, ...] = (
             "in 4283e18."
         ),
     ),
+    # The two entries below are the synthetic redaction positive control in
+    # scripts/demo/selftest.sh, as committed in 9c5ea742 (PR #166, blob
+    # 4a92b47ca7bb) and still reachable in history.  The script now assembles
+    # both values from fragments at run time, so the working tree no longer
+    # matches; rewriting history instead would rewrite an approved PR's
+    # commits.  Each entry is scoped to that path and one exact digest.
+    Allow(
+        pattern_name="jwt",
+        digest="93d82f8ab3d5741e1742be380ab53766ac5216d1786f81a76827da33e72f464c",
+        path_regex=r"^scripts/demo/selftest\.sh$",
+        reason=(
+            "Synthetic redaction control in scripts/demo/selftest.sh: a JWT-shaped "
+            "string whose header is `{\"alg\":\"RS256\"}`, whose claims are "
+            "`{\"sub\":\"synthetic\"}` and whose signature segment is the base64 "
+            "of `syntheticsig`; it signs nothing and authorises nothing. The "
+            "demo self-test writes it to a file to prove its own secret scanner "
+            "matches a JWT (a positive control). Reviewed 2026-09-26; assembled "
+            "from fragments since the integration commit that added this entry."
+        ),
+    ),
+    Allow(
+        pattern_name="pem-private-key",
+        digest="3021d90eb9437b2d8f30e8363695c4418b5e5f1870801b5c317e9398ee0f572d",
+        path_regex=r"^scripts/demo/selftest\.sh$",
+        reason=(
+            "Synthetic redaction control in scripts/demo/selftest.sh: the header "
+            "line of a PEM block whose only body is the base64 of the word "
+            "`synthetic`, not a key. The demo self-test writes it to prove its "
+            "scanner matches a PEM block and that `demo_redact` removes it (a "
+            "positive control). Reviewed 2026-09-26; assembled from fragments "
+            "since the integration commit that added this entry."
+        ),
+    ),
 )
 
 

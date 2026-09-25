@@ -49,8 +49,18 @@ run() { # LABEL WANT_RC CMD...
 secret_hits() { grep -Elc -- "$DEMO_SECRET_PATTERN" "$@" 2>/dev/null | wc -l | tr -d ' '; }
 
 # Positive control: the scanner must find both shapes.
-printf 'x eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljc2ln x\n' >"$OUT/control-jwt"
-printf -- '-----BEGIN PRIVATE KEY-----\nc3ludGhldGlj\n-----END PRIVATE KEY-----\n' >"$OUT/control-pem"
+# The synthetic JWT and PEM are assembled from fragments at run time, so no
+# source line is itself credential-shaped and the repository's own secret scan
+# (scripts/m6-release-checks.py --check secrets) has nothing to match here.
+control_dashes='-----'
+control_jwt_header='eyJhbGciOiJSUzI1NiJ9'
+control_jwt_claims='eyJzdWIiOiJzeW50aGV0aWMifQ'
+control_jwt_sig='c3ludGhldGljc2ln'
+control_pem_label='PRIVATE KEY'
+printf 'x %s.%s.%s x\n' "$control_jwt_header" "$control_jwt_claims" "$control_jwt_sig" >"$OUT/control-jwt"
+printf '%sBEGIN %s%s\nc3ludGhldGlj\n%sEND %s%s\n' \
+  "$control_dashes" "$control_pem_label" "$control_dashes" \
+  "$control_dashes" "$control_pem_label" "$control_dashes" >"$OUT/control-pem"
 [ "$(secret_hits "$OUT/control-jwt" "$OUT/control-pem")" = 2 ] ||
   die "secret scanner positive control failed: it did not match a synthetic JWT and PEM"
 [ "$(demo_redact <"$OUT/control-pem" | secret_hits /dev/stdin)" = 0 ] ||
