@@ -1,0 +1,4 @@
+# Build dependencies for the one locked package with no aarch64 wheel:
+# evdev 2.0.0 (sdist only; build-system requires setuptools>=77.0).
+# Installed first, so evdev builds with --no-build-isolation against these.
+setuptools>=77.0

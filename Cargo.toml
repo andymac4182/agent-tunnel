@@ -75,6 +75,11 @@ resolver = "3"
 # set determines what `deny.toml`'s `[graph] targets` may narrow to, what M6-03's
 # platform matrix enumerates, and what M6-01 must ship a passing bundle for.
 [workspace.metadata.release]
+# `x86_64-pc-windows-msvc` is a client-only, locked-checks target (task row
+# M1-04, owner decision 2026-09-25): its bundle ships `tunnel-client` and
+# `tunnel-deadman` only, and the M1 real-socket acceptance runs on the Unix
+# targets. The release tooling has no per-target role field, so this comment
+# and docs/operator.md carry that statement.
 advertised-targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",

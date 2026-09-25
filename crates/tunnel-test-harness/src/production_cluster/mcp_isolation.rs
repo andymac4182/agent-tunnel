@@ -144,6 +144,26 @@ const ROTATION_BOUND: Duration = Duration::from_secs(
     (ISOLATION_ROTATION.interval_seconds + ISOLATION_ROTATION.overlap_seconds)
         * (ROTATION_SPAN + 2),
 );
+/// How long the rotation-span case waits for the one scheduled rotation
+/// completion it anchors on: at most one interval until the next attempt
+/// starts, plus that attempt's own handshake and overlap, doubled for
+/// headroom (M3-34).
+const ANCHOR_BOUND: Duration = Duration::from_secs(
+    (ISOLATION_ROTATION.interval_seconds
+        + ISOLATION_ROTATION.handshake_timeout_seconds
+        + ISOLATION_ROTATION.overlap_seconds)
+        * 2,
+);
+/// The quiet window the anchor buys: after an observed completion, no
+/// scheduled freeze begins for one whole interval.  The session open and the
+/// spanning call (99-330 ms after the anchor in every recorded run, M3-34)
+/// must fit inside it with margin, so a shorter policy would reintroduce the
+/// race this anchor exists to remove.
+const ANCHOR_MIN_INTERVAL_SECONDS: u64 = 3;
+const _: () = assert!(
+    ISOLATION_ROTATION.interval_seconds >= ANCHOR_MIN_INTERVAL_SECONDS,
+    "the rotation-span anchor needs an interval long enough to open a session and dispatch the call before the next freeze (M3-34)"
+);
 /// How long an explicit outcome may take to reach the consumer after a
 /// fault.
 const OUTCOME_WAIT: Duration = Duration::from_secs(90);
@@ -355,8 +375,17 @@ pub struct RevocationEvidence {
 /// `rotation-span`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RotationSpanEvidence {
-    /// Completed scheduled rotations while the call was open.
+    /// Completed scheduled rotations while the call was open, counted from
+    /// the anchoring completion the call was sent after (M3-34).
     pub rotations_spanned: u64,
+    /// The call reached the device before any rotation it is credited with
+    /// began: once its hold had started, the owner session was still
+    /// `active` with the anchor's completed count (M3-34).  A call that was
+    /// refused into a freeze and resent until after it would read `false`.
+    pub dispatched_between_rotations: bool,
+    /// Milliseconds from the anchoring rotation's completion being observed
+    /// to the call's hold starting on the device.  Reported, not asserted.
+    pub anchor_to_dispatch_ms: u128,
     pub status: u16,
     /// The call's result text matched the fixture's exactly.
     pub result_exact: bool,
@@ -485,7 +514,7 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             && (500..=599).contains(&outcome.status)
     };
     let forgery = &evidence.forgery;
-    let checks: [(&str, bool); 45] = [
+    let checks: [(&str, bool); 46] = [
         ("three relays ran", evidence.relay_count == 3),
         (
             "the ingress was not the owner",
@@ -685,6 +714,10 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
         (
             "one call spanned the required scheduled rotations",
             rotation.rotations_spanned >= ROTATION_SPAN,
+        ),
+        (
+            "the spanning call reached the device before the rotations it spanned began",
+            rotation.dispatched_between_rotations,
         ),
         (
             "the spanning call completed exactly once with exact bytes",
@@ -2504,14 +2537,72 @@ impl Gate<'_> {
 
     // ---- case: a call spanning rotations ------------------------------------
 
+    /// The owner session's rotation phase and completed-rotation count.
+    async fn owner_rotation(&self) -> Result<(String, u64)> {
+        let snapshot = self.cluster.relay("relay-a")?.snapshot().await?;
+        Ok(snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session_id == self.session_id)
+            .map_or_else(
+                || ("missing".to_owned(), 0),
+                |session| (session.phase.clone(), session.rotations_completed),
+            ))
+    }
+
+    /// Wait for the owner to complete its next scheduled rotation and return
+    /// the new completed count and when it was observed.
+    ///
+    /// The owner starts a scheduled rotation only once its session has been
+    /// `active` for a whole interval since the previous `ROTATE_COMPLETE`
+    /// (`last_rotation`, reset in the same step that increments
+    /// `rotations_completed`; `rotation_due` in `tunnel-relay` `actor.rs`).
+    /// So from a completion observed here, no freeze can begin for
+    /// `ISOLATION_ROTATION.interval_seconds`: the case's requests start in
+    /// that window rather than wherever the rotation schedule happens to be
+    /// when the case begins (M3-34).
+    async fn after_rotation_complete(&self) -> Result<(u64, Instant)> {
+        let (_, entry) = self.owner_rotation().await?;
+        let deadline = Instant::now() + ANCHOR_BOUND;
+        loop {
+            let (phase, completed) = self.owner_rotation().await?;
+            if completed > entry {
+                return Ok((completed, Instant::now()));
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "no scheduled rotation completed within {} s (rotation interval {} s) to anchor the spanning call; owner session phase={phase:?} rotations_completed={completed}",
+                    ANCHOR_BOUND.as_secs(),
+                    ISOLATION_ROTATION.interval_seconds
+                )));
+            }
+            sleep(POLL).await;
+        }
+    }
+
+    /// One held call that must be in flight across `ROTATION_SPAN` completed
+    /// scheduled rotations.
+    ///
+    /// The case anchors on a rotation completion before it sends anything
+    /// (M3-34).  Unanchored, it began wherever the 6 s schedule happened to
+    /// be: on hosted Linux the case starts at about 6.1 s, at the session's
+    /// first freeze, and the spanning call reached the owner after it had
+    /// quiesced but before the connector had seen `ROTATE_QUIESCE` (the owner
+    /// quiesces as soon as the candidate attaches), so the call was refused
+    /// `not_dispatched` outside any freeze the gate could observe, and was
+    /// correctly not resent (M3-30).  A resend would not have helped the
+    /// case either: a call admitted only after that rotation is not in
+    /// flight across it.  So the case also proves, rather than assumes, that
+    /// the call reached the device before any rotation it is credited with
+    /// began, and counts rotations from the anchor.
     async fn rotation_span(
         &mut self,
         consumer: &Consumer,
     ) -> Result<(RotationSpanEvidence, String)> {
         let uri = self.uri(SERVICE_2025);
+        let (rotations_before, anchored_at) = self.after_rotation_complete().await?;
         let session = self.open_session(consumer, &uri).await?;
         let before = self.invocations(SERVICE_2025, "gate");
-        let rotations_before = self.rotations_completed().await?;
         let session_before = self.session_id.clone();
         let body = call_body("5", "gate", &json!({"label": "span"}), None);
         let call = {
@@ -2532,6 +2623,20 @@ impl Gate<'_> {
         let mut call = call;
         self.wait_hold_started("gatespan", "the spanning call", &mut call)
             .await?;
+        let anchor_to_dispatch_ms = anchored_at.elapsed().as_millis();
+        // The hold has started, so the call is on the device.  If the owner
+        // is still `active` with the anchor's count, no rotation has begun
+        // since the anchor, so every rotation counted below began after the
+        // call was dispatched.
+        let (phase_at_dispatch, completed_at_dispatch) = self.owner_rotation().await?;
+        let dispatched_between_rotations =
+            phase_at_dispatch == "active" && completed_at_dispatch == rotations_before;
+        if !dispatched_between_rotations {
+            eprintln!(
+                "MCP isolation gate: the spanning call started {anchor_to_dispatch_ms} ms after its anchor (rotation interval {} ms) with the owner session phase={phase_at_dispatch:?} rotations_completed={completed_at_dispatch} (anchor {rotations_before})",
+                ISOLATION_ROTATION.interval_seconds * 1_000
+            );
+        }
         let deadline = Instant::now() + ROTATION_BOUND;
         let spanned = loop {
             let spanned = self
@@ -2566,6 +2671,8 @@ impl Gate<'_> {
         Ok((
             RotationSpanEvidence {
                 rotations_spanned: spanned,
+                dispatched_between_rotations,
+                anchor_to_dispatch_ms,
                 status: answer.status,
                 result_exact,
                 invocations: self
@@ -3335,6 +3442,8 @@ mod tests {
             },
             rotation_span: RotationSpanEvidence {
                 rotations_spanned: ROTATION_SPAN,
+                dispatched_between_rotations: true,
+                anchor_to_dispatch_ms: 40,
                 status: 200,
                 result_exact: true,
                 invocations: 1,
@@ -3531,6 +3640,9 @@ mod tests {
             }),
             ("rotations spanned", |e| {
                 e.rotation_span.rotations_spanned = ROTATION_SPAN - 1;
+            }),
+            ("span dispatched inside a freeze", |e| {
+                e.rotation_span.dispatched_between_rotations = false;
             }),
             ("span status", |e| e.rotation_span.status = 504),
             ("span bytes", |e| e.rotation_span.result_exact = false),

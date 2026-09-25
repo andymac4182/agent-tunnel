@@ -2214,11 +2214,33 @@ fn checked_echo_output_len(canary_len: usize, payload_len: usize) -> Option<usiz
 /// (task row M6-C23).
 pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate validity";
 
+/// `Transport` scope of a `STREAM_FORGET` whose terminal proof was still
+/// waiting for the relay's final data-channel ACK when its bounded
+/// revalidation window ended (task row M6-C105). Everything but that ACK
+/// validated; only evidence is missing, and a missing ACK is what a stalled
+/// process (`Instant` keeps running through SIGSTOP) or a lost data path
+/// produces, including a host suspended past the relay's idle eviction -- so
+/// the session fails retryable and `connect` reconnects. Evidence that
+/// contradicts the proof, or an owner snapshot invalid in itself, stays
+/// `ClientError::Protocol`.
+pub const STREAM_FORGET_PROOF_SCOPE: &str = "stream forget proof";
+
+/// The one detail written under `STREAM_FORGET_PROOF_SCOPE`.
+pub const STREAM_FORGET_PROOF_EXPIRED: &str =
+    "STREAM_FORGET terminal proof did not converge before its deadline";
+
 /// `Transport` scope of a relay certificate this client found expired or not
 /// yet valid on **its own** clock. Retryable: either this host's clock is
 /// wrong or the relay's certificate is due for renewal, and both are fixed
 /// without touching the device.
 pub const RELAY_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "relay certificate validity";
+
+/// Safe message of `ClientError::AuthorizationExpired` (`AUTHORIZATION_STALE`,
+/// exit `4`). Published so a harness that buckets CLI messages matches the
+/// text by name rather than by a copy that can drift (task row M6-C39).
+pub const AUTHORIZATION_EXPIRED_MESSAGE: &str = "a stream's authorization window lapsed before \
+its frame was written, so the session was restarted; this is usually a stalled or congested \
+data path";
 
 /// How a TLS handshake failure is classified before sanitization.
 enum TlsFailure {
@@ -2505,10 +2527,12 @@ impl ClientError {
             Self::Transport { scope, detail } if *scope == "stream forget barrier" => {
                 format!("{scope} failed: {}", safe_barrier_detail(detail))
             }
-            // Fixed reasons written by `classify_rustls_refusal`.
+            // Fixed reasons written by `classify_rustls_refusal`, and the one
+            // fixed detail of an expired STREAM_FORGET proof.
             Self::Transport { scope, detail }
                 if *scope == DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE
-                    || *scope == RELAY_CERTIFICATE_NOT_CURRENT_SCOPE =>
+                    || *scope == RELAY_CERTIFICATE_NOT_CURRENT_SCOPE
+                    || *scope == STREAM_FORGET_PROOF_SCOPE =>
             {
                 detail.clone()
             }
@@ -2519,7 +2543,7 @@ impl ClientError {
             }
             Self::TlsRefused(reason) => (*reason).to_owned(),
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
-            Self::AuthorizationExpired => "authorization confirmation deadline expired".to_owned(),
+            Self::AuthorizationExpired => AUTHORIZATION_EXPIRED_MESSAGE.to_owned(),
             Self::QueueLimit => "bounded connector queue limit reached".to_owned(),
             Self::OpenRetentionFull => {
                 "OPEN idempotency retention is full; start a fresh session".to_owned()

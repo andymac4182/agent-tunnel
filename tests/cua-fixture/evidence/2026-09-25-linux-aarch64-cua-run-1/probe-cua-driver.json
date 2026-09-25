@@ -1,0 +1,213 @@
+{
+  "aliases": {
+    "click": "left_click",
+    "exec": "run_command",
+    "key": "press_key",
+    "ls": "list_dir",
+    "mkdir": "create_dir",
+    "read_file": "read_text",
+    "rm": "delete_file",
+    "rmdir": "delete_dir",
+    "shell": "run_command",
+    "tap": "left_click",
+    "type": "type_text",
+    "write_file": "write_text"
+  },
+  "command_count": 56,
+  "commands": [
+    "activate_window",
+    "close_window",
+    "copy_to_clipboard",
+    "create_dir",
+    "delete_dir",
+    "delete_file",
+    "diorama_cmd",
+    "directory_exists",
+    "double_click",
+    "drag",
+    "drag_to",
+    "escalate_capture_scope",
+    "file_exists",
+    "find_element",
+    "get_accessibility_tree",
+    "get_application_windows",
+    "get_capture_scope_state",
+    "get_current_window_id",
+    "get_cursor_position",
+    "get_desktop_environment",
+    "get_desktop_state",
+    "get_file_size",
+    "get_screen_size",
+    "get_window_name",
+    "get_window_position",
+    "get_window_size",
+    "hotkey",
+    "key_down",
+    "key_up",
+    "launch",
+    "left_click",
+    "list_dir",
+    "maximize_window",
+    "minimize_window",
+    "mouse_down",
+    "mouse_up",
+    "move_cursor",
+    "open",
+    "press_key",
+    "read_bytes",
+    "read_text",
+    "right_click",
+    "run_command",
+    "screenshot",
+    "scroll",
+    "scroll_direction",
+    "scroll_down",
+    "scroll_up",
+    "set_clipboard",
+    "set_wallpaper",
+    "set_window_position",
+    "set_window_size",
+    "type_text",
+    "version",
+    "write_bytes",
+    "write_text"
+  ],
+  "commands_http_status": 200,
+  "label": "cua-driver",
+  "param_names_mentioning_display": [],
+  "param_names_mentioning_scale": [],
+  "params": {
+    "get_capture_scope_state": [],
+    "get_cursor_position": [],
+    "get_desktop_state": [
+      {
+        "default": null,
+        "name": "screenshot_out_file",
+        "required": false
+      }
+    ],
+    "get_screen_size": [],
+    "screenshot": [
+      {
+        "default": "png",
+        "name": "format",
+        "required": false
+      },
+      {
+        "default": 95,
+        "name": "quality",
+        "required": false
+      }
+    ],
+    "version": []
+  },
+  "result_keys_mentioning_scale": [
+    "get_desktop_state.payload.scale_factor"
+  ],
+  "results": {
+    "get_capture_scope_state": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "capture_scope": "desktop",
+        "desktop_unlocked": true,
+        "effective_scope": "desktop",
+        "escalation_detail": null,
+        "escalation_reason": null,
+        "session": "computer-server-1280-3816b2ee",
+        "success": true
+      }
+    },
+    "get_cursor_position": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "position": {
+          "x": 640,
+          "y": 400
+        },
+        "success": true
+      }
+    },
+    "get_desktop_state": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "display": "primary",
+        "format": "png",
+        "image_data": "<10596 chars elided>",
+        "images": [
+          {
+            "data_base64": "<10596 chars elided>",
+            "mime_type": "image/png"
+          }
+        ],
+        "platform": "linux",
+        "scale_factor": 1.0,
+        "screen_height": 800,
+        "screen_width": 1280,
+        "screenshot_height": 800,
+        "screenshot_mime_type": "image/png",
+        "screenshot_width": 1280,
+        "success": true
+      }
+    },
+    "get_screen_size": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "size": {
+          "height": 800,
+          "width": 1280
+        },
+        "success": true
+      }
+    },
+    "screenshot": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "format": "png",
+        "image_data": "<7946 bytes elided>",
+        "success": true
+      }
+    },
+    "version": {
+      "content_type": "text/plain; charset=utf-8",
+      "framing": "data: <JSON>\\n\\n",
+      "http_status": 200,
+      "payload": {
+        "package": "0.3.46",
+        "protocol": 1,
+        "success": true
+      }
+    }
+  },
+  "screenshot_image": {
+    "pixels": {
+      "bottom_left": "#0000ff",
+      "bottom_right": "#ff00ff",
+      "centre": "#ffff00",
+      "top_left": "#ff0000",
+      "top_right": "#00ff00"
+    },
+    "png_bytes": 7946,
+    "png_height": 800,
+    "png_width": 1280
+  },
+  "status": {
+    "body": {
+      "features": [
+        "mcp"
+      ],
+      "os_type": "linux",
+      "status": "ok"
+    },
+    "http_status": 200
+  }
+}

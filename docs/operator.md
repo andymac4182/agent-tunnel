@@ -8,11 +8,41 @@ against `da2a24d`; section 2.3 extended to MCP, ACP and filesystem services for
 M6-C57 on 2026-09-23 against `721ed2a`; section 2.5 (day-2 catalog changes)
 added for M6-C31 on 2026-09-24 against `6091f4c` and merged forward to
 `8f486bf`. This is the guide
-an outside tester follows first. It covers what to download and verify, device
+an outside tester follows to **run a relay**. A tester who only connects a
+computer to a relay someone else runs follows
+[Join an existing relay](join-relay.md) instead (M6-C103). This guide covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
 this guide says "not supported in this alpha" and names the task row, instead of
 describing a procedure the code does not have.**
+
+> **Known limitation: device certificate renewal.** A device certificate
+> cannot be renewed in this alpha (task row M6-C56, deferred by owner
+> decision on 2026-09-25). `credentials import` refuses to replace an
+> installed certificate, and the relay's catalog keeps the **first**
+> certificate's expiry, so even a hand-installed renewal stops being accepted
+> at the original expiry. **Re-enrol the device before its certificate
+> expires**, as a new device:
+>
+> 1. Create a new key and CSR in a new profile and have it issued, as in
+>    [section 2.1](#21-device-credentials) (`credentials create`, the
+>    issuer's `openssl x509 -req` step, whose `subjectAltName` must name the
+>    new device UUID, then `credentials import`).
+> 2. Register it with a **new device UUID** by `tunnel-relay add-device`,
+>    with `add-service` and `set-grant` for its export and grant, as in
+>    [section 2.5](#25-day-2-catalog-changes-more-users-and-devices-grants-revocation).
+>    The new profile's `device_id` and its export names must be the **new**
+>    device and service UUIDs, not the old ones.
+> 3. Switch `connect` to the new profile, and switch every cloud caller to
+>    the new device and service IDs: requests addressed to the old ones stop
+>    working once it is revoked.
+> 4. `revoke-device` the old device.
+>
+> [deploy-fly.md section 6.5](deploy-fly.md#65-certificate-expiry-and-rotation)
+> describes the same path on Fly.
+> The earliest expiry this affects is the dogfood credential's catalog
+> expiry, 2026-12-22; renewal must be resolved before certificates issued to
+> testers approach expiry.
 
 ## How this guide is tested
 
@@ -80,7 +110,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
-| Download, checksum, provenance and licence notices | Supported for `aarch64-apple-darwin` only | M6-01, M6-C13 |
+| Download, checksum, provenance and licence notices | A maintainer bundle passing every release check: `aarch64-apple-darwin` only. CI archives for all four targets are built and smoke-tested on native hosted runners and published as prereleases, without those checks | M6-01, M6-C13 |
 | Device key, CSR, certificate import, local `doctor` | Supported | — |
 | Relay and cluster configuration dry runs, local state initialization | Supported | — |
 | Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
@@ -88,6 +118,8 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
 | Adding users, devices, services and grants after the first provisioning, replacing a grant, and revoking a grant, device or credential | Supported while `serve` runs, with `add-user`, `add-device`, `add-service`, `set-grant`, `revoke-grant`, `revoke-device` and `revoke-credential` (section 2.5); a second tenant, and changing or deactivating a user or service, are **not supported in this alpha** | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
+| Device certificate renewal | **Not supported in this alpha**: re-enrol before the certificate expires (see the known limitation above) | M6-C56 |
+| Windows | **Client-only**: `tunnel-client` and `tunnel-deadman` build and pass the locked checks; the relay, `credentials create` and `credentials import` refuse there, and the M1 real-socket acceptance runs on Linux and macOS only (section 1) | M1-04 |
 | Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
 | Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
 | Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** in general. One piece is nonetheless mixed-version safe by design: the statuses a cluster owner uses to refuse a forwarded device session, so a new relay never turns an older one's transient refusal into a terminal device exit ([runtime.md](runtime.md), M6-C38) | M6-C23 |
@@ -99,27 +131,49 @@ while it runs (section 2.5). Anything larger is not supported yet:
 
 ## 1. Download and verify
 
+**There are two archive formats, and this section executes only one.** The
+archives most testers download are the CI archives on the GitHub
+pre-releases, `https://github.com/andymac4182/agentuplink/releases`:
+`agentuplink-<tag>-<target>.tar.gz` (`.zip` for Windows) with a `.sha256` file
+beside it. A CI archive unpacks **flat, with no top-level folder**, into
+`LICENSE`, `README.txt`, `bin/`, `examples/`, `notices/` and `release.json`
+(archives built after M6-C50 also carry `docs/`). It has no `SHA256SUMS`,
+`PROVENANCE.txt`, `NOTICE` or `Cargo.lock`: `release.json` names the source
+commit (`sourceSha`), CI run and target, and `notices/` holds the licence
+texts. So the `cd agentuplink-bundle`, `SHA256SUMS`, `PROVENANCE.txt` and
+`NOTICE` steps below do not apply to it. Download, check and unpack a CI
+archive with section 1 of [Join an existing relay](join-relay.md), put its
+`bin/` on your `PATH`, and continue at section 2 here. The rest of this
+section is the **maintainer bundle**, the format the docs check runs
+(M6-C103).
+
 The declared release targets live in `[workspace.metadata.release]
 advertised-targets` in the root `Cargo.toml`: `aarch64-apple-darwin`,
 `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` and
 `x86_64-unknown-linux-gnu`. **Only `aarch64-apple-darwin` has a bundle that
-passes the release checks.** The other three have no host here that can run
-their checks (M6-C13), so treat any build for them as unverified. The hosted CI
-that would build them has not run since 2026-09-11, and no GitHub release has
-been published, so the only way to get a verified bundle today is from a
-maintainer who built it with `scripts/m6-release-artifact.py bundle`.
+passes the release checks.** Hosted CI builds all four on native runners,
+smoke-tests each build's own binaries there, and publishes the archives as
+GitHub prereleases (for example workflow run 35987957788 at `af23c2f`), but
+none of the checks below has run on the other three (M6-C13), so treat those
+builds as unverified. A verified bundle comes from a maintainer who built it
+with `scripts/m6-release-artifact.py bundle`.
 
 **The Windows bundle has no relay.** The relay runs on Linux and macOS only.
 `x86_64-pc-windows-msvc` ships `tunnel-client` and `tunnel-deadman`, the
 device half, and a Windows build of `tunnel-relay` exits 2 at once with
 `tunnel-relay: the relay runs only on Linux and macOS; on Windows, run the
 device binaries (tunnel-client) instead` (task row M6-C83).
+**Windows is a client-only, locked-checks target** (task row M1-04, owner
+decision 2026-09-25): hosted CI runs the formatter, strict Clippy and the
+workspace tests there, but the relay and `credentials create`/`credentials
+import` refuse to run on Windows, so the M1 real-socket acceptance is run on
+the Unix targets (Linux and macOS) only.
 
-**The bundle carries no documentation**, not even this guide (M6-C50). Read
-this guide and every document it links from the repository at the `commit`
-line of the bundle's `PROVENANCE.txt`, for example
-`https://github.com/andymac4182/agentuplink/blob/<commit>/docs/operator.md`,
-so the guide and the binaries describe the same code.
+**The bundle carries this guide** as `docs/operator.md`, with every document
+it links beside it in `docs/`, all listed in `SHA256SUMS` (M6-C50). Read the
+copy in the bundle: it describes the same commit as the binaries. A link in
+those documents to a file the bundle does not carry points at that file on
+GitHub at the bundle's `commit` (the `commit` line of `PROVENANCE.txt`).
 
 A bundle is one `.tar.gz` plus a `.sha256` file beside it. This guide calls
 them `agentuplink-bundle.tar.gz` and `agentuplink-bundle.tar.gz.sha256`;
@@ -133,6 +187,8 @@ $ tar -xzf agentuplink-bundle.tar.gz
 $ cd agentuplink-bundle
 $ shasum -a 256 -c --quiet SHA256SUMS; echo "exit=$?"
 exit=0
+$ ls docs/operator.md
+docs/operator.md
 ```
 
 `shasum -c` checks only the files `SHA256SUMS` lists. The release check also
@@ -175,10 +231,18 @@ Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config 
 
 `tunnel-relay` has no `--version`; use `PROVENANCE.txt`.
 
-The public [downloads page](../site/docs/downloads.html) describes a second
-archive format, produced by `scripts/package_release.py` for the release
-workflow. It has no `PROVENANCE.txt` or `SHA256SUMS`, and none of the checks
-above cover it (M6-C11, M6-01).
+`examples/` holds the configurations this guide uses: `m1-client.toml` and
+`m1-relay.toml` are the device and relay starting points, `m6-catalog*.toml`
+are the catalog records of section 2.3, and `m7-cluster-relay.toml` is the
+cluster relay of section 3.3. `client.toml` and `relay.toml` are older
+configuration-only starters that hold rotation settings alone; this guide does
+not use them, and neither connects anything.
+
+The public [downloads page](https://agentuplink.dev/docs/downloads) describes a
+second archive format, produced by `scripts/package_release.py` for the release
+workflow. It carries this guide and the documents it links under `docs/`, but
+no `PROVENANCE.txt` or `SHA256SUMS`, and none of the checks above cover it
+(M6-C11, M6-01).
 
 ## 2. Credential provisioning
 
@@ -288,8 +352,9 @@ relay also needs the device's CA in its `device_tls_client_ca` file, and a
 matching device and credential record in the Redis catalog, which section 2.3
 creates. Certificate renewal and self-service enrollment are not implemented
 (`credentials renew` and `enroll` in
-[runtime.md](runtime.md#proposed-cli-surface); the renewal shape is an open
-owner decision, M6-C56 and M0-03).
+[runtime.md](runtime.md#proposed-cli-surface); renewal is deferred by owner
+decision, M6-C56, and its shape is still open under M0-03). **Re-enrol before
+the certificate expires**; see the known limitation at the top of this guide.
 
 `credentials import` never leaves the profile half-updated by a **refusal**
 (M6-C55). It checks both destinations before writing either, writes each under
