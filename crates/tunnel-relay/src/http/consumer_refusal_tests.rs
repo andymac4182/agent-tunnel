@@ -298,9 +298,23 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
         "Bearer {}",
         signer.token(KNOWN_SUBJECT, 300, "devices:read")
     );
+    // An unknown consumer whose token also lacks the scope is refused as an
+    // unknown consumer (`401`), never told its token is fine (`403`): the
+    // verifier checks scope only after the identity lookup.
+    let unknown_unscoped = format!(
+        "Bearer {}",
+        signer.token("consumer-refusal-stranger", 300, "devices:read")
+    );
     // (label, Authorization, expected status, expected message, stage)
-    let causes: [(&str, Option<&str>, u16, &str, &str); 5] = [
+    let causes: [(&str, Option<&str>, u16, &str, &str); 6] = [
         ("no token", None, 401, MISSING_MESSAGE, "bearer"),
+        (
+            "unknown sub without the scope",
+            Some(&unknown_unscoped),
+            401,
+            CONSUMER_TOKEN_REFUSED,
+            "identity",
+        ),
         (
             "garbage token",
             Some(garbage),
@@ -358,7 +372,7 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
     // M6-C52: payload-free and credential-free -- no token, and no part of
     // one, in anything the relay logged for any of the requests above.
     let logs = all_logs;
-    for token in [&unknown, &expired, &unscoped] {
+    for token in [&unknown, &expired, &unscoped, &unknown_unscoped] {
         let token = token.trim_start_matches("Bearer ");
         for part in token.split('.') {
             assert!(!logs.contains(part), "a token segment reached the log");
