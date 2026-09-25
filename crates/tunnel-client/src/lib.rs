@@ -2210,11 +2210,13 @@ pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate valid
 
 /// `Transport` scope of a `STREAM_FORGET` whose terminal proof was still
 /// waiting for the relay's final data-channel ACK when its bounded
-/// revalidation window ended (task row M6-C105). The proof it holds is
-/// consistent; only evidence is missing, and a missing ACK is what a lost or
-/// stalled data carrier produces -- a laptop asleep, a process stopped, a
-/// path gone -- so the session fails retryable and `connect` reconnects.
-/// Evidence that *contradicts* the proof stays `ClientError::Protocol`.
+/// revalidation window ended (task row M6-C105). Everything but that ACK
+/// validated; only evidence is missing, and a missing ACK is what a stalled
+/// process (`Instant` keeps running through SIGSTOP) or a lost data path
+/// produces, including a host suspended past the relay's idle eviction -- so
+/// the session fails retryable and `connect` reconnects. Evidence that
+/// contradicts the proof, or an owner snapshot invalid in itself, stays
+/// `ClientError::Protocol`.
 pub const STREAM_FORGET_PROOF_SCOPE: &str = "stream forget proof";
 
 /// The one detail written under `STREAM_FORGET_PROOF_SCOPE`.

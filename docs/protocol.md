@@ -194,17 +194,28 @@ terminal. A connector whose proof fails **only** because that ACK (or bounded
 carrier-control debt) is still outstanding retains the message for one bounded
 revalidation window (5 s, an absolute deadline that neither a duplicate
 message nor a barrier retry extends) and revalidates it as data progresses.
-Expiry of that window is terminal for the proof -- a late ACK cannot rescue
-it, and nothing is reclaimed -- and it ends the session, but it is **not** a
-protocol violation: missing evidence is what a stalled or lossy device
-produces (a laptop asleep, a process stopped, a data path gone), and the
-connector cannot distinguish it from a relay that never sent the ACK. It is a
-retryable transport failure, and the successor session starts with an empty
-journal, so nothing is replayed; the relay answers exchanges that were still
-in flight with an explicit unknown execution outcome (task row M6-C105).
+The proof is validated before the clock is consulted, so a proof that is
+complete when it is examined completes even if its last evidence arrived after
+the deadline; the deadline bounds retention, not safety. A proof still
+incomplete at the deadline ends the session, and nothing is reclaimed. That
+failure is **not** a protocol violation when everything except the owner's
+final ACK already holds -- the owner's sender evidence, the receive-side
+match, the sequence reconciliation and the owner snapshot's own invariants,
+with only the connector sender's pending-ACK state and that ACK's queued
+carrier control treated as satisfied. Missing evidence is what a stalled or
+lossy device produces: a process stopped (a monotonic clock keeps running
+through SIGSTOP, so the deadline has passed when the process resumes and can
+fire before the buffered ACK is read), or a data path gone, including a host
+suspended long enough for the relay's 30 s idle eviction, after which the ACK
+never arrives. (A suspended host's monotonic clock does not advance on macOS
+or Linux, so suspend reaches this only through that eviction.) The connector
+cannot distinguish missing evidence from a relay that never sent the ACK. It
+is a retryable transport failure, and the successor session starts with an
+empty journal, so nothing is replayed; the relay answers exchanges that were
+still in flight with an explicit unknown execution outcome (task row M6-C105).
 Evidence that **contradicts** the proof -- a mismatched cursor, byte count,
-terminal or identity -- stays a non-retryable protocol error, before or after
-the window.
+terminal or identity -- or an owner snapshot that is invalid in itself stays a
+non-retryable protocol error, before or after the window.
 
 The connector also keeps a bounded monotonic record of reclaimed stream IDs,
 which covers the IDs it refused before journaling them: those can be above the
