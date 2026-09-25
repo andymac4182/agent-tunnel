@@ -13,6 +13,13 @@
  *    `md5sum` against the remote export.
  * 3. **Mastra** — the real `Workspace` from `@mastra/core` 1.65.0 over
  *    `TunnelMastraFilesystem`, with `@mastra/core`'s own error classes.
+ * 4. **Files SDK** — the real `Files` from `files-sdk` 2.4.0 over
+ *    `createFilesAdapter`: `list`, `head` and `download`.
+ *
+ * With `DEMO_SIGNAL_DIR` set it then holds the session open, writes
+ * `ready` there, waits for the script to revoke the grant and write
+ * `revoked`, and reports how the live session ended (task row M4-06's
+ * "revocation under a live shared TypeScript client").
  *
  * It then shows the export refusing what the grant does not allow: a write,
  * a path that climbs out of the export, and a symlink that points outside it.
@@ -31,10 +38,12 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import * as workspaceModule from '@mastra/core/workspace';
 import { Workspace } from '@mastra/core/workspace';
+import { Files, FilesError } from 'files-sdk';
 import { Bash } from 'just-bash';
 import type { SecurityViolationType } from 'just-bash';
 
@@ -44,6 +53,7 @@ import {
   connectFilesystem,
   type RemoteFilesystem,
 } from '../src/index.ts';
+import { createFilesAdapter } from '../src/adapters/files-sdk.ts';
 import { TunnelJustBashFilesystem } from '../src/adapters/just-bash.ts';
 import { TunnelMastraFilesystem } from '../src/adapters/mastra.ts';
 
@@ -205,7 +215,18 @@ async function main(): Promise<void> {
   console.log(`readFile /data/numbers.csv: sha256=${mastraCsvSha.slice(0, 16)}…`);
   console.log(`exists /missing.txt: ${await mastraFs.exists('/missing.txt')}`);
 
-  heading('5. what the export refuses');
+  heading('5. Files SDK: new Files({ adapter }) over createFilesAdapter');
+  const files = new Files({ adapter: createFilesAdapter({ remote, FilesError }), retries: 0 });
+  const listed = await files.list();
+  const filesKeys = listed.items.map((item) => item.key).sort();
+  console.log(`list: ${filesKeys.length} keys`);
+  console.log(`  ${filesKeys.join('\n  ')}`);
+  const head = await files.head('data/blob.bin');
+  const blob = new Uint8Array(await (await files.download('data/blob.bin')).arrayBuffer());
+  const filesBlobSha = sha256(blob);
+  console.log(`head data/blob.bin: size=${head.size}; download sha256=${filesBlobSha.slice(0, 16)}…`);
+
+  heading('6. what the export refuses');
   const refusals: Refusal[] = [];
   const attempt = async (label: string, run: () => Promise<unknown>): Promise<void> => {
     try {
@@ -225,6 +246,7 @@ async function main(): Promise<void> {
   await attempt('read /escape-link (symlink to a file outside the export)', async () =>
     await remote.readFile('/escape-link'));
   await attempt('mastra writeFile /new.txt', async () => await mastraFs.writeFile('/new.txt', 'synthetic'));
+  await attempt('files-sdk upload new.txt', async () => await files.upload('new.txt', 'synthetic'));
   await attempt('bash: echo synthetic > /new.txt', async () => {
     // A redirection the export refuses either fails the command or, as
     // just-bash 3.4.2 does for a filesystem error, rejects `exec` itself.
@@ -235,7 +257,52 @@ async function main(): Promise<void> {
   });
 
   await workspace.destroy();
-  await remote.close();
+
+  let revocation: Record<string, unknown> | undefined;
+  const signalDir = process.env.DEMO_SIGNAL_DIR;
+  if (signalDir !== undefined && signalDir !== '') {
+    heading('7. revocation under a live session');
+    // Prove the session is live first, so the failure below is the revocation.
+    await remote.stat('/README.md');
+    writeFileSync(join(signalDir, 'ready'), 'ready\n');
+    console.log('session live; waiting for the operator to revoke the grant');
+    const waitStarted = Date.now();
+    while (!existsSync(join(signalDir, 'revoked'))) {
+      if (Date.now() - waitStarted > 60_000) {
+        throw new Error('the grant was never revoked');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const revokedAt = Date.now();
+    let code = 'none';
+    let attempts = 0;
+    while (Date.now() - revokedAt < 30_000) {
+      attempts += 1;
+      try {
+        await remote.stat('/README.md');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } catch (error) {
+        code = codeOf(error).code;
+        break;
+      }
+    }
+    const closed = remote.closedWith;
+    revocation = {
+      code,
+      attempts,
+      elapsedMs: Date.now() - revokedAt,
+      closeCode: closed?.code ?? null,
+      closeLocal: closed?.local ?? null,
+      state: remote.state,
+    };
+    console.log(
+      `after revoke-grant: operation refused ${code} after ${String(revocation.elapsedMs)} ms; ` +
+        `socket closed ${String(revocation.closeCode)} by ${closed?.local === true ? 'this client' : 'the relay'}; state=${remote.state}`,
+    );
+  }
+  if (remote.state !== 'closed') {
+    await remote.close();
+  }
   console.log('\nclosed the session');
 
   console.log(
@@ -248,7 +315,9 @@ async function main(): Promise<void> {
       bash: bashResults,
       bashFailuresRecorded: failures.entries.length,
       mastra: { entries: mastraEntries, csvSize: mastraStat.size, csvSha256: mastraCsvSha },
+      files: { keys: filesKeys, blobSize: head.size, blobSha256: filesBlobSha },
       refusals,
+      revocation: revocation ?? null,
     })}`,
   );
 }

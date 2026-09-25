@@ -14,7 +14,9 @@
 #    outside the repository: a relay listener CA and leaf, a device CA, an
 #    identity-issuer key and its JWKS.
 # 3. Starts a disposable TLS-only Redis container (the relay refuses a
-#    plaintext Redis), or uses DEMO_REDIS_URL / DEMO_REDIS_CA if given.
+#    plaintext Redis); or, with DEMO_PLAINTEXT_REDIS=host:port, fronts an
+#    existing plaintext Redis with a TLS terminator and no Docker; or uses
+#    DEMO_REDIS_URL / DEMO_REDIS_CA as given.
 # 4. Provisions the catalog with the shipped operator commands
 #    (activate-first-incarnation, provision-catalog), starts `serve`, and
 #    enrols and connects the device with the shipped client commands
@@ -30,6 +32,8 @@
 #
 # Everything it starts -- relay, device, Redis container, key directory -- is
 # stopped and removed on exit. DEMO_KEEP=1 keeps the work directory.
+# DEMO_NEGATIVE_CONTROL=1 changes a host file after the consumer read it, and
+# DEMO_NEGATIVE_CONTROL=revoke skips the revocation; each must end FAILED.
 #
 # Needs: cargo, node >= 24, npm, openssl, python3, curl, and docker (unless
 # DEMO_REDIS_URL is given). Synthetic data only.
@@ -53,11 +57,43 @@ case "$work/" in "$repo"/*) fail "refusing: work directory $work is inside the r
 relay_pid=""
 client_pid=""
 redis_container=""
+redis_tls_pid=""
+namespace=""
 cleanup() {
   status=$?
   [ -n "$client_pid" ] && kill "$client_pid" 2>/dev/null && wait "$client_pid" 2>/dev/null || true
   [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null && wait "$relay_pid" 2>/dev/null || true
   [ -n "$redis_container" ] && docker rm -f "$redis_container" >/dev/null 2>&1 || true
+  if [ -n "${DEMO_PLAINTEXT_REDIS:-}" ] && [ -n "$namespace" ]; then
+    # Delete this run's namespace from the shared plaintext Redis.
+    python3 - "$DEMO_PLAINTEXT_REDIS" "$namespace" <<'PY' || true
+import socket, sys
+host, _, port = sys.argv[1].rpartition(":")
+s = socket.create_connection((host, int(port)), timeout=5)
+f = s.makefile("rb")
+def cmd(*parts):
+    s.sendall(b"*%d\r\n" % len(parts) + b"".join(b"$%d\r\n%s\r\n" % (len(p), p) for p in parts))
+def read():
+    line = f.readline()
+    kind, rest = line[:1], line[1:-2]
+    if kind == b"*":
+        return [read() for _ in range(int(rest))]
+    if kind == b"$":
+        n = int(rest)
+        return None if n < 0 else f.read(n + 2)[:-2]
+    return rest
+cursor, deleted = b"0", 0
+while True:
+    cmd(b"SCAN", cursor, b"MATCH", b"*" + sys.argv[2].encode() + b"*", b"COUNT", b"1000")
+    cursor, keys = read()
+    for key in keys:
+        cmd(b"DEL", key); read(); deleted += 1
+    if cursor == b"0":
+        break
+print(f"cleanup: deleted {deleted} keys of namespace {sys.argv[2]}")
+PY
+  fi
+  [ -n "$redis_tls_pid" ] && kill "$redis_tls_pid" 2>/dev/null || true
   if [ "${DEMO_KEEP:-0}" = 1 ]; then
     echo "cleanup: kept $work (DEMO_KEEP=1); stopped relay, device and Redis (exit=$status)"
   else
@@ -112,7 +148,49 @@ printf '{"keys":[{"kid":"fs-demo-issuer","kty":"RSA","alg":"RS256","n":"%s","e":
 ok "relay CA and listener certificate (127.0.0.1, localhost), device CA, issuer key and JWKS"
 
 echo "== Redis (TLS only)"
-if [ -n "${DEMO_REDIS_URL:-}" ]; then
+if [ -n "${DEMO_PLAINTEXT_REDIS:-}" ]; then
+  # A local plaintext Redis (host:port), fronted by a TLS terminator the demo
+  # runs itself, because the relay refuses a plaintext Redis. The terminator
+  # neither reads nor alters the RESP stream. The demo's keys live under its
+  # own namespace and are deleted on exit.
+  redis_port=$(free_port)
+  cat > "$work/redis-tls.py" <<'PY'
+import asyncio, ssl, sys
+cert, key, port, upstream = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+host, _, uport = upstream.rpartition(":")
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain(cert, key)
+async def pipe(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        writer.close()
+async def handle(client_reader, client_writer):
+    try:
+        up_reader, up_writer = await asyncio.open_connection(host, int(uport))
+    except OSError:
+        client_writer.close()
+        return
+    await asyncio.gather(pipe(client_reader, up_writer), pipe(up_reader, client_writer))
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", port, ssl=context)
+    print("ready", flush=True)
+    async with server:
+        await server.serve_forever()
+asyncio.run(main())
+PY
+  python3 "$work/redis-tls.py" "$pki/relay.pem" "$pki/relay-key.pem" "$redis_port" "$DEMO_PLAINTEXT_REDIS" > "$work/redis-tls.log" 2>&1 &
+  redis_tls_pid=$!
+  for _ in $(seq 1 50); do grep -q ready "$work/redis-tls.log" 2>/dev/null && break; sleep 0.1; done
+  grep -q ready "$work/redis-tls.log" || { cat "$work/redis-tls.log"; fail "the Redis TLS terminator did not start"; }
+  redis_url="rediss://localhost:$redis_port/0"
+  redis_ca=$pki/relay-ca.pem
+  ok "TLS terminator on 127.0.0.1:$redis_port in front of the plaintext Redis at $DEMO_PLAINTEXT_REDIS"
+elif [ -n "${DEMO_REDIS_URL:-}" ]; then
   redis_url=$DEMO_REDIS_URL
   redis_ca=${DEMO_REDIS_CA:?DEMO_REDIS_CA must name the CA of DEMO_REDIS_URL}
   ok "using DEMO_REDIS_URL (its CA from DEMO_REDIS_CA)"
@@ -315,16 +393,43 @@ stranger=$(descriptor "$work/stranger.token")
 ok "an unprovisioned subject is refused: HTTP $stranger"
 
 echo "== consumer: packages/client/demo/filesystem-demo.ts"
-set +e
+signals=$work/signals
+mkdir "$signals"
 env -u NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS="$pki/relay-ca.pem" \
-  DEMO_ENDPOINT="$endpoint" DEMO_TOKEN_FILE="$work/consumer.token" \
-  node "$repo/packages/client/demo/filesystem-demo.ts" > "$work/consumer.out" 2> "$work/consumer.err"
+  DEMO_ENDPOINT="$endpoint" DEMO_TOKEN_FILE="$work/consumer.token" DEMO_SIGNAL_DIR="$signals" \
+  node "$repo/packages/client/demo/filesystem-demo.ts" > "$work/consumer.out" 2> "$work/consumer.err" &
+consumer_pid=$!
+# The consumer holds its session open and writes `ready`; the operator then
+# revokes the grant with the shipped day-2 command while that session is live.
+for _ in $(seq 1 600); do
+  [ -e "$signals/ready" ] && break
+  kill -0 "$consumer_pid" 2>/dev/null || break
+  sleep 0.1
+done
+revoke_status=""
+if [ -e "$signals/ready" ] && [ "${DEMO_NEGATIVE_CONTROL:-0}" = revoke ]; then
+  # Proves the revocation check can go red: signal without revoking.
+  echo "negative control: signalling the consumer without revoking the grant"
+  revoke_status=0
+  echo "(negative control: no revoke-grant was run)" > "$work/revoke.out"
+  touch "$signals/revoked"
+elif [ -e "$signals/ready" ]; then
+  "$relay" revoke-grant --config "$work/relay.toml" --tenant "$tenant" --user "$user" \
+    --device "$device" --service "$service" > "$work/revoke.out" 2>&1 && revoke_status=0 || revoke_status=$?
+  touch "$signals/revoked"
+fi
+set +e
+wait "$consumer_pid"
 consumer_status=$?
 set -e
 grep -v '^DEMO-RESULT ' "$work/consumer.out" || true
 [ "$consumer_status" = 0 ] || { cat "$work/consumer.err" >&2; fail "consumer exited $consumer_status"; }
 grep '^DEMO-RESULT ' "$work/consumer.out" | sed 's/^DEMO-RESULT //' > "$work/result.json"
 [ -s "$work/result.json" ] || fail "consumer printed no DEMO-RESULT line"
+[ "$revoke_status" = 0 ] || { cat "$work/revoke.out" >&2; fail "revoke-grant exited ${revoke_status:-without running}"; }
+sed 's/^/  /' "$work/revoke.out"
+after_revoke=$(descriptor "$work/consumer.token")
+echo "descriptor for the revoked subject: HTTP $after_revoke"
 
 if [ "${DEMO_NEGATIVE_CONTROL:-0}" = 1 ]; then
   # Proves the comparison below can go red: one host file changes after the
@@ -337,7 +442,7 @@ fi
 echo
 echo "== checks against the host directory"
 checks=0
-python3 - "$work/result.json" "$export_root" <<'PY' || checks=$?
+AFTER_REVOKE=$after_revoke python3 - "$work/result.json" "$export_root" <<'PY' || checks=$?
 import hashlib, json, os, sys
 
 result = json.load(open(sys.argv[1]))
@@ -400,6 +505,24 @@ check("Mastra recursive readdir lists the tree", names == expected,
 size, digest, _ = host_files["/data/numbers.csv"]
 check("Mastra stat and readFile of /data/numbers.csv equal the host's",
       mastra["csvSize"] == size and mastra["csvSha256"] == digest)
+
+files = result["files"]
+check("Files SDK list returns every key", sorted(files["keys"]) == sorted(p[1:] for p in host_files),
+      f"{len(files['keys'])} keys")
+size, digest, _ = host_files["/data/blob.bin"]
+check("Files SDK head and download of data/blob.bin equal the host's",
+      files["blobSize"] == size and files["blobSha256"] == digest, f"{files['blobSize']} bytes")
+
+revocation = result["revocation"]
+# The relay's revoke-grant promises an admitted stream ends within its 5 s
+# authorization snapshot; one second of slack covers the consumer's polling.
+check("revoking the grant ends the live session with 1008 (AUTH_EXPIRED) within the 5 s snapshot",
+      revocation is not None and revocation["code"] == "AUTH_EXPIRED" and revocation["closeCode"] == 1008
+      and revocation["closeLocal"] is False and revocation["elapsedMs"] <= 6000,
+      f"code={revocation and revocation['code']} close={revocation and revocation['closeCode']} "
+      f"after {revocation and revocation['elapsedMs']} ms")
+after = int(os.environ.get("AFTER_REVOKE", "0"))
+check("the revoked subject gets no new descriptor (the export is not disclosed)", after in (403, 404), f"HTTP {after}")
 
 refusals = {r["attempt"]: r for r in result["refusals"]}
 for attempt, r in refusals.items():
