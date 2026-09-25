@@ -275,7 +275,10 @@ EXPECTED_MODULE_FILTERS = 9
 #: one.
 EXPECTED_GUARD_ANCHORS = {
     "fs-guard-deletion.py": 485,
-    "acp-guard-deletion.py": 148,
+    # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
+    # `availability()`. Re-measured, not incremented: 150 first, which fails
+    # naming acp ("found 149"), then 149.
+    "acp-guard-deletion.py": 149,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
@@ -312,7 +315,13 @@ EXPECTED_GUARD_ANCHORS = {
     #
     # Then **27**, for review S2's carrier-loss case in the same suite.
     # Re-measured the same way: 28 first, which fails naming m3, then 27.
-    "m3-guard-deletion.py": 27,
+    #
+    # Then **34**, measured by the M5-C16 worker: `--check-anchors` reported
+    # 34 across 11 suites with the new `m3c09` availability case, so the floor
+    # had been lagging six behind the truth before that case was added (not
+    # attributed here to the suites that landed without raising it). Re-measured the same way:
+    # 35 first, which fails naming m3 ("found 34"), then 34.
+    "m3-guard-deletion.py": 34,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

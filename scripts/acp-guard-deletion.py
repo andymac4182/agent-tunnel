@@ -2466,6 +2466,31 @@ C7_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    (
+        # Task row M5-C16, the ACP copy of M5-C11's `m5c8` case.  The sentinel
+        # tests in `process_residue.rs` now *skip*, naming themselves, when
+        # `availability()` says the helper is absent -- so an `availability()`
+        # that reported it missing whatever is on disk would skip every one of
+        # them and the coverage would vanish silently.  This defeats it into
+        # exactly that.  `C7_BUILD` is load-bearing here rather than
+        # boilerplate: with no helper beside the tests the control correctly
+        # asserts `false == false` and this case would report `still green`
+        # over a rule that was never exercised.  Its witness is declared in
+        # `WITNESSES` below rather than owed in the debt ledger.
+        "a present ACP sentinel helper cannot be reported as missing",
+        [
+            (
+                DEADMAN_LIB,
+                """    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
+    }""",
+                "    Availability::SentinelMissing",
+            )
+        ],
+        False,
+    ),
 ]
 
 
@@ -2588,7 +2613,7 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: The test(s) each case's deleted guard must make redden, keyed by
 #: `(suite, case)`.
 #:
-#: **Empty, and deliberately so (task row M4-23).**  A witness is a
+#: **No guessed entries, deliberately (task row M4-23).**  A witness is a
 #: measurement -- the test that actually reddens when *this* guard is deleted,
 #: one `cargo test` per case -- and it cannot be read off the case's text.
 #: Filling this in by writing a plausible test name beside each case would
@@ -2600,7 +2625,18 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: keeps the old unattributed classification, and is reported as owing a
 #: witness.  Moving a case out of that ledger and into this table is the unit
 #: of progress; the ledger can only shrink, and a case may not appear in both.
-WITNESSES: dict[tuple[str, str], frozenset[str]] = {}
+#:
+#: **One entry, and it is not a moved debt (task row M5-C16).**  The case
+#: below was added with its witness declared from the start, so it never
+#: entered the ledger; its witness was measured red from this harness, not
+#: read off the case's text.  The positive control is the only test that can
+#: notice a skip taken while the helper is present, because every sentinel
+#: test it guards goes *green* by skipping.
+WITNESSES: dict[tuple[str, str], frozenset[str]] = {
+    ("m8c7", "a present ACP sentinel helper cannot be reported as missing"): frozenset(
+        {"the_skip_cannot_hide_a_helper_that_is_on_disk"}
+    ),
+}
 
 #: The pinned ledger, loaded once.
 DEBT = load_witness_debt('acp-guard-deletion')
