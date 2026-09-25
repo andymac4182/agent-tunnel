@@ -75,7 +75,7 @@ example the documentation mentions is in the repository at `sourceSha`:
 `https://github.com/andymac4182/agentuplink/tree/<sourceSha>/examples`.
 Newer archives' `README.txt` says to start with `docs/operator.md`. That guide
 is for running a relay; as a tester joining one, ignore that pointer and follow
-this page.
+this page, which those archives also carry as `docs/join-relay.md`.
 
 **macOS only:** the binaries are not code-signed or notarized. `gh release
 download` does not mark files as quarantined, so they run as they are. An
@@ -195,7 +195,7 @@ outbound. When `connect` exits, its status says why
 | `7` | `OWNER_BUSY` | Another `connect` for this device is still running, here or on another computer. Stop it (`pgrep -fl "tunnel-client connect"`) and run again. After a relay crash the old session holds the device for up to 30 seconds |
 | `3` | `CREDENTIAL_ERROR` | The relay refused this device's identity. Check `device_id` and the export UUID with the operator; they must match the catalog |
 | `4` | `TRANSPORT_ERROR` | With `--no-reconnect`: the relay was unreachable or the session was lost. Check the URL, port 9443 and `relay-ca.pem` |
-| `1` | `PROTOCOL_ERROR` | A version mismatch with the relay, or a known defect after a network stall with a request in flight ("STREAM_FORGET terminal proof did not converge before its deadline", M6-C103). Run `connect` again; a service manager should restart it on exit `1` |
+| `1` | `PROTOCOL_ERROR` | A version mismatch with the relay, or, in releases up to `f9f7abf`, a known defect after a network stall with a request in flight ("STREAM_FORGET terminal proof did not converge before its deadline"; fixed on `main` by M6-C105, awaiting verification). Run `connect` again; a service manager should restart it on exit `1` |
 
 ## 6. Call the echo
 
