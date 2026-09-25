@@ -52,3 +52,12 @@ redis_restart_continuity_seconds = 5
 interval_seconds = 300
 handshake_timeout_seconds = 10
 overlap_seconds = 30
+
+# HTTP forwarding (docs/http-forwarding.md, docs/mcp.md): the MCP profiles this
+# relay serves. A catalog service reaches the public
+# /v1/devices/<device>/services/<service>/http/... route only when its
+# `http_forward_profile` capability names one of these; every other service
+# answers 404 there. Limits are the defaults (1 MiB request, 64 MiB response,
+# 300 s deadline). Enabled on Fly on 2026-09-25 for the demo MCP export.
+[http_forward]
+profiles = ["mcp-2026-07-28", "mcp-2025-11-25"]
