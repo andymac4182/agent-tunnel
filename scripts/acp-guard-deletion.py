@@ -1078,7 +1078,19 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
     }
 
     async fn answer_permission(""",
-            )
+            ),
+            # Since M8-C27 a finished turn's result travels the ordered
+            # transport channel and only falls back to the direct send above
+            # when the dispatcher is gone.  Defeating only the fallback left
+            # this case green, which is how the reroute was noticed; both
+            # paths are defeated so the 202 really does lie.
+            (
+                BRIDGE,
+                """                    let body = match ordered {
+                        Some(ordered) => match ordered""",
+                """                    let body = match None::<mpsc::Sender<OutboundMessage>> {
+                        Some(ordered) => match ordered""",
+            ),
         ],
         False,
     ),
