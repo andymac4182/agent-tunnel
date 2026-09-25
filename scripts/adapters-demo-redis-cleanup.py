@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Delete one demo run's Redis keys (scripts/adapters-demo.sh cleanup).
 
-    adapters-demo-redis-cleanup.py REDISS_URL CA_FILE NAMESPACE
+    adapters-demo-redis-cleanup.py REDIS_URL CA_FILE NAMESPACE
+
+REDIS_URL is rediss://, or plaintext redis:// on loopback only (the shared
+verification Redis, reached with DEMO_ALLOW_SHARED_REDIS=1).
 
 Removes every key whose name contains NAMESPACE, which the demo makes unique
 per run (`adapters-demo-<pid>-<time>`), so a Redis supplied through
@@ -62,12 +65,17 @@ def main():
         print("redis cleanup: refused, namespace is not a demo namespace", file=sys.stderr)
         return 2
     parts = urlsplit(url)
-    if parts.scheme != "rediss":
-        print("redis cleanup: refused, only rediss:// is supported", file=sys.stderr)
+    if parts.scheme == "redis" and parts.hostname not in ("127.0.0.1", "localhost"):
+        print("redis cleanup: refused, plaintext redis:// only on loopback", file=sys.stderr)
         return 2
-    context = ssl.create_default_context(cafile=ca)
+    if parts.scheme not in ("redis", "rediss"):
+        print("redis cleanup: refused, not a redis URL", file=sys.stderr)
+        return 2
     raw = socket.create_connection((parts.hostname, parts.port or 6379), timeout=10)
-    sock = context.wrap_socket(raw, server_hostname=parts.hostname)
+    if parts.scheme == "rediss":
+        sock = ssl.create_default_context(cafile=ca).wrap_socket(raw, server_hostname=parts.hostname)
+    else:
+        sock = raw
     redis = Resp(sock)
     if parts.password is not None:
         user = unquote(parts.username) if parts.username else "default"

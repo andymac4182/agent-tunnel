@@ -46,6 +46,8 @@ client_pid=""
 redis_container=""
 redis_url=""
 redis_ca=""
+cleanup_redis_url=""
+forward_pid=""
 namespace=""
 cleanup() {
   status=$?
@@ -54,10 +56,13 @@ cleanup() {
   # Delete this run's catalog keys before the Redis goes away, so a Redis given
   # through DEMO_REDIS_URL is left as it was found. Runs for the disposable
   # container too, which is how every run exercises it.
-  if [ -n "$namespace" ] && [ -n "$redis_url" ]; then
-    python3 "$repo/scripts/adapters-demo-redis-cleanup.py" "$redis_url" "$redis_ca" "$namespace" \
-      || echo "cleanup: WARNING could not delete Redis keys for namespace $namespace" >&2
+  if [ -n "$namespace" ] && [ -n "$cleanup_redis_url" ]; then
+    if ! python3 "$repo/scripts/adapters-demo-redis-cleanup.py" "$cleanup_redis_url" "$redis_ca" "$namespace"; then
+      echo "cleanup: FAILED could not delete Redis keys for namespace $namespace" >&2
+      [ "$status" = 0 ] && status=1
+    fi
   fi
+  [ -n "$forward_pid" ] && kill "$forward_pid" 2>/dev/null && wait "$forward_pid" 2>/dev/null || true
   [ -n "$redis_container" ] && docker rm -f "$redis_container" >/dev/null 2>&1 || true
   if [ "${DEMO_KEEP:-0}" = 1 ]; then
     echo "cleanup: kept $work (DEMO_KEEP=1); stopped relay, device and Redis (exit=$status)"
@@ -65,6 +70,7 @@ cleanup() {
     rm -rf "$work"
     echo "cleanup: stopped relay, device and Redis; removed $work (exit=$status)"
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -113,14 +119,35 @@ printf '{"keys":[{"kid":"adapters-demo-issuer","kty":"RSA","alg":"RS256","n":"%s
 ok "relay CA and listener certificate (127.0.0.1, localhost), device CA, issuer key and JWKS"
 
 echo "== Redis (TLS only)"
-if [ -n "${DEMO_REDIS_URL:-}" ]; then
+shared_redis=127.0.0.1:63790
+if [ "${DEMO_ALLOW_SHARED_REDIS:-0}" = 1 ]; then
+  # Explicit opt-in to the shared verification Redis (for when Docker is not
+  # available). It is plaintext and `relay serve` accepts only rediss://, so a
+  # stdlib TLS forwarder with this run's synthetic relay leaf sits in between.
+  # The run's namespace is unique and its keys are deleted on exit, directly
+  # against the shared Redis; a failed deletion fails the run.
+  [ -z "${DEMO_REDIS_URL:-}" ] || fail "DEMO_ALLOW_SHARED_REDIS=1 uses $shared_redis; do not also set DEMO_REDIS_URL"
+  python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1",63790),timeout=3)' 2>/dev/null \
+    || fail "the shared Redis on $shared_redis is not reachable"
+  forward_port=$(free_port)
+  python3 "$repo/scripts/adapters-demo-tls-forward.py" "$forward_port" "$pki/relay.pem" "$pki/relay-key.pem" 127.0.0.1 63790 \
+    > "$work/forward.log" 2>&1 &
+  forward_pid=$!
+  for _ in $(seq 1 50); do grep -q ready "$work/forward.log" 2>/dev/null && break; sleep 0.1; done
+  grep -q ready "$work/forward.log" || fail "the TLS forwarder did not start"
+  redis_url="rediss://localhost:$forward_port/0"
+  redis_ca=$pki/relay-ca.pem
+  cleanup_redis_url="redis://$shared_redis/0"
+  ok "shared Redis $shared_redis (DEMO_ALLOW_SHARED_REDIS=1) behind a loopback TLS forwarder on 127.0.0.1:$forward_port; keys deleted on exit"
+elif [ -n "${DEMO_REDIS_URL:-}" ]; then
   # 127.0.0.1:63790 is the shared verification Redis other agents' gates use;
-  # this demo must never write its catalog there.
+  # this demo writes there only with the explicit DEMO_ALLOW_SHARED_REDIS=1.
   case "$DEMO_REDIS_URL" in
-    *:63790|*:63790/*) fail "refusing DEMO_REDIS_URL on port 63790: that is the shared verification Redis" ;;
+    *:63790|*:63790/*) fail "refusing DEMO_REDIS_URL on port 63790: that is the shared verification Redis (set DEMO_ALLOW_SHARED_REDIS=1 instead, which deletes the run's keys)" ;;
   esac
   redis_url=$DEMO_REDIS_URL
   redis_ca=${DEMO_REDIS_CA:?DEMO_REDIS_CA must name the CA of DEMO_REDIS_URL}
+  cleanup_redis_url=$redis_url
   ok "using DEMO_REDIS_URL (its CA from DEMO_REDIS_CA)"
 else
   need docker
@@ -145,6 +172,7 @@ else
     || { docker logs "$redis_container"; fail "Redis did not start"; }
   redis_url="rediss://localhost:$redis_port/0"
   redis_ca=$pki/relay-ca.pem
+  cleanup_redis_url=$redis_url
   ok "disposable Redis container $redis_container, TLS only, on 127.0.0.1:$redis_port"
 fi
 

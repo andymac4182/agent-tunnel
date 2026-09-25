@@ -29,8 +29,18 @@ offers the tools, validates the input against each tool's schema, calls
 - `cargo` (Rust 1.95.0 from `rust-toolchain.toml`), `node` ≥ 24 (24.21.0 is
   pinned in `packages/client/.node-version`), `npm`, `openssl`, `python3`,
   `curl`.
-- `docker`, for a disposable TLS-only Redis (`redis:8.4.0-alpine`) — or set
-  `DEMO_REDIS_URL` (a `rediss://` URL) and `DEMO_REDIS_CA`.
+- One Redis, in this order of preference:
+  - `docker`, for a disposable TLS-only Redis (`redis:8.4.0-alpine`) — the
+    default;
+  - `DEMO_REDIS_URL` (a `rediss://` URL) and `DEMO_REDIS_CA`, for a Redis of
+    your own; a URL on port 63790 is refused;
+  - `DEMO_ALLOW_SHARED_REDIS=1`, which uses the shared plaintext verification
+    Redis on `127.0.0.1:63790` when Docker is unavailable. `tunnel-relay
+    serve` accepts only `rediss://`, so the script puts a loopback TLS
+    forwarder (`scripts/adapters-demo-tls-forward.py`, standard library only)
+    in front of it with the run's synthetic relay certificate. The run's
+    namespace is unique and its keys are deleted on exit directly against
+    the shared Redis; if that deletion fails, the run fails.
 - Free disk for a debug build of `tunnel-relay` and `tunnel-client`.
 
 ## Run it
@@ -148,7 +158,9 @@ the real `generateText` loop and a real Mastra `Agent` with a scripted model.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `FAILED prerequisite: 'docker' is not on PATH` | Start Docker, or pass `DEMO_REDIS_URL` and `DEMO_REDIS_CA` for an existing TLS Redis. |
+| `FAILED prerequisite: 'docker' is not on PATH` | Start Docker, or pass `DEMO_REDIS_URL` and `DEMO_REDIS_CA` for an existing TLS Redis, or `DEMO_ALLOW_SHARED_REDIS=1` for the shared verification Redis. |
+| The run stops after `== Redis (TLS only)` | `docker create`/`start` is hanging: Docker Desktop is unresponsive. Interrupt the run and use `DEMO_ALLOW_SHARED_REDIS=1`. |
+| `cleanup: FAILED could not delete Redis keys` | The run exits 1. Delete the keys by hand: `python3 scripts/adapters-demo-redis-cleanup.py URL CA NAMESPACE` with the namespace the run printed. |
 | `Redis did not start` | The image could not be pulled or the port was taken; re-run (the port is chosen fresh each time), or set `DEMO_REDIS_IMAGE`. |
 | `relay exited before it was ready` | The script prints `relay.log`. Usually a stale binary: rebuild, or point `DEMO_BIN_DIR` at a current `target/debug`. |
 | `the export never came online` | The device could not connect; the script prints `device.log`, `relay.log` and the last descriptor. Check that nothing is intercepting `127.0.0.1`. |
