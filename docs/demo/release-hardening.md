@@ -88,10 +88,29 @@ commit with `sourceSha` in the archive's `release.json`. It is provenance, not
 code signing and not a review of the source (see join-relay.md section 1).
 A release published before this change answers `HTTP 404`.
 
-## 4. An aarch64 Linux client, built locally (not a release target)
+## 4. An aarch64 Linux client (CI-built, not a release target)
 
-`aarch64-unknown-linux-gnu` is not an advertised release target; adding it is
-an owner decision (M6-C115). On an Apple silicon Mac with Docker, the local
+`aarch64-unknown-linux-gnu` is a CI-only target (`ci-only-targets` in the
+root `Cargo.toml`). Advertising it is an owner decision (M6-C115). The
+release workflow builds it on `ubuntu-24.04-arm` as a client-only archive,
+verifies the unpacked archive there, and attests it, but never publishes it.
+Take it from a green run's workflow artifact, which is kept for 7 days. Run
+36153487478 is one such run:
+
+```text
+gh run download <run-id> -R andymac4182/agentuplink -n release-aarch64-unknown-linux-gnu -D armlinux
+cd armlinux && sha256sum -c agentuplink-*.tar.gz.sha256
+gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink \
+  --signer-workflow andymac4182/agentuplink/.github/workflows/release.yml
+mkdir release && tar -xzf agentuplink-*.tar.gz -C release
+```
+
+The unpacked `bin/` holds `tunnel-client` and `tunnel-deadman`. Keep them
+together, then continue with [join-relay.md](../join-relay.md) section 2.
+
+### 4.1 Local build without CI
+
+On an Apple silicon Mac with Docker, the local
 `rust:1.95.0` image (linux/arm64) builds the device half natively, reusing the
 host's crate cache so nothing is fetched:
 
