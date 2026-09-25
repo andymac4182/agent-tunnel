@@ -119,6 +119,9 @@ node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)
 
 mkdir -p "$work/logs"
 chmod 700 "$work"
+# The relay refuses TLS material under a symlinked path (macOS's $TMPDIR is
+# under /var -> /private/var), so work from the physical path.
+work=$(cd "$work" && pwd -P)
 log="$work/logs/m3-sdk-conformance.log"
 echo "nonce=$nonce head=$head" > "$log"
 say "nonce=$nonce head=$head work=$work"
