@@ -5,7 +5,8 @@
 #   * up.sh from nothing succeeds, and a second up.sh is a no-op ("already up"),
 #   * show.sh for every ready feature exits 0, and a TODO feature exits 2,
 #   * a token minted by token.sh is accepted by the relay,
-#   * down.sh leaves no demo container, no process started from the state
+#   * with an MCP session left open, down.sh leaves no device-side child,
+#     no demo container, no process started from the state
 #     directory, no pid recorded by up.sh still alive, and no state directory,
 #   * a second down.sh is a no-op,
 #   * no output of any command contains a JWT-shaped string or a PEM block.
@@ -35,6 +36,15 @@ run() { # LABEL WANT_RC CMD...
   [ "$rc" = "$want" ] || die "$label exited $rc (wanted $want)"
 }
 
+# The first plug-in up.sh did not bring up (a TODO stub), if any.
+first_todo() {
+  local ready n
+  ready=" $(. "$DEMO_STATE/ids.env"; echo "$DEMO_FEATURES") "
+  for n in $(demo_feature_names); do
+    if ! printf '%s' "$ready" | grep -q " $n "; then echo "$n"; return 0; fi
+  done
+}
+
 round=0
 "$DIR/down.sh" >/dev/null 2>&1
 while [ "$round" -lt "$ROUNDS" ]; do
@@ -53,15 +63,30 @@ while [ "$round" -lt "$ROUNDS" ]; do
     shown="$shown$name,"
   done
   run "show all" 0 "$DIR/show.sh" all
-  todo=$(for n in $(demo_feature_names); do case " $(. "$DEMO_STATE/ids.env"; echo "$DEMO_FEATURES") " in *" $n "*) ;; *) echo "$n" ;; esac; done | head -1)
+  todo=$(first_todo)
   if [ -n "$todo" ]; then run "show $todo (TODO)" 2 "$DIR/show.sh" "$todo"; fi
   tok=$("$DIR/token.sh" echo:invoke 60 </dev/null) || die "token.sh failed"
   (. "$DEMO_STATE/ids.env"
    printf 'Authorization: Bearer %s\n' "$tok" | curl -s -o /dev/null -w '%{http_code}' -H @- --cacert "$DEMO_PKI/server-ca.pem" \
      --data-binary token-check "$DEMO_CONSUMER_URL/v1/devices/$DEMO_DEVICE/services/$DEMO_SERVICE_ECHO/echo") >"$OUT/last" 2>&1
   [ "$(cat "$OUT/last")" = 200 ] || die "token.sh token was not accepted: $(cat "$OUT/last")"
+  # Leave an MCP session open, so the device has a live stdio child that
+  # down.sh must not orphan.
+  children=
+  case " $(. "$DEMO_STATE/ids.env"; echo "$DEMO_FEATURES") " in *" mcp "*)
+    tok=$("$DIR/token.sh" http:invoke 60 </dev/null) || die "token.sh failed"
+    (. "$DEMO_STATE/ids.env"
+     printf 'Authorization: Bearer %s\n' "$tok" | curl -s -o /dev/null -w '%{http_code}' -H @- --cacert "$DEMO_PKI/server-ca.pem" \
+       -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+       --data-binary '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"selftest","version":"1"}}}' \
+       "$DEMO_CONSUMER_URL/v1/devices/$DEMO_DEVICE/services/$DEMO_SERVICE_MCP/http/mcp") >"$OUT/last" 2>&1
+    [ "$(cat "$OUT/last")" = 200 ] || die "open MCP session: $(cat "$OUT/last")"
+    children=$(pgrep -P "$(cat "$DEMO_PIDS/device.pid")" | tr '\n' ' ')
+    [ -n "$children" ] || die "the open MCP session has no device-side child process"
+    ;;
+  esac
   unset tok
-  pids=$(cat "$DEMO_PIDS"/*.pid 2>/dev/null | tr '\n' ' ')
+  pids="$(cat "$DEMO_PIDS"/*.pid 2>/dev/null | tr '\n' ' ') $children"
   run down 0 "$DIR/down.sh"
   run down-again 0 "$DIR/down.sh"
   for pid in $pids; do kill -0 "$pid" 2>/dev/null && die "pid $pid survived down.sh"; done
@@ -71,6 +96,6 @@ while [ "$round" -lt "$ROUNDS" ]; do
   if grep -Eq 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.|-----BEGIN' "$OUT/all"; then
     die "output contains a token- or PEM-shaped string"
   fi
-  echo "demo-selftest round=$round ok up_ms=$up_ms shown=${shown%,} todo_refused=${todo:-none} token_sh=200 stopped_pids=$(echo $pids | wc -w | tr -d ' ') container_removed=true state_removed=true secrets_in_output=0"
+  echo "demo-selftest round=$round ok up_ms=$up_ms shown=${shown%,} todo_refused=${todo:-none} token_sh=200 stopped_pids=$(echo $pids | wc -w | tr -d ' ') mcp_children_stopped=$(echo $children | wc -w | tr -d ' ') container_removed=true state_removed=true secrets_in_output=0"
 done
 echo "demo-selftest ok rounds=$round nonce=$nonce head=$head"
