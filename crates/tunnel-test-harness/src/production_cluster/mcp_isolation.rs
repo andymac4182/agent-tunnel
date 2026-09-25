@@ -154,6 +154,16 @@ const ANCHOR_BOUND: Duration = Duration::from_secs(
         + ISOLATION_ROTATION.overlap_seconds)
         * 2,
 );
+/// The quiet window the anchor buys: after an observed completion, no
+/// scheduled freeze begins for one whole interval.  The session open and the
+/// spanning call (99-330 ms after the anchor in every recorded run, M3-34)
+/// must fit inside it with margin, so a shorter policy would reintroduce the
+/// race this anchor exists to remove.
+const ANCHOR_MIN_INTERVAL_SECONDS: u64 = 3;
+const _: () = assert!(
+    ISOLATION_ROTATION.interval_seconds >= ANCHOR_MIN_INTERVAL_SECONDS,
+    "the rotation-span anchor needs an interval long enough to open a session and dispatch the call before the next freeze (M3-34)"
+);
 /// How long an explicit outcome may take to reach the consumer after a
 /// fault.
 const OUTCOME_WAIT: Duration = Duration::from_secs(90);
@@ -2561,8 +2571,9 @@ impl Gate<'_> {
             }
             if Instant::now() >= deadline {
                 return Err(HarnessError::Timeout(format!(
-                    "no scheduled rotation completed within {} s to anchor the spanning call; owner session phase={phase:?} rotations_completed={completed}",
-                    ANCHOR_BOUND.as_secs()
+                    "no scheduled rotation completed within {} s (rotation interval {} s) to anchor the spanning call; owner session phase={phase:?} rotations_completed={completed}",
+                    ANCHOR_BOUND.as_secs(),
+                    ISOLATION_ROTATION.interval_seconds
                 )));
             }
             sleep(POLL).await;
@@ -2622,7 +2633,8 @@ impl Gate<'_> {
             phase_at_dispatch == "active" && completed_at_dispatch == rotations_before;
         if !dispatched_between_rotations {
             eprintln!(
-                "MCP isolation gate: the spanning call started {anchor_to_dispatch_ms} ms after its anchor with the owner session phase={phase_at_dispatch:?} rotations_completed={completed_at_dispatch} (anchor {rotations_before})"
+                "MCP isolation gate: the spanning call started {anchor_to_dispatch_ms} ms after its anchor (rotation interval {} ms) with the owner session phase={phase_at_dispatch:?} rotations_completed={completed_at_dispatch} (anchor {rotations_before})",
+                ISOLATION_ROTATION.interval_seconds * 1_000
             );
         }
         let deadline = Instant::now() + ROTATION_BOUND;
