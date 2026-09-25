@@ -342,7 +342,14 @@ EXPECTED_GUARD_ANCHORS = {
     # had been lagging six behind the truth before that case was added (not
     # attributed here to the suites that landed without raising it). Re-measured the same way:
     # 35 first, which fails naming m3 ("found 34"), then 34.
-    "m3-guard-deletion.py": 34,
+    #
+    # Then **60**, measured on branch `m7-connector`: `--check-anchors`
+    # reported 51 across 12 suites after merging `origin/main` (the floor had
+    # lagged 17 behind), and 60 across 14 once the `m7-connector-relay` and
+    # `m7-connector-client` suites added their nine cases (M7-C84, M7-C94,
+    # M7-C95, M7-C98, M7-C109, M7-C110).  Re-measured the same way: 61 first,
+    # which fails naming m3, then 60.
+    "m3-guard-deletion.py": 60,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

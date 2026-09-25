@@ -3470,6 +3470,215 @@ async fn a_unary_echo_invalidated_before_dispatch_is_reset_and_forgotten() {
     );
 }
 
+/// M7-C94: a CANCEL from the connector after dispatch.  The relay answers
+/// the consumer, echoes the CANCEL, and the connector then ends its stream
+/// with RESET.  Before the fix that RESET named a removed entry and failed
+/// the whole session as `INVALID_RESET`.
+#[tokio::test]
+async fn a_unary_echo_cancelled_by_the_connector_is_forgotten_and_keeps_the_session() {
+    let mut fixture = FreezeFixture::new("unary-connector-cancel", false);
+    let (stream_id, operation_id, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            wire::cancel(
+                &fixture.key.session_id,
+                fixture.key.epoch,
+                stream_id,
+                &operation_id,
+            ),
+        )
+        .await;
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "CANCELLED",
+            execution: "unknown"
+        })
+    ));
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::reset(
+            1,
+            generation,
+            stream_id,
+            1,
+            2,
+            tunnel_protocol::reset_reason::PROTOCOL,
+        ))
+        .await;
+    assert!(
+        fixture.session_alive(),
+        "the connector's RESET after a CANCEL must not fail the session"
+    );
+    assert_eq!(
+        acks_for(&drain_data(&mut fixture.old_rx), stream_id),
+        vec![1]
+    );
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.final_state.last_emitted))
+            .collect::<Vec<_>>(),
+        vec![(stream_id, 2)]
+    );
+}
+
+/// M7-C94: the connector invalidates the authorization of an echo it has
+/// admitted but the relay has not dispatched.  The relay answers the consumer
+/// and ends its own direction with RESET; the connector's own RESET completes
+/// the exchange, which is forgotten.  Before the fix the entry was dropped
+/// and the connector's RESET failed the session as `INVALID_RESET`.
+#[tokio::test]
+async fn a_unary_echo_invalidated_by_the_connector_is_reset_and_forgotten() {
+    let mut fixture = FreezeFixture::new("unary-connector-invalidated", false);
+    let (stream_id, operation_id, open_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .connector_opened_unary(stream_id, &operation_id, &open_id)
+        .await;
+    let challenge_id = format!("unary-challenge-{stream_id}");
+    if let Some(pending) = fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .and_then(|session| session.pending.get_mut(&stream_id))
+    {
+        pending.challenge_id = Some(challenge_id.clone());
+    }
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            wire::authorization_invalidated(
+                &fixture.key.session_id,
+                fixture.key.epoch,
+                stream_id,
+                &challenge_id,
+                fixture.grant.revision,
+                "operation deadline elapsed",
+            ),
+        )
+        .await;
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "AUTHORIZATION_REVOKED",
+            execution: "not_dispatched"
+        })
+    ));
+    let generation = fixture.attempt.old_generation;
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Reset, 1, generation)]
+    );
+    fixture
+        .connector_frame(Frame::reset(
+            1,
+            generation,
+            stream_id,
+            1,
+            1,
+            tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED,
+        ))
+        .await;
+    assert!(fixture.session_alive());
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.final_state.last_emitted))
+            .collect::<Vec<_>>(),
+        vec![(stream_id, 1)]
+    );
+}
+
+/// M7-C94: the operation timeout is the tick's other expiry.  An echo that
+/// outlived it is answered and abandoned, and its late completion is still
+/// acknowledged and forgotten rather than failing the session.
+#[tokio::test]
+async fn a_unary_echo_past_its_operation_timeout_is_still_forgotten() {
+    let mut fixture = FreezeFixture::new("unary-operation-timeout", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    let timeout = fixture.actor.options.limits.operation_timeout;
+    if let Some(pending) = fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .and_then(|session| session.pending.get_mut(&stream_id))
+    {
+        pending.created_at = Instant::now() - timeout - StdDuration::from_secs(1);
+    }
+    let key = fixture.key.clone();
+    fixture.actor.expire_pending_echoes(&key);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "REVERSE_CHANNEL_INTERRUPTED",
+            execution: "unknown"
+        })
+    ));
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 2)
+        .await;
+    assert!(fixture.session_alive());
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(forgets.len(), 1);
+    assert_eq!(forgets[0].stream_id, stream_id);
+}
+
+/// M7-C94: an abandoned exchange is retained only while its proofs can still
+/// arrive.  One whose connector never answers is not kept forever: once it
+/// has waited past `UNARY_ABANDON_TIMEOUT` the tick closes the session with
+/// that typed reason.
+#[tokio::test]
+async fn an_abandoned_unary_echo_that_never_ends_closes_the_session_after_its_bound() {
+    let mut fixture = FreezeFixture::new("unary-abandon-bound", false);
+    let (stream_id, _, _, receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    drop(receiver);
+    let key = fixture.key.clone();
+    fixture.actor.expire_pending_echoes(&key);
+    fixture.actor.tick().await;
+    assert!(
+        fixture.session_alive(),
+        "within its bound the abandoned exchange is simply retained"
+    );
+    if let Some(pending) = fixture
+        .actor
+        .sessions
+        .get_mut(&key.scope())
+        .and_then(|session| session.pending.get_mut(&stream_id))
+    {
+        pending.abandon.abandoned_at =
+            Some(Instant::now() - super::UNARY_ABANDON_TIMEOUT - StdDuration::from_secs(1));
+    }
+    fixture.actor.tick().await;
+    assert!(
+        !fixture.session_alive(),
+        "past its bound the session is closed"
+    );
+    assert_eq!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some(super::UNARY_ABANDON_TIMEOUT_REASON)
+    );
+    assert_eq!(
+        super::runtime::terminal_close_reason(super::UNARY_ABANDON_TIMEOUT_REASON),
+        super::UNARY_ABANDON_TIMEOUT_REASON,
+        "the reason is on the terminal-close allowlist, not redacted to OTHER"
+    );
+}
+
 /// M7-C94, the freeze case: a consumer leaves an undispatched echo while the
 /// writer is frozen.  The entry must stay in the frozen roster (fenced at
 /// nothing), the relay's RESET must wait for the writer to resume, and the

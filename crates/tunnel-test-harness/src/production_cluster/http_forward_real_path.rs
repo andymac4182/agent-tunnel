@@ -244,7 +244,7 @@ pub fn validate_http_forward_real_path_evidence(
     evidence: &HttpForwardRealPathEvidence,
 ) -> Result<()> {
     let body_queue_bound = BODY_QUEUE_CHUNKS * MAX_BODY_PAYLOAD_LEN;
-    let checks: [(&str, bool); 54] = [
+    let checks: [(&str, bool); 58] = [
         (
             "owner-local ingress answers the permission request",
             evidence.owner_local_permission_exact,
