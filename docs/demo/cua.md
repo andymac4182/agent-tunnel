@@ -1,8 +1,8 @@
 # Demo: computer use (CUA) through a local relay
 
-Status: written for task rows M5-C20..M5-C27 on 2026-09-26 on branch
-`feat-cua-demo`. Linux guest only; macOS and Windows guests are not built
-(see [What is not covered](#what-is-not-covered)).
+Status: written for task rows M5-C20 to M5-C28 on 2026-09-26, on branch
+`feat-cua-demo`. It covers a Linux guest only; macOS and Windows guests are
+not built yet (see [What is not covered](#what-is-not-covered)).
 
 A consumer on your Mac takes a screenshot of a synthetic app, clicks it and
 types into it. The app runs in a **disposable Linux VM**, and every request
@@ -11,16 +11,23 @@ goes consumer → local `tunnel-relay` → `tunnel-client` in the VM → the pin
 to the CUA server directly.
 
 ```text
-host (macOS)                                   guest (Tart clone of cua-golden)
-curl --http2 ──► tunnel-relay ◄── mTLS WSS ──── tunnel-client --features cua
- (consumer)     consumer 127.0.0.1               AGENT_TUNNEL_CUA_LANE_B=1
-                device   192.168.64.1                 │ supervises
-                                                       ▼
-                                          cua-computer-server 0.3.46 (127.0.0.1)
-                                                       │ XTest / ImageGrab
-                                                       ▼
-                                          Xorg + fixture app (state.json)
+host (macOS)                                     guest (Tart clone of cua-golden)
+curl --http2 ──► tunnel-relay                    tunnel-client --features cua
+ (consumer)      consumer 127.0.0.1:C            AGENT_TUNNEL_CUA_LANE_B=1
+                 device   127.0.0.1:D ◄─ ssh -R ── 127.0.0.1:G (mTLS WSS)
+                                                      │ supervises
+                                                      ▼
+                                         cua-computer-server 0.3.46 (127.0.0.1)
+                                                      │ XTest / ImageGrab
+                                                      ▼
+                                         Xorg + fixture app (state.json)
 ```
+
+The relay listens on **host loopback only**. The guest reaches the relay's
+device port through an SSH *reverse* forward over Tart's private network,
+authenticated by the guest's own host key. So the macOS application
+firewall, which silently dropped the guest's direct connection in demo run 4,
+needs no exception, and no host security setting is changed.
 
 ## Safety: read this first
 
@@ -48,7 +55,6 @@ curl --http2 ──► tunnel-relay ◄── mTLS WSS ──── tunnel-clien
 | Tart **2.38.0** | the VM; the script refuses other versions | `~/.local/bin/tart --version` |
 | `cua-golden` built by `scripts/m5-cua-vm.sh golden` | the hardened, hash-locked image | `tart list` shows `cua-golden` |
 | ≥ 20 GiB free after the step | the scripts' disk floor | `df -h ~/.tart` |
-| Docker (arm64) | builds the guest's `tunnel-client` for `aarch64-unknown-linux-gnu` | `docker info` |
 | A disposable plaintext Redis | the relay's catalog; a TLS terminator is put in front of it | `redis-cli -p 63790 ping` |
 | `openssl`, `python3`, `curl` with HTTP/2 | PKI, helper tools, the consumer | `curl -V` lists `HTTP2` |
 
@@ -64,43 +70,45 @@ From the repository root:
 PATH="$HOME/.local/bin:$PATH" scripts/m5-cua-vm.sh golden --rebuild
 
 # 2. The guest binaries: tunnel-client with the cua feature, and the
-#    tunnel-deadman sentinel, built natively for linux/arm64 in Docker.
-mkdir -p /tmp/cua-guest-target
-docker run --rm -v "$PWD":/src:ro -v /tmp/cua-guest-target:/target \
-  -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
-  -e CARGO_TARGET_DIR=/target -w /src rust:1.95.0 \
-  cargo build --offline --locked --release -p tunnel-client --features cua \
-    -p tunnel-deadman --bins
+#    tunnel-deadman sentinel, built INSIDE a disposable clone (same Ubuntu,
+#    same glibc as the guest). Committed code only (git archive HEAD).
+cargo fetch --locked
+PATH="$HOME/.local/bin:$PATH" scripts/m5-cua-vm.sh build-client /tmp/cua-guest-bin
 
-# 3. The demo: clone, relay, device, consumer, verdict, teardown.
-TART="$HOME/.local/bin/tart" TEST_REDIS_URL=redis://127.0.0.1:63790/0 \
-GUEST_BIN_DIR=/tmp/cua-guest-target/release \
+# 3. The host relay.
+cargo build --locked -p tunnel-relay --bin tunnel-relay
+
+# 4. The demo: clone, relay, device, consumer, verdict, teardown.
+PATH="$HOME/.local/bin:$PATH" TART="$HOME/.local/bin/tart" \
+TEST_REDIS_URL=redis://127.0.0.1:63790/0 GUEST_BIN_DIR=/tmp/cua-guest-bin \
+RELAY_BIN="${CARGO_TARGET_DIR:-target}/debug/tunnel-relay" \
   scripts/m5-cua-demo.sh /tmp/cua-demo-evidence
 ```
 
-`rust:1.95.0` is Debian 13 (glibc 2.41) and the guest is Ubuntu 24.04
-(glibc 2.39). Check that the binary needs nothing newer than 2.39 before you
-copy it in:
-
-```sh
-docker run --rm -v /tmp/cua-guest-target:/t rust:1.95.0 sh -c \
-  "objdump -T /t/release/tunnel-client | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1"
-```
+`build-client` takes about 20 minutes on 4 vCPU. It downloads `rustup` and
+the pinned 1.95.0 toolchain from the official Rust distribution **inside the
+clone**; crates come from your host's cargo registry, so the build itself is
+`--offline --locked`. A Docker cross-build (`rust:1.95.0`, Debian 13, glibc
+2.41) was tried first. It is not recommended: its I/O through bind mounts
+stalled, and its glibc is newer than the guest's 2.39.
 
 ## What the script does
 
 1. **Clones and boots** `cua-demo-<nonce>` from `cua-golden`, and waits until a
    root capture *inside the guest* shows the fixture's red marker.
 2. **Makes synthetic PKI** on the host: a server CA and a relay certificate
-   for `relay.cua-demo.test` and the host's address on Tart's private network,
-   a device CA, and an RSA identity issuer with a JWKS.
+   for `relay.cua-demo.test`, `localhost` and `127.0.0.1`, a device CA, and an RSA identity issuer with a JWKS. All keys stay in a
+   `0700` temporary directory, which is deleted on exit.
 3. **Starts a TLS terminator** in front of the plaintext Redis
    (`tunnel-relay serve` requires `rediss://`).
 4. **Enrols the device inside the guest** as the `cua` user:
    `tunnel-client credentials create` makes the key and CSR in the guest (the
    private key never leaves it); the host signs the CSR with the device CA,
    adding `URI:urn:agent-tunnel:device:<uuid>`; `credentials import` installs
-   it. The guest's `/etc/hosts` maps `relay.cua-demo.test` to the host.
+   it. The guest's `/etc/hosts` maps `relay.cua-demo.test` to its own loopback,
+   and, once the relay is serving, an `ssh -R` forward carries that port to
+   the relay's device listener. The script refuses to go on unless `sshd` is
+   the only listener on the guest port.
 5. **Provisions and starts the relay** with
    [`examples/m6-catalog-cua.toml`](../../examples/m6-catalog-cua.toml)
    (`http_forward_profile = "computer-v1"`) and `[http_forward] profiles =
@@ -159,12 +167,41 @@ docker run --rm -v /tmp/cua-guest-target:/t rust:1.95.0 sh -c \
 
 ## Expected output
 
-The last lines of a passing run (from the run recorded in
-[`tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/`](../../tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/)):
+A passing run, abridged (demo run 8, nonce `5b9a30fd13f1`, recorded in
+[`tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/`](../../tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/)).
+Ports, addresses and timings vary. The first `describe` is slow because it
+starts the backend:
 
 ```text
-EXPECTED_OUTPUT_PLACEHOLDER
+m5-cua-vm: cua-demo-5b9a30fd13f1: X session up, fixture mapped, root capture shows the markers
+m5-cua-demo: guest 192.168.64.20 on Tart's private network
+m5-cua-demo: relay 5688 owns consumer 127.0.0.1:56015 and device 127.0.0.1:56016
+m5-cua-demo: guest 127.0.0.1:33497 forwards to the relay's device listener over SSH
+m5-cua-demo: device session ready
+consumer describe: http=200 2 outcome=answered_locally code=None ms=10121
+consumer screen_info: http=200 2 outcome=ok code=None ms=469
+consumer cursor_position: http=200 2 outcome=ok code=None ms=236
+consumer capture: http=200 2 outcome=ok code=None ms=366
+consumer click: http=200 2 outcome=not_dispatched code=lease_not_held ms=281
+consumer acquire_input_lease: http=200 2 outcome=answered_locally code=None ms=257
+consumer click: http=200 2 outcome=ok code=None ms=604
+consumer type_text: http=200 2 outcome=ok code=None ms=581
+consumer click: http=200 2 outcome=ok code=None ms=208
+consumer capture: http=200 2 outcome=ok code=None ms=443
+consumer click: http=200 2 outcome=not_dispatched code=capture_superseded ms=239
+consumer release_input_lease: http=200 2 outcome=answered_locally code=None ms=408
+m5-cua-demo: M5-C09a residue probe (guest-local, native backend)
+m5-cua-demo verdict: {"clicks_after": 1, "clicks_before": 0, "consumer_exit": 0, "markers_match_fixture": true, "ok": true, "stale_click": "capture_superseded", "text_before_chars": 0, "text_matches": true, "unleased_click": "lease_not_held"}
+redis-clean namespace=m5-cua-demo-5b9a30fd13f1 deleted=23
+m5-cua-vm: cua-demo-5b9a30fd13f1 deleted
 ```
+
+The script exits 0 only if `verdict.json` has `"ok": true`. That requires
+all of these: exactly one more click in the app, the field equal to the typed
+text, the markers matched, the unleased click refused `lease_not_held`, and
+the stale click refused `capture_superseded`. The `Terminated` line after
+teardown is the Redis TLS terminator being stopped. In `OUTDIR` the typed
+text is replaced by its length and SHA-256.
 
 `OUTDIR` holds `consumer.json` (every call's outcome and timing; for each
 capture, the image's SHA-256, size and marker colours instead of the image),
@@ -212,7 +249,10 @@ status.**
 | `aborting: free space would drop below 20 GiB` | Free disk space, or run `scripts/m5-cua-vm.sh destroy-golden` and rebuild later. |
 | `X session / fixture did not start` | Guest boot problem: `KEEP_VM=1` keeps the clone; inspect `~/.local/state/agentuplink-m5-cua-vm/logs/`. |
 | `port N listeners are '...', expected only the relay` | Something else is listening on the chosen port. Rerun (ports are chosen per run); never skip the check. |
-| `device not ready` | Read `OUTDIR/connect.log`. `this tunnel-client was built without the cua feature` means `GUEST_BIN_DIR` holds the wrong build; `set AGENT_TUNNEL_CUA_LANE_B=1` means the opt-in did not reach the process. |
+| `device not ready` with `TLS/WebSocket handshake deadline exceeded` | The device cannot reach the relay. The script uses an SSH reverse forward for exactly this reason; check that `~/.local/state/agentuplink-m5-cua-vm/id_ed25519` exists (made by `golden`). Do not open a host firewall port. |
+| `device not ready`, other | Read `OUTDIR/connect.log`. `this tunnel-client was built without the cua feature` means `GUEST_BIN_DIR` holds the wrong build; `set AGENT_TUNNEL_CUA_LANE_B=1` means the opt-in did not reach the process. |
+| `Redis root CA path contains a symlink` | The relay refuses symlinked TLS paths; the script resolves its work directory with `pwd -P`. If you changed `TMPDIR`, keep it a physical path. |
+| every call `not_permitted` | Negotiation found nothing. On a current branch this means the backend's `/commands` was unreadable (M5-C27). Read the server log in the guest (`KEEP_VM=1`). |
 | `backend_unavailable` on the first call | The supervised server did not come up within `startup_seconds`. Read `/tmp/cua-server-*.log` in the guest (`KEEP_VM=1`). |
 | `frame is not the fixture; no input will be sent` | The screenshot did not show the markers (for example the black-root-framebuffer defect in testing.md). No input was sent; that is the gate working. |
 | `capture_scale_undeclared` on a click | `point_width`/`point_height` disagree with the guest's `get_screen_size` (M5-C19): the export refused to declare them. Fix the export table. |
@@ -229,6 +269,11 @@ status.**
   the point-space derivation is proven at 2x only against the Lane A
   fixture.
 - **Restart on a failed health probe** (M5-C23), **grant revision delivery**
-  (M5-C05) and **per-operation grants** (M5-C24).
+  (M5-C05) and **per-operation grants** (M5-C28).
+- **CI**: the Lane B tests need `--features cua`, which the workspace run
+  and hosted CI do not build (M5-C24).
+- **Cancellation, lost-answer, unsupported-capability and permission-denied
+  fixtures over the tunnel** (M5-03, M5-04), and the `vnc` and `cua-driver`
+  backends through the tunnel (M5-C02).
 - **A second principal through the relay**: the second-agent lease refusal
   is proven against the fixture (`cua_export::tests`), not through the relay.
