@@ -2787,11 +2787,13 @@ pub(crate) async fn main() -> ExitCode {
                     );
                     let hold = &evidence.owner_freeze_hold;
                     println!(
-                        "M3 MCP cloud client owner rotation-freeze hold: held={} admitted_after_hold={} released_on_commit={} released_on_abort={} refused_after_bound={} refused_hold_full={} cancelled={} released_on_session_loss={} currently_held={} max_hold_wait_ms={}",
+                        "M3 MCP cloud client owner rotation-freeze hold: held={} admitted_after_hold={} released_on_commit={} released_on_abort={} released_on_recovery={} released_with_deferred_writes={} refused_after_bound={} refused_hold_full={} cancelled={} released_on_session_loss={} currently_held={} max_hold_wait_ms={}",
                         hold.held,
                         hold.admitted_after_hold,
                         hold.released_on_commit,
                         hold.released_on_abort,
+                        hold.released_on_recovery,
+                        hold.released_with_deferred_writes,
                         hold.refused_after_bound,
                         hold.refused_hold_full,
                         hold.cancelled,
