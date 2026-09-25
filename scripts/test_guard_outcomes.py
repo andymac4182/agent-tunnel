@@ -127,6 +127,11 @@ def main() -> int:
     a_foreign_edit_during_a_case_is_not_overwritten()
     a_commit_during_a_case_is_refused()
     a_staged_mutation_is_refused()
+    a_partial_add_of_a_multi_edit_is_refused()
+    a_flagged_foreign_edit_survives_the_next_run_and_recovery()
+    a_crashed_case_with_a_foreign_edit_is_not_recovered()
+    a_crashed_case_whose_head_moved_is_not_recovered()
+    a_crashed_case_with_a_staged_mutation_is_not_recovered()
 
     # The harness code between the shared module and the source-text
     # checks, which nothing here used to execute.
@@ -1457,6 +1462,169 @@ def a_staged_mutation_is_refused() -> None:
             f"a staged mutation must be refused by name, got {refusal!r}",
         )
         check(guard.read_text() == ORIGINAL, "the working tree must still be restored")
+
+
+TWO_GUARDS = "fn a() -> bool {\n    check_a()\n}\nfn b() -> bool {\n    check_b()\n}\n"
+
+
+def a_partial_add_of_a_multi_edit_is_refused() -> None:
+    """M4-30: `git add -p` staging part of a mutation is a change of index.
+
+    The index-holds-the-whole-mutation check cannot see a partial stage: the
+    index then holds text that is neither the original nor the mutation.  The
+    case compares the index blob at its start with the one at its end.
+
+    **Defeating it.**  Drop the start/end comparison and this returns quietly
+    with half the defeated guard staged.
+    """
+    with scratch_git_repo() as (repo, git):
+        guard = repo / "guard.rs"
+        guard.write_text(TWO_GUARDS)
+        git("add", "guard.rs")
+        git("commit", "-qm", "two guards")
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "m4c30", "a two-edit case") as applied:
+                applied.apply_all([(guard, "check_a()", "true"), (guard, "check_b()", "true")])
+                whole = guard.read_text()
+                # What `git add -p` accepting only the first hunk stages.
+                guard.write_text(TWO_GUARDS.replace("check_a()", "true"))
+                git("add", "guard.rs")
+                guard.write_text(whole)
+        refusal = _exit_refusal(body)
+        check(
+            "the index entry for guard.rs changed" in refusal
+            and "git add -p" in refusal
+            and "index stages the defeated text" not in refusal,
+            f"a partially staged mutation must be refused as such, got {refusal!r}",
+        )
+
+
+def _recover(repo: Path) -> tuple[int, str]:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = recover_mutations(repo)
+    return code, out.getvalue()
+
+
+def _startup_refusal(repo: Path) -> str:
+    try:
+        refuse_resident_mutation("test-harness", repo)
+    except SystemExit as stop:
+        return str(stop)
+    return ""
+
+
+def a_flagged_foreign_edit_survives_the_next_run_and_recovery() -> None:
+    """M4-32, one step later: the refusal and the recovery must not undo it.
+
+    Review reproduced it: the live restore kept the foreign-edited file in
+    the journal, the next run's refusal then recommended
+    `--recover-mutations` without mentioning the edit, and recovery wrote the
+    original back unconditionally -- erasing the edit the restore had
+    refused to touch.
+
+    **Defeating it.**  Make `recover_mutations` write back unconditionally
+    again and the foreign line is gone and the exit code is 0.
+    """
+    with scratch_git_repo() as (repo, _git):
+        guard = repo / "guard.rs"
+
+        def body() -> None:
+            with AppliedCase("test-harness", repo, "m4c32", "a raced case") as applied:
+                applied.apply(guard, "real_check()", "true")
+                guard.write_text(MUTATED + "// a foreign edit\n")
+        _exit_refusal(body)
+        startup = _startup_refusal(repo)
+        check(
+            "FOREIGN EDIT is present" in startup
+            and "flagged by the live restore" in startup
+            and "--recover-mutations will REFUSE" in startup
+            and "Recover with:" not in startup,
+            f"the next run's refusal must say a foreign edit is present and "
+            f"must not recommend recovery, got {startup!r}",
+        )
+        code, said = _recover(repo)
+        check(
+            code == 1 and "REFUSING" in said and "guard.rs: a FOREIGN EDIT" in said,
+            f"recovery must refuse a flagged file by name, got {code} {said!r}",
+        )
+        check(
+            guard.read_text() == MUTATED + "// a foreign edit\n",
+            "recovery erased the foreign edit the live restore kept (M4-32)",
+        )
+        check(mutation_journal(repo).exists(), "a refused recovery must keep the journal")
+        # The flag is load-bearing on its own: an editor's undo can put the
+        # file back to exactly the mutated text, and a content check alone
+        # would then call recovery safe over an edit nobody reconciled.
+        guard.write_text(MUTATED)
+        code, said = _recover(repo)
+        check(
+            code == 1 and "flagged by the live restore" in said,
+            f"a file the live restore flagged must stay refused even when it "
+            f"holds the mutation again, got {code} {said!r}",
+        )
+
+
+def _crash(repo: Path, edits) -> None:
+    """Apply a case and never restore it: what a `SIGKILL` leaves."""
+    applied = AppliedCase("m5-guard-deletion", repo, "m5c4", "a killed case")
+    check(applied.apply_all(edits) is None, "the crash fixture's edit should apply")
+
+
+def a_crashed_case_with_a_foreign_edit_is_not_recovered() -> None:
+    """A `SIGKILL`ed case: no live restore ran, so nothing was flagged.
+
+    Recovery must still see that the file holds neither recorded text.
+    """
+    with scratch_git_repo() as (repo, _git):
+        guard = repo / "guard.rs"
+        _crash(repo, [(guard, "real_check()", "true")])
+        guard.write_text(MUTATED + "// edited after the kill\n")
+        code, said = _recover(repo)
+        check(
+            code == 1 and "guard.rs: a FOREIGN EDIT" in said
+            and "flagged by the live restore" not in said,
+            f"an unflagged foreign edit must still refuse recovery, got {code} {said!r}",
+        )
+        check(guard.read_text() == MUTATED + "// edited after the kill\n",
+              "recovery erased an edit made after the kill")
+
+
+def a_crashed_case_whose_head_moved_is_not_recovered() -> None:
+    """M4-30 on the crash path: a commit after the kill may carry the mutation.
+
+    Restoring the worktree then leaves the defeated guard in HEAD with a
+    clean-looking tree, so recovery refuses and says why.
+    """
+    with scratch_git_repo() as (repo, git):
+        guard = repo / "guard.rs"
+        _crash(repo, [(guard, "real_check()", "true")])
+        git("add", "guard.rs")
+        git("commit", "-qm", "docs: a commit taken over a resident mutation")
+        code, said = _recover(repo)
+        check(
+            code == 1 and "HEAD moved" in said and "never --amend" in said,
+            f"recovery after HEAD moved must refuse, got {code} {said!r}",
+        )
+        check(guard.read_text() == MUTATED, "a refused recovery must write nothing")
+        check("HEAD moved" in _startup_refusal(repo),
+              "the startup refusal must name the moved HEAD too")
+
+
+def a_crashed_case_with_a_staged_mutation_is_not_recovered() -> None:
+    """M4-30 on the crash path: the index holds the mutation after the kill."""
+    with scratch_git_repo() as (repo, git):
+        guard = repo / "guard.rs"
+        _crash(repo, [(guard, "real_check()", "true")])
+        git("add", "guard.rs")
+        code, said = _recover(repo)
+        check(
+            code == 1 and "guard.rs: the index entry changed" in said
+            and "HEAD moved" not in said,
+            f"recovery over a staged mutation must refuse, got {code} {said!r}",
+        )
+        check(guard.read_text() == MUTATED, "a refused recovery must write nothing")
 
 
 def every_harness_main_runs_to_its_summary() -> None:

@@ -3609,7 +3609,7 @@ mod tests {
             .filter_map(|rest| rest.split_whitespace().next())
             .filter(|command| command.starts_with("verify"))
             .collect();
-        // Anti-vacuity floor: 67 `verify*` arms existed when this landed, so a
+        // Anti-vacuity floor: 66 `verify*` arms existed when this landed, so a
         // scan that stopped matching the dispatch cannot pass as an empty set.
         assert!(
             arms.len() >= 60,

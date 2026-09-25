@@ -228,6 +228,24 @@ def check_anchors(
 #   commit would still promote it.  An index blob equal to the mutated bytes
 #   is a refusal.
 #
+# * **An index entry that changed at all (M4-30).**  The index blob of each
+#   file is recorded when the case first touches it and compared at the end,
+#   which catches a partial `git add -p` of a multi-edit case that the
+#   whole-mutation comparison above cannot see.
+#
+# **The crash path reads the same record (review of M4-30/M4-32).**  The
+# journal holds HEAD, and per file the original, the mutation (journalled
+# before it is written), the starting index blob and the `foreign` flag, so
+# `journal_problems` -- used by the startup refusal and by
+# `recover_mutations` -- refuses a `SIGKILL`ed case whose HEAD moved, whose
+# index moved, or whose file holds a foreign edit, instead of writing the
+# originals back over them.
+#
+# **Not covered, stated:** a `git stash` taken mid-case moves the mutation
+# into `refs/stash` and puts the original back, so every check passes.  The
+# stash is shared by every worktree and other sessions push to it, so its
+# movement is not evidence of this run.
+#
 # The HEAD and index checks need a git work tree.  Every harness calls
 # `require_git_index` before its first case, so in a harness they always run;
 # the fixtures in `test_guard_outcomes.py` that use a bare temporary directory
@@ -242,6 +260,92 @@ def mutation_journal(repo: Path) -> Path:
     return repo / MUTATION_JOURNAL_NAME
 
 
+def _read_journal(harness: str, journal: Path) -> dict | None:
+    try:
+        return json.loads(journal.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as problem:
+        sys.exit(
+            f"{harness}: a mutation journal exists at {journal} but could not "
+            f"be read ({problem}). A previous guard run was interrupted while a "
+            "guard was deleted from the product; do not trust this tree. "
+            "Compare it against HEAD blob by blob before doing anything else."
+        )
+
+
+def journal_problems(repo: Path, record: dict) -> list[str]:
+    """Why the journal's originals may NOT simply be written back.
+
+    Shared by the startup refusal, which must say so, and by
+    `recover_mutations`, which must refuse (M4-30, M4-32).  Empty means every
+    journalled file holds exactly its recorded original or its recorded
+    mutation, HEAD is the HEAD the case began on, and no index entry moved --
+    which is the only state in which writing the originals back loses nothing
+    and leaves nothing defeated behind in history or the index.
+
+    Checked per file:
+
+    * a file the live restore flagged as foreign-edited (`foreign`), or one
+      holding neither its original nor its mutation now, carries somebody
+      else's edit; writing the original back would erase it (M4-32);
+    * a journal written before these fields existed records no mutation, so
+      "holds exactly the mutation" cannot be checked and it is refused;
+    * an index entry whose blob differs from the one recorded when the case
+      began was staged mid-case -- possibly the whole mutation, possibly part
+      of it by `git add -p` (M4-30).
+
+    And once: HEAD differs from the one recorded when the case began, so a
+    commit may have promoted the defeated text into history (M4-30).
+
+    **What no journal can see:** a `git stash` taken mid-case moves the
+    mutation into the stash and puts the original back, so every check here
+    passes while `refs/stash` holds the defeated guard.  The stash is shared by
+    every worktree of the repository and other sessions push to it, so a
+    change in it is not evidence of this run; the limit is stated on M4-30 and
+    M4-32 rather than guessed at.
+    """
+    problems: list[str] = []
+    for entry in record.get("files", []):
+        rel = entry.get("path")
+        path = repo / rel
+        current = path.read_text() if path.exists() else None
+        if "mutated" not in entry:
+            problems.append(
+                f"{rel}: this journal predates the recorded-mutation field, so "
+                "whether the file still holds only the case's mutation cannot "
+                "be checked; compare it with HEAD by hand"
+            )
+        elif entry.get("foreign") or current not in (entry["original"], entry["mutated"]):
+            problems.append(
+                f"{rel}: a FOREIGN EDIT is present -- the file holds neither the "
+                "original nor the case's mutation"
+                + (" (flagged by the live restore)" if entry.get("foreign") else "")
+                + ". Writing the original back would erase that edit (task row "
+                "M4-32); reconcile it with HEAD by hand"
+            )
+        if record.get("head") is not None and "index_start" in entry:
+            now = _git_index_blob(repo, rel)
+            if now != entry["index_start"]:
+                problems.append(
+                    f"{rel}: the index entry changed while the case was applied "
+                    f"({entry['index_start']} -> {now}); a `git add` -- whole or "
+                    "`-p` -- staged some of the mutation (task row M4-30). Check "
+                    f"`git diff --cached -- {rel}` before anything else"
+                )
+    head = record.get("head")
+    if head is not None:
+        now = _git_head(repo)
+        if now != head:
+            problems.append(
+                f"HEAD moved from {head} to {now} since the case began (task row "
+                "M4-30): a commit may carry the defeated guard. Compare each "
+                "file's HEAD blob with the journal's `mutated` text; the remedy "
+                "is a forward fix commit, never --amend"
+            )
+    return problems
+
+
 def refuse_resident_mutation(harness: str, repo: Path) -> None:
     """Refuse to start when a previous run left a mutation applied.
 
@@ -252,21 +356,32 @@ def refuse_resident_mutation(harness: str, repo: Path) -> None:
     *which* suite and *which* case was in flight, and which files hold a
     defeated guard right now, because a resident mutation is not a dirty tree
     to be tidied: it is a guard deleted from the product.
+
+    It also says whether `--recover-mutations` is safe (`journal_problems`):
+    before M4-32's review it recommended recovery unconditionally, and recovery
+    then erased the very foreign edit the live restore had refused to touch.
     """
     journal = mutation_journal(repo)
-    try:
-        record = json.loads(journal.read_text())
-    except FileNotFoundError:
+    record = _read_journal(harness, journal)
+    if record is None:
         return
-    except (OSError, ValueError) as problem:
-        sys.exit(
-            f"{harness}: a mutation journal exists at {journal} but could not "
-            f"be read ({problem}). A previous guard run was interrupted while a "
-            "guard was deleted from the product; do not trust this tree. "
-            "Compare it against HEAD blob by blob before doing anything else."
-        )
     files = record.get("files", [])
     listing = "\n".join(f"    {entry.get('path')}" for entry in files)
+    problems = journal_problems(repo, record)
+    if problems:
+        advice = (
+            "  --recover-mutations will REFUSE, because:\n    "
+            + "\n    ".join(problems)
+            + "\n  Resolve those by hand, then write back the originals the "
+            "journal records only for files that hold exactly the mutation."
+        )
+    else:
+        advice = (
+            "  Recover with: python3 scripts/guard_outcomes.py --recover-mutations\n"
+            "  which writes back the original text this journal recorded, then "
+            "removes it. Do NOT simply delete the journal: that discards the only "
+            "record of what was mutated."
+        )
     sys.exit(
         f"{harness}: refusing to run -- a previous guard-deletion run was "
         f"interrupted while a case was applied, so a defeated guard may be "
@@ -275,11 +390,7 @@ def refuse_resident_mutation(harness: str, repo: Path) -> None:
         f"  suite:   {record.get('suite')}\n"
         f"  case:    {record.get('case')}\n"
         f"  pid:     {record.get('pid')}\n"
-        f"  files holding a mutation:\n{listing}\n"
-        "  Recover with: python3 scripts/guard_outcomes.py --recover-mutations\n"
-        "  which writes back the original text this journal recorded, then "
-        "removes it. Do NOT simply delete the journal: that discards the only "
-        "record of what was mutated."
+        f"  files holding a mutation:\n{listing}\n" + advice
     )
 
 
@@ -291,20 +402,26 @@ def recover_mutations(repo: Path) -> int:
     reading it, and a harness that quietly fixed the tree and carried on would
     make the incident invisible -- which is the whole complaint of M5-C07.
 
-    **It writes the recorded originals back without checking that each file
-    still holds the mutation**, so an edit made to one of those files *after*
-    the interrupted run would be clobbered.  That is accepted rather than
-    guarded: the refusal this answers says in terms not to trust the tree, so
-    "read the refusal, then edit the named files, then recover" is not a
-    sequence anybody is being invited into.  A caller who has already edited
-    those files should revert from `HEAD` and delete the journal by hand.
+    **All or nothing, and only over a tree it can vouch for (M4-30, M4-32).**
+    It used to write the originals back unconditionally, which erased a
+    foreign edit the live restore had deliberately left in place -- the M4-32
+    protection undone one step later.  Now any `journal_problems` finding
+    refuses the whole recovery, writes nothing, keeps the journal and returns
+    1, naming each file.
     """
     journal = mutation_journal(repo)
-    try:
-        record = json.loads(journal.read_text())
-    except FileNotFoundError:
+    record = _read_journal("recover-mutations", journal)
+    if record is None:
         print(f"no mutation journal at {journal}; nothing to recover", flush=True)
         return 0
+    problems = journal_problems(repo, record)
+    if problems:
+        print(
+            "recover-mutations: REFUSING to write anything back; the journal "
+            "is kept.\n  " + "\n  ".join(problems),
+            flush=True,
+        )
+        return 1
     restored = 0
     for entry in record.get("files", []):
         path = repo / entry["path"]
@@ -358,6 +475,17 @@ def _git_head(repo: Path) -> str | None:
     return done.stdout.strip() or None if done.returncode == 0 else None
 
 
+def _git_index_blob(repo: Path, rel: str) -> str | None:
+    """The blob id the index holds for `rel`, or None when it holds none."""
+    done = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f":{rel}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return done.stdout.strip() or None if done.returncode == 0 else None
+
+
 def _git_blob_text(repo: Path, spec: str) -> str | None:
     """The text of `<rev>:<path>` or `:<path>` (the index), or None."""
     done = subprocess.run(
@@ -380,6 +508,13 @@ class AppliedCase:
     us out of it -- a normal return, a refusal, an exception, a
     `KeyboardInterrupt`, or the `SystemExit` that `install_interrupt_restore`
     turns `SIGTERM` into.
+
+    **The journal carries everything a crashed case needs checked (M4-30,
+    M4-32):** per file the original, the exact text the case writes (journalled
+    *before* it is written), the index blob when the case first touched it, and
+    a `foreign` flag the live restore sets; and once, HEAD when the case began.
+    `journal_problems` reads the same record, so a `SIGKILL`ed case is judged by
+    the rules a completing one is.
     """
 
     def __init__(self, harness: str, repo: Path, suite: str, case: str) -> None:
@@ -387,15 +522,14 @@ class AppliedCase:
         self.repo = repo
         self.suite = suite
         self.case = case
-        #: `(path, original text)` for every file mutated so far, in order.
-        self.originals: list[tuple[Path, str]] = []
-        #: `path -> the exact text this case wrote`, so the restore can tell
-        #: its own mutation from a foreign edit made mid-case (M4-32).
-        self.mutated: dict[Path, str] = {}
+        #: Per mutated file, in first-touch order: `original` (the text before
+        #: the case), `mutated` (the last text the case wrote), `index_start`
+        #: (the index blob when first touched) and `foreign`.
+        self.files: dict[Path, dict] = {}
         #: HEAD when the first edit was applied, or None when `repo` is not a
         #: git work tree (only the bare-directory fixtures). See M4-30.
         self.head: str | None = None
-        self._head_read = False
+        self._git_read = False
 
     def __enter__(self) -> AppliedCase:
         return self
@@ -417,19 +551,25 @@ class AppliedCase:
         which is the safe direction.
         """
         journal = mutation_journal(self.repo)
+        entries = []
+        for path, entry in self.files.items():
+            item = {
+                "path": str(path.relative_to(self.repo)),
+                "original": entry["original"],
+                "mutated": entry["mutated"],
+                "foreign": entry["foreign"],
+            }
+            if "index_start" in entry:
+                item["index_start"] = entry["index_start"]
+            entries.append(item)
         payload = json.dumps(
             {
                 "harness": self.harness,
                 "suite": self.suite,
                 "case": self.case,
                 "pid": os.getpid(),
-                "files": [
-                    {
-                        "path": str(path.relative_to(self.repo)),
-                        "original": original,
-                    }
-                    for path, original in self.originals
-                ],
+                "head": self.head,
+                "files": entries,
             },
             indent=2,
         )
@@ -440,10 +580,11 @@ class AppliedCase:
     def apply(self, path: Path, old: str, new: str) -> str | None:
         """Record the original and mutate, or return why it could not.
 
-        The original is journalled **before** the file is written, so a kill
-        between the two leaves a journal naming a file that turns out to be
-        unmutated -- which is recoverable and honest.  The other order would
-        leave a mutated file no journal mentions, which is the defect.
+        The original **and the mutation** are journalled before the file is
+        written, so a kill between the two leaves a journal naming a file that
+        holds one of the two texts it records -- recoverable and checkable.
+        The other order would leave a mutated file no journal mentions, which
+        is the defect.
 
         Both occurrence refusals are load-bearing and were carried here from
         the four copies this replaces.  Zero occurrences means the guard text
@@ -458,19 +599,28 @@ class AppliedCase:
             return "guard text not found"
         if occurrences > 1:
             return f"guard text is ambiguous: {occurrences} occurrences"
-        self.originals.append((path, text))
-        self._write_journal()
-        if not self._head_read:
-            # After the journal write, so read-only mode is still refused by
-            # the `Path.write_text` barrier on the journal first (M4-36), and
-            # before the mutation, so HEAD is the tree the case began on.
-            self.head = _git_head(self.repo)
-            self._head_read = True
         mutated = text.replace(old, new, 1)
+        first_touch = path not in self.files
+        if first_touch:
+            self.files[path] = {"original": text, "mutated": mutated, "foreign": False}
+        else:
+            # A second edit to the same file mutates the already-mutated text,
+            # so the last write is what the file must hold at restore.
+            self.files[path]["mutated"] = mutated
+        # First journal write before any git read, so read-only mode is refused
+        # by the `Path.write_text` barrier on the journal first (M4-36).
+        self._write_journal()
+        if not self._git_read:
+            self.head = _git_head(self.repo)
+            self._git_read = True
+        if first_touch and self.head is not None:
+            # Before the mutation, so a partial `git add -p` of it is visible
+            # as a change from this blob (M4-30).
+            self.files[path]["index_start"] = _git_index_blob(
+                self.repo, str(path.relative_to(self.repo))
+            )
+            self._write_journal()
         path.write_text(mutated)
-        # A second edit to the same file mutates the already-mutated text, so
-        # the last write is what the file must hold at restore.
-        self.mutated[path] = mutated
         return None
 
     def apply_all(self, edits: Iterable[tuple[Path, str, str]]) -> str | None:
@@ -485,31 +635,47 @@ class AppliedCase:
         """Write back every recorded original, then drop the journal.
 
         Refuses (M4-30, M4-32) rather than restoring over a foreign edit, and
-        refuses when HEAD moved or the index staged a mutation during the
-        case. See the section comment above `MUTATION_JOURNAL_NAME`.
+        refuses when HEAD moved or an index entry changed during the case. See
+        the section comment above `MUTATION_JOURNAL_NAME`.
         """
-        # The earliest original per file is the true original; a later entry
-        # for the same file recorded an already-mutated text.
-        first: dict[Path, str] = {}
-        for path, original in self.originals:
-            first.setdefault(path, original)
         foreign: list[Path] = []
-        for path, original in first.items():
+        for path, entry in self.files.items():
             current = path.read_text() if path.exists() else None
-            if current == self.mutated.get(path) or current == original:
-                if current != original:
-                    path.write_text(original)
+            if current == entry["mutated"] or current == entry["original"]:
+                if current != entry["original"]:
+                    path.write_text(entry["original"])
             else:
+                entry["foreign"] = True
                 foreign.append(path)
+        problems: list[str] = [
+            f"{path.relative_to(self.repo)} was edited by something else "
+            "while this case was applied; it was NOT restored, because "
+            "writing the original back would erase that edit (task row "
+            "M4-32). It still holds the case's mutation plus the foreign "
+            "edit, and is kept in the journal flagged `foreign`, so "
+            "--recover-mutations will refuse it too: compare it with HEAD by "
+            "hand."
+            for path in foreign
+        ]
+        problems.extend(self._git_problems())
         journal = mutation_journal(self.repo)
-        if foreign:
-            # Keep exactly the files not restored, so the next run refuses to
-            # start and names them, and `--recover-mutations` still holds the
-            # originals.
-            self.originals = [(path, first[path]) for path in foreign]
-            self._write_journal()
+        if problems:
+            # Keep the journal while anything is unresolved: the files not
+            # restored (flagged), and -- when history or the index moved --
+            # the HEAD and index blobs the case began on, so the next run's
+            # refusal names the same finding instead of starting clean.
+            self.files = {
+                path: entry
+                for path, entry in self.files.items()
+                if entry["foreign"] or self._index_moved(path, entry)
+                or self._head_moved()
+            }
+            if self.files:
+                self._write_journal()
+            elif journal.exists():
+                journal.unlink()
         else:
-            self.originals = []
+            self.files = {}
             # Only when present: under `NoWriteCapability` the journal write
             # was the refused call, and an unconditional unlink would raise a
             # second, sibling refusal over the one that matters (M4-43).
@@ -521,18 +687,6 @@ class AppliedCase:
         temporary = journal.with_name(journal.name + ".tmp")
         if temporary.exists():
             temporary.unlink()
-
-        problems: list[str] = []
-        for path in foreign:
-            problems.append(
-                f"{path.relative_to(self.repo)} was edited by something else "
-                "while this case was applied; it was NOT restored, because "
-                "writing the original back would erase that edit (task row "
-                "M4-32). It still holds the case's mutation plus the foreign "
-                "edit: compare it with HEAD by hand."
-            )
-        problems.extend(self._git_problems(first))
-        self.mutated = {}
         if problems:
             sys.exit(
                 f"{self.harness}: refusing to continue after [{self.suite}] "
@@ -541,7 +695,16 @@ class AppliedCase:
                 "measurement.\n  " + "\n  ".join(problems)
             )
 
-    def _git_problems(self, first: dict[Path, str]) -> list[str]:
+    def _head_moved(self) -> bool:
+        return self.head is not None and _git_head(self.repo) != self.head
+
+    def _index_moved(self, path: Path, entry: dict) -> bool:
+        if self.head is None or "index_start" not in entry:
+            return False
+        rel = str(path.relative_to(self.repo))
+        return _git_index_blob(self.repo, rel) != entry["index_start"]
+
+    def _git_problems(self) -> list[str]:
         """HEAD and index checks (M4-30). Empty when `repo` is not git."""
         if self.head is None:
             return []
@@ -550,9 +713,9 @@ class AppliedCase:
         if now != self.head:
             carried = [
                 str(path.relative_to(self.repo))
-                for path in first
+                for path, entry in self.files.items()
                 if _git_blob_text(self.repo, f"{now}:{path.relative_to(self.repo)}")
-                == self.mutated.get(path)
+                == entry["mutated"]
             ]
             problems.append(
                 f"HEAD moved from {self.head} to {now} while this case was "
@@ -568,14 +731,23 @@ class AppliedCase:
                 + "Remedy: a forward fix commit, never --amend; commit before "
                 "a guard run, never during one."
             )
-        for path in first:
+        for path, entry in self.files.items():
             rel = str(path.relative_to(self.repo))
-            if _git_blob_text(self.repo, f":{rel}") == self.mutated.get(path):
+            if _git_blob_text(self.repo, f":{rel}") == entry["mutated"]:
                 problems.append(
                     f"the index stages the defeated text of {rel} (task row "
                     "M4-30): a `git add` ran while this case was applied, and "
                     "the next commit would promote the mutation. Unstage it "
                     f"with: git restore --staged {rel}"
+                )
+            elif self._index_moved(path, entry):
+                problems.append(
+                    f"the index entry for {rel} changed while this case was "
+                    f"applied ({entry['index_start']} -> "
+                    f"{_git_index_blob(self.repo, rel)}) without holding the "
+                    "whole mutation: a partial `git add -p` may have staged "
+                    "part of it (task row M4-30). Check `git diff --cached -- "
+                    f"{rel}` before committing anything"
                 )
         return problems
 

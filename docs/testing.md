@@ -1021,6 +1021,18 @@ load-bearing ones; several of gate 4's mask one another and are red only in
 combination, and the honest form of that claim is the combination, not the
 single.
 
+**Witnesses, and what they attribute (M4-42).** Every guard case in
+`fs-guard-deletion`, `m5-guard-deletion` and `acp-guard-deletion` except three
+acp cases names the test(s) its deletion must redden (`WITNESSES`), measured by
+a run and re-checked by a full re-run; a red that does not include them is
+`RED (wrong witness)` and fails the run. That proves the red came from the named
+tests and not from anything else in the suite's surface. It does **not** always
+tell cases apart *within* a suite: **300** fs, **14** m5 and **73** acp cases
+share their exact witness set with another case in the same suite, mostly
+because one validator test reddens for every rule it checks. Those cases are
+attributed at suite level only -- their red is the suite's own validator
+noticing *a* defeated rule, not evidence that it noticed *this* one.
+
 **What this gate does not prove, and must not be read as proving.** A filesystem
 session across the relay-to-relay peer hop, because gate 4 admits one only at
 the owning relay. Anything across a scheduled data-socket rotation, a consumer
