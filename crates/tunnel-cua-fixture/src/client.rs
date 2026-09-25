@@ -449,16 +449,14 @@ pub async fn read_commands(endpoint: BackendEndpoint) -> std::io::Result<Vec<Str
     let (_, body) = parse_response(&response).ok_or(std::io::ErrorKind::InvalidData)?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| std::io::ErrorKind::InvalidData)?;
-    Ok(value
+    // The released server's `commands` is an object keyed by command name
+    // (M5-C27); the names are its keys. Anything else is not a listing this
+    // profile understands, and is refused rather than read as "no commands".
+    let listing = value
         .get("commands")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default())
+        .and_then(Value::as_object)
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    Ok(listing.keys().cloned().collect())
 }
 
 /// Build a `computer.v1` request body, the way a consumer would.

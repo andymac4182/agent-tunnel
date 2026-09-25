@@ -708,7 +708,18 @@ async fn handle_connection(
     };
     match path.as_str() {
         COMMANDS_PATH => {
-            let listing = json!({"commands": REGISTERED_COMMANDS});
+            // **The released shape** (M5-C27): `commands` is an object keyed
+            // by command name, each value carrying that command's `params`,
+            // beside an `aliases` object -- measured on the pinned 0.3.46
+            // server in the Linux guest (`probe-native.json`). This fixture
+            // used to send a bare array, which the released server never
+            // does, so a device reading only arrays negotiated nothing
+            // against the real backend while every Lane A test passed.
+            let commands: serde_json::Map<String, serde_json::Value> = REGISTERED_COMMANDS
+                .iter()
+                .map(|name| ((*name).to_owned(), json!({"params": []})))
+                .collect();
+            let listing = json!({"commands": commands, "aliases": {}});
             write_response(
                 &mut stream,
                 200,
