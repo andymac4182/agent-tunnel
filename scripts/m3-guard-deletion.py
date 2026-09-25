@@ -721,6 +721,82 @@ READINESS_PINS_CASES: list[Case] = [
     ),
 ]
 
+#: **M7-C80, M7-C86, M7-C90 and M7-C91: membership re-signs and the shared
+#: peer-pin wiring.**  Each case defeats one fix in `membership_runtime.rs`
+#: and names the regression in `tests/m7_membership_resign.rs` that sees it.
+#: The witnesses drive the real `MembershipRuntime` and the library
+#: `PeerPinPublisher` / `peer_trust_tick` that the serving relay and the
+#: production-cluster fixture both install, so no Redis is needed.
+MEMBERSHIP_RUNTIME = RELAY / "src" / "membership_runtime.rs"
+MEMBERSHIP_RESIGN_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--test",
+    "m7_membership_resign",
+]
+
+MEMBERSHIP_RESIGN_CASES: list[Case] = [
+    Case(
+        # M7-C86 / M7-C90.  Defeated, every unready reason withdraws the pin
+        # set again -- the pre-split rule -- so a transient catalog failure or
+        # an unapproved local key empties it, and the refresh tick with no
+        # admission active withdraws peer trust instead of readiness.
+        "only rejected trust evidence withdraws the verified pin set",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "            Self::UnknownAuthority | Self::MembershipRejected "
+                "| Self::CheckpointExpired => true,\n"
+                "            Self::MissingLocalMembership\n"
+                "            | Self::MissingLocalKey\n"
+                "            | Self::CatalogUnavailable\n"
+                "            | Self::PersistenceUnavailable\n"
+                "            | Self::Cancelled => false,",
+                "            _ => true,",
+            )
+        ],
+        frozenset(
+            {
+                "only_rejected_trust_evidence_withdraws_the_pin_set",
+                "the_refresh_tick_keeps_the_verified_set_while_transiently_unready",
+            }
+        ),
+    ),
+    Case(
+        # M7-C91.  Defeated, no readiness transition reaches the change
+        # observer, so the reconcile that restores membership leaves the pin
+        # set empty until the next refresh tick.
+        "the reconcile that restores membership republishes the pin set",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "        self.notify_change_observer();\n    }",
+                "    }",
+            )
+        ],
+        frozenset({"readiness_returns_within_the_reconcile_that_restores_membership"}),
+    ),
+    Case(
+        # M7-C80.  Defeated, any record-version change invalidates the
+        # admission again, killing every in-flight peer stream at a routine
+        # same-key re-sign.
+        "a same-key re-sign re-binds the active admission",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "            let version_regressed =\n"
+                "                current_version.is_none_or(|version| version < peer.record_version);",
+                "            let version_regressed = current_version != Some(peer.record_version);",
+            )
+        ],
+        frozenset({"a_same_key_resign_keeps_the_active_admission"}),
+    ),
+]
+
 #: **M7-C92 and M7-C93: the finite (unary) echo on an M2 session.**  M7-C92
 #: made the relay issue the owner `STREAM_FORGET` that releases a finite
 #: echo's connector OPEN journal entry, without which a device session
@@ -1366,6 +1442,12 @@ SUITES: list[Suite] = [
     Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
     Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
+    Suite(
+        "m7-membership-resign",
+        [RELAY],
+        MEMBERSHIP_RESIGN_TEST,
+        MEMBERSHIP_RESIGN_CASES,
+    ),
     Suite("m7c92-unary-echo", [RELAY], UNARY_ECHO_TEST, UNARY_ECHO_CASES),
     Suite(
         "m7c97-retiring-admission",
