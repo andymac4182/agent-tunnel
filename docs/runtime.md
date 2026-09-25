@@ -299,7 +299,16 @@ Keep transport failures, authentication decisions, admission, and application ou
 | `Rotation` | `CANDIDATE_TIMEOUT`, `DRAIN_TIMEOUT` | Inspect connection IDs, watermark gaps, credit stalls, and the absolute overlap deadline |
 | `Adapter` | `ADAPTER_UNAVAILABLE`, `OUTCOME_UNKNOWN` | Distinguish failure before dispatch from an operation that may have executed |
 
-The codes above are proposed public vocabulary, to freeze with the error-schema implementation. Logs retain nested causes locally; external errors contain only the stable safe code, a short explanation, request/operation ID where available, and a permitted retry hint. Do not leak host paths or raw TLS/backend errors through consumer responses.
+The codes above are proposed public vocabulary, to freeze with the error-schema implementation.
+
+**Session close reasons that look alike and mean different things (implemented).** The relay records why it closed a device session in its `session_closed` log line (`reason`) and its bounded session terminal diagnostics, and sends the same code to the device in a `REJECTED`. Three of them concern the data carrier and are easy to confuse:
+
+| Close reason | Meaning | Operator interpretation |
+| --- | --- | --- |
+| `REVERSE_CHANNEL_UNAVAILABLE` | A frame for the device could not be queued because the data carrier's receiver is gone: the device's data socket has ended | Treat as a lost device transport; the connector reconnects or recovers |
+| `FLOW_CONTROL_UNDELIVERABLE` | A relay flow-control frame (`ACK`, `WINDOW_UPDATE`, or the `RESET` answering a device `RESET`) could not be queued on a **live** carrier even from the reserved control capacity: the relay's own backpressure (task row M4-37) | The device was healthy. Look at the session's queue diagnostics (`queue_bytes_high_water`, `data_queue_depth_high_water`, `data_queue_refusals`) for a consumer or carrier that stopped draining; a unary echo consumer sees the same code in its 503 |
+| `CONTROL_CLOSED` | The device's control socket ended -- or its data socket's loss was processed first and retained recovery could not start because control had gone too (M4-49) | The device's transport ended on both sockets |
+ Logs retain nested causes locally; external errors contain only the stable safe code, a short explanation, request/operation ID where available, and a permitted retry hint. Do not leak host paths or raw TLS/backend errors through consumer responses.
 
 Initial runbooks should answer a bounded set of questions:
 
