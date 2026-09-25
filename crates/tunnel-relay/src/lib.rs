@@ -91,7 +91,8 @@ pub use recovery::{
 pub use runtime::{
     OwnerUnregisterEvent, OwnerUnregisterKind, RelayCarrierSnapshot, RelayRotationSnapshot,
     RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
-    StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent, recovery_reason_name,
+    RotationFreezeHoldSnapshot, StreamTerminalCause, StreamTerminalEvent,
+    StreamTerminalReceiptEvent, recovery_reason_name,
 };
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 

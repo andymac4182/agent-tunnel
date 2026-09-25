@@ -73,6 +73,11 @@ use crate::{
     wire::{self, WireError},
 };
 
+#[path = "actor_freeze_hold.rs"]
+mod freeze_hold;
+pub(crate) use freeze_hold::ROTATION_FREEZE_RETRY_AFTER_MS;
+use freeze_hold::sleep_until_hold_deadline;
+
 #[path = "actor_http_stream.rs"]
 mod http_stream;
 pub(crate) use http_stream::{
@@ -819,6 +824,13 @@ pub enum RelayError {
     /// states; profile and scope errors remain ordinary
     /// authorization/conflict failures.
     OwnerNotReady,
+    /// A new stream OPEN landed in a scheduled data-rotation freeze
+    /// (QUIESCE to COMMITTED) and the freeze outlasted the owner's bounded
+    /// hold, or the hold was full (task row M3-15).  Nothing was dispatched.
+    /// Kept apart from [`RelayError::OwnerNotReady`] so a consumer can tell
+    /// this scheduled, always-safe-to-retry case from the fault states that
+    /// share that refusal.
+    RotationFreeze,
     /// The owner has reached its bounded concurrent stream limit.
     StreamLimit,
     Conflict(&'static str),
@@ -846,6 +858,7 @@ impl std::fmt::Display for RelayError {
             Self::Forbidden => formatter.write_str("operation is not authorized"),
             Self::OwnerBusy => formatter.write_str("device owner is still live"),
             Self::OwnerNotReady => formatter.write_str("peer owner is not ready"),
+            Self::RotationFreeze => formatter.write_str("device data rotation freeze"),
             Self::StreamLimit => formatter.write_str("stream limit reached"),
             Self::Conflict(message) => formatter.write_str(message),
             Self::NotFound => formatter.write_str("device or service was not found"),
@@ -1665,6 +1678,14 @@ impl StreamAdmissionReply {
         }
     }
 
+    /// Whether the consumer waiting on this admission has gone away.
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Echo(response) => response.is_closed(),
+            Self::Http(response) | Self::Fs { response, .. } => response.is_closed(),
+        }
+    }
+
     /// Report a refused admission.  Successful admissions are sent by the
     /// admission path itself with the variant-specific registration.
     fn send(self, result: Result<ConsumerStreamRegistration, RelayError>) -> Result<(), ()> {
@@ -2234,6 +2255,7 @@ impl RelayHandle {
             background_tasks: JoinSet::new(),
             background_failure,
             shutting_down: false,
+            freeze_hold: freeze_hold::FreezeHold::default(),
         };
         // Keep the actor failure boundary attached to the relay-wide
         // cancellation token.  A panic in the actor must not leave listener
@@ -3006,6 +3028,8 @@ struct RelayActor {
     background_tasks: JoinSet<()>,
     background_failure: Arc<AtomicBool>,
     shutting_down: bool,
+    /// New OPENs held across a data-rotation freeze (task row M3-15).
+    freeze_hold: freeze_hold::FreezeHold,
 }
 
 impl RelayActor {
@@ -3053,10 +3077,18 @@ impl RelayActor {
                     self.handle(command).await;
                     if !shutdown {
                         self.after_command_http_maintenance(scope).await;
+                        // A command can end a freeze, end a session or pass a
+                        // hold deadline; settle held OPENs against it.
+                        self.service_held_opens(Instant::now());
                     }
                     if shutdown || self.shutting_down {
                         break;
                     }
+                }
+                () = sleep_until_hold_deadline(self.freeze_hold.next_deadline()),
+                    if !self.freeze_hold.is_empty() =>
+                {
+                    self.service_held_opens(Instant::now());
                 }
             }
             if self.shutting_down {
@@ -4897,6 +4929,33 @@ impl RelayActor {
         request_id: Option<String>,
         response: StreamAdmissionReply,
     ) {
+        let _ = self.admit_consumer_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            consumer_expires_at,
+            request_id,
+            response,
+            true,
+        );
+    }
+
+    /// [`Self::open_consumer_stream`] with the rotation-freeze hold explicit.
+    /// `hold` is false only when a held OPEN is re-admitted after its freeze
+    /// ended, so an OPEN is never held twice.
+    #[allow(clippy::too_many_arguments)] // Exact authorization, lifetime, request, and reply context.
+    fn admit_consumer_stream(
+        &mut self,
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+        response: StreamAdmissionReply,
+        hold: bool,
+    ) -> freeze_hold::Admission {
         let http = response.is_http();
         let fs = response.is_fs();
         let fs_capabilities = response.fs_capabilities().map(str::to_owned);
@@ -4916,29 +4975,29 @@ impl RelayActor {
             || !grant.permissions.allows(required_operation)
         {
             let _ = response.send(Err(RelayError::Forbidden));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         let scope = DeviceScope::new(consumer.tenant_id, device_id);
         let Some(session) = self.sessions.get_mut(&scope) else {
             let _ = response.send(Err(RelayError::NotFound));
-            return;
+            return freeze_hold::Admission::Refused;
         };
         if !session.profile.supports_rotation() {
             let _ = response.send(Err(RelayError::Conflict(
                 "M2 ordered stream is not available",
             )));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if session.identity.tenant_id != consumer.tenant_id {
             let _ = response.send(Err(RelayError::Forbidden));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if session.active_carrier.is_none()
             || (session.cluster_profile && !session.owner_fenced)
             || session.owner_write_unknown.is_some()
         {
             let _ = response.send(Err(RelayError::OwnerNotReady));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         if Self::rotation_frozen(session) {
             // docs/protocol.md "Quiesce admission": new OPEN admission is paused
@@ -4946,14 +5005,55 @@ impl RelayActor {
             // the immutable roster fixed at quiesce cannot drift.  An OPEN
             // landing mid-attempt would be excluded from the roster and make
             // the pure machine's `frozen()` roster-equality check fail with
-            // RosterMismatch, stalling the attempt until the deadline.  The
-            // protocol permits a "retryable overload" here; `OwnerNotReady` is
-            // the existing pending-owner outcome (the owner is live but
-            // momentarily not admitting) and already carries `not_dispatched`
-            // plus a bounded retry-after, so no new code or HTTP mapping is
-            // needed.  Streams already admitted continue unaffected.
-            let _ = response.send(Err(RelayError::OwnerNotReady));
-            return;
+            // RosterMismatch, stalling the attempt until the deadline.
+            //
+            // Task row M3-15 (owner decision, 2026-09-25): a scheduled
+            // attempt's freeze holds the OPEN, bounded, and admits it once the
+            // freeze ends; nothing reaches the device meanwhile, so the roster
+            // is untouched.  Past the bound, or with the hold full, the answer
+            // is the distinct `RotationFreeze`.  Recovery is a fault state,
+            // not a scheduled freeze, and keeps `OwnerNotReady`.  Streams
+            // already admitted continue unaffected.
+            if !freeze_hold::attempt_frozen(session) {
+                let _ = response.send(Err(RelayError::OwnerNotReady));
+                return freeze_hold::Admission::Refused;
+            }
+            if !hold {
+                let _ = response.send(Err(RelayError::RotationFreeze));
+                return freeze_hold::Admission::Refused;
+            }
+            let now = Instant::now();
+            let bound = freeze_hold::hold_bound(
+                session
+                    .rotation
+                    .as_ref()
+                    .map_or(0, |rotation| rotation.state.config().handshake_timeout_ms),
+                self.options.limits.operation_timeout,
+                self.options
+                    .cluster
+                    .as_ref()
+                    .map(|cluster| Duration::from_secs(cluster.peer_idle_timeout_seconds)),
+            );
+            let held = freeze_hold::HeldOpen {
+                key: session.key.clone(),
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+                request_id,
+                response,
+                held_at: now,
+                deadline: now + bound,
+            };
+            let cap = freeze_hold::per_device_cap(self.options.limits.max_streams_per_device);
+            return match self.freeze_hold.try_hold(scope, held, cap) {
+                None => freeze_hold::Admission::Held,
+                Some(refused) => {
+                    let _ = refused.response.send(Err(RelayError::RotationFreeze));
+                    freeze_hold::Admission::Refused
+                }
+            };
         }
         let active_streams = session
             .streams
@@ -4969,11 +5069,11 @@ impl RelayActor {
             || session.streams.len() >= retained_stream_limit
         {
             let _ = response.send(Err(RelayError::StreamLimit));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         let Some(stream_id) = allocate_stream_id(&mut session.next_stream_id) else {
             let _ = response.send(Err(RelayError::Conflict("stream ID space exhausted")));
-            return;
+            return freeze_hold::Admission::Refused;
         };
         let operation_id = Uuid::new_v4().to_string();
         let service_name = service_id.to_string();
@@ -5006,12 +5106,12 @@ impl RelayActor {
                 let _ = response.send(Err(RelayError::Protocol(
                     "stream OPEN exceeds the control bound".into(),
                 )));
-                return;
+                return freeze_hold::Admission::Refused;
             }
         };
         if queue_control(&session.control_tx, &session.queue_budget, open).is_err() {
             let _ = response.send(Err(RelayError::Overloaded("control queue is full")));
-            return;
+            return freeze_hold::Admission::Refused;
         }
         let stream_slots = self.options.limits.max_streams_per_device.max(1);
         // Keep enough retained capacity for one legal response record even
@@ -5050,7 +5150,7 @@ impl RelayActor {
             Ok(sequence) => sequence,
             Err(error) => {
                 let _ = response.send(Err(RelayError::Protocol(error.to_string())));
-                return;
+                return freeze_hold::Admission::Refused;
             }
         };
         let closed = CancellationToken::new();
@@ -5143,6 +5243,7 @@ impl RelayActor {
                 unreachable!("a raw-stream admission always creates HTTP stream state")
             }
         }
+        freeze_hold::Admission::Admitted
     }
 
     fn send_echo_registration(
@@ -8590,6 +8691,8 @@ impl RelayActor {
         // resumed on the new generation (phase Retiring).  Emit every frame
         // held while the writer was frozen, each with the continuing sequence.
         self.flush_frozen_writes(key);
+        // Then admit the OPENs held across the freeze, in arrival order.
+        self.service_held_scope(&key.scope(), Instant::now());
     }
 
     async fn handle_rotate_retired(
@@ -9361,6 +9464,7 @@ impl RelayActor {
             // back onto it with the continuing sequence (no gap).  A no-op
             // while the bilateral abort is still completing.
             self.flush_frozen_writes(key);
+            self.service_held_scope(&key.scope(), Instant::now());
         }
     }
 
@@ -13547,6 +13651,7 @@ impl RelayActor {
         // is back to Active with a live carrier (e.g. active-loss recovery
         // leaves data_tx cleared and is handled by the recovery path instead).
         self.flush_frozen_writes(&key);
+        self.service_held_scope(&key.scope(), Instant::now());
         if old_closed {
             self.finish_rotation_if_ready(&key);
         }
@@ -13632,6 +13737,9 @@ impl RelayActor {
         }
         // A successor session must never inherit a retryable FORGET identity.
         self.owner_forgets.remove(key);
+        // OPENs held across a rotation freeze of this session were never
+        // dispatched; answer them now rather than at their deadline.
+        self.service_held_scope(&key.scope(), Instant::now());
         if session.closed {
             return;
         }
@@ -13853,6 +13961,7 @@ impl RelayActor {
         for key in keys {
             self.close_session(&key, "SHUTDOWN").await;
         }
+        self.release_held_opens_at_shutdown();
         self.tickets.clear();
         let graceful_deadline = deadline - CLEANUP_OPERATION_TIMEOUT;
         let joined = self
@@ -14191,6 +14300,7 @@ impl RelayActor {
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
             http_forward: self.http_forward_diagnostics.snapshot(),
+            rotation_freeze_hold: self.freeze_hold.snapshot(),
             stream_terminal_receipt_events: self
                 .stream_terminal_receipt_events
                 .iter()
@@ -16046,6 +16156,7 @@ mod stream_identity_tests {
             background_tasks: tokio::task::JoinSet::new(),
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutting_down: false,
+            freeze_hold: super::freeze_hold::FreezeHold::default(),
         };
         (
             actor,

@@ -584,7 +584,54 @@ pub struct RelaySnapshot {
     /// from the immutable first-terminal latches above because a connector
     /// terminal frame may arrive after the first logical terminal transition.
     pub stream_terminal_receipt_events: Vec<StreamTerminalReceiptEvent>,
+    /// Payload-free counters for new OPENs held across a data-rotation
+    /// freeze (task row M3-15).
+    pub rotation_freeze_hold: RotationFreezeHoldSnapshot,
     pub sessions: Vec<RelaySessionSnapshot>,
+}
+
+/// Counters for the owner's bounded admission hold across a data-rotation
+/// freeze (docs/protocol.md, "Quiesce admission"; task row M3-15).
+///
+/// A new consumer stream OPEN that lands between `ROTATE_QUIESCE` and the
+/// connector's `ROTATE_COMMITTED` (or the attempt's end without a commit) is
+/// held at the owner instead of refused. Every held OPEN leaves the hold
+/// exactly once, through one of the `released_*`, `refused_after_bound` or
+/// `cancelled` counters, so
+/// `held == currently_held + released_on_commit + released_on_abort +
+/// refused_after_bound + cancelled + released_on_session_loss`.
+/// `refused_hold_full` counts OPENs that were never held because the cap was
+/// full. Every field is a count or a duration: no identity, route or payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RotationFreezeHoldSnapshot {
+    /// OPENs admitted into the hold.
+    pub held: u64,
+    /// OPENs in the hold at the time of the snapshot.
+    pub currently_held: u64,
+    /// Held OPENs that were admitted once the hold ended, whatever ended it.
+    pub admitted_after_hold: u64,
+    /// Held OPENs released because the attempt committed.
+    pub released_on_commit: u64,
+    /// Held OPENs released because the attempt ended without a commit: a
+    /// coordinated abort, or recovery. Each was then answered by ordinary
+    /// admission, so an abort that resumed the old carrier admits it and one
+    /// that entered recovery gives the existing owner-not-ready refusal.
+    pub released_on_abort: u64,
+    /// Held OPENs refused with `ROTATION_FREEZE` because the freeze outlasted
+    /// the hold bound.
+    pub refused_after_bound: u64,
+    /// OPENs refused with `ROTATION_FREEZE` without being held, because the
+    /// per-device or relay-wide hold cap was full.
+    pub refused_hold_full: u64,
+    /// Held OPENs whose consumer went away during the hold. Nothing was
+    /// dispatched for them and no OPEN reached the device.
+    pub cancelled: u64,
+    /// Held OPENs released because their device session ended (including
+    /// relay shutdown). Each was refused with the owner-not-ready fault
+    /// refusal, `not_dispatched`.
+    pub released_on_session_loss: u64,
+    /// The longest time any OPEN spent in the hold, in milliseconds.
+    pub max_hold_wait_ms: u64,
 }
 
 /// Convert the protocol phase to a stable diagnostics string without exposing

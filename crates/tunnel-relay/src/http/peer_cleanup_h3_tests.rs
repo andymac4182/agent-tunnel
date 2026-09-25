@@ -3368,3 +3368,153 @@ async fn peer_device_data_refusal_responds_and_preserves_the_connection_sibling_
     drop(carrier);
     fixture.shutdown().await;
 }
+
+/// Which pre-admission refusal the staged owner answers with.
+#[derive(Clone, Copy)]
+enum StagedOwnerRefusal {
+    OwnerNotReady,
+    RotationFreeze,
+}
+
+/// An owner that runs the production peer admission and then refuses the
+/// request before any body record, exactly as the owner handlers do for a
+/// `RelayError::OwnerNotReady` or `RelayError::RotationFreeze` admission
+/// answer (task row M3-15).
+struct RefusingOwnerHandler {
+    runtime: Arc<PeerRuntime>,
+    refusal: StagedOwnerRefusal,
+    returned_errors: Arc<AtomicUsize>,
+}
+
+impl PeerRequestHandler for RefusingOwnerHandler {
+    fn handle(
+        &self,
+        identity: TlsIdentity,
+        request: Request<()>,
+        stream: PeerServerStream,
+    ) -> PeerHandlerFuture {
+        let runtime = Arc::clone(&self.runtime);
+        let refusal = self.refusal;
+        let returned_errors = Arc::clone(&self.returned_errors);
+        Box::pin(async move {
+            let result = async {
+                let inbound = runtime
+                    .accept_inbound(identity, request, stream)
+                    .await
+                    .map_err(|error| PeerTransportError::H3(error.to_string()))?;
+                match refusal {
+                    StagedOwnerRefusal::OwnerNotReady => inbound.reject_owner_not_ready().await,
+                    StagedOwnerRefusal::RotationFreeze => inbound.reject_rotation_freeze().await,
+                }
+                .map_err(|error| PeerTransportError::H3(error.to_string()))
+            }
+            .await;
+            if result.is_err() {
+                returned_errors.fetch_add(1, Ordering::AcqRel);
+            }
+            result
+        })
+    }
+}
+
+/// Over real HTTP/3, the owner's scheduled-freeze refusal reaches the ingress
+/// as its own typed error and the consumer as `ROTATION_FREEZE`, while the
+/// fault refusal still arrives as `OwnerNotReady` and the old body (task row
+/// M3-15).  Witness: before the distinct marker the owner could only send the
+/// owner-not-ready marker, so the freeze arm below could not be told apart.
+#[tokio::test]
+async fn forwarded_rotation_freeze_refusal_keeps_its_distinct_reason() {
+    for refusal in [
+        StagedOwnerRefusal::RotationFreeze,
+        StagedOwnerRefusal::OwnerNotReady,
+    ] {
+        let fixture = H3PeerFixture::new_with(
+            move |runtime, _handle, _catalog, _oidc, _device, returned_errors| {
+                RefusingOwnerHandler {
+                    runtime,
+                    refusal,
+                    returned_errors,
+                }
+            },
+        )
+        .await;
+        let owner = fixture
+            .catalog
+            .claim_owner(&OwnerClaimRequest {
+                deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+                tenant_id: tenant_id(),
+                device_id: device_id(),
+                node_id: DESTINATION_NODE.to_owned(),
+                boot_id: DESTINATION_BOOT.to_owned(),
+                session_id: "forwarded-freeze-owner".to_owned(),
+                lease_expires_at: Utc::now() + ChronoDuration::minutes(5),
+            })
+            .await
+            .expect("claim the staged remote owner");
+        let route = fixture
+            .runtime
+            .resolve(OwnerScope::new(tenant_id(), device_id()), Utc::now())
+            .await
+            .expect("resolve the staged remote owner route");
+        assert!(!route.is_local());
+        assert_eq!(route.owner_token(), &owner.token);
+        let envelope = consumer_envelope(
+            "forwarded-freeze-request",
+            "forwarded-freeze-stream",
+            route.owner_token(),
+            &fixture.consumer_token,
+        );
+        let exchange = fixture
+            .runtime
+            .open(&route, envelope)
+            .await
+            .expect("open the staged ingress exchange");
+        let (_send, mut recv) = exchange.split();
+        let error = recv
+            .accept_response()
+            .await
+            .expect_err("the staged owner refuses before admission");
+        let body = match (refusal, &error) {
+            (
+                StagedOwnerRefusal::RotationFreeze,
+                PeerRuntimeError::RotationFreeze {
+                    retry_after_ms: 250,
+                },
+            )
+            | (
+                StagedOwnerRefusal::OwnerNotReady,
+                PeerRuntimeError::OwnerNotReady {
+                    retry_after_ms: 250,
+                },
+            ) => {
+                let response = crate::http::peer_failure_response(error);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(axum::http::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("1")
+                );
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .expect("bounded refusal body");
+                serde_json::from_slice::<serde_json::Value>(&body).expect("refusal JSON")
+            }
+            (_, other) => panic!("unexpected ingress error {other:?}"),
+        };
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        match refusal {
+            StagedOwnerRefusal::RotationFreeze => assert_eq!(body["code"], "ROTATION_FREEZE"),
+            StagedOwnerRefusal::OwnerNotReady => {
+                assert_eq!(body["code"], "PEER_UNAVAILABLE");
+                assert_eq!(
+                    body["message"],
+                    "selected owner is not ready; retry after the bounded hint"
+                );
+            }
+        }
+        fixture.shutdown().await;
+    }
+}

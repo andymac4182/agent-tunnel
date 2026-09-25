@@ -214,6 +214,9 @@ pub enum PeerFaultCause {
     UnexpectedRecord,
     /// The owner is committed but not ready.
     OwnerNotReady,
+    /// The owner held the request across a scheduled data-rotation freeze
+    /// and the freeze outlasted the bound, or the hold was full (M3-15).
+    RotationFreeze,
     /// The owner's bounded stream limit is full.
     Capacity,
     /// The peer membership admission expired.
@@ -233,7 +236,7 @@ impl PeerFaultCause {
     /// `tunnel-test-harness` compares them, and the exhaustive match in
     /// `every_cause_is_enumerated` below fails to compile if a variant is
     /// added without being listed here.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::NoLiveOwner,
         Self::Catalog,
         Self::Membership,
@@ -256,6 +259,7 @@ impl PeerFaultCause {
         Self::InvalidRoute,
         Self::UnexpectedRecord,
         Self::OwnerNotReady,
+        Self::RotationFreeze,
         Self::Capacity,
         Self::MembershipExpired,
         Self::Closed,
@@ -287,6 +291,7 @@ impl PeerFaultCause {
             Self::InvalidRoute => "invalid_route",
             Self::UnexpectedRecord => "unexpected_record",
             Self::OwnerNotReady => "owner_not_ready",
+            Self::RotationFreeze => "rotation_freeze",
             Self::Capacity => "capacity",
             Self::MembershipExpired => "membership_expired",
             Self::Closed => "closed",
@@ -333,6 +338,7 @@ impl PeerFaultCause {
             PeerRuntimeError::InvalidRoute(_) => Self::InvalidRoute,
             PeerRuntimeError::UnexpectedRecord(_) => Self::UnexpectedRecord,
             PeerRuntimeError::OwnerNotReady { .. } => Self::OwnerNotReady,
+            PeerRuntimeError::RotationFreeze { .. } => Self::RotationFreeze,
             PeerRuntimeError::Capacity { .. } => Self::Capacity,
             PeerRuntimeError::MembershipExpired => Self::MembershipExpired,
             PeerRuntimeError::Closed => Self::Closed,
@@ -349,6 +355,7 @@ impl PeerFaultCause {
                 | Self::RemoteForbidden
                 | Self::RemoteStatus
                 | Self::OwnerNotReady
+                | Self::RotationFreeze
                 | Self::Capacity
         )
     }
@@ -785,6 +792,7 @@ mod tests {
                 | PeerFaultCause::InvalidRoute
                 | PeerFaultCause::UnexpectedRecord
                 | PeerFaultCause::OwnerNotReady
+                | PeerFaultCause::RotationFreeze
                 | PeerFaultCause::Capacity
                 | PeerFaultCause::MembershipExpired
                 | PeerFaultCause::Closed

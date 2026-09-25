@@ -75,12 +75,16 @@ const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 
 /// Whether the owner session is, or has just been, in a rotation freeze.
 ///
-/// The relay answers every owner-not-ready condition with the same
-/// retryable `503 PEER_UNAVAILABLE` `not_dispatched` body (`http.rs`
-/// `retryable_peer_failure_response`), so the body alone cannot say whether
-/// the refusal came from the documented quiesce-admission pause or from a
-/// fault state.  The gate samples the owner's session phase instead and
-/// resends only while that says a rotation is frozen.
+/// Before M3-15 the relay answered a request landing in a rotation freeze
+/// with the same retryable `503 PEER_UNAVAILABLE` `not_dispatched` body as
+/// every owner-not-ready fault state, so the gate sampled the owner's session
+/// phase and resent only while that said a rotation was frozen.  The owner
+/// now holds such a request until the freeze ends and names a freeze that
+/// outlasts the hold with its own `ROTATION_FREEZE` code, so a POST no longer
+/// needs this watch to decide a resend.  A standalone GET's refusal still
+/// carries no body to read, so it is still resent only inside an observed
+/// freeze, and a refusal outside one is still reported with the connector's
+/// phase.
 #[derive(Debug, Default)]
 pub(in crate::production_cluster) struct FreezeWatch {
     frozen: AtomicBool,
@@ -196,27 +200,41 @@ impl FreezeWatch {
     }
 }
 
-/// The message of the relay's owner-not-ready refusal
-/// (`retryable_peer_failure_response` in `tunnel-relay/src/http.rs`), which is
-/// what separates it from the empty-pin-set refusal that shares its code,
-/// execution and `retryable` (M3-30).
-pub(in crate::production_cluster) const OWNER_NOT_READY_MESSAGE: &str =
-    "selected owner is not ready; retry after the bounded hint";
+/// The message of the relay's owner-not-ready fault refusal
+/// (`retryable_peer_failure_response` in `tunnel-relay/src/http.rs`).  Since
+/// M3-15 no gate resends it; the tests keep it to prove that.
+#[cfg(test)]
+const OWNER_NOT_READY_MESSAGE: &str = "selected owner is not ready; retry after the bounded hint";
 
-/// The retry hint of the relay's retryable **owner-not-ready** refusal, or
-/// `None` for any other failure.  Only that refusal may be resent here: the
-/// relay states nothing was dispatched, and it is the answer a rotation freeze
-/// produces.
+/// The relay's code for a request refused because the device's scheduled
+/// data-rotation freeze outlasted the owner's bounded admission hold, or the
+/// hold was full (`ROTATION_FREEZE_CODE` in `tunnel-relay/src/http.rs`;
+/// M3-15).
+pub(in crate::production_cluster) const ROTATION_FREEZE_CODE: &str = "ROTATION_FREEZE";
+
+/// The retry hint of the relay's retryable **rotation-freeze** refusal in a
+/// `503` body, or `None` for any other answer (M3-15).
 ///
-/// Narrowed as the isolation gate's `owner_not_ready_hint` was (M3-30): code,
-/// execution and `retryable` alone also match the empty-pin-set refusal
-/// (`peer_trust_unavailable_response`, M7-C83), which carries its own message
-/// and a 5000 ms hint.  So the message must be the owner-not-ready one and the
-/// hint must be present and within `1..=MIN_RETRY_HINT_MS` -- this harness's
-/// copy of the relay's `OWNER_NOT_READY_RETRY_AFTER_MS` (250 ms,
-/// `tunnel-relay/src/peer_runtime.rs`), the ceiling
-/// `retryable_peer_failure_response` clamps its hint to.  A missing hint is
-/// no longer defaulted.
+/// This is the one refusal the relay itself says is the scheduled freeze, and
+/// the only one a consumer should resend without its own evidence: nothing
+/// was dispatched and the condition is scheduled to clear.  The
+/// owner-not-ready body (`OWNER_NOT_READY_MESSAGE`) now answers only fault
+/// states and is never resent, and neither is the empty-pin-set refusal
+/// (M7-C83).  The hint must be present and within `1..=MIN_RETRY_HINT_MS`,
+/// the relay's `OWNER_NOT_READY_RETRY_AFTER_MS` from which the freeze hint is
+/// derived.
+pub(in crate::production_cluster) fn rotation_freeze_hint(body: &[u8]) -> Option<Duration> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let hint = value["retry_after_ms"].as_u64()?;
+    (value["code"] == ROTATION_FREEZE_CODE
+        && value["execution"] == "not_dispatched"
+        && value["retryable"] == true
+        && (1..=MIN_RETRY_HINT_MS).contains(&hint))
+    .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))
+}
+
+/// [`rotation_freeze_hint`] for an rmcp POST failure, which carries the
+/// status line and body as text.
 fn not_dispatched_retry_after(
     error: &StreamableHttpError<rmcp::transport::common::unix_socket::UnixSocketError>,
 ) -> Option<Duration> {
@@ -224,14 +242,7 @@ fn not_dispatched_retry_after(
         return None;
     };
     let body = text.strip_prefix("HTTP 503 Service Unavailable: ")?;
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    let hint = value["retry_after_ms"].as_u64()?;
-    (value["code"] == "PEER_UNAVAILABLE"
-        && value["execution"] == "not_dispatched"
-        && value["retryable"] == true
-        && value["message"] == OWNER_NOT_READY_MESSAGE
-        && (1..=MIN_RETRY_HINT_MS).contains(&hint))
-    .then(|| Duration::from_millis(hint).min(MAX_RETRY_AFTER))
+    rotation_freeze_hint(body.as_bytes())
 }
 
 /// The connector rotation phases in which the owner pauses new stream
@@ -360,12 +371,13 @@ pub struct WireCounts {
     pub errors: BTreeMap<String, u64>,
     /// POSTs that failed at the transport (other than an expired session).
     pub post_failures: u64,
-    /// POSTs the relay refused with a retryable `503 PEER_UNAVAILABLE`
-    /// `not_dispatched` answer.
+    /// POSTs the relay refused with its retryable `503 ROTATION_FREEZE`
+    /// `not_dispatched` answer: a rotation freeze that outlasted the owner's
+    /// bounded hold, or a full hold (M3-15).
     pub not_dispatched_refusals: u64,
-    /// Those refusals that coincided with an observed owner rotation freeze
-    /// and were therefore sent again after the hint.  A refusal outside a
-    /// freeze is never resent, so it fails its call.
+    /// Those refusals sent again after the hint, at most
+    /// `NOT_DISPATCHED_RETRIES` per request.  Any other refusal is never
+    /// resent, so it fails its call.
     pub not_dispatched_retries: u64,
     /// The connector state at the first refusal that did not coincide with
     /// a freeze, so a failure names its cause.
@@ -805,20 +817,21 @@ impl StreamableHttpClient for CountingHttpClient {
                     max_sse_event_size,
                 )
                 .await;
+            // The relay names the scheduled freeze itself (M3-15), so the
+            // resend no longer waits on this gate's own freeze watch.  Any
+            // other refusal, including the owner-not-ready fault body, is
+            // returned to its call.
             if let Err(error) = &result
                 && let Some(delay) = not_dispatched_retry_after(error)
             {
-                let coincides = self.freeze.coincides();
-                let cause = (!coincides).then(|| self.freeze.unexplained());
+                let resend = retries < NOT_DISPATCHED_RETRIES;
                 self.ledger.with(|inner| {
                     inner.counts.not_dispatched_refusals += 1;
-                    if coincides {
+                    if resend {
                         inner.counts.not_dispatched_retries += 1;
-                    } else if let Some(cause) = cause {
-                        inner.counts.unexplained_refusal.get_or_insert(cause);
                     }
                 });
-                if coincides && retries < NOT_DISPATCHED_RETRIES {
+                if resend {
                     retries += 1;
                     sleep(delay).await;
                     continue;
@@ -1372,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_not_ready_503_carries_a_retry_hint() {
+    fn only_the_rotation_freeze_503_carries_a_retry_hint() {
         let refusal = |body: &str| {
             StreamableHttpError::UnexpectedServerResponse(std::borrow::Cow::Owned(format!(
                 "HTTP 503 Service Unavailable: {body}"
@@ -1391,28 +1404,36 @@ mod tests {
                 }
                 value.to_string()
             };
-        let owner_not_ready = |hint: u64| {
+        const FREEZE_MESSAGE: &str =
+            "device data rotation is in progress; retry after the bounded hint";
+        let rotation_freeze = |hint: u64| {
             body(
-                "PEER_UNAVAILABLE",
+                ROTATION_FREEZE_CODE,
                 "not_dispatched",
-                OWNER_NOT_READY_MESSAGE,
+                FREEZE_MESSAGE,
                 true,
                 Some(hint),
             )
         };
         assert_eq!(
-            not_dispatched_retry_after(&refusal(&owner_not_ready(250))),
+            not_dispatched_retry_after(&refusal(&rotation_freeze(250))),
             Some(Duration::from_millis(250))
         );
         assert_eq!(
-            not_dispatched_retry_after(&refusal(&owner_not_ready(1))),
+            not_dispatched_retry_after(&refusal(&rotation_freeze(1))),
             Some(Duration::from_millis(1))
         );
-        // The empty-pin-set refusal shares code, execution and `retryable`
-        // and differs in its message and its 5000 ms hint (M7-C83): it is not
-        // a freeze and is never resent.  Nor is an owner-not-ready body with
-        // a hint above the relay's clamp or none, another message or code, an
+        // The owner-not-ready body now answers only fault states (M3-15), so
+        // it is no longer resent; nor is the empty-pin-set refusal (M7-C83),
+        // a freeze body with a hint above the relay's clamp or none, an
         // unknown outcome, or `retryable: false`.
+        let owner_not_ready = body(
+            "PEER_UNAVAILABLE",
+            "not_dispatched",
+            OWNER_NOT_READY_MESSAGE,
+            true,
+            Some(250),
+        );
         let empty_pin_set = body(
             "PEER_UNAVAILABLE",
             "not_dispatched",
@@ -1421,41 +1442,28 @@ mod tests {
             Some(5_000),
         );
         for refused in [
+            owner_not_ready.clone(),
             empty_pin_set,
-            owner_not_ready(251),
-            owner_not_ready(0),
+            rotation_freeze(251),
+            rotation_freeze(0),
             body(
-                "PEER_UNAVAILABLE",
+                ROTATION_FREEZE_CODE,
                 "not_dispatched",
-                OWNER_NOT_READY_MESSAGE,
+                FREEZE_MESSAGE,
                 true,
                 None,
             ),
             body(
-                "PEER_UNAVAILABLE",
-                "not_dispatched",
-                "something else",
-                true,
-                Some(250),
-            ),
-            body(
-                "STREAM_LIMIT",
-                "not_dispatched",
-                OWNER_NOT_READY_MESSAGE,
-                true,
-                Some(250),
-            ),
-            body(
-                "PEER_UNAVAILABLE",
+                ROTATION_FREEZE_CODE,
                 "unknown",
-                OWNER_NOT_READY_MESSAGE,
+                FREEZE_MESSAGE,
                 true,
                 Some(250),
             ),
             body(
-                "PEER_UNAVAILABLE",
+                ROTATION_FREEZE_CODE,
                 "not_dispatched",
-                OWNER_NOT_READY_MESSAGE,
+                FREEZE_MESSAGE,
                 false,
                 Some(250),
             ),
@@ -1468,7 +1476,7 @@ mod tests {
         }
         assert_eq!(
             not_dispatched_retry_after(&StreamableHttpError::UnexpectedServerResponse(
-                std::borrow::Cow::Owned(format!("HTTP 502 Bad Gateway: {}", owner_not_ready(250)))
+                std::borrow::Cow::Owned(format!("HTTP 502 Bad Gateway: {}", rotation_freeze(250)))
             )),
             None
         );
