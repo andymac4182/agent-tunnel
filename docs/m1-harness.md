@@ -247,9 +247,28 @@ results above are unchanged by it.
 There is **no Windows M1 acceptance**: the relay refuses to start off Unix
 (M6-C83) and credential creation and import are unsupported there. Whether
 Windows is advertised as a client-only target is an open owner decision on
-M1-04. The hosted Linux acceptance is **not reliably green**: its pre-body
-admission assertion has failed on four hosted runs (M6-C85, still
-undiagnosed), so one green run is not a repeated acceptance.
+M1-04. Before `4aab5c4` the hosted acceptance was **not reliably green**: its
+pre-body admission assertion failed on four hosted Linux runs and, at `64863b5`,
+on macOS (run 36097122395, job 107951664801). That was M6-C85, a harness
+ordering race and not a relay defect. A held request was counted as holding
+an admission permit once it was queued on the client, so the ninth request
+could take the eighth permit first. From `4aab5c4` each hold waits for the
+relay's `100 Continue`, which is written only once the handler holds both
+permits, and the ninth request is sent once and must be answered
+`429 ADMISSION_LIMIT`. The hosted repeats after that fix are below.
+
+| Commit | Run and attempt | Job | Runner | Result |
+| --- | --- | --- | --- | --- |
+| `4aab5c4` | 36101014774, attempt 1 (`ci-main-probe`) | `M1 real-socket acceptance (Redis)` 107963302386 | ubuntu-latest, Redis `8.4.0-alpine` service | success; `M1 acceptance passed: clients=5 echo_requests=21 ...` |
+| `4aab5c4` | 36101014774, attempt 1 | `M1 real-socket acceptance (macOS, Redis)` 107963302352 | macos-latest, Homebrew Redis | success; same line |
+| `4aab5c4` | 36101014774, attempt 2 | `M1 real-socket acceptance (Redis)` 107970760129 | ubuntu-latest | success |
+| `4aab5c4` | 36101014774, attempt 2 | `M1 real-socket acceptance (macOS, Redis)` 107970760302 | macos-latest | success |
+| `4aab5c4` | 36101014774, attempt 3 | `M1 real-socket acceptance (Redis)` 107977833722 | ubuntu-latest | success |
+| `4aab5c4` | 36101014774, attempt 3 | `M1 real-socket acceptance (macOS, Redis)` 107977833981 | macos-latest | success |
+
+Six of six hosted M1 jobs passed at `4aab5c4`. Locally at the same commit, the
+acceptance passed 30 of 30 under 16 CPU burners, against 2 of 20 red before the
+fix, and `scripts/m1-harness-verify.sh` passed 5 of 5.
 
 ## Required checks and evidence
 

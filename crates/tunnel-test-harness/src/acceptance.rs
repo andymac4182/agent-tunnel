@@ -705,52 +705,44 @@ async fn verify_prebody_admission(
     evidence: &mut Evidence,
 ) -> Result<()> {
     const HELD_REQUESTS: usize = 8;
+    // Each hold returns only once the relay has admitted it (M6-C85), so all
+    // eight permits are held before the ninth request is sent.  A hold the
+    // relay refuses fails here, naming its position, rather than leaving a
+    // free permit for the ninth request to take.
     let mut held = Vec::<HeldConsumerRequest>::with_capacity(HELD_REQUESTS);
-    for _ in 0..HELD_REQUESTS {
-        held.push(
-            hold_consumer_request(
-                consumer_addr,
-                &harness.pki.server_ca.certificate_der,
-                token,
-                path,
-                100,
-            )
-            .await?,
-        );
-    }
-
-    let probe_started = Instant::now();
-    let mut rejected = false;
-    while probe_started.elapsed() < Duration::from_secs(3) {
-        match consumer_request_with_timeout(
+    for index in 0..HELD_REQUESTS {
+        let request = hold_consumer_request(
             consumer_addr,
             &harness.pki.server_ca.certificate_der,
             token,
-            "POST",
             path,
-            b"admission-probe".to_vec(),
-            Duration::from_millis(500),
+            100,
         )
         .await
-        {
-            Ok(response) if response.status == hyper::StatusCode::TOO_MANY_REQUESTS => {
-                rejected = true;
-                break;
-            }
-            Ok(response) if response.status == hyper::StatusCode::OK => {}
-            Ok(response) => {
-                return Err(HarnessError::Http(format!(
-                    "pre-body admission probe returned unexpected status {} code {:?}",
-                    response.status,
-                    error_code(&response),
-                )));
-            }
-            Err(_) => {}
-        }
-        sleep(Duration::from_millis(25)).await;
+        .map_err(|error| {
+            HarnessError::Http(format!(
+                "pre-body admission hold {} of {HELD_REQUESTS} was not admitted: {error}",
+                index + 1
+            ))
+        })?;
+        held.push(request);
     }
+
+    // With every permit held, the ninth request must be refused on its first
+    // attempt: there is nothing to wait for and nothing to retry.
+    let probe = consumer_request_with_timeout(
+        consumer_addr,
+        &harness.pki.server_ca.certificate_der,
+        token,
+        "POST",
+        path,
+        b"admission-probe".to_vec(),
+        Duration::from_secs(5),
+    )
+    .await?;
     assert_named(
-        rejected,
+        probe.status == hyper::StatusCode::TOO_MANY_REQUESTS
+            && error_code(&probe).as_deref() == Some("ADMISSION_LIMIT"),
         "ninth request receives bounded pre-body admission HTTP 429",
     )?;
     evidence.queue_rejections += 1;
