@@ -1,0 +1,93 @@
+# Task row M6-03: soak, load, chaos and fairness experiments on a dedicated
+# GitHub-hosted runner.  Manual only: it takes about three hours.
+#
+# The artifact holds synthetic metrics only (requests.csv, samples.csv,
+# events.jsonl, summary.json, run.txt and the sequence log): no relay or
+# device log, no payload and no token (M7-C112: no public unredacted logs).
+name: m6-soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: Soak duration in seconds
+        default: "7260"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: M6-03 soak, load, chaos and fairness (Linux, Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    services:
+      redis:
+        image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Host
+        run: |
+          uptime; nproc; free -m; lscpu | head -20; python3 --version; openssl version
+          docker version --format '{{.Server.Version}}'
+      - name: Build release binaries
+        run: |
+          cargo +1.95.0 build --release --locked -p tunnel-relay -p tunnel-client \
+            -p tunnel-deadman -p tunnel-mcp-fixture --bins
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/tunnel-relay target/release/tunnel-client \
+            target/release/tunnel-deadman target/release/tunnel-mcp-fixture "$RUNNER_TEMP/bin/"
+          sha256sum "$RUNNER_TEMP"/bin/*
+      - name: Pull the dedicated chaos Redis image
+        run: docker pull redis:8.4.0-alpine
+      - name: Run the experiments
+        env:
+          M6_SOAK_MAX_LOAD: "1000"
+          M6_SOAK_CHAOS_ARGS: "--dedicated-redis"
+          M6_SOAK_REDIS: "127.0.0.1:6379"
+          M6_SOAK_DURATION: ${{ inputs.soak_seconds || '7260' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          { echo "uptime=$(uptime)"; echo "nproc=$(nproc)"; echo "head=$GITHUB_SHA"; \
+            echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"; } > "$RUNNER_TEMP/logs/host.txt"
+          sh scripts/m6-soak-all.sh "$RUNNER_TEMP/bin" "$GITHUB_SHA" "$RUNNER_TEMP/logs" | tee "$RUNNER_TEMP/logs/all.log"
+          for d in chaos load fairness soak; do
+            grep -q "m6-soak-all: $d exit=0" "$RUNNER_TEMP/logs/all.log" || echo "::warning::$d did not exit 0"
+          done
+      - name: Collect synthetic metrics only
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/artifact"; mkdir -p "$out"
+          cp "$RUNNER_TEMP/logs/host.txt" "$RUNNER_TEMP/logs/all.log" "$out/" 2>/dev/null || true
+          for run in "$RUNNER_TEMP"/logs/*-2*/; do
+            [ -d "$run" ] || continue
+            name=$(basename "$run"); mkdir -p "$out/$name"
+            for f in requests.csv samples.csv events.jsonl summary.json run.txt; do
+              [ -f "$run/$f" ] && cp "$run/$f" "$out/$name/"
+            done
+          done
+          # Driver output carries only the harness's own event lines and summaries.
+          for d in chaos load fairness soak; do
+            f="$RUNNER_TEMP/logs/$d-driver.log"
+            [ -f "$f" ] && grep -E '^\[|^\{|^ |^\}|Traceback|Error|exit' "$f" > "$out/$d-driver.log" || true
+          done
+          ls -lR "$out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m6-soak-metrics
+          path: ${{ runner.temp }}/artifact
+          retention-days: 7

@@ -538,6 +538,12 @@ def rss_kib(pid: int) -> int | None:
 
 
 def fd_count(pid: int) -> int | None:
+    proc = Path(f"/proc/{pid}/fd")
+    if proc.is_dir():  # Linux: exact descriptor count, no lsof needed
+        try:
+            return len(os.listdir(proc))
+        except OSError:
+            return None
     out = subprocess.run(["lsof", "-n", "-P", "-p", str(pid)], capture_output=True, text=True)
     lines = out.stdout.strip().splitlines()
     return max(0, len(lines) - 1) if lines else None
