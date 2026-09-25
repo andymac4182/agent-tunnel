@@ -50,9 +50,9 @@ JSON errors use `{ "error": { "code": "...", "message": "...", "requestId": "...
 
 | HTTP | Code and meaning |
 | --- | --- |
-| 401 | `UNAUTHENTICATED`; missing/invalid/expired consumer token; standard Bearer challenge |
+| 401 | `UNAUTHENTICATED`; missing/invalid/expired consumer token; standard Bearer challenge. The message distinguishes only a missing token ("a consumer access token is required") from a refused one ("the consumer access token was not accepted"), the same text every consumer route uses (M6-C53) |
 | 404 | `EXPORT_NOT_FOUND`; nonexistent or undiscoverable device/service; same external response for both |
-| 403 | `ACCESS_DENIED`; authenticated, discoverable export but requested operation/session permission is absent |
+| 403 | `ACCESS_DENIED`; authenticated, discoverable export but requested operation/session permission is absent, or a valid token without the `fs:connect` scope (M6-C53) |
 | 409 | `CAPABILITIES_CHANGED`; descriptor revision no longer matches; no filesystem work admitted |
 | 429 | `RESOURCE_EXHAUSTED`; consumer/tenant/session admission limit; bounded `Retry-After` |
 | 503 | `DEVICE_OFFLINE` or `BACKEND_UNAVAILABLE`; no filesystem session created |

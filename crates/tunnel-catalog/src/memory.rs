@@ -226,6 +226,14 @@ impl MemoryCatalog {
     }
 }
 
+/// Task row M6-C63: a successful owner claim or renewal is the device being
+/// seen at `now`, as the Redis catalog's claim and renew scripts record it.
+fn mark_seen(state: &mut State, key: (Uuid, Uuid), now: DateTime<Utc>) {
+    if let Some(device) = state.devices.get_mut(&key) {
+        device.last_seen_at = Some(now);
+    }
+}
+
 #[async_trait]
 impl Catalog for MemoryCatalog {
     async fn resolve_device(
@@ -658,7 +666,9 @@ impl Catalog for MemoryCatalog {
                     && current.token.boot_id == request.boot_id
                     && current.token.session_id == request.session_id
                 {
-                    return Ok(current.clone());
+                    let claim = current.clone();
+                    mark_seen(state, key, now);
+                    return Ok(claim);
                 }
                 return Err(CatalogError::OwnerBusy);
             }
@@ -680,6 +690,7 @@ impl Catalog for MemoryCatalog {
             };
             state.owner_epochs.insert(key, epoch);
             state.owners.insert(key, claim.clone());
+            mark_seen(state, key, now);
             Ok(claim)
         })
         .await
@@ -709,6 +720,7 @@ impl Catalog for MemoryCatalog {
                 return Ok(false);
             }
             claim.lease_expires_at = lease_expires_at;
+            mark_seen(state, (token.tenant_id, token.device_id), now);
             Ok(true)
         })
         .await

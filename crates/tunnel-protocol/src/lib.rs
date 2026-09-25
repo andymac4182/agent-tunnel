@@ -16,11 +16,13 @@ pub mod sequence;
 pub use control::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
     CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
-    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, Cancel, Control, ControlError,
-    ControlMessage, DEVICE_CONTROL_IDLE_TIMEOUT, DEVICE_CONTROL_PING_INTERVAL, DataReady, GoAway,
-    Hello, MAX_AUTHORIZATION_MESSAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_RESULT_DETAIL_BYTES,
-    Message, Open, Opened, Ping, Pong, Rejected, ResultDetail, ResultStatus, RotationPolicy,
-    ServiceAdvertisement, Welcome, decode_control, encode_control,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON,
+    CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE, CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON, Cancel,
+    Control, ControlError, ControlMessage, DEVICE_CONTROL_IDLE_TIMEOUT,
+    DEVICE_CONTROL_PING_INTERVAL, DataReady, GoAway, Hello, MAX_AUTHORIZATION_MESSAGE_BYTES,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_RESULT_DETAIL_BYTES, Message, Open, Opened, Ping, Pong,
+    Rejected, ResultDetail, ResultStatus, RotationPolicy, ServiceAdvertisement, Welcome,
+    decode_control, encode_control,
 };
 pub use frame::{
     DataContext, Frame, FrameError, FrameKind, HEADER_LEN, MAGIC, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,

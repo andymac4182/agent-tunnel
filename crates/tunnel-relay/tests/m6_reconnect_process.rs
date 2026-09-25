@@ -32,6 +32,15 @@
 //!   device draws `1008 DEVICE_IDENTITY_REJECTED`, and the loop exits `3`
 //!   after one attempt instead of backing off.
 //!
+//! * `m6c38_a_hello_on_another_protocol_major_is_closed_typed` -- task row
+//!   M6-C38, the relay half against the real `serve`: a device, holding the
+//!   provisioned certificate, sends a HELLO naming protocol major 2 and must
+//!   be answered with the typed `1002 PROTOCOL_UNSUPPORTED` close (the client
+//!   half, the real `tunnel-client` exiting `1` on that close without a
+//!   backoff, is `crates/tunnel-client/tests/reconnect_cli.rs`), and the
+//!   relay must log one payload-free refusal line for it (M6-C52).  The
+//!   identity-mismatch case above also requires its refusal line.
+//!
 //! * `m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconnect`
 //!   -- task row M6-C68, the M6-C23 reviewer's cut path: the client reaches
 //!   the relay through a TCP proxy. A healthy session is first left idle for
@@ -639,11 +648,23 @@ impl Deployment {
 
     /// Start `serve` and wait until it prints `tunnel-relay listening`.
     fn serve(&self, name: &str) -> Running {
+        self.serve_at(name, "warn", None)
+    }
+
+    /// [`Deployment::serve`] at the relay's default `info` level, keeping
+    /// every stderr line after `listening` for the caller (M6-C52).
+    fn serve_logged(&self, name: &str) -> (Running, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let relay = self.serve_at(name, "info", Some(Arc::clone(&lines)));
+        (relay, lines)
+    }
+
+    fn serve_at(&self, name: &str, level: &str, keep: Option<Arc<Mutex<Vec<String>>>>) -> Running {
         let mut relay = Running(
             Command::new(&self.relay_bin)
                 .args(["serve", "--config"])
                 .arg(&self.relay_config)
-                .env("RUST_LOG", "warn")
+                .env("RUST_LOG", level)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -673,7 +694,13 @@ impl Deployment {
             );
         }
         // Keep draining so a full pipe can never stall the relay.
-        std::thread::spawn(move || while rx.recv().is_ok() {});
+        std::thread::spawn(move || {
+            while let Ok(line) = rx.recv() {
+                if let Some(keep) = &keep {
+                    keep.lock().expect("relay log").push(line);
+                }
+            }
+        });
         relay
     }
 
@@ -1113,7 +1140,7 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
     let deployment = Deployment::provision("expired").await;
     let now = unix_now();
     deployment.reissue_device_certificate(now - 172_800, now - 3_600);
-    let relay = deployment.serve("serve");
+    let (relay, relay_log) = deployment.serve_logged("serve");
     let mut client = deployment.connect();
     let exit = client.wait_exit("expired certificate");
     let events: Vec<Value> = client
@@ -1130,9 +1157,16 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
         "{events:?}"
     );
     assert!(client.states("backoff").is_empty(), "{events:?}");
+    // M6-C52: the relay's side of the same refusal, at its default level.
+    let refusal = wait_for_log_line(&relay_log, "TLS handshake refused");
+    assert!(
+        refusal.contains("\"refusal\":\"client_certificate_expired\""),
+        "{refusal}"
+    );
     drop(relay);
     println!(
-        "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0 \
+         relay_tls_refusal_logged=true",
         deployment.nonce
     );
 }
@@ -1157,7 +1191,7 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
         ),
     )
     .expect("mismatched profile");
-    let relay = deployment.serve("serve");
+    let (relay, relay_log) = deployment.serve_logged("serve");
     let mut client = deployment.connect_with(&mismatched);
     let exit = client.wait_exit("identity mismatch");
     let events: Vec<Value> = client
@@ -1178,10 +1212,140 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
     );
     assert!(client.states("backoff").is_empty(), "{events:?}");
     assert!(client.states("disconnected").is_empty(), "{events:?}");
+    // M6-C52: the relay says why, in one bounded line naming the stage and
+    // the certificate's device, and nothing the device sent.
+    let refusal = wait_for_log_line(&relay_log, "device session refused");
+    assert!(refusal.contains("\"stage\":\"control_hello\""), "{refusal}");
+    assert!(refusal.contains("identity_rejected"), "{refusal}");
+    let mismatched_id = fs::read_to_string(&mismatched)
+        .expect("read mismatched profile")
+        .lines()
+        .find_map(|line| line.strip_prefix("device_id = "))
+        .map(|value| value.trim_matches('"').to_owned())
+        .expect("mismatched device_id");
+    assert!(
+        !refusal.contains(&mismatched_id),
+        "the HELLO's connector_id is not logged: {refusal}"
+    );
     drop(relay);
     println!(
-        "m6c23-reconnect ok label=identity nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        "m6c23-reconnect ok label=identity nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0 \
+         relay_refusal_logged=true",
         deployment.nonce
+    );
+}
+
+/// Wait up to the step deadline for a relay log line containing `needle`.
+fn wait_for_log_line(lines: &Arc<Mutex<Vec<String>>>, needle: &str) -> String {
+    let deadline = Instant::now() + STEP_DEADLINE;
+    loop {
+        if let Some(line) = lines
+            .lock()
+            .expect("relay log")
+            .iter()
+            .find(|line| line.contains(needle))
+        {
+            return line.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no relay log line containing {needle:?} within {STEP_DEADLINE:?}: {:?}",
+            lines.lock().expect("relay log")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// M6-C38, the relay half, against the real `serve`: a HELLO naming another
+/// protocol major is closed with the typed `1002 PROTOCOL_UNSUPPORTED`, not
+/// dropped.  The device is a raw WebSocket holding the provisioned device
+/// certificate and key, because the shipped client cannot be made to send
+/// another major; the client half of the row is proved with the real client
+/// binary against a stand-in relay (`reconnect_cli.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c38_a_hello_on_another_protocol_major_is_closed_typed() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::{
+        Connector, connect_async_tls_with_config,
+        tungstenite::{Message as WsMessage, client::IntoClientRequest, http::HeaderValue},
+    };
+
+    let deployment = Deployment::provision("protocol-major").await;
+    let (relay, relay_log) = deployment.serve_logged("serve");
+    let credentials = deployment
+        .client_config
+        .parent()
+        .expect("profile directory")
+        .join("credentials");
+    let tls = tunnel_transport::load_client_config_from_pem_with_alpn(
+        &fs::read(credentials.join("device-cert-chain.pem")).expect("device certificate"),
+        &fs::read(credentials.join("device-key.pem")).expect("device key"),
+        &fs::read(credentials.join("relay-ca.pem")).expect("relay CA"),
+        &[b"http/1.1"],
+    )
+    .expect("device TLS configuration");
+    let mut request = format!(
+        "wss://127.0.0.1:{}/v1/tunnel/control",
+        deployment.device_listener.port()
+    )
+    .into_client_request()
+    .expect("control request");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("agent-tunnel.control.v1"),
+    );
+    let (mut socket, _) = tokio::time::timeout(
+        STEP_DEADLINE,
+        connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls))),
+    )
+    .await
+    .expect("control upgrade in time")
+    .expect("control upgrade");
+    let device = fs::read_to_string(&deployment.client_config)
+        .expect("profile")
+        .lines()
+        .find_map(|line| line.strip_prefix("device_id = "))
+        .map(|value| value.trim_matches('"').to_owned())
+        .expect("device_id");
+    let mut hello = tunnel_protocol::Hello::new(Uuid::new_v4().to_string(), device, 2, 0);
+    hello.features.push("echo".to_owned());
+    let text = tunnel_protocol::encode_control(&tunnel_protocol::ControlMessage::Hello(hello))
+        .expect("encode HELLO");
+    socket
+        .send(WsMessage::Text(
+            String::from_utf8(text).expect("UTF-8 HELLO").into(),
+        ))
+        .await
+        .expect("send HELLO");
+    let close = loop {
+        match tokio::time::timeout(STEP_DEADLINE, socket.next())
+            .await
+            .expect("the relay answers the HELLO in time")
+        {
+            Some(Ok(WsMessage::Close(frame))) => break frame,
+            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    };
+    let frame = close.expect("a close frame with a code and a reason");
+    assert_eq!(
+        u16::from(frame.code),
+        tunnel_protocol::CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE
+    );
+    assert_eq!(
+        frame.reason.as_str(),
+        tunnel_protocol::CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON
+    );
+    let refusal = wait_for_log_line(&relay_log, "device session refused");
+    assert!(refusal.contains("protocol_major_unsupported"), "{refusal}");
+    assert!(refusal.contains("\"stage\":\"control_hello\""), "{refusal}");
+    drop(relay);
+    println!(
+        "m6c38-protocol ok nonce={} close_code={} close_reason={} relay_refusal_logged=true",
+        deployment.nonce,
+        u16::from(frame.code),
+        frame.reason
     );
 }
 

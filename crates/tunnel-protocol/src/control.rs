@@ -106,6 +106,15 @@ const _: () = {
 /// half of that answer (whether a key is known to the catalog) is not the
 /// relay's to disclose over the socket.
 pub const CONTROL_IDENTITY_REJECTED_CLOSE_REASON: &str = "DEVICE_IDENTITY_REJECTED";
+/// WebSocket close status used when the relay refuses a device's HELLO
+/// because it names a protocol major this relay does not speak (task row
+/// M6-C38).  1002 is RFC 6455's protocol-error status.  No retry of the same
+/// binary can succeed -- the relay or the client must be upgraded -- so the
+/// device must be told so rather than see an unexplained socket loss, which
+/// its reconnect loop retries indefinitely.
+pub const CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE: u16 = 1002;
+/// Bounded, fixed close reason for [`CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE`].
+pub const CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON: &str = "PROTOCOL_UNSUPPORTED";
 
 /// Serde helper for u64 values represented as decimal JSON strings.
 pub mod decimal_u64 {

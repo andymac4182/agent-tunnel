@@ -48,10 +48,11 @@ use tokio_util::sync::CancellationToken;
 use tunnel_protocol::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
     CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
-    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, Cancel, ControlMessage,
-    DataReady, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,
-    Open, Opened, Ping, Pong, Rejected, ServiceAdvertisement, Welcome, decode_control,
-    encode_control,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON,
+    CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE, CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON, Cancel,
+    ControlMessage, DataReady, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES, MAX_FRAME_LEN,
+    MAX_PAYLOAD_LEN, Open, Opened, Ping, Pong, Rejected, ServiceAdvertisement, Welcome,
+    decode_control, encode_control,
 };
 use url::Url;
 use uuid::Uuid;
@@ -819,6 +820,18 @@ fn classify_initial_control_close(frame: &CloseFrame) -> Option<ClientError> {
         && &*frame.reason == CONTROL_OWNER_BUSY_CLOSE_REASON
     {
         return Some(ClientError::OwnerBusy);
+    }
+    // M6-C38: the relay does not speak this client's protocol major.  A
+    // protocol error, so `PROTOCOL_ERROR`, terminal for the reconnect loop:
+    // only upgrading one side can fix it.
+    if frame.code == CloseCode::from(CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE)
+        && &*frame.reason == CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON
+    {
+        return Some(ClientError::Protocol(format!(
+            "the relay refused this client's protocol major {PROTOCOL_MAJOR} \
+             ({CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON}); upgrade tunnel-client or the \
+             relay so they share a protocol major; retrying will not help"
+        )));
     }
     // M6-C32: the relay refused this device's identity.  A credential
     // error, so `CREDENTIAL_ERROR`, exit 3, and not retryable.
@@ -2842,6 +2855,30 @@ mod tests {
         let wrong_reason = CloseFrame {
             code: rejected.code,
             reason: "catalog lookup failed".into(),
+        };
+        assert!(classify_initial_control_close(&wrong_reason).is_none());
+    }
+
+    /// M6-C38: the relay's protocol-major refusal is a terminal protocol
+    /// error naming the cause, never a retryable transport loss; a close
+    /// with the right code and another reason is not classified.
+    #[test]
+    fn a_protocol_unsupported_close_is_a_non_retryable_protocol_error() {
+        let refused = CloseFrame {
+            code: CloseCode::from(CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_CODE),
+            reason: CONTROL_PROTOCOL_UNSUPPORTED_CLOSE_REASON.into(),
+        };
+        let error = classify_initial_control_close(&refused).expect("classified");
+        assert!(matches!(error, ClientError::Protocol(_)), "{error:?}");
+        assert_eq!(error.code(), "PROTOCOL_ERROR");
+        assert!(!error.retryable());
+        let message = error.to_string();
+        assert!(message.contains("protocol major 1"), "{message}");
+        assert!(message.contains("PROTOCOL_UNSUPPORTED"), "{message}");
+
+        let wrong_reason = CloseFrame {
+            code: refused.code,
+            reason: "protocol error".into(),
         };
         assert!(classify_initial_control_close(&wrong_reason).is_none());
     }

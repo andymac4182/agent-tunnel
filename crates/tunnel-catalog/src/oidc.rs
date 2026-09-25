@@ -222,11 +222,8 @@ impl OidcVerifier {
     /// Validate the `Authorization: Bearer` value and return its durable
     /// claims.  This method never logs or includes the bearer in an error.
     pub fn validate_bearer(&self, authorization: &str) -> Result<ValidatedClaims, OidcError> {
-        let token = authorization
-            .strip_prefix("Bearer ")
-            .or_else(|| authorization.strip_prefix("bearer "))
-            .ok_or(OidcError::InvalidToken)?;
-        if token.is_empty() || token.len() > self.config.max_token_bytes {
+        let token = bearer_token(authorization)?;
+        if token.len() > self.config.max_token_bytes {
             return Err(OidcError::InvalidToken);
         }
         self.validate_token(token)
@@ -236,6 +233,29 @@ impl OidcVerifier {
     /// `validate_bearer` so the route cannot accidentally accept another
     /// credential scheme.
     pub fn validate_token(&self, token: &str) -> Result<ValidatedClaims, OidcError> {
+        let claims = self.validate_token_claims(token)?;
+        self.require_configured_scopes(&claims)?;
+        Ok(claims)
+    }
+
+    /// Every configured scope must be present.
+    fn require_configured_scopes(&self, claims: &ValidatedClaims) -> Result<(), OidcError> {
+        if self
+            .config
+            .required_scopes
+            .iter()
+            .all(|scope| claims.scopes.contains(scope))
+        {
+            Ok(())
+        } else {
+            Err(OidcError::InsufficientScope)
+        }
+    }
+
+    /// [`OidcVerifier::validate_token`] without the configured-scope check,
+    /// so [`OidcVerifier::authenticate_access`] can apply every scope check
+    /// after the identity lookup.
+    fn validate_token_claims(&self, token: &str) -> Result<ValidatedClaims, OidcError> {
         if token.is_empty() || token.len() > self.config.max_token_bytes {
             return Err(OidcError::InvalidToken);
         }
@@ -269,10 +289,19 @@ impl OidcVerifier {
         validation.required_spec_claims.insert("sub".to_owned());
         validation.required_spec_claims.insert("aud".to_owned());
 
-        let decoded = decode::<Claims>(token, &approved.key, &validation)
-            .map_err(|_| OidcError::InvalidToken)?;
+        let decoded = decode::<Claims>(token, &approved.key, &validation).map_err(|error| {
+            use jsonwebtoken::errors::ErrorKind;
+            match error.kind() {
+                ErrorKind::ExpiredSignature
+                | ErrorKind::ImmatureSignature
+                | ErrorKind::InvalidIssuer
+                | ErrorKind::InvalidAudience
+                | ErrorKind::InvalidSubject => OidcError::ClaimsRejected,
+                _ => OidcError::InvalidToken,
+            }
+        })?;
         if decoded.claims.sub.trim().is_empty() || decoded.claims.iss != self.config.issuer {
-            return Err(OidcError::InvalidToken);
+            return Err(OidcError::ClaimsRejected);
         }
         let exp = i64::try_from(decoded.claims.exp).map_err(|_| OidcError::InvalidToken)?;
         let expires_at = DateTime::<Utc>::from_timestamp(exp, 0).ok_or(OidcError::InvalidToken)?;
@@ -285,14 +314,6 @@ impl OidcVerifier {
             .filter(|scope| !scope.is_empty())
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-        if !self
-            .config
-            .required_scopes
-            .iter()
-            .all(|scope| scopes.contains(scope))
-        {
-            return Err(OidcError::InsufficientScope);
-        }
         Ok(ValidatedClaims {
             issuer: decoded.claims.iss,
             subject: decoded.claims.sub,
@@ -336,12 +357,11 @@ impl OidcVerifier {
         tenant_id: Option<Uuid>,
         required_scope: Option<&str>,
     ) -> Result<ValidatedAccessToken, OidcError> {
-        let claims = self.validate_bearer(authorization)?;
-        if let Some(scope) = required_scope
-            && !claims.scopes.contains(scope)
-        {
-            return Err(OidcError::InsufficientScope);
+        let token = bearer_token(authorization)?;
+        if token.len() > self.config.max_token_bytes {
+            return Err(OidcError::InvalidToken);
         }
+        let claims = self.validate_token_claims(token)?;
         let consumer = catalog
             .resolve_consumer(&claims.issuer, &claims.subject, tenant_id)
             .await
@@ -350,7 +370,18 @@ impl OidcVerifier {
         // The catalog lookup is an await boundary.  Do not let a token that
         // expired while it was in flight create a usable relay identity.
         if Utc::now() >= claims.expires_at {
-            return Err(OidcError::InvalidToken);
+            return Err(OidcError::ClaimsRejected);
+        }
+        // M6-C53: the scope checks come after the identity lookup, so
+        // `InsufficientScope` -- which a route answers `403` -- is only ever
+        // said of a token whose signature, claims and consumer all passed.
+        // Checked first, an unknown consumer's token lacking the scope was
+        // told its token was fine and only its scope was wrong.
+        self.require_configured_scopes(&claims)?;
+        if let Some(scope) = required_scope
+            && !claims.scopes.contains(scope)
+        {
+            return Err(OidcError::InsufficientScope);
         }
         Ok(ValidatedAccessToken {
             consumer,
@@ -360,6 +391,16 @@ impl OidcVerifier {
             expires_at: claims.expires_at,
         })
     }
+}
+
+/// The token of an `Authorization: Bearer` value, or
+/// [`OidcError::MissingBearer`] when none was presented (M6-C53).
+fn bearer_token(authorization: &str) -> Result<&str, OidcError> {
+    authorization
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("bearer "))
+        .filter(|token| !token.is_empty())
+        .ok_or(OidcError::MissingBearer)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,7 +423,19 @@ pub struct ValidatedAccessToken {
 #[derive(Debug)]
 pub enum OidcError {
     InvalidConfiguration,
+    /// No `Authorization: Bearer` credential was presented at all: no header,
+    /// another scheme, or an empty token (task row M6-C53).  Kept apart from
+    /// [`OidcError::InvalidToken`] so a route never tells a consumer that
+    /// sent a token that it sent none.
+    MissingBearer,
+    /// A token that is not a well-formed, correctly signed JWT for an approved
+    /// key: undecodable, a bad signature, an oversized or malformed claim.
     InvalidToken,
+    /// A correctly signed token whose registered claims this relay refuses:
+    /// expired or not yet valid (`exp`/`nbf`, including expiry during the
+    /// catalog lookup), or the wrong issuer, audience or subject (M6-C52's
+    /// `iss`/`aud`/`exp` stage).
+    ClaimsRejected,
     DisallowedAlgorithm,
     MissingKeyId,
     UnknownKey,
@@ -397,7 +450,11 @@ impl fmt::Display for OidcError {
             Self::InvalidConfiguration => {
                 formatter.write_str("invalid OIDC verifier configuration")
             }
+            Self::MissingBearer => formatter.write_str("no consumer bearer credential"),
             Self::InvalidToken => formatter.write_str("invalid consumer credential"),
+            Self::ClaimsRejected => {
+                formatter.write_str("consumer credential claims are not accepted")
+            }
             Self::DisallowedAlgorithm => {
                 formatter.write_str("consumer credential algorithm is not allowed")
             }
@@ -702,6 +759,17 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         matches!(error, OidcError::InvalidToken)
     }
 
+    /// M6-C52/M6-C53: a correctly signed token whose `iss`, `aud`, `sub`,
+    /// `exp` or `nbf` is refused is its own stage, not "invalid token".
+    fn claims_rejected(error: &OidcError) -> bool {
+        matches!(error, OidcError::ClaimsRejected)
+    }
+
+    /// M6-C53: no bearer credential at all is not an invalid one.
+    fn missing_bearer(error: &OidcError) -> bool {
+        matches!(error, OidcError::MissingBearer)
+    }
+
     fn invalid_configuration(error: &OidcError) -> bool {
         matches!(error, OidcError::InvalidConfiguration)
     }
@@ -832,24 +900,27 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         let sign = |claims: &Value| key.sign(&header(Algorithm::EdDSA, ED_KID), claims);
         let mut wrong_issuer = claims();
         wrong_issuer["iss"] = json!("https://other-issuer.test");
-        rejects(verifier.validate_token(&sign(&wrong_issuer)), invalid_token);
+        rejects(
+            verifier.validate_token(&sign(&wrong_issuer)),
+            claims_rejected,
+        );
         let mut wrong_audience = claims();
         wrong_audience["aud"] = json!("agent-tunnel-staging");
         rejects(
             verifier.validate_token(&sign(&wrong_audience)),
-            invalid_token,
+            claims_rejected,
         );
         let mut foreign_audiences = claims();
         foreign_audiences["aud"] = json!(["someone-else", "another-service"]);
         rejects(
             verifier.validate_token(&sign(&foreign_audiences)),
-            invalid_token,
+            claims_rejected,
         );
         let mut empty_audiences = claims();
         empty_audiences["aud"] = json!([]);
         rejects(
             verifier.validate_token(&sign(&empty_audiences)),
-            invalid_token,
+            claims_rejected,
         );
         // RFC 7519 allows several audiences as long as this relay is one.
         let mut shared_audience = claims();
@@ -861,7 +932,7 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         blank_subject["sub"] = json!("   ");
         rejects(
             verifier.validate_token(&sign(&blank_subject)),
-            invalid_token,
+            claims_rejected,
         );
         let mut numeric_subject = claims();
         numeric_subject["sub"] = json!(42);
@@ -880,10 +951,13 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         // the verifier's default of zero must not.
         let mut expired = claims();
         expired["exp"] = json!(now() - 30);
-        rejects(strict.validate_token(&sign(&expired)), invalid_token);
+        rejects(strict.validate_token(&sign(&expired)), claims_rejected);
         let mut not_yet_valid = claims();
         not_yet_valid["nbf"] = json!(now() + 120);
-        rejects(strict.validate_token(&sign(&not_yet_valid)), invalid_token);
+        rejects(
+            strict.validate_token(&sign(&not_yet_valid)),
+            claims_rejected,
+        );
         let mut already_valid = claims();
         already_valid["nbf"] = json!(now() - 5);
         strict
@@ -899,7 +973,7 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
             .expect("within configured leeway");
         rejects(
             strict.validate_token(&sign(&slightly_expired)),
-            invalid_token,
+            claims_rejected,
         );
         rejects(
             OidcVerifier::new(config(vec![key.approved(ED_KID)]).with_leeway_seconds(31)),
@@ -958,12 +1032,13 @@ MCowBQYDK2VwAyEA+0dizco+FMBvifqw1ZUJzKYN5gspRlxsvm+MudOfijQ=
         verifier
             .validate_bearer(&format!("Bearer {token}"))
             .expect("scoped token validates");
-        rejects(verifier.validate_bearer(&token), invalid_token);
+        rejects(verifier.validate_bearer(&token), missing_bearer);
         rejects(
             verifier.validate_bearer(&format!("Basic {token}")),
-            invalid_token,
+            missing_bearer,
         );
-        rejects(verifier.validate_bearer("Bearer "), invalid_token);
+        rejects(verifier.validate_bearer("Bearer "), missing_bearer);
+        rejects(verifier.validate_bearer(""), missing_bearer);
         let oversized = format!("Bearer {token}{}", "A".repeat(32 * 1024));
         rejects(verifier.validate_bearer(&oversized), invalid_token);
         let mut other_scope = claims();

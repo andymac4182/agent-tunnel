@@ -224,17 +224,18 @@ async fn admit(
             crate::FS_SESSION_OPERATION,
         )
         .await
-        .map_err(|error| match error {
-            tunnel_catalog::OidcError::Catalog(_) => fs_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "BACKEND_UNAVAILABLE",
-                "authorization unavailable",
-            ),
-            _ => fs_error(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHENTICATED",
-                "a consumer access token is required",
-            ),
+        .map_err(|error| {
+            // M6-C53: the same classification, status and message as every
+            // other route, in this contract's code vocabulary.  Before it,
+            // every refusal here said no token was sent.
+            let refusal = super::classify_consumer_refusal(&error);
+            super::log_consumer_refusal("fs", &refusal);
+            let code = match refusal.status {
+                StatusCode::SERVICE_UNAVAILABLE => "BACKEND_UNAVAILABLE",
+                StatusCode::FORBIDDEN => "ACCESS_DENIED",
+                _ => "UNAUTHENTICATED",
+            };
+            fs_error(refusal.status, code, refusal.message)
         })?;
     let device_id = parse_uuid(device).map_err(|()| {
         // A nonexistent and an undiscoverable export get the same external
@@ -289,6 +290,7 @@ async fn admit(
         || grant.valid_until <= now
         || validated.expires_at <= now
     {
+        super::log_consumer_grant_refusal("fs", &validated.consumer, device_id, Some(service_id));
         return Err(fs_error(
             StatusCode::FORBIDDEN,
             "ACCESS_DENIED",
