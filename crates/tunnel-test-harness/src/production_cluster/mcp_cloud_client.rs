@@ -302,6 +302,11 @@ pub struct McpCloudClientEvidence {
     /// The oldest the membership records in force were when a case ended;
     /// every case must end inside the records' 60 s lifetime.
     pub max_membership_age_at_case_end_ms: u128,
+    /// The owner relay's rotation-freeze admission hold counters at the end
+    /// of the run (M3-15): how many new OPENs a freeze held, how they left
+    /// the hold, and the longest wait.  Reported, not asserted: whether a
+    /// request happens to land in a freeze is the schedule's choice.
+    pub owner_freeze_hold: tunnel_relay::RotationFreezeHoldSnapshot,
     pub not_covered: Vec<String>,
 }
 
@@ -707,7 +712,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
             ),
             (
                 format!(
-                    "{name}: every not_dispatched refusal coincided with a rotation freeze and was bounded"
+                    "{name}: every not_dispatched refusal was the relay's rotation-freeze answer (a standalone GET: inside an observed freeze) and its resends were bounded"
                 ),
                 combo.case_wires().iter().all(|(_, wire)| {
                     wire.not_dispatched_refusals == wire.not_dispatched_retries
@@ -2335,14 +2340,10 @@ async fn run(
             .http_forward
             .exchanges_recorded
             - ingress_before.exchanges_recorded;
-        evidence.owner_exchanges_recorded = gate
-            .cluster
-            .relay("relay-a")?
-            .snapshot()
-            .await?
-            .http_forward
-            .exchanges_recorded
-            - owner_before.exchanges_recorded;
+        let owner_after = gate.cluster.relay("relay-a")?.snapshot().await?;
+        evidence.owner_exchanges_recorded =
+            owner_after.http_forward.exchanges_recorded - owner_before.exchanges_recorded;
+        evidence.owner_freeze_hold = owner_after.rotation_freeze_hold;
         Ok::<_, HarnessError>(())
     }
     .await;
@@ -2570,6 +2571,7 @@ mod tests {
             leftover_processes: 0,
             resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
             max_membership_age_at_case_end_ms: 30_000,
+            owner_freeze_hold: tunnel_relay::RotationFreezeHoldSnapshot::default(),
             not_covered: NOT_COVERED.iter().map(|item| (*item).to_owned()).collect(),
         }
     }

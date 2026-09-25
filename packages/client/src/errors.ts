@@ -64,6 +64,8 @@ export type DiscoveryErrorCode =
   | 'RESOURCE_EXHAUSTED'
   | 'DEVICE_OFFLINE'
   | 'BACKEND_UNAVAILABLE'
+  /** The device's data rotation outlasted the relay's bounded admission hold (M3-15); retryable. */
+  | 'ROTATION_FREEZE'
   | 'METHOD_NOT_ALLOWED'
   | 'SUBPROTOCOL_REQUIRED'
   | 'INVALID_UPGRADE'

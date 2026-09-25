@@ -2030,6 +2030,14 @@ pub(crate) async fn handle_peer_http_stream(
             );
             return request.reject_owner_not_ready().await;
         }
+        Err(RelayError::RotationFreeze) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::RotationFreeze,
+            );
+            return request.reject_rotation_freeze().await;
+        }
         Err(RelayError::StreamLimit) => {
             handle.record_peer_fault_tuple(
                 fault,
