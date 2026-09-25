@@ -131,10 +131,13 @@ pub(crate) mod test_hooks {
         pub(crate) forget_tick: std::sync::Mutex<Option<ForgetTickHook>>,
     }
 
-    /// Seeds actor state (the argument is the M2 actor as `dyn Any`), then
-    /// signals `entered` and waits for `release` before the tick continues.
+    /// Seeds actor state; the argument is the M2 actor as `dyn Any`.
+    pub(crate) type ForgetTickSeed = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
+
+    /// Runs its seed, then signals `entered` and waits for `release` before
+    /// the tick continues.
     pub(crate) struct ForgetTickHook {
-        pub(crate) seed: Box<dyn FnOnce(&mut dyn std::any::Any) + Send>,
+        pub(crate) seed: ForgetTickSeed,
         pub(crate) entered: std::sync::Arc<Notify>,
         pub(crate) release: std::sync::Arc<Notify>,
     }
