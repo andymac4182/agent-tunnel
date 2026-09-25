@@ -49,7 +49,8 @@
 #    call with each refusal, and a single relay's continuity token.  The
 #    M6-C65 process gate restarts a Redis, so it is not run here (it never
 #    touches `TEST_REDIS_URL`); `scripts/m6-redis-restart-verify.sh` runs it
-#    against its own Redis container, and this step skips it by name.
+#    against its own Redis container, and this step skips it by name, as it
+#    skips M6-C67's readiness gate (`m6c67_`), which does the same.
 #
 # Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
 # run because it needs Redis: the 8 catalog provisioning tests (M6-C63's
@@ -126,7 +127,7 @@ require "Redis connection stage tests" "$scratch/stage.log" "test result: ok. 3 
 
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  --test-threads=1 --skip m6c65_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 --skip m6c65_ --skip m6c67_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
 require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 7 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
   "m6c34-serve-before-provisioning ok exit=1 class=unprovisioned keys=2" \
