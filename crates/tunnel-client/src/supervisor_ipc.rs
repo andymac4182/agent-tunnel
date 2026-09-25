@@ -413,13 +413,23 @@ mod unix {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
-                let authorized = stream.peer_cred().is_ok_and(|credential| {
-                    peer_is_authorized(credential.uid(), self.expected_uid)
-                });
-                if !authorized {
-                    counters.peers_refused = counters.peers_refused.saturating_add(1);
-                    drop(stream);
-                    continue;
+                // A peer whose credentials cannot be read -- a same-user
+                // probe that already closed, as a second `connect` checking
+                // the lock does -- is not a refused user; it is counted with
+                // the malformed requests, so `peers_refused` counts only
+                // peers the kernel reported as another UID.
+                match stream.peer_cred() {
+                    Ok(credential) if peer_is_authorized(credential.uid(), self.expected_uid) => {}
+                    Ok(_) => {
+                        counters.peers_refused = counters.peers_refused.saturating_add(1);
+                        drop(stream);
+                        continue;
+                    }
+                    Err(_) => {
+                        counters.bad_requests = counters.bad_requests.saturating_add(1);
+                        drop(stream);
+                        continue;
+                    }
                 }
                 match tokio::time::timeout(IPC_IO_TIMEOUT, answer(stream, &status, &mut counters))
                     .await
