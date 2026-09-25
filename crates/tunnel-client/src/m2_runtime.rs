@@ -5331,13 +5331,8 @@ impl M2Actor {
         Ok(())
     }
 
-    /// Validate the owner's sender-direction proof against the connector's local
-    /// receiver-direction state.  `ResumeDirectionState` is a snapshot from the
-    /// relay's perspective: for `RelayToConnector`, its `last_emitted`, sent
-    /// bytes, and send terminal must match the connector's receive cursor,
-    /// received bytes, and receive terminal.  Comparing the wire value with the
-    /// same local direction would compare sender fields with receiver fields and
-    /// reject every real terminal exchange.
+    /// The final form of `validate_owner_stream_forget_state_with`, for tests.
+    #[cfg(test)]
     fn validate_owner_stream_forget_state(
         sequence: &StreamState,
         direction: Direction,
@@ -5346,6 +5341,14 @@ impl M2Actor {
         Self::validate_owner_stream_forget_state_with(sequence, direction, final_state, false)
     }
 
+    /// Validate the owner's sender-direction proof against the connector's local
+    /// receiver-direction state.  `ResumeDirectionState` is a snapshot from the
+    /// relay's perspective: for `RelayToConnector`, its `last_emitted`, sent
+    /// bytes, and send terminal must match the connector's receive cursor,
+    /// received bytes, and receive terminal.  Comparing the wire value with the
+    /// same local direction would compare sender fields with receiver fields and
+    /// reject every real terminal exchange.
+    ///
     /// See `validate_stream_forget_with` for `awaiting_owner_ack`.
     fn validate_owner_stream_forget_state_with(
         sequence: &StreamState,
