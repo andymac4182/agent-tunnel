@@ -16,6 +16,8 @@ on:
       - 'docs/operator.md'
       - 'docs/join-relay.md'
       - 'examples/**'
+      - '.cargo/config.toml'
+      - 'Cargo.lock'
       - 'crates/tunnel-client/src/main.rs'
       - 'crates/tunnel-relay/src/main.rs'
       - 'crates/tunnel-deadman/src/**'
