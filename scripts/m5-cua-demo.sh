@@ -326,6 +326,12 @@ verdict["ok"] = (consumer_exit == 0 and verdict["clicks_after"] == verdict["clic
                  and verdict["unleased_click"] == "lease_not_held"
                  and verdict["stale_click"] == "capture_superseded")
 json.dump(verdict, open(f"{out}/verdict.json", "w"), indent=2, sort_keys=True)
+# Typed text is never kept, even synthetic: replace it with its length and
+# digest once the verdict has compared it.
+import hashlib
+typed = after["text"]
+after["text"] = f"<redacted: {len(typed)} chars, sha256 {hashlib.sha256(typed.encode()).hexdigest()}>"
+json.dump(after, open(f"{out}/fixture-state-after.json", "w"), sort_keys=True)
 print("m5-cua-demo verdict: " + json.dumps(verdict, sort_keys=True))
 sys.exit(0 if verdict["ok"] else 1)
 EOF

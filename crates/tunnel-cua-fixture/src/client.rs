@@ -382,7 +382,9 @@ impl FailureStage {
 /// released server answers `/cmd` with a Starlette `StreamingResponse`, which
 /// has no `Content-Length`, so uvicorn frames it with
 /// `Transfer-Encoding: chunked` on an HTTP/1.1 request -- observed in the
-/// Linux guest on 2026-09-25 (task row M5-03). The fixture writes an
+/// Linux guest on 2026-09-26 (task row M5-C22; the raw answer is
+/// `tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/wire-cmd-http11.txt`).
+/// The fixture writes an
 /// identity-framed body, which is why the Lane A tests never needed this.
 /// A chunked body that does not end in its terminating zero-size chunk was
 /// cut off after the request was written, so it returns `None` and the
