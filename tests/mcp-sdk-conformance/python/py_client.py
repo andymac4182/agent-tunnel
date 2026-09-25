@@ -4,6 +4,14 @@ scripts/m3-sdk-conformance.sh (task row M3-17).
 
     python py_client.py reference <auto|legacy> <url>
     python py_client.py fixture <auto|legacy> <url> <device-workspace>
+    python py_client.py known-m3-47 <auto|legacy> <url>
+
+`reference` expects a server with the conformance reference server's tool,
+resource and prompt names (the harness uses ts-sdk-server.mjs); `fixture` the
+repository's rmcp fixture; `known-m3-47` the conformance reference server
+itself, whose refusal of this SDK's `initialize` (task row M3-47) must still
+arrive, forwarded unchanged, as JSON-RPC error -32020 -- if it stops, the row
+must be re-examined, so that case then fails.
 
 `auto` is the SDK's default connect mode (probe `server/discover`, fall back
 to `initialize`); `legacy` forces the 2025-11-25 `initialize` handshake. The
@@ -45,8 +53,23 @@ async def check(sdk_mode: str, name: str, body: Callable[[], Awaitable[str | Non
         report(sdk_mode, name, True, detail or "")
     except Exception as error:  # noqa: BLE001 - every failure is a reported case
         # SDK errors carry status codes and JSON-RPC messages, never bodies or the token.
-        message = f"{type(error).__name__}: {error}"[:300]
+        message = describe(error)[:400]
         report(sdk_mode, name, False, f"error={json.dumps(message)}")
+
+
+def describe(error: BaseException) -> str:
+    """Name the leaf exceptions of an ExceptionGroup, which anyio raises."""
+    if isinstance(error, BaseExceptionGroup):
+        return "; ".join(describe(inner) for inner in error.exceptions)
+    return f"{type(error).__name__}: {error}"
+
+
+def error_codes(error: BaseException) -> set[int]:
+    """The JSON-RPC error codes inside an (ExceptionGroup of) MCPError."""
+    if isinstance(error, BaseExceptionGroup):
+        return set().union(*(error_codes(inner) for inner in error.exceptions))
+    code = getattr(error, "code", None)
+    return {code} if isinstance(code, int) else set()
 
 
 def expect(condition: Any, what: str) -> None:
@@ -68,7 +91,7 @@ async def main() -> int:
     ca = os.environ.get("AGENTUPLINK_CA")
     if (
         len(args) < 3
-        or args[0] not in ("reference", "fixture")
+        or args[0] not in ("reference", "fixture", "known-m3-47")
         or args[1] not in ("auto", "legacy")
         or (args[0] == "fixture" and len(args) != 4)
         or not token
@@ -80,51 +103,76 @@ async def main() -> int:
     workspace = Path(args[3]) if scenario == "fixture" else None
 
     tls = ssl.create_default_context(cafile=ca)
-    http = httpx2.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"},
-        verify=tls,
-        timeout=httpx2.Timeout(30.0, read=300.0),
-    )
     logs: list[str] = []
 
     async def on_log(params: Any) -> None:
-        logs.append(str(params.level))
+        logs.append(str(params.data))
 
-    client = Client(
-        streamable_http_client(url, http_client=http),
-        mode=sdk_mode,
-        logging_callback=on_log,
-    )
+    def connect() -> tuple[httpx2.AsyncClient, Client]:
+        http = httpx2.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"},
+            verify=tls,
+            timeout=httpx2.Timeout(30.0, read=300.0),
+        )
+        client = Client(streamable_http_client(url, http_client=http), mode=sdk_mode, logging_callback=on_log)
+        return http, client
 
-    entered = False
+    if scenario == "known-m3-47":
+        http, client = connect()
 
-    async def initialize() -> str:
-        nonlocal entered
-        await client.__aenter__()
-        entered = True
-        version = client.session.protocol_version
-        expect(version == "2025-11-25", f"negotiated 2025-11-25, got {version}")
-        return f"protocol={version}"
+        async def refused() -> str:
+            try:
+                await client.__aenter__()
+            except BaseException as error:  # noqa: BLE001
+                codes = error_codes(error)
+                expect(-32020 in codes, f"JSON-RPC error -32020 from the backend, got {describe(error)[:200]}")
+                return "backend_error=-32020 upstream_row=M3-47"
+            finally:
+                await http.aclose()
+            raise AssertionError("initialize succeeded: M3-47 no longer reproduces; re-examine and close the row")
 
-    await check(sdk_mode, "initialize", initialize)
-    if not entered:
-        await http.aclose()
-        return 1
+        await check(sdk_mode, "initialize-known-m3-47", refused)
+        return 0 if FAILURES == 0 else 1
 
-    try:
-        if scenario == "reference":
-            await run_reference(sdk_mode, client, logs)
-        else:
-            assert workspace is not None
-            await run_fixture(sdk_mode, client, workspace)
-    finally:
+    async def session(suffix: str, body: Callable[[Client], Awaitable[None]], known_close_row: str | None = None) -> None:
+        http, client = connect()
+        entered = False
 
-        async def close() -> str:
-            await client.__aexit__(None, None, None)
+        async def initialize() -> str:
+            nonlocal entered
+            await client.__aenter__()
+            entered = True
+            version = client.session.protocol_version
+            expect(version == "2025-11-25", f"negotiated 2025-11-25, got {version}")
+            return f"protocol={version}"
+
+        await check(sdk_mode, "initialize" + suffix, initialize)
+        if not entered:
             await http.aclose()
-            return "closed=true"
+            return
+        try:
+            await body(client)
+        finally:
+            try:
+                await client.__aexit__(None, None, None)
+                report(sdk_mode, "close" + suffix, True, "closed=true")
+            except Exception as error:  # noqa: BLE001
+                if known_close_row and "ClosedResourceError" in describe(error):
+                    # Not counted as a pass or a failure: the SDK surfaces the
+                    # device's late 502 for the cancelled call (see the row).
+                    print(f"sdk=python mode={sdk_mode} case=close{suffix} result=known row={known_close_row} "
+                          f"error={json.dumps(describe(error)[:120])}", flush=True)
+                else:
+                    report(sdk_mode, "close" + suffix, False, f"error={json.dumps(describe(error)[:400])}")
+            await http.aclose()
 
-        await check(sdk_mode, "close", close)
+    if scenario == "reference":
+        await session("", lambda client: run_reference(sdk_mode, client, logs))
+    else:
+        assert workspace is not None
+        await session("", lambda client: run_fixture(sdk_mode, client, workspace))
+        # Cancellation in a session of its own, whose close may meet M3-48.
+        await session("-cancel", lambda client: run_cancel(sdk_mode, client, workspace), known_close_row="M3-48")
     return 0 if FAILURES == 0 else 1
 
 
@@ -190,13 +238,17 @@ async def run_reference(sdk_mode: str, client: Client, logs: list[str]) -> None:
         return "progress=0,50,100"
 
     async def logging() -> str:
-        logs.clear()
         await client.set_logging_level("debug")
+        logs.clear()
         await client.call_tool("test_tool_with_logging", {})
-        # Notifications are dispatched to the callback concurrently with the result.
-        await wait_for("3 log notifications", 2.0, lambda: len(logs) >= 3)
-        expect(len(logs) == 3, f"3 log notifications, got {len(logs)}")
-        return f"logs={len(logs)}"
+        # The reference server also logs the level change; count only the
+        # tool's three messages. Notifications reach the callback
+        # concurrently with the result, so wait briefly for the third.
+        expected = ["Tool execution started", "Tool processing data", "Tool execution completed"]
+        tool = lambda: [data for data in logs if data.startswith("Tool ")]  # noqa: E731
+        await wait_for("the tool's 3 log notifications", 2.0, lambda: len(tool()) >= 3)
+        expect(tool() == expected, f"the tool's 3 log notifications in order, got {len(tool())}")
+        return f"logs={len(tool())}"
 
     await check(sdk_mode, "tools/list", tools_list)
     await check(sdk_mode, "tools/call", tools_call)
@@ -211,13 +263,6 @@ async def run_reference(sdk_mode: str, client: Client, logs: list[str]) -> None:
 
 
 async def run_fixture(sdk_mode: str, client: Client, workspace: Path) -> None:
-    invocations = workspace / "invocations.log"
-
-    def sleep_count() -> int:
-        if not invocations.exists():
-            return 0
-        return sum(1 for line in invocations.read_text().splitlines() if line == "sleep")
-
     async def tools_list() -> str:
         result = await client.list_tools()
         names = {tool.name for tool in result.tools}
@@ -241,6 +286,19 @@ async def run_fixture(sdk_mode: str, client: Client, workspace: Path) -> None:
         await client.call_tool("progress", {"steps": 5}, progress_callback=on_progress)
         expect(seen == [1, 2, 3, 4, 5], f"5 ordered progress notifications, got {seen}")
         return "progress=5"
+
+    await check(sdk_mode, "tools/list", tools_list)
+    await check(sdk_mode, "tools/call", tools_call)
+    await check(sdk_mode, "notifications/progress", progress)
+
+
+async def run_cancel(sdk_mode: str, client: Client, workspace: Path) -> None:
+    invocations = workspace / "invocations.log"
+
+    def sleep_count() -> int:
+        if not invocations.exists():
+            return 0
+        return sum(1 for line in invocations.read_text().splitlines() if line == "sleep")
 
     async def cancellation() -> str:
         label = f"py{os.getpid()}"
@@ -270,9 +328,6 @@ async def run_fixture(sdk_mode: str, client: Client, workspace: Path) -> None:
         expect(not result.is_error, "a successful call")
         return "session=usable"
 
-    await check(sdk_mode, "tools/list", tools_list)
-    await check(sdk_mode, "tools/call", tools_call)
-    await check(sdk_mode, "notifications/progress", progress)
     await check(sdk_mode, "cancellation", cancellation)
     await check(sdk_mode, "after-cancel", after_cancel)
 

@@ -3,6 +3,8 @@
 #
 #   scripts/m3-sdk-conformance.sh
 #   M3SC_KEEP=1 scripts/m3-sdk-conformance.sh      # keep the work directory
+#   M3SC_HOLD=1 M3SC_KEEP=1 scripts/m3-sdk-conformance.sh   # pause with both stacks up
+#   M3SC_PLAIN_REDIS=127.0.0.1:63790 ...            # TLS-front an existing plaintext Redis
 #
 # Pinned in tests/mcp-sdk-conformance (never a runtime dependency):
 #   * the official MCP TypeScript SDK   @modelcontextprotocol/sdk 1.30.1 (npm lockfile)
@@ -11,16 +13,22 @@
 #   * the suite's reference "everything" server, fetched from
 #     modelcontextprotocol/conformance at REFERENCE_COMMIT and SHA-256 checked
 #
-# Two relays share one throwaway TLS Redis (a container of this run's own,
-# since `tunnel-relay serve` refuses a plaintext catalog), each in its own
-# namespace, each with one device (`tunnel-client connect`) exporting one
-# mcp-2025-11-25 service:
-#   reference  the device exports the reference server (Streamable HTTP
-#              backend on loopback) -- initialize, tools, resources, prompts,
-#              progress and log notifications, and the conformance suite;
-#   fixture    the device exports the repository's rmcp fixture over stdio --
-#              tools, ordered progress, and a cancel that must reach the
-#              device's server after dispatch.
+# Three relays share one TLS Redis endpoint (`tunnel-relay serve` refuses a
+# plaintext catalog; see step 4), each in its own nonce-named namespace, each
+# with one device (`tunnel-client connect`) exporting one mcp-2025-11-25
+# service:
+#   reference  the suite's reference server (Streamable HTTP backend on
+#              loopback): the TypeScript SDK's cases and the conformance
+#              suite.  It refuses the Python SDK's initialize (M3-47), which
+#              is checked as a known upstream incompatibility;
+#   sdkserver  ts-sdk-server.mjs, a plain server on the pinned TypeScript SDK
+#              with the reference server's names: initialize, tools,
+#              resources, prompts, progress and log notifications, for both
+#              SDKs;
+#   fixture    the repository's rmcp fixture over stdio: tools, `_meta`,
+#              ordered progress, and a cancel that must reach the device's
+#              server after dispatch (the Python session's close after it
+#              may meet M3-48, reported as `result=known`).
 # Every client goes client -> relay consumer listener (HTTPS + bearer token)
 # -> device WebSocket (mTLS) -> tunnel-client -> MCP server.  Nothing
 # bypasses the relay.  The conformance suite also runs directly against the
@@ -32,7 +40,8 @@
 # (each of which must still fail, so a stale entry is red too).
 #
 # Requirements: cargo, node >= 24 with npm, uv (or python3 >= 3.10 with
-# venv/pip), openssl, curl, docker.  Network access to npm, PyPI and
+# venv/pip), openssl, curl, and either a plaintext test Redis
+# (M3SC_PLAIN_REDIS or TEST_REDIS_URL) or docker.  Network access to npm, PyPI and
 # raw.githubusercontent.com for the pinned, hash-checked installs.
 set -eu
 
@@ -50,7 +59,8 @@ nonce="m3sc-$(date +%s)-$$-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 head=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)
 work=${M3SC_DIR:-${TMPDIR:-/tmp}/m3-sdk-conformance-$nonce}
 work=${work%/}
-container="m3-sdk-conformance-$nonce"
+container=
+plain_redis=
 issuer="https://issuer.m3sc.agentuplink.test/"
 audience="agent-tunnel"
 profile="mcp-2025-11-25"
@@ -89,7 +99,10 @@ cleanup() {
   status=$?
   for pid in $pids; do kill "$pid" 2>/dev/null || true; done
   for pid in $pids; do wait "$pid" 2>/dev/null || true; done
-  docker rm -f "$container" >/dev/null 2>&1 || true
+  if [ -n "$container" ]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+  if [ -n "$plain_redis" ]; then
+    python3 "$suite/redis_tls_proxy.py" purge "${plain_redis%:*}" "${plain_redis##*:}" "$nonce" >&2 || true
+  fi
   if [ "$status" = 0 ] && [ "${M3SC_KEEP:-0}" != 1 ]; then
     rm -rf "$work"
   else
@@ -98,7 +111,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for tool in cargo node npm openssl curl docker python3; do
+for tool in cargo node npm openssl curl python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing prerequisite: $tool"
 done
 node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)' \
@@ -151,30 +164,61 @@ keyUsage=digitalSignature
 extendedKeyUsage=serverAuth
 subjectAltName=DNS:localhost,IP:127.0.0.1
 EOF
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=m3sc synthetic server CA" \
+# Python >= 3.13 verifies strictly (VERIFY_X509_STRICT) and refuses a CA
+# without keyUsage, which a bare `openssl req -x509` omits (task row M3-48).
+ca_ext="-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign"
+# shellcheck disable=SC2086
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=m3sc synthetic server CA" $ca_ext \
   -keyout "$work/server-ca-key.pem" -out "$work/server-ca.pem" 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
   -keyout "$work/relay-key.pem" -out "$work/relay.csr" 2>/dev/null
 openssl x509 -req -in "$work/relay.csr" -CA "$work/server-ca.pem" -CAkey "$work/server-ca-key.pem" \
   -CAcreateserial -days 1 -extfile "$work/server-ext.cnf" -out "$work/relay-cert.pem" 2>/dev/null
 cat "$work/relay-cert.pem" "$work/server-ca.pem" > "$work/relay-cert-chain.pem"
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=m3sc synthetic device CA" \
+# shellcheck disable=SC2086
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=m3sc synthetic device CA" $ca_ext \
   -keyout "$work/device-ca-key.pem" -out "$work/device-ca.pem" 2>/dev/null
 
-# 4. A TLS Redis of this run's own.
-mkdir -p "$work/redis"
-cp "$work/relay-cert.pem" "$work/redis/cert.pem"
-cp "$work/relay-key.pem" "$work/redis/key.pem"
-cp "$work/server-ca.pem" "$work/redis/ca.pem"
-chmod 644 "$work/redis/"*.pem   # synthetic; the container's redis user must read it
-chmod 755 "$work/redis"
-redis_port=$(free_port)
-say "start TLS Redis container $container on 127.0.0.1:$redis_port"
-docker run -d --rm --name "$container" -p "127.0.0.1:$redis_port:6380" \
-  -v "$work/redis:/tls:ro" "$REDIS_IMAGE" redis-server --port 0 --tls-port 6380 \
-  --tls-cert-file /tls/cert.pem --tls-key-file /tls/key.pem --tls-ca-cert-file /tls/ca.pem \
-  --tls-auth-clients no --save '' --appendonly no >"$work/logs/redis.log" 2>&1 \
-  || { cat "$work/logs/redis.log" >&2; fail "docker run redis"; }
+# 4. A TLS Redis endpoint.  With M3SC_PLAIN_REDIS=host:port, or CI's
+#    TEST_REDIS_URL=redis://host:port/, a TLS front (redis_tls_proxy.py) is put
+#    before that existing plaintext test Redis, and this run's keys (all named
+#    with its nonce) are purged on exit.  Otherwise a TLS Redis container of
+#    this run's own is started.
+plain_redis=${M3SC_PLAIN_REDIS:-}
+if [ -z "$plain_redis" ] && [ -n "${TEST_REDIS_URL:-}" ]; then
+  plain_redis=$(printf '%s' "$TEST_REDIS_URL" | sed -E 's#^redis://([^/]+)/?.*$#\1#')
+fi
+if [ -n "$plain_redis" ]; then
+  plain_host=${plain_redis%:*}
+  plain_port=${plain_redis##*:}
+  say "TLS front for the plaintext test Redis at $plain_host:$plain_port (keys namespaced by $nonce)"
+  python3 "$suite/redis_tls_proxy.py" serve "$work/relay-cert-chain.pem" "$work/relay-key.pem" \
+    "$plain_host" "$plain_port" "$work/redis-port" >"$work/logs/redis-proxy.log" 2>&1 &
+  proxy_pid=$!
+  pids="$pids $proxy_pid"
+  n=0
+  until [ -s "$work/redis-port" ]; do
+    n=$((n + 1))
+    { [ "$n" -lt 80 ] && kill -0 "$proxy_pid" 2>/dev/null; } || { cat "$work/logs/redis-proxy.log" >&2; fail "redis TLS front"; }
+    sleep 0.25
+  done
+  redis_port=$(cat "$work/redis-port")
+else
+  container="m3-sdk-conformance-$nonce"
+  mkdir -p "$work/redis"
+  cp "$work/relay-cert.pem" "$work/redis/cert.pem"
+  cp "$work/relay-key.pem" "$work/redis/key.pem"
+  cp "$work/server-ca.pem" "$work/redis/ca.pem"
+  chmod 644 "$work/redis/"*.pem   # synthetic; the container's redis user must read it
+  chmod 755 "$work/redis"
+  redis_port=$(free_port)
+  say "start TLS Redis container $container on 127.0.0.1:$redis_port"
+  docker run -d --rm --name "$container" -p "127.0.0.1:$redis_port:6380" \
+    -v "$work/redis:/tls:ro" "$REDIS_IMAGE" redis-server --port 0 --tls-port 6380 \
+    --tls-cert-file /tls/cert.pem --tls-key-file /tls/key.pem --tls-ca-cert-file /tls/ca.pem \
+    --tls-auth-clients no --save '' --appendonly no >"$work/logs/redis.log" 2>&1 \
+    || { cat "$work/logs/redis.log" >&2; fail "docker run redis"; }
+fi
 
 # 5. A synthetic identity issuer and one consumer token (scope http:invoke).
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/issuer-key.pem" 2>/dev/null
@@ -203,10 +247,16 @@ say "start the reference server on 127.0.0.1:$ref_port"
 ref_pid=$!
 pids="$pids $ref_pid"
 wait_for_line "$work/logs/reference-server.log" "running on" "$ref_pid" "the reference server"
+sdk_port=$(free_port)
+say "start the TypeScript SDK server on 127.0.0.1:$sdk_port"
+(cd "$suite" && PORT=$sdk_port exec node ts-sdk-server.mjs) >"$work/logs/ts-sdk-server.log" 2>&1 &
+sdk_pid=$!
+pids="$pids $sdk_pid"
+wait_for_line "$work/logs/ts-sdk-server.log" "running on" "$sdk_pid" "the TypeScript SDK server"
 
 # 7. One relay and one device per stack.
-start_stack() { # name backend-kind
-  name=$1 kind=$2
+start_stack() { # name backend-kind [backend-url]
+  name=$1 kind=$2 backend_url=${3:-}
   dir="$work/$name"
   mkdir -p "$dir/device/workspace"
   consumer_port=$(free_port)
@@ -216,7 +266,7 @@ start_stack() { # name backend-kind
   cp "$repo/examples/m1-client.toml" "$dir/device/client.toml"
   set_key "$dir/device/client.toml" relay_url "\"wss://127.0.0.1:$device_port/v1/tunnel/control\""
   python3 - "$dir/device/client.toml" "$service_id" "$profile" "$kind" "$bin/tunnel-mcp-fixture" \
-    "$dir/device/workspace" "http://127.0.0.1:$ref_port/mcp" <<'PY'
+    "$dir/device/workspace" "$backend_url" <<'PY'
 import sys
 path, service, profile, kind, command, workspace, url = sys.argv[1:8]
 text = open(path).read()
@@ -282,12 +332,31 @@ PY
   echo "https://localhost:$consumer_port" > "$dir/origin"
   say "$name stack up: relay :$consumer_port, device connected, backend $kind"
 }
-start_stack reference streamable-http
+start_stack reference streamable-http "http://127.0.0.1:$ref_port/mcp"
+start_stack sdkserver streamable-http "http://127.0.0.1:$sdk_port/mcp"
 start_stack fixture stdio
+sdkserver_url=$(cat "$work/sdkserver/url")
 reference_url=$(cat "$work/reference/url")
 reference_origin=$(cat "$work/reference/origin")
 fixture_url=$(cat "$work/fixture/url")
 fixture_workspace="$work/fixture/device/workspace"
+
+# Demo and debugging: keep both stacks up for your own clients.
+if [ "${M3SC_HOLD:-0}" = 1 ]; then
+  umask 077
+  printf '%s' "$token" > "$work/consumer-token"
+  {
+    echo "REFERENCE_URL=$reference_url"
+    echo "SDKSERVER_URL=$sdkserver_url"
+    echo "FIXTURE_URL=$fixture_url"
+    echo "FIXTURE_WORKSPACE=$fixture_workspace"
+    echo "SERVER_CA=$work/server-ca.pem"
+    echo "TOKEN_FILE=$work/consumer-token"
+    echo "PYTHON=$venv/bin/python"
+  } > "$work/stack.env"
+  say "M3SC_HOLD=1: stacks are up; see $work/stack.env; touch $work/release to continue"
+  until [ -e "$work/release" ]; do sleep 1; done
+fi
 
 # 8. The SDK clients through the relay.
 failed=0
@@ -304,15 +373,33 @@ run_case_set() { # label command...
 say "TypeScript SDK $ts_sdk through the relay"
 run_case_set ts-reference env AGENTUPLINK_TOKEN="$token" NODE_EXTRA_CA_CERTS="$work/server-ca.pem" \
   node "$suite/ts-client.ts" reference "$reference_url"
+run_case_set ts-sdkserver env AGENTUPLINK_TOKEN="$token" NODE_EXTRA_CA_CERTS="$work/server-ca.pem" \
+  node "$suite/ts-client.ts" reference "$sdkserver_url"
 run_case_set ts-fixture env AGENTUPLINK_TOKEN="$token" NODE_EXTRA_CA_CERTS="$work/server-ca.pem" \
   node "$suite/ts-client.ts" fixture "$fixture_url" "$fixture_workspace"
 say "Python SDK $python_sdk through the relay"
 for mode in legacy auto; do
-  run_case_set "py-$mode-reference" env AGENTUPLINK_TOKEN="$token" AGENTUPLINK_CA="$work/server-ca.pem" \
-    "$venv/bin/python" "$suite/python/py_client.py" reference "$mode" "$reference_url"
+  run_case_set "py-$mode-sdkserver" env AGENTUPLINK_TOKEN="$token" AGENTUPLINK_CA="$work/server-ca.pem" \
+    "$venv/bin/python" "$suite/python/py_client.py" reference "$mode" "$sdkserver_url"
+  run_case_set "py-$mode-known-m3-47" env AGENTUPLINK_TOKEN="$token" AGENTUPLINK_CA="$work/server-ca.pem" \
+    "$venv/bin/python" "$suite/python/py_client.py" known-m3-47 "$mode" "$reference_url"
   run_case_set "py-$mode-fixture" env AGENTUPLINK_TOKEN="$token" AGENTUPLINK_CA="$work/server-ca.pem" \
     "$venv/bin/python" "$suite/python/py_client.py" fixture "$mode" "$fixture_url" "$fixture_workspace"
 done
+# The relay's own DNS-rebinding answer: any request carrying Origin (which a
+# browser always sends) is refused before admission, naming the header.  This
+# stands in for the conformance suite's dns-rebinding-protection scenario,
+# which cannot run through the relay (task row M3-49).
+origin_reply=$(curl -sS --cacert "$work/server-ca.pem" -o - -w ' status=%{http_code}' \
+  -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -H 'Origin: http://evil.example.com' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$reference_url" 2>&1 || true)
+case "$origin_reply" in
+  *'"header":"origin"'*' status=400')
+    echo "sdk=curl case=origin-refused result=pass status=400 header=origin" >> "$results" ;;
+  *)
+    echo "sdk=curl case=origin-refused result=fail" >> "$results"; failed=1 ;;
+esac
 sed 's/^/  /' "$results" >&2
 cat "$results" >> "$log"
 
@@ -385,12 +472,13 @@ grep '^conformance' "$log" | sed 's/^/  /' >&2
 
 sdk_pass=$(grep -c 'result=pass' "$results" || true)
 sdk_fail=$(grep -c 'result=fail' "$results" || true)
+sdk_known=$(grep -c 'result=known' "$results" || true)
 elapsed=$(( $(date +%s) - start_epoch ))
-summary="summary nonce=$nonce head=$head sdk_cases_pass=$sdk_pass sdk_cases_fail=$sdk_fail elapsed_s=$elapsed"
+summary="summary nonce=$nonce head=$head sdk_cases_pass=$sdk_pass sdk_cases_fail=$sdk_fail sdk_cases_known=$sdk_known elapsed_s=$elapsed"
 echo "$summary" >> "$log"
 say "$summary"
 if [ -n "${M3SC_LOG_COPY:-}" ]; then cp "$log" "$M3SC_LOG_COPY"; fi
 # A run that reported nothing is not a pass.
-[ "$sdk_pass" -ge 40 ] || { say "only $sdk_pass SDK cases passed; expected at least 40"; failed=1; }
+[ "$sdk_pass" -ge 70 ] || { say "only $sdk_pass SDK cases passed; expected at least 70"; failed=1; }
 [ "$failed" = 0 ] || fail "see $work/logs"
 say "ok: the pinned TypeScript and Python MCP SDKs and the conformance suite work through the relay"

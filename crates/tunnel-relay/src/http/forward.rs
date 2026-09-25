@@ -1266,11 +1266,20 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
 /// keep-alive`, `user-agent`; `BaseClient.headers` in `httpx/_client.py`) are
 /// covered by the first two entries, the profiles' own `accept`, and the
 /// bridge's consumption of HTTP/1.1 `connection: keep-alive`.
-const DROPPED_CLIENT_HEADERS: [http::HeaderName; 4] = [
+///
+/// `cache-control` (task row M3-46) is what the official MCP Python SDK
+/// (mcp 2.2.0) adds, as `no-store`, to the 2025-11-25 standalone GET stream
+/// through httpx2's SSE helper; refusing it failed that stream on every
+/// Python client.  A request cache directive has no authority, the relay and
+/// the device cache nothing, and an MCP backend serves an event stream
+/// uncached whatever the request said, so dropping it changes nothing the
+/// export or the consumer can observe.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 5] = [
     header::USER_AGENT,
     header::ACCEPT_ENCODING,
     header::ACCEPT_LANGUAGE,
     http::HeaderName::from_static("sec-fetch-mode"),
+    header::CACHE_CONTROL,
 ];
 
 /// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
@@ -2361,6 +2370,32 @@ mod tests {
                     });
             }
         }
+        // M3-46: the official MCP Python SDK (mcp 2.2.0) opens the 2025-11-25
+        // standalone GET stream through httpx2's SSE helper, which adds
+        // `Cache-Control: no-store` (`httpx2/_client.py`).  Captured on the
+        // wire through a real relay by scripts/m3-sdk-conformance.sh.
+        let python_sdk_get: &[(&str, &str)] = &[
+            ("host", "127.0.0.1"),
+            ("accept", "text/event-stream"),
+            ("cache-control", "no-store"),
+            ("accept-encoding", "gzip, deflate"),
+            ("connection", "keep-alive"),
+            ("user-agent", "python-httpx2/2.13.1"),
+            ("mcp-session-id", "0123abcd"),
+            ("mcp-protocol-version", "2025-11-25"),
+        ];
+        let policies = tunnel_mcp::McpProfile::V2025_11_25
+            .policies(tunnel_mcp::McpLimits::default())
+            .expect("MCP profile");
+        let mut request = http::Request::get("/mcp").version(http::Version::HTTP_11);
+        for (name, value) in python_sdk_get {
+            request = request.header(*name, *value);
+        }
+        let mut parts = request.body(()).expect("request").into_parts().0;
+        strip_default_client_headers(&mut parts.headers, &policies.request.headers);
+        tunnel_http_bridge::normalize::request_head(&parts, &policies.request).unwrap_or_else(
+            |error| panic!("the Python SDK's standalone GET head was refused: {error:?}"),
+        );
         // Nit: a header over the name bound is skipped, and the next
         // unlisted one is named instead of none.
         let policies = tunnel_mcp::McpProfile::V2025_11_25

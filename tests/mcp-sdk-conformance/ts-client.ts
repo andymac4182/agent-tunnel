@@ -59,7 +59,7 @@ const transport = new StreamableHTTPClientTransport(new URL(rawUrl), {
 const client = new Client({ name: 'm3-17-typescript-sdk', version: '0.0.0' });
 const logs: string[] = [];
 client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
-  logs.push(String(notification.params.level));
+  logs.push(String(notification.params.data));
 });
 
 await check('initialize', async () => {
@@ -138,11 +138,15 @@ if (mode === 'reference') {
     return `progress=${seen.join(',')}`;
   });
   await check('notifications/message', async () => {
-    logs.length = 0;
     await client.setLoggingLevel('debug');
+    logs.length = 0;
     await client.callTool({ name: 'test_tool_with_logging', arguments: {} });
-    assert(logs.length === 3, `3 log notifications, got ${logs.length}`);
-    return `logs=${logs.length}`;
+    // The reference server also logs the level change; count only the
+    // tool's three messages, which must arrive in order.
+    const tool = logs.filter((data) => data.startsWith('Tool '));
+    const expected = ['Tool execution started', 'Tool processing data', 'Tool execution completed'];
+    assert(tool.join('|') === expected.join('|'), `the tool's 3 log notifications in order, got ${tool.length}`);
+    return `logs=${tool.length}`;
   });
 } else {
   const invocations = join(workspace!, 'invocations.log');
