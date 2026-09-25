@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "4e568c45778c41f28f15c578313cad4f16a0c990",
-  "lastPublishedOriginMain": "4e568c45778c41f28f15c578313cad4f16a0c990",
-  "lastReviewAt": "2026-09-25T18:03:59+10:00",
-  "lastReviewOutcome": "Reviewed test tooling and M1 admission harness ordering fixes through 4e568c4. Updated support evidence with six hosted M1 passes and three M7 probe passes at 4aab5c4, preserving Windows limitations and newly tracked MCP isolation and fixture-supervision intermittents. Runtime tests not rerun; CI and release gates unchanged by this website update.",
+  "reviewedOriginMain": "c13ee4c87c35f9bff0afd2674038a44954510c9d",
+  "lastPublishedOriginMain": "c13ee4c87c35f9bff0afd2674038a44954510c9d",
+  "lastReviewAt": "2026-09-25T21:03:54+10:00",
+  "lastReviewOutcome": "Reviewed owner decisions and CLI mapping through c13ee4c. Published AUTHORIZATION_STALE exit 4 guidance, Windows client-only locked-checks scope and new-device re-enrollment before certificate expiry. Runtime tests not rerun; CI and release gates unchanged by this website update.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support page exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T18:03:59+10:00",
-  "deploymentId": "dpl_cheP4qwGpeZH8JYcEh7Lfkbgu6mx"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support and downloads pages exactly matched reviewed local content. Runtime acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-25T21:03:54+10:00",
+  "deploymentId": "dpl_EqAe5vjJKdXJUf4VzZz4zTTABu1L"
 }

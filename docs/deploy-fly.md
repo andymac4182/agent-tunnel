@@ -667,7 +667,9 @@ the `721ed2a` relay also worked. On Fly:
 - The image was built by section 6.1 with `--image-label main-af23c2f`
   (`registry.fly.io/agentuplink-relay:main-af23c2f@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`).
 - Section 6.3's `fly deploy --image …main-af23c2f --ha=false` updated the
-  one relay machine in place.
+  one relay machine in place. That relay was **running**. Onto a **stopped**
+  relay the same command replaced the machine with a new ID and left it
+  stopped (M6-C104; section 6.5.1 step 6).
 - The log showed `tunnel-relay listening: consumer=0.0.0.0:8443
   device=0.0.0.0:9443` and then `tunnel-relay Redis restart continuity:
   interval_seconds=5`, and both checks passed.
@@ -677,8 +679,11 @@ the `721ed2a` relay also worked. On Fly:
 - After `fly machine restart --signal SIGTERM`, the device went through
   `backoff`, `reconnecting`, `reconnected` and `ready` on its own. The
   second echo attempt returned `200`, 4 s after the restart.
-- An in-place restart of the Fly Redis machine has not been exercised on
-  Fly. The local rehearsal and the M6-C65 gate are the evidence for it.
+- An in-place restart of the Fly Redis machine with the relay **stopped**
+  was run on Fly on 2026-09-25 by the credential rotation (section 6.5.1),
+  followed by `rebind-redis-run` in a one-off machine. A Redis restart under a
+  **running** relay, which re-binds by itself, has still not been exercised on
+  Fly; the local rehearsal and the M6-C65 gate are the evidence for that.
 - Rollback: `fly deploy . --config deploy/fly/relay/fly.toml --image
   registry.fly.io/agentuplink-relay:main-721ed2a --ha=false`. That image
   has no M6-C65, so after a rollback any Redis restart ends the namespace
@@ -736,6 +741,14 @@ fresh VM; and both checks logged failing at 12:51:09Z and passing at
 12:51:10Z. It ends the device sessions like any restart. Change
 `redis_namespace` or `deployment_incarnation` only when section 6.4.1 says so:
 a new value in `relay.toml` needs section 6.2 again.
+
+**Only a running relay is updated in place.** Every in-place update above was
+onto a running relay. On 2026-09-25 the same `fly deploy --image ... --ha=false`
+onto a relay stopped with `fly machine stop` replaced the machine: its ID
+changed (`7819962c1e3de8` became `185e264a927d58`) and the new machine was left
+stopped until `fly machine start` (M6-C104). If you deploy onto a stopped
+relay, follow section 6.5.1 step 6: read the new ID from `fly machine list`,
+start it, and use the new ID from then on.
 
 ### 6.4 After a Redis restart
 
@@ -825,8 +838,12 @@ empty Redis (`class=unbound`) but cannot tell a restore of an older snapshot
 from a restart, and re-binding a restored Redis would bring back whatever it
 held, such as a revoked grant. After a restore, use section 6.4.1. The
 command was run locally against a restarted Redis by
-`scripts/m6-redis-restart-verify.sh`, not on Fly; the entrypoint's
-`rebind-redis-run` case is new with M6-C65 and was checked with `sh -n` only.
+`scripts/m6-redis-restart-verify.sh`. **Run on Fly** on 2026-09-25 (M6-C15,
+section 6.5.1): with the relay stopped and Redis restarted in place by a
+secrets import, a one-off machine of `main-77bfd28` logged `Re-bound namespace
+agentuplink-fly-1 (deployment incarnation fly-1) from Redis run <old> to
+<new>, on the operator's declaration that Redis restarted in place; not
+verified.` and exited `0`, and the relay deployed afterwards served.
 
 #### 6.4.1 A new namespace
 
@@ -890,6 +907,99 @@ Section 3.1 issues the relay's server certificate for 90 days and the CAs for
   an image built before that, including `main-af23c2f`, refuses them with
   `unknown command`.
 
+#### 6.5.1 Rotating every credential at once
+
+Measured on Fly on 2026-09-25 (task row M6-C15), with the relay on
+`main-77bfd28` and one device. It replaces the Redis password and TLS
+certificate, all three CAs, the relay's server certificate, the consumer
+issuer's signing key and the device's key and certificate, keeps the
+namespace, and ended with 150 of 150 echoes. **The relay was
+unavailable for about two minutes and ten seconds**, from step 2 to step 6.
+
+**Replacing the device CA cuts off every enrolled device at once.** From the
+moment the relay serves the new `AT_DEVICE_CLIENT_CA_B64` (step 6), it refuses
+the TLS handshake of every device whose certificate the old device CA signed:
+`connect` exits `3` with `CREDENTIAL_ERROR` "unknown CA". Renewing a device in
+place is not implemented (M6-C56), so **each enrolled device has to be enrolled
+again** with a new device UUID. For each device, that means:
+- on the device: a new key and certificate request (`credentials create` in a
+  new profile), then importing the certificate and the new `relay-ca.pem`, and
+  restarting `connect` with the new profile;
+- for the operator: signing the request, three day-2 writes (`add-device`,
+  `add-service`, `set-grant`, each after its dry run) and one `revoke-device`
+  for the old UUID, which is eight one-off machines;
+- for every consumer: the new device and service UUIDs in its URLs.
+
+When this was measured, the catalog held one device and no tester. With
+testers enrolled, schedule the rotation with them. The relay CA and the
+consumer signing key are also in every device's and consumer's hands, so
+rotating those needs every device to import the new `relay-ca.pem` and every
+token issuer to switch keys.
+
+0. Copy the whole credentials directory to a dated backup (`cp -Rp`, mode
+   `700`) and keep it until the new setup is verified. Generate everything
+   new into a fresh subdirectory with section 3.1's commands, a new JWKS kid
+   (section 3.2) and a new device (section 6.6's onboarding, with a new
+   device UUID and service UUID). Check each new certificate against its new
+   CA with `openssl verify`, and run `tunnel-client doctor` on the new
+   profile, before anything touches Fly.
+1. Stage all eight relay secrets from the new files with
+   `fly secrets import -a agentuplink-relay --stage` (section 4). The
+   serving relay is not affected.
+2. Stop the relay: `fly machine stop <id> -a agentuplink-relay`. Stopping it
+   first means no relay holds a continuity token across the Redis restart,
+   and nothing serves on the old password in between.
+3. Import the three Redis secrets **without** `--stage`. This restarts Redis
+   in place. Check `fly machine list` and `fly volumes list` show the same
+   machine and volume, and that the log shows the AOF loaded and `Ready to
+   accept connections tls`. `fly secrets list -a agentuplink-redis` showed
+   the new digests as `Staged` right after the import returned and as
+   `Deployed` a few seconds later.
+4. Run section 6.2.1's probe. **One-off machines get the staged secrets**
+   (measured: it printed `PONG` and the new `run_id` with the relay's staged
+   password and Redis CA), so this checks the new relay secrets against the
+   new Redis before the relay starts.
+5. Re-bind the namespace to the new Redis run with section 6.4's
+   `rebind-redis-run --redis-restarted-in-place` one-off machine.
+6. `fly deploy . --config deploy/fly/relay/fly.toml --image <the serving
+   label> --ha=false`. **On a stopped relay this replaced the machine with a
+   new one, with a new machine ID, and left it stopped**: `fly machine list`
+   showed it `created`, then `stopped`. Start it with `fly machine start <new
+   id> -a agentuplink-relay`, then expect `listening`, `Redis restart
+   continuity`, both checks passing, and every secret `Deployed` with a new
+   digest. Use the new ID from here on.
+7. Register the new device with `add-device`, `add-service` and `set-grant`
+   (section 6.6, dry runs first). Keep `add-device`'s `credential=`.
+8. From the Mac: `/readyz` with the new `relay-ca.pem`, connect the new
+   profile, then 150 echoes with a token signed by the new key. Also check
+   that the old credentials now fail: `curl --cacert <old relay-ca.pem>`
+   fails certificate verification, a token signed with the old key gets
+   `401`, and the old device's `connect` exits `3` with "unknown CA".
+   Restart the relay with `--signal SIGTERM` and check the device reconnects
+   and echoes by itself.
+9. Only then revoke the old device with `revoke-device` (dry run first). It
+   cannot be undone. Its echo route then answers `404`.
+10. Move the new material into place in the credentials directory. Anything
+    that signs tokens needs the new key **and** the new `kid`.
+
+**Rollback.** Before step 3, re-stage the old relay secrets from the backup
+and start the relay. From step 3 on, Redis has restarted: re-import the old
+Redis secrets (another restart), re-stage the old relay secrets, and repeat
+steps 5 and 6. If Redis came back without its keys, the only way back is
+section 6.4.1. Do not roll the relay image back to `main-721ed2a` for this: it
+has no M6-C65, so a Redis restart would end the namespace. If a day-2 write
+in step 7 fails, a possible fallback is to sign the old device key with the
+new device CA. **This is read from the code, not measured:** the catalog finds
+a device by its key's SPKI fingerprint, not by its issuer (`resolve_device` in
+`crates/tunnel-catalog`), so no catalog write should be needed. But the
+credential record holds the validity window copied from the **original**
+certificate when the device was added, and that record, not the new
+certificate, decides when the credential expires. A re-signed certificate with
+a different window may therefore not match the record: the record's
+`not_after` still ends the credential, whatever the new certificate says.
+Whether the relay rejects a certificate whose window differs from the record's
+was not checked.
+
 ### 6.6 Day-2 catalog changes: onboarding a tester, and revocation
 
 **Run on Fly** (M6-C91, 2026-09-24, coordinator): with the relay serving
@@ -898,7 +1008,9 @@ one-off machine of that image logged `Catalog change is valid for namespace
 agentuplink-fly-1: add-user … This dry run contacted no Redis authority and
 wrote nothing.` and exited `0` (`fly machine status`: `exit_code=0`); the
 machine was destroyed and `fly machine list` showed only the serving relay.
-No write command has been run on Fly yet. The route is also proven locally by
+The first writes on Fly ran on 2026-09-25 for the credential rotation (M6-C15,
+section 6.5.1): `add-device`, `add-service`, `set-grant` and `revoke-device`,
+each after its dry run, each `exit_code=0`, with `oneoff` below. The route is also proven locally by
 `deploy/fly/local-proof.sh` (section 7): with `serve` running, each command
 ran in a one-off container of the relay image through its entrypoint, with its
 records copied in, and the new tester's echo succeeded.

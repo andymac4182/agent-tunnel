@@ -684,6 +684,13 @@ def check_deps() -> Result:
         )
         ok = False
 
+    # The licence policy's scope, proved per advertised target (M6-C05).
+    scope_ok, scope_notes = licence_scope(binary)
+    for line in scope_notes:
+        result.note(line)
+    if not scope_ok:
+        ok = False
+
     # Advisories are reported, never folded into the pass. An offline run
     # against a stale RustSec database is green for reasons unrelated to this
     # workspace.
@@ -691,6 +698,144 @@ def check_deps() -> Result:
 
     result.passed = ok
     return result
+
+
+# --------------------------------------------------------------------------
+# The licence policy's scope (docs/tasks.md M6-C05)
+#
+# `Cargo.lock` pins more registry crates than cargo-deny checks, and the
+# difference used to be an unexamined subtraction: a crate in the lockfile and
+# outside the checked graph is outside the fail-closed allowlist.  That is
+# correct only if no advertised target can build it, and nothing proved that.
+#
+# **The proof is `cargo tree`, not a `cargo metadata --filter-platform` walk.**
+# The metadata walk was measured first (M5-C04 uses it for a deny-list, where
+# over-reaching is safe) and it reaches 12 to 14 of the unchecked crates on
+# every advertised target -- `jiff`, `defmt`, `aho-corasick` and others --
+# while `cargo tree -i` on each prints nothing for any target: `cargo
+# metadata`'s resolve lists dependencies whose features the real feature
+# resolver never enables.  `cargo tree` runs that resolver, as a build does,
+# and so does cargo-deny's graph.  So, for each advertised target, every
+# registry crate `cargo tree --workspace --target T -e normal,build,dev`
+# reaches must be in cargo-deny's checked set.  If it holds, every crate
+# outside the checked set is unreachable on every advertised target, for
+# normal, build and dev edges, under the workspace's own features.  If a
+# feature change pulls one in (`aws-lc-sys` is the case the row names), it
+# enters both graphs together and the allowlist judges it; if the two
+# resolvers ever disagree, this fails naming the crate.
+# --------------------------------------------------------------------------
+REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+# Registry crates one advertised target reaches, measured 293 to 296 across
+# the four at the M6-C05 change.  Below this the walk examined too little to
+# prove anything, however consistent its answer.
+TARGET_REACH_FLOOR = 250
+TREE_PACKAGE_RE = re.compile(r"^(\S+) v(\S+)(.*)$")
+
+
+def lockfile_registry_crates(lock_text: str) -> set[tuple[str, str]]:
+    packages = tomllib.loads(lock_text).get("package", [])
+    return {
+        (p["name"], p["version"]) for p in packages if p.get("source") == REGISTRY_SOURCE
+    }
+
+
+def checked_registry_crates(binary: str) -> set[tuple[str, str]] | None:
+    """The registry crates cargo-deny's graph holds, from its own JSON listing."""
+    proc = run([binary, "deny", *OFFLINE, "list", "-l", "crate", "-f", "json"])
+    try:
+        listing = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    crates = set()
+    for key in listing:
+        parts = key.split(" ")
+        if len(parts) >= 3 and parts[2] == REGISTRY_SOURCE:
+            crates.add((parts[0], parts[1]))
+    return crates
+
+
+def target_reach(target: str) -> set[tuple[str, str]] | None:
+    """Registry crates the real feature resolver reaches for `target`."""
+    proc = run(
+        [
+            "cargo", "tree", "--locked", *OFFLINE, "--workspace", "--target", target,
+            "-e", "normal,build,dev", "--prefix", "none", "--format", "{p}",
+        ]
+    )
+    if proc.returncode != 0:
+        return None
+    reached = set()
+    for line in proc.stdout.splitlines():
+        match = TREE_PACKAGE_RE.match(line.strip())
+        # A path crate prints its directory, "(/...)"; the lockfile carries no
+        # git sources (checked by `provenance`), so the rest are registry crates.
+        if match and "(/" not in match.group(3):
+            reached.add((match.group(1), match.group(2)))
+    return reached
+
+
+def licence_scope_verdict(
+    lock: set[tuple[str, str]],
+    checked: set[tuple[str, str]],
+    reach: dict[str, set[tuple[str, str]] | None],
+) -> tuple[bool, list[str]]:
+    """Pure rule: every crate an advertised target reaches is licence-checked."""
+    ok = True
+    notes = []
+    unchecked = lock - checked
+    for target, reached in sorted(reach.items()):
+        if reached is None:
+            notes.append(f"  FAIL: licence scope: `cargo tree` failed for {target}")
+            ok = False
+            continue
+        floor_ok = len(reached) >= TARGET_REACH_FLOOR
+        outside = sorted(reached - checked)
+        notes.append(
+            f"  licence scope {target}: {len(reached)} registry crates reached, "
+            f"{len(outside)} outside the checked graph"
+        )
+        if not floor_ok:
+            notes.append(
+                f"  FAIL: licence scope: {target} reached only {len(reached)} crates, "
+                f"below the {TARGET_REACH_FLOOR} floor; the walk examined too little"
+            )
+            ok = False
+        if outside:
+            named = ", ".join(f"{n}@{v}" for n, v in outside[:5])
+            notes.append(
+                f"  FAIL: {len(outside)} crate(s) {target} can build are not licence-"
+                f"checked: {named}"
+            )
+            ok = False
+    stray = sorted(checked - lock)
+    if stray:
+        notes.append(f"  FAIL: cargo-deny checks crates the lockfile does not pin: {stray[:3]}")
+        ok = False
+    if ok:
+        notes.append(
+            f"  licence scope: {len(lock)} lockfile registry crates, {len(checked)} "
+            f"licence-checked, {len(unchecked)} unreachable on all {len(reach)} "
+            "advertised targets (normal, build and dev edges)"
+        )
+        if unchecked:
+            notes.append(
+                "  unreachable and unchecked: "
+                + ", ".join(f"{n}@{v}" for n, v in sorted(unchecked))
+            )
+    return ok, notes
+
+
+def licence_scope(binary: str) -> tuple[bool, list[str]]:
+    try:
+        targets = declared_targets()
+    except ValueError as error:
+        return False, [f"  FAIL: licence scope: no advertised targets to prove it for: {error}"]
+    checked = checked_registry_crates(binary)
+    if checked is None:
+        return False, ["  FAIL: licence scope: cargo-deny's JSON crate listing did not parse"]
+    lock = lockfile_registry_crates((REPO / "Cargo.lock").read_text(encoding="utf-8"))
+    reach = {target: target_reach(target) for target in targets}
+    return licence_scope_verdict(lock, checked, reach)
 
 
 def advisory_db_status() -> str:
@@ -733,11 +878,51 @@ def workspace_members() -> list[str]:
 # --------------------------------------------------------------------------
 # Check: provenance
 # --------------------------------------------------------------------------
-def check_provenance() -> Result:
+VCS_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def vendored_vcs_verdict(directory: Path, crate: str) -> tuple[str, str | None]:
+    """The upstream commit a vendored crate records, or why it records none.
+
+    Returns `(sha, problem)`.  **A missing or malformed `.cargo_vcs_info.json`
+    is a FAIL** (docs/tasks.md M6-C02).  It used to be a NOTE, on the grounds
+    that a crate unpacked from an sdist need not carry VCS info -- and that is
+    how `vendor/h3-quinn` shipped with its provenance reduced to a version
+    number while its two siblings pinned a commit.  Every patched crate here
+    now records one, so the asymmetry cannot come back unseen: a patch is a
+    diff, and a diff against an unrecorded tree cannot be re-derived.
+    """
+    vcs = directory / ".cargo_vcs_info.json"
+    if not vcs.is_file():
+        return "absent", (
+            f"vendor/{crate} has no .cargo_vcs_info.json, so the upstream tree its "
+            "patch was taken against is unrecorded. Copy the file from the "
+            "published crate and check it against upstream history (M6-C02)."
+        )
+    try:
+        info = json.loads(vcs.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        return "malformed", f"vendor/{crate}/.cargo_vcs_info.json is not JSON: {error}"
+    vcs_block = info.get("git") if isinstance(info, dict) else None
+    sha = vcs_block.get("sha1") if isinstance(vcs_block, dict) else None
+    if not isinstance(sha, str) or VCS_SHA_RE.fullmatch(sha) is None:
+        return "malformed", (
+            f"vendor/{crate}/.cargo_vcs_info.json records no 40-hex sha1 ({sha!r})"
+        )
+    if info.get("path_in_vcs") != crate:
+        return sha, (
+            f"vendor/{crate}/.cargo_vcs_info.json names path_in_vcs "
+            f"{info.get('path_in_vcs')!r}, not {crate!r}: it describes another crate"
+        )
+    return sha, None
+
+
+def check_provenance(root: Path | None = None) -> Result:
+    root = root or REPO
     result = Result("provenance")
     ok = True
 
-    lock = (REPO / "Cargo.lock").read_text(encoding="utf-8")
+    lock = (root / "Cargo.lock").read_text(encoding="utf-8")
     packages = lock.count("[[package]]")
     registry = lock.count("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
     checksums = lock.count("checksum = ")
@@ -772,7 +957,7 @@ def check_provenance() -> Result:
     # what is actually on disk: a licence file, an upstream-patch note, and a
     # recorded upstream commit.
     for crate in VENDORED:
-        directory = REPO / "vendor" / crate
+        directory = root / "vendor" / crate
         if not directory.is_dir():
             result.note(f"  FAIL: vendor/{crate} is missing but Cargo.toml patches to it.")
             ok = False
@@ -780,10 +965,7 @@ def check_provenance() -> Result:
         licence_files = sorted(p.name for p in directory.iterdir() if p.name.startswith("LICENSE"))
         manifest = (directory / "Cargo.toml").read_text(encoding="utf-8")
         declared = re.search(r'(?m)^license = "([^"]+)"', manifest)
-        vcs = directory / ".cargo_vcs_info.json"
-        sha = "absent"
-        if vcs.is_file():
-            sha = json.loads(vcs.read_text(encoding="utf-8")).get("git", {}).get("sha1", "absent")
+        sha, vcs_problem = vendored_vcs_verdict(directory, crate)
         patch_note = (directory / "UPSTREAM_PATCH.md").is_file()
         result.note(
             f"  vendor/{crate}: license={declared.group(1) if declared else 'MISSING'} "
@@ -806,16 +988,9 @@ def check_provenance() -> Result:
                 "divergence from upstream is unrecorded."
             )
             ok = False
-        if sha == "absent":
-            # Reported, not fatal: a crate unpacked from an sdist legitimately
-            # may not carry VCS info. It is recorded because it is a real
-            # asymmetry between the three patched crates and a reviewer should
-            # see it rather than discover it.
-            result.note(
-                f"  NOTE: vendor/{crate} has no .cargo_vcs_info.json, so its "
-                "upstream commit is not pinned in-tree the way its siblings' are. "
-                "Not failed here; recorded so it is visible."
-            )
+        if vcs_problem is not None:
+            result.note(f"  FAIL: {vcs_problem}")
+            ok = False
 
     result.passed = ok
     return result
@@ -2346,10 +2521,116 @@ def control_visibility_is_read_only() -> tuple[bool, str]:
     )
 
 
+def control_deps_licence_scope_covers_every_target() -> tuple[bool, str]:
+    """A crate some advertised target builds but cargo-deny skips turns `deps` red.
+
+    Uses the real graphs, then withdraws from cargo-deny's checked set one
+    crate that only one advertised target reaches -- the shape of a
+    target-specific dependency falling out of scope -- and requires the rule to
+    fail naming that target and crate.  An empty reach must fail the floor
+    rather than pass vacuously, and the real, unmodified inputs must pass.
+    """
+    binary = cargo_deny_binary()
+    if binary is None:
+        return False, "cargo-deny absent, so this control DID NOT RUN"
+    checked = checked_registry_crates(binary)
+    if checked is None:
+        return False, "cargo-deny's JSON listing did not parse; the control did not run"
+    lock = lockfile_registry_crates((REPO / "Cargo.lock").read_text(encoding="utf-8"))
+    reach = {target: target_reach(target) for target in declared_targets()}
+    if any(r is None for r in reach.values()):
+        return False, "`cargo tree` failed for an advertised target; the control did not run"
+    real_ok, real_notes = licence_scope_verdict(lock, checked, reach)
+    if not real_ok:
+        return False, "the real inputs fail: " + " | ".join(n.strip() for n in real_notes)
+    only_one = None
+    for target, reached in sorted(reach.items()):
+        others = set().union(*(r for t, r in reach.items() if t != target))
+        specific = sorted(reached - others)
+        if specific:
+            only_one = (target, specific[0])
+            break
+    if only_one is None:
+        return False, "no crate is specific to one advertised target; the control cannot plant"
+    target, crate = only_one
+    ok, notes = licence_scope_verdict(lock, checked - {crate}, reach)
+    name = f"{crate[0]}@{crate[1]}"
+    if ok or not any("FAIL" in n and target in n and name in n for n in notes):
+        return False, f"{name} withdrawn from the checked set: the rule did not fail naming {target}"
+    empty_ok, _ = licence_scope_verdict(lock, checked, {t: set() for t in reach})
+    if empty_ok:
+        return False, "an empty reach for every target passed; the floor did not fire"
+    return True, (
+        f"real graphs pass; withdrawing {name} (reached only on {target}) fails naming "
+        "both; an empty reach fails the floor"
+    )
+
+
+def control_provenance_requires_every_upstream_commit() -> tuple[bool, str]:
+    """A vendored crate that stops recording its upstream commit turns `provenance` red.
+
+    Runs the real check over a throwaway copy of `Cargo.lock` and `vendor/`,
+    first unmodified (it must PASS, or the copies below prove nothing), then
+    with each of three defeats applied to one crate at a time: the file
+    deleted, the commit replaced by a non-hash, and the file borrowed from a
+    sibling crate.  Each must FAIL, and FAIL on that crate's line.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shutil.copy2(REPO / "Cargo.lock", root / "Cargo.lock")
+        shutil.copytree(REPO / "vendor", root / "vendor")
+        baseline = check_provenance(root)
+        if not baseline.passed:
+            return False, "the unmodified copy does not pass: " + " | ".join(
+                line.strip() for line in baseline.lines if "FAIL" in line
+            )
+        defeats = []
+        for crate in VENDORED:
+            vcs = root / "vendor" / crate / ".cargo_vcs_info.json"
+            original = vcs.read_bytes()
+            sibling = next(c for c in VENDORED if c != crate)
+            cases = (
+                ("deleted", None),
+                ("sha replaced", original.replace(b'"sha1": "', b'"sha1": "not-a-commit-')),
+                (
+                    f"copied from {sibling}",
+                    (root / "vendor" / sibling / ".cargo_vcs_info.json").read_bytes(),
+                ),
+            )
+            for label, content in cases:
+                if content is None:
+                    vcs.unlink()
+                else:
+                    vcs.write_bytes(content)
+                verdict = check_provenance(root)
+                named = any("FAIL" in line and f"vendor/{crate}" in line for line in verdict.lines)
+                if verdict.passed or not named:
+                    return False, (
+                        f"vendor/{crate} with its .cargo_vcs_info.json {label}: provenance "
+                        f"{'PASSED' if verdict.passed else 'failed without naming the crate'}"
+                    )
+                defeats.append(f"{crate}:{label}")
+                vcs.write_bytes(original)
+    return True, (
+        f"unmodified copy passes; {len(defeats)} defeats across {len(VENDORED)} "
+        "patched crates each FAIL naming the crate"
+    )
+
+
 CONTROLS: dict[str, list[tuple[str, object]]] = {
+    "provenance": [
+        (
+            "a patched crate without its upstream commit turns provenance red",
+            control_provenance_requires_every_upstream_commit,
+        ),
+    ],
     "deps": [
         ("a licence outside the allowlist turns the policy red", control_deps_fails_closed),
         ("the crate floor can still fire", control_deps_empty_graph_would_not_pass),
+        (
+            "every crate an advertised target builds is licence-checked",
+            control_deps_licence_scope_covers_every_target,
+        ),
     ],
     "secrets": [
         ("every pattern matches its own synthetic fixture", control_every_secret_pattern_fires),
@@ -2456,12 +2737,7 @@ def main() -> int:
             print()
         unguarded = sorted(set(CHECKS) - set(CONTROLS))
         if unguarded:
-            print(
-                f"NOTE: checks with no positive control: {unguarded}. `provenance` is "
-                "a set of assertions over files in the tree rather than a scanner, so "
-                "its failure mode is a missing file rather than a pattern that cannot "
-                "match; it is exercised by the repository's own state.\n"
-            )
+            print(f"NOTE: checks with no positive control: {unguarded}.\n")
         print(f"controls: {total - failures}/{total} passed")
         return 1 if failures else 0
 

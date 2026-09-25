@@ -117,11 +117,16 @@ impl Cause {
     /// * `2` — the invocation or the configuration document is wrong; fix
     ///   local input. Nothing was attempted.
     /// * `3` — the credential or the authorization behind it was refused.
-    ///   `AUTHORIZATION_STALE` belongs here and not in the generic bucket:
-    ///   the documented meaning is "untrusted credentials / authorization
-    ///   denied", and the fix is to re-authorize, not to retry.
+    ///   Nothing else: a retry cannot help, and the fix is to re-enroll or
+    ///   re-authorize.
     /// * `4` — the relay or the network could not be reached, or closed the
     ///   session. A retry is meaningful once reachability returns.
+    ///   `AUTHORIZATION_STALE` belongs here and not at `3` (M6-C39, owner
+    ///   decision 2026-09-25): it is produced only when a stream's
+    ///   operation-authorization window lapsed before its queued frame was
+    ///   written, so the session was failed and restarted. Nothing about the
+    ///   credential or grant was refused; the likeliest cause is a stalled or
+    ///   congested data path, and the reconnect loop already retries it.
     /// * `5` — a bounded deadline elapsed.
     /// * `7` — the work was **refused before dispatch**: the device owner
     ///   slot is already held, or a bounded local budget was exhausted. No
@@ -147,8 +152,8 @@ impl Cause {
     fn exit_code(self) -> u8 {
         match self {
             Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => 2,
-            Self::CredentialError | Self::AuthorizationStale => 3,
-            Self::TransportError | Self::SessionClosed => 4,
+            Self::CredentialError => 3,
+            Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
             Self::OwnerBusy | Self::ResourceExhausted => 7,
             Self::Cancelled => 130,
@@ -1801,17 +1806,19 @@ fn print_error_json(command: &str, error: &CliError) {
 }
 
 fn usage() -> &'static str {
-    "tunnel-client — Agent Tunnel M1 connector\n\n\
+    "tunnel-client — Agent Uplink device connector\n\n\
 Usage:\n\
   tunnel-client --help | --version\n\
   tunnel-client check-config [PATH]\n\
   tunnel-client config check --config PATH [--json]\n\
-  tunnel-client doctor --config PATH --json\n\
+  tunnel-client doctor --config PATH [--json]\n\
   tunnel-client connect --config PATH [--json] [--no-reconnect]\n\
   tunnel-client credentials create --config PATH --csr-out PATH\n\
   tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\n\
-M1 uses one mTLS control socket and one mTLS data socket. Transport failure\n\
-closes both sockets and requires a fresh session; rotation and resume are M2."
+connect holds one mTLS control socket and one mTLS data socket and replaces\n\
+the data socket on the profile's [rotation] interval. A transport failure\n\
+ends the session; connect then starts a fresh one with bounded, jittered\n\
+backoff, or exits at once with --no-reconnect."
 }
 
 #[cfg(test)]
@@ -1959,6 +1966,91 @@ mod tests {
         ));
     }
 
+    /// Every `Usage:` line of `--help` must agree with the parser it
+    /// documents (M6-C26 item 4). The help said `doctor --config PATH --json`
+    /// while the parser treats `--json` as optional, and nothing compared the
+    /// two. Each line is parsed as written, with a placeholder for every
+    /// `PATH`; then each bracketed flag is dropped and the line must still
+    /// parse, and each unbracketed flag is dropped and the line must be
+    /// refused. So a flag the help calls required is required, and one it
+    /// calls optional is optional.
+    #[test]
+    fn every_help_usage_line_matches_the_parser() {
+        let help = usage();
+        let lines: Vec<&str> = help
+            .lines()
+            // The usage lines are the block between `Usage:` and the next
+            // blank line; the title line also starts with the binary's name.
+            .skip_while(|line| line.trim() != "Usage:")
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.trim().strip_prefix("tunnel-client "))
+            .filter(|line| !line.starts_with("--help"))
+            .collect();
+        assert!(
+            lines.len() >= 6,
+            "parsed only {} usage lines from --help",
+            lines.len()
+        );
+        let argv = |words: &[&str]| -> Vec<OsString> {
+            words
+                .iter()
+                .map(|word| OsString::from(if *word == "PATH" { "p.toml" } else { word }))
+                .collect()
+        };
+        let mut optional_seen = 0;
+        let mut required_seen = 0;
+        for line in lines {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let full: Vec<&str> = words
+                .iter()
+                .map(|word| word.trim_start_matches('[').trim_end_matches(']'))
+                .collect();
+            // `check-config [PATH]` brackets a positional, not a flag.
+            let full: Vec<&str> = full.into_iter().filter(|word| !word.is_empty()).collect();
+            parse_command(&argv(&full))
+                .unwrap_or_else(|error| panic!("`{line}` as written: {}", error.message));
+            for (index, word) in words.iter().enumerate() {
+                let bare = word.trim_start_matches('[').trim_end_matches(']');
+                if !bare.starts_with("--") || index == 0 {
+                    continue;
+                }
+                // A flag followed by `PATH` is removed with its value.
+                let takes_value =
+                    words.get(index + 1).map(|next| next.trim_end_matches(']')) == Some("PATH");
+                let without: Vec<&str> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| {
+                        *position != index && !(takes_value && *position == index + 1)
+                    })
+                    .map(|(_, word)| *word)
+                    .collect();
+                let parsed = parse_command(&argv(&without));
+                if word.starts_with('[') {
+                    optional_seen += 1;
+                    assert!(
+                        parsed.is_ok(),
+                        "`{line}` marks {bare} optional, and the parser refuses the line without it"
+                    );
+                } else {
+                    required_seen += 1;
+                    assert!(
+                        parsed.is_err(),
+                        "`{line}` shows {bare} as required, and the parser accepts the line without it"
+                    );
+                }
+            }
+        }
+        assert!(optional_seen >= 3 && required_seen >= 6);
+        // M2 rotation is delivered; the help must not describe it as a future
+        // milestone.
+        assert!(
+            !help.contains("are M2"),
+            "--help still calls rotation future work"
+        );
+    }
+
     #[test]
     fn network_doctor_is_rejected_without_touching_the_network() {
         let error = parse_command(&[
@@ -2023,7 +2115,7 @@ mod tests {
                 3,
             ),
             (ClientError::HandshakeTimeout, "DEADLINE_EXCEEDED", 5),
-            (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 3),
+            (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 4),
             (ClientError::QueueLimit, "RESOURCE_EXHAUSTED", 7),
             (ClientError::OpenRetentionFull, "RESOURCE_EXHAUSTED", 7),
             (ClientError::Cancelled, "CANCELLED", 130),
@@ -2073,8 +2165,8 @@ mod tests {
         );
         assert_ne!(
             stale, internal,
-            "a stale authorization is not an internal failure: the operator \
-             re-authorizes"
+            "a lapsed stream authorization window is not an internal failure: \
+             the operator checks the data path and retries"
         );
         assert_ne!(
             owner_busy, cancelled,
@@ -2086,7 +2178,10 @@ mod tests {
         // distinct values, including nonsense ones, so pin the table too.
         assert_eq!(owner_busy, 7, "refused before dispatch");
         assert_eq!(cancelled, 130, "interrupted before orderly completion");
-        assert_eq!(stale, 3, "authorization denied");
+        assert_eq!(
+            stale, 4,
+            "a lapsed stream authorization window is transport class (M6-C39)"
+        );
         assert_eq!(internal, 1, "unexpected internal failure");
     }
 

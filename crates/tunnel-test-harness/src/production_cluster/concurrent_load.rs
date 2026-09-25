@@ -755,9 +755,11 @@ fn push_cli_cause(values: &mut Vec<String>, message: &str) {
 /// message itself is deliberately omitted because the category is enough to
 /// distinguish queue pressure, control/data loss, and generic transport.
 fn classify_cli_cause(message: &str) -> &'static str {
+    if message == tunnel_client::AUTHORIZATION_EXPIRED_MESSAGE {
+        return "authorization_expired";
+    }
     match message {
         "bounded connector queue limit reached" => "queue_limit",
-        "authorization confirmation deadline expired" => "authorization_expired",
         "TLS/WebSocket handshake deadline exceeded" => "handshake_timeout",
         "connector cancelled" => "cancelled",
         "connector supervisor failed" => "supervisor_failed",
