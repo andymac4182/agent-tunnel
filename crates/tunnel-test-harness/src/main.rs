@@ -2871,7 +2871,7 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.correlation.misrouted,
                     );
                     println!(
-                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {} withdrawn_in={}ms) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={}",
+                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {} withdrawn_in={}ms) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={} revoked_sessions_ended={} session_ended_within={}ms",
                         evidence.revocation.baseline_status,
                         evidence.revocation.in_flight_status,
                         evidence.revocation.in_flight_code,
@@ -2885,6 +2885,8 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.revocation.sibling_principal_served,
                         evidence.revocation.device_session_survived,
                         evidence.revocation.revoked_session_unreachable,
+                        evidence.revocation.revoked_sessions_ended,
+                        evidence.revocation.session_ended_within_ms,
                     );
                     println!(
                         "M3 MCP isolation rotation-span: rotations={} dispatched_between_rotations={} anchor_to_dispatch_ms={} status={} exact={} invocations={} session_stable={}",
