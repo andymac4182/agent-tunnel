@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "5bc0a64f4d42edfc7300f844df2fbad5904d57ff",
-  "lastPublishedOriginMain": "5bc0a64f4d42edfc7300f844df2fbad5904d57ff",
-  "lastReviewAt": "2026-09-25T15:04:31+10:00",
-  "lastReviewOutcome": "Reviewed filesystem idle enforcement, client versus device limit ownership, retained-recovery replay and credit fixes, typed carrier/backpressure diagnostics and scoped M4 evidence through 5bc0a64. Published filesystem operator guidance with hosted probe failure and remaining acceptance boundaries explicit. Runtime tests not rerun; CI and release gates unchanged by this website update.",
+  "reviewedOriginMain": "c383ac06ce3eb1ef2302125b5e2e6608d7c5bde6",
+  "lastPublishedOriginMain": "c383ac06ce3eb1ef2302125b5e2e6608d7c5bde6",
+  "lastReviewAt": "2026-09-25T16:04:27+10:00",
+  "lastReviewOutcome": "Reviewed CUA source-backed default-display refusal, position-free scroll semantics, PNG capture dimensions, explicit scale requirement and device-local lease lifecycle through c383ac0. Published corrected CUA boundaries: real desktop probes, scale declaration, relay routing and revocation delivery remain open. Runtime tests not rerun; CI and release gates unchanged by this website update.",
   "reviewedDate": "2026-09-25",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live filesystem page exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-25T15:04:31+10:00",
-  "deploymentId": "dpl_CJDwxPoNi4zm2mL2Du23iZBXgfCW"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live CUA page exactly matched reviewed local content. Runtime and desktop acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-25T16:04:27+10:00",
+  "deploymentId": "dpl_F4eFWNZrqjdHxuJoZN7dmf2kPHrN"
 }
