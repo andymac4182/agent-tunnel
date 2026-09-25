@@ -1762,7 +1762,9 @@ pub(crate) async fn http_forward_route(
             .await
             {
                 Ok(Ok(registration)) => registration,
-                Ok(Err(error)) => return local_consumer_admission_response(error),
+                Ok(Err(error)) => {
+                    return local_consumer_admission_response("http-forward", error);
+                }
                 Err(_) => {
                     return gateway_error(
                         StatusCode::SERVICE_UNAVAILABLE,

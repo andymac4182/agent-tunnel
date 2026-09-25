@@ -106,6 +106,31 @@ struct StartupFixture {
     consumer_bind: SocketAddr,
     device_bind: SocketAddr,
     peer_bind: SocketAddr,
+    /// The sockets bound to the three addresses above, held for the
+    /// fixture's whole life (task row M6-C93).  Picking a port by binding
+    /// and releasing it let another process take it before
+    /// [`Self::assert_bindings_available`] re-bound it, which failed tests
+    /// with `AddrInUse`.  Held, nothing else can take them, and `serve`
+    /// cannot bind them either: a `serve` that reached its listeners would
+    /// fail with a bind error instead of the typed refusal each test asserts.
+    _held: HeldAddresses,
+}
+
+/// The fixture's own consumer, device and peer sockets.
+struct HeldAddresses {
+    consumer: TcpListener,
+    device: TcpListener,
+    peer: UdpSocket,
+}
+
+impl HeldAddresses {
+    fn bind() -> Self {
+        Self {
+            consumer: TcpListener::bind("127.0.0.1:0").expect("hold startup consumer port"),
+            device: TcpListener::bind("127.0.0.1:0").expect("hold startup device port"),
+            peer: UdpSocket::bind("127.0.0.1:0").expect("hold startup peer port"),
+        }
+    }
 }
 
 impl StartupFixture {
@@ -185,7 +210,15 @@ impl StartupFixture {
         let state = files.path("startup-membership-state.json");
         let config = files.path("relay.toml");
 
+        let held = HeldAddresses::bind();
         Self {
+            consumer_bind: held
+                .consumer
+                .local_addr()
+                .expect("read startup consumer port"),
+            device_bind: held.device.local_addr().expect("read startup device port"),
+            peer_bind: held.peer.local_addr().expect("read startup peer port"),
+            _held: held,
             redis_root_ca: ca.clone(),
             files,
             certificate_chain,
@@ -195,9 +228,6 @@ impl StartupFixture {
             membership_trust,
             state,
             config,
-            consumer_bind: free_tcp_addr(),
-            device_bind: free_tcp_addr(),
-            peer_bind: free_udp_addr(),
         }
     }
 
@@ -282,13 +312,33 @@ require_private_ip = true
         )
     }
 
+    /// `serve` bound none of the fixture's addresses (M6-C93).  The fixture
+    /// holds them, so `serve` could not have bound them without failing at
+    /// the bind; this proves the hold still excludes the relay's own bind
+    /// calls (tokio's `TcpListener::bind`, which sets `SO_REUSEADDR`, and a
+    /// plain UDP bind, which is how quinn binds the peer endpoint), so the
+    /// argument does not depend on the host's socket semantics.
     fn assert_bindings_available(&self) {
-        TcpListener::bind(self.consumer_bind)
-            .expect("consumer listener was not left serving after startup failure");
-        TcpListener::bind(self.device_bind)
-            .expect("device listener was not left serving after startup failure");
-        UdpSocket::bind(self.peer_bind)
-            .expect("peer listener was not left serving after startup failure");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("startup bind-probe runtime");
+        for (label, address) in [
+            ("consumer", self.consumer_bind),
+            ("device", self.device_bind),
+        ] {
+            let refused = runtime
+                .block_on(TokioTcpListener::bind(address))
+                .expect_err("the fixture must hold its address against the relay's TCP bind");
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::AddrInUse,
+                "{label}: {refused}"
+            );
+        }
+        let refused = UdpSocket::bind(self.peer_bind)
+            .expect_err("the fixture must hold its address against the relay's UDP bind");
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "peer: {refused}");
     }
 }
 
@@ -314,11 +364,6 @@ fn set_mode(path: &Path, mode: u32) {
 fn free_tcp_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("allocate startup TCP port");
     listener.local_addr().expect("read startup TCP port")
-}
-
-fn free_udp_addr() -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("allocate startup UDP port");
-    socket.local_addr().expect("read startup UDP port")
 }
 
 fn relay_binary() -> std::ffi::OsString {
@@ -371,6 +416,10 @@ fn assert_failure(output: &Output, expected: &str) {
     assert!(
         !diagnostics.contains("tunnel-relay listening:"),
         "startup emitted a serving marker before failing: {diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("already in use"),
+        "startup reached a listener bind before its refusal: {diagnostics}"
     );
     assert!(
         !diagnostics.contains(DIAGNOSTIC_SECRET),

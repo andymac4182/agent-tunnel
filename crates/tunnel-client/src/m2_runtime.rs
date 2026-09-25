@@ -7263,6 +7263,23 @@ impl M2Actor {
                 &quiesce.attempt.new_connection_id,
             )
         });
+        if !pending_attempt_matches
+            && !candidate_attempt_matches
+            && self
+                .pending_candidate_close
+                .as_ref()
+                .is_some_and(|(closed, _)| closed == &quiesce.attempt)
+        {
+            // Task row M2-07: the candidate of this very attempt closed while
+            // the owner's QUIESCE was already on the wire.  The owner has not
+            // observed the close yet; it will, and its ROTATE_ABORT decides
+            // the attempt.  Admission and old writes are already frozen by
+            // `defer_candidate_abort`, and there is no candidate to barrier,
+            // so the crossed QUIESCE is recorded as seen and not applied.
+            // Failing the session here would turn a candidate loss the
+            // protocol recovers from into a terminal protocol error.
+            return Ok(());
+        }
         if !pending_attempt_matches && !candidate_attempt_matches {
             return Err(ClientError::Protocol(
                 "ROTATE_QUIESCE candidate identity mismatch".to_owned(),
@@ -16393,5 +16410,114 @@ mod tests {
         old_carrier_task
             .await
             .expect("old carrier task joins after the forced closure");
+    }
+
+    /// Task row M2-07: the owner sends `ROTATE_QUIESCE` as soon as the
+    /// candidate is data-ready, and the candidate can close while that
+    /// QUIESCE is on the wire (the M2 candidate-abort gate closes it in any
+    /// precommit phase).  The connector then holds the closure for the
+    /// owner's ABORT and has neither a pending nor an installed candidate.
+    /// The crossed QUIESCE must not fail the session with a candidate
+    /// identity mismatch; the owner's ABORT must still settle the attempt.
+    #[tokio::test]
+    async fn a_quiesce_crossing_the_candidate_close_waits_for_the_owner_abort() {
+        let (mut actor, active_key, _active_receiver, mut control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        // The receiver is dropped: the carrier has no task, so its close is
+        // joined at once and the local closure is evidenced.
+        let (candidate_tx, _) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor.rotation_prepare_message_id = Some("prepare".to_owned());
+
+        // The candidate socket closes before QUIESCE is read.
+        actor
+            .mark_carrier_closed(&candidate_key, true, true)
+            .await
+            .expect("a precommit candidate close defers to the owner's ABORT");
+        assert!(actor.candidate.is_none());
+        assert!(actor.pending_candidate.is_none());
+        assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
+        assert!(actor.writes_frozen && !actor.accepting);
+
+        // The owner's QUIESCE for that attempt arrives after the close.
+        let quiesce = RotateQuiesce {
+            message_id: "quiesce".to_owned(),
+            reply_to: "prepare".to_owned(),
+            attempt: attempt.clone(),
+            roster: tunnel_protocol::rotation_control::StreamRoster::new("snapshot", Vec::new()),
+            remaining_ms: 5_000,
+        };
+        actor
+            .handle_control(ControlMessage::RotateQuiesce(quiesce.clone()))
+            .await
+            .expect("a QUIESCE crossing the candidate close is not a protocol error");
+        assert!(actor.pending_quiesce.is_none(), "nothing to barrier");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
+        assert!(actor.writes_frozen && !actor.accepting);
+
+        // A QUIESCE for any other attempt is still refused.
+        let mut other = quiesce;
+        other.message_id = "quiesce-other".to_owned();
+        other.attempt.new_connection_id = "other-candidate".to_owned();
+        let refused = actor
+            .handle_rotate_quiesce(other)
+            .expect_err("an unrelated attempt keeps the identity check");
+        assert!(
+            refused.to_string().contains("candidate identity mismatch"),
+            "{refused}"
+        );
+
+        // The owner observes the close and aborts; the connector answers
+        // with its closure evidence.
+        actor
+            .handle_control(ControlMessage::RotateAbort(RotateAbort {
+                message_id: "abort".to_owned(),
+                reply_to: String::new(),
+                attempt: attempt.clone(),
+                reason: "candidate transport lost".to_owned(),
+                remaining_ms: 5_000,
+            }))
+            .await
+            .expect("the owner's ABORT settles the crossed attempt");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Aborting);
+        assert!(actor.pending_candidate_close.is_none());
+        let aborted = drain_control_messages(&mut control_receiver)
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::RotateAborted(aborted) => Some(aborted),
+                _ => None,
+            })
+            .expect("ROTATE_ABORTED is sent to the owner");
+        assert_eq!(aborted.reply_to, "abort");
+        assert_eq!(aborted.attempt, attempt);
+        assert_eq!(aborted.closed_connection_id, candidate_key.connection_id);
     }
 }

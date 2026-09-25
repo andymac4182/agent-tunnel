@@ -3925,6 +3925,46 @@ mod tests {
         assert!(!message.contains("bearer-token"));
     }
 
+    /// Task row M6-C96: the fault stage's pass line is printed only for
+    /// evidence that every stage ran; each missing or skipped part refuses.
+    #[test]
+    fn m2_fault_gate_requires_every_stage() {
+        let complete = m2_acceptance::M2FaultEvidence {
+            stages: m2_acceptance::M2_FAULT_STAGES.to_vec(),
+            faults_injected: 5,
+            sessions_recovered: 2,
+            sessions_ended: 3,
+            revocation_outcome_ms: 1_200,
+            consumer_rejections: 4,
+        };
+        assert!(m2_acceptance::require_m2_fault_evidence(&complete).is_ok());
+        assert!(
+            m2_acceptance::require_m2_fault_evidence(&m2_acceptance::M2FaultEvidence::default())
+                .is_err()
+        );
+        for skipped in 0..m2_acceptance::M2_FAULT_STAGES.len() {
+            let mut evidence = complete.clone();
+            evidence.stages.remove(skipped);
+            assert!(
+                m2_acceptance::require_m2_fault_evidence(&evidence).is_err(),
+                "stage {skipped} skipped"
+            );
+        }
+        let mut reordered = complete.clone();
+        reordered.stages.swap(0, 1);
+        assert!(m2_acceptance::require_m2_fault_evidence(&reordered).is_err());
+        for mutate in [
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.faults_injected = 4,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.sessions_recovered = 1,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.sessions_ended = 2,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.consumer_rejections = 3,
+        ] {
+            let mut evidence = complete.clone();
+            mutate(&mut evidence);
+            assert!(m2_acceptance::require_m2_fault_evidence(&evidence).is_err());
+        }
+    }
+
     #[test]
     fn m2_continuous_traffic_gate_requires_each_flag_and_bound() {
         assert!(

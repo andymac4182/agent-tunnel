@@ -359,7 +359,8 @@ async fn run_connected_scenario(context: ConnectedScenario<'_>) -> Result<()> {
         .await
         .map_err(|error| stage_error("slow-consumer", error))?;
     if plan.faults {
-        return run_fault_sequence(FaultScenario {
+        let plan_name = plan.name;
+        let faults = run_fault_sequence(FaultScenario {
             harness,
             handle,
             stream,
@@ -373,7 +374,22 @@ async fn run_connected_scenario(context: ConnectedScenario<'_>) -> Result<()> {
             valid_token: consumer_token,
         })
         .await
-        .map_err(|error| stage_error("faults", error));
+        .map_err(|error| stage_error("faults", error))?;
+        require_m2_fault_evidence(&faults).map_err(|error| stage_error("faults", error))?;
+        // Task row M6-C96: a passing fault stage says what it measured, and
+        // `scripts/m2-harness-verify.sh` requires this line, so a skipped or
+        // filtered fault stage cannot pass on its exit status alone.
+        println!(
+            "M2 fault sequence passed: plan={} stages={} faults_injected={} sessions_recovered={} sessions_ended={} revocation_outcome_ms={} consumer_rejections={}",
+            plan_name,
+            faults.stages.join(","),
+            faults.faults_injected,
+            faults.sessions_recovered,
+            faults.sessions_ended,
+            faults.revocation_outcome_ms,
+            faults.consumer_rejections,
+        );
+        return Ok(());
     }
     // Keep consumer traffic flowing continuously across every handover.  At
     // least one record is written while the relay writer is quiesced,
@@ -1280,7 +1296,49 @@ struct FaultScenario<'a> {
     valid_token: &'a str,
 }
 
-async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
+/// What a passing fault sequence measured (task row M6-C96).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct M2FaultEvidence {
+    /// Stages completed, in order.
+    pub stages: Vec<&'static str>,
+    /// Faults injected: a closed carrier, a cancellation or a revocation.
+    pub faults_injected: u32,
+    /// Faults the same logical session survived with its stream intact.
+    pub sessions_recovered: u32,
+    /// Sessions a fault ended explicitly, with relay and proxy cleanup.
+    pub sessions_ended: u32,
+    /// Time from the catalog revocation to the stream's explicit outcome.
+    pub revocation_outcome_ms: u64,
+    /// Consumer requests refused with the expected status afterwards.
+    pub consumer_rejections: u32,
+}
+
+/// The fault stages, in the order `run_fault_sequence` runs them.
+pub const M2_FAULT_STAGES: [&str; 6] = [
+    "data_loss_replay",
+    "candidate_abort",
+    "control_loss",
+    "cancellation",
+    "revocation",
+    "consumer_rejections",
+];
+
+/// Refuse fault evidence that does not show every stage having run.
+pub fn require_m2_fault_evidence(evidence: &M2FaultEvidence) -> Result<()> {
+    if evidence.stages != M2_FAULT_STAGES
+        || evidence.faults_injected != 5
+        || evidence.sessions_recovered != 2
+        || evidence.sessions_ended != 3
+        || evidence.consumer_rejections != 4
+    {
+        return Err(HarnessError::Process(format!(
+            "M2 fault evidence is incomplete: {evidence:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<M2FaultEvidence> {
     let FaultScenario {
         harness,
         handle,
@@ -1294,6 +1352,7 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
         config,
         valid_token,
     } = context;
+    let mut evidence = M2FaultEvidence::default();
     let proxy = harness.proxy.as_ref().ok_or_else(|| {
         HarnessError::InvalidInput("M2 fault flow requires its real TCP proxy".to_owned())
     })?;
@@ -1355,6 +1414,9 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
                 .to_owned(),
         ));
     }
+    evidence.stages.push("data_loss_replay");
+    evidence.faults_injected += 1;
+    evidence.sessions_recovered += 1;
 
     // Candidate abort: hold the active data response direction, enqueue one
     // bounded record, and wait until the relay has emitted that request while
@@ -1417,6 +1479,9 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
             "M2 candidate abort changed the active logical session".to_owned(),
         ));
     }
+    evidence.stages.push("candidate_abort");
+    evidence.faults_injected += 1;
+    evidence.sessions_recovered += 1;
 
     // Control loss is an explicit interruption.  Closing the exact control
     // source address must end this session; the relay may not silently attach
@@ -1455,6 +1520,9 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
     wait_for_proxy_idle(proxy, Duration::from_secs(30))
         .await
         .map_err(|error| stage_error("control-loss proxy cleanup", error))?;
+    evidence.stages.push("control_loss");
+    evidence.faults_injected += 1;
+    evidence.sessions_ended += 1;
 
     // Cancellation during a pending replacement is a separate terminal case
     // from physical control loss.  Keep this session isolated and complete its
@@ -1537,6 +1605,9 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
     wait_for_proxy_idle(proxy, Duration::from_secs(30))
         .await
         .map_err(|error| stage_error("cancellation proxy cleanup", error))?;
+    evidence.stages.push("cancellation");
+    evidence.faults_injected += 1;
+    evidence.sessions_ended += 1;
 
     // Start a fresh session for the revocation-during-drain case.  This keeps
     // the control-loss result independent from the authorization result while
@@ -1682,6 +1753,8 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
             revocation_started.elapsed().as_secs_f64()
         )));
     }
+    evidence.revocation_outcome_ms =
+        u64::try_from(revocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The candidate was observed by source address before revocation; close
     // it only after the authorization result is visible so this fault cannot
     // be confused with a candidate-abort pass.
@@ -1713,7 +1786,10 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
     verify_proxy_retirement(harness, plan.rotations)
         .await
         .map_err(|error| stage_error("revocation proxy retirement", error))?;
-    verify_consumer_rejections(
+    evidence.stages.push("revocation");
+    evidence.faults_injected += 1;
+    evidence.sessions_ended += 1;
+    evidence.consumer_rejections = verify_consumer_rejections(
         harness,
         harness
             .production_addresses()
@@ -1726,7 +1802,9 @@ async fn run_fault_sequence(context: FaultScenario<'_>) -> Result<()> {
         valid_token,
     )
     .await
-    .map_err(|error| stage_error("revocation authorization rejection", error))
+    .map_err(|error| stage_error("revocation authorization rejection", error))?;
+    evidence.stages.push("consumer_rejections");
+    Ok(evidence)
 }
 
 async fn wait_for_connection_for_addr(
@@ -3250,7 +3328,7 @@ async fn verify_consumer_rejections(
     device_id: Uuid,
     service_id: Uuid,
     valid_token: &str,
-) -> Result<()> {
+) -> Result<u32> {
     let expired = harness
         .oidc
         .issue_expired(&harness.topology.consumers_a[0].name)?;
@@ -3323,7 +3401,9 @@ async fn verify_consumer_rejections(
         &[403, 404],
         "revoked M2 consumer grant",
     )
-    .await
+    .await?;
+    // Expired token, insufficient scope, cross tenant, revoked grant.
+    Ok(4)
 }
 
 async fn expect_consumer_status(

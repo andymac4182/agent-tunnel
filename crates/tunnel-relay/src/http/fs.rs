@@ -156,6 +156,7 @@ fn rotation_freeze_fs_error() -> Response {
 /// refusal keeps that code.
 fn fs_admission_refusal(error: &crate::actor::RelayError) -> Response {
     if matches!(error, crate::actor::RelayError::RotationFreeze) {
+        crate::metrics::count_local_rotation_freeze("fs");
         return rotation_freeze_fs_error();
     }
     fs_error(
@@ -1062,7 +1063,18 @@ mod tests {
             .expect("bounded body");
         let other: serde_json::Value = serde_json::from_slice(&other).expect("json");
         assert_eq!(other["error"]["code"], "BACKEND_UNAVAILABLE");
+        let counted = || {
+            crate::metrics::consumer_refusals()
+                .get(&("fs", "rotation_freeze"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = counted();
         let response = super::fs_admission_refusal(&crate::actor::RelayError::RotationFreeze);
+        assert!(
+            counted() > before,
+            "the metrics scrape counts the fs route's freeze refusal"
+        );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
