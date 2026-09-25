@@ -73,6 +73,10 @@ that is **not the build machine**.  Every check here therefore runs against the
                 the build tree works only beside `target/`, which is exactly
                 the failure this gate exists to catch, and it is invisible to
                 every other check here because the binary runs fine *here*.
+  `docs-redis`  Not in the default set: docs/operator.md's Redis-writing
+                shape-only commands, `serve` and `connect`, executed against
+                this bundle and a disposable Redis given with `--redis-url`
+                (M6-C33); DID NOT RUN without one.
   `docs`        docs/operator.md, executed.  Every `console` block runs, as
                 one shell session, against this bundle's archive and binaries
                 and must print what the guide shows; every `sh shape-only`
@@ -1560,11 +1564,12 @@ DOCS_PROSE_FENCES = ("toml", "text", "json")
 #: because each *writes* the Redis authority and this check deliberately has
 #: none: it runs as a stranger against the bundle, and making a Redis server a
 #: prerequisite of `verify` would make the release check depend on the host.
-#: They are not left unexecuted: `scripts/m6-provisioning-verify.sh` runs both,
-#: then `serve`, `connect` and an echo, against a real Redis with the same two
-#: examples the guide uses -- with cargo-built binaries, not this bundle's,
-#: which is the gap that remains.  `provision-catalog --dry-run` contacts no
-#: Redis, so it may **not** be shape-only (`DOCS_SHAPE_ONLY_REFUSED_FLAGS`).
+#: They are not left unexecuted: `docs-redis` (M6-C33) runs them, the day-2
+#: commands, `serve`, `connect` and an echo **with this bundle's binaries**
+#: against a disposable Redis the maintainer supplies, and
+#: `scripts/m6-provisioning-verify.sh` runs them with cargo-built binaries.
+#: `provision-catalog --dry-run` contacts no Redis, so it may **not** be
+#: shape-only (`DOCS_SHAPE_ONLY_REFUSED_FLAGS`).
 DOCS_SHAPE_ONLY_PERMITTED = {
     ("tunnel-relay", "serve"),
     ("tunnel-client", "connect"),
@@ -1882,6 +1887,45 @@ def run_session(commands: list[DocCommand], work: Path, env: dict[str, str],
     return outputs, codes, raw
 
 
+def execute_session(session: list[DocCommand], work: Path, env: dict[str, str],
+                    check: str) -> tuple[Result | None, int]:
+    """Run the guide's `console` blocks as one session in `work`.
+
+    Returns (a red result, or None when every command exited 0 and printed
+    what it shows; the number of output assertions matched).
+    """
+    nonce = sha256_bytes(os.urandom(16))[:16]
+    outputs, codes, raw = run_session(session, work, env, nonce)
+    asserted = 0
+    for index, command in enumerate(session):
+        where = f"docs/operator.md:{command.line} `{command.text[:70]}`"
+        if index not in codes:
+            return Result(check, False,
+                          summary=f"{where} did not complete (session output tail: "
+                                  f"{raw.strip()[-200:]!r})",
+                          witness="documented-command-failed"), asserted
+        output = outputs.get(index, "")
+        if codes[index] != 0:
+            return Result(check, False,
+                          summary=f"{where} exited {codes[index]}: "
+                                  f"{output.strip()[:240]!r}",
+                          witness="documented-command-failed"), asserted
+        lines = output.splitlines()
+        position = 0
+        for pieces in assertions(command):
+            hit = next((i for i in range(position, len(lines))
+                        if _line_matches(pieces, lines[i])), None)
+            if hit is None:
+                return Result(check, False,
+                              summary=f"{where} did not print {' ... '.join(pieces)!r} "
+                                      f"(after its line {position}); it printed "
+                                      f"{output.strip()[:240]!r}",
+                              witness="documented-output-missing"), asserted
+            position = hit + 1
+            asserted += 1
+    return None, asserted
+
+
 def shape_check(command: DocCommand, bundle: Path, work: Path,
                 env: dict[str, str]) -> str | None:
     """None when the binary accepts the documented vocabulary, else why not."""
@@ -2026,35 +2070,9 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
             staged = stage_archive(bundle, work, archive)
         except FileNotFoundError as error:
             return Result("docs", False, ran=False, summary=str(error))
-        nonce = sha256_bytes(os.urandom(16))[:16]
-        outputs, codes, raw = run_session(session, work, env, nonce)
-        asserted = 0
-        for index, command in enumerate(session):
-            where = f"docs/operator.md:{command.line} `{command.text[:70]}`"
-            if index not in codes:
-                return Result("docs", False,
-                              summary=f"{where} did not complete (session output tail: "
-                                      f"{raw.strip()[-200:]!r})",
-                              witness="documented-command-failed")
-            output = outputs.get(index, "")
-            if codes[index] != 0:
-                return Result("docs", False,
-                              summary=f"{where} exited {codes[index]}: "
-                                      f"{output.strip()[:240]!r}",
-                              witness="documented-command-failed")
-            lines = output.splitlines()
-            position = 0
-            for pieces in assertions(command):
-                hit = next((i for i in range(position, len(lines))
-                            if _line_matches(pieces, lines[i])), None)
-                if hit is None:
-                    return Result("docs", False,
-                                  summary=f"{where} did not print {' ... '.join(pieces)!r} "
-                                          f"(after its line {position}); it printed "
-                                          f"{output.strip()[:240]!r}",
-                                  witness="documented-output-missing")
-                position = hit + 1
-                asserted += 1
+        failed, asserted = execute_session(session, work, env, "docs")
+        if failed is not None:
+            return failed
 
         shape_work = Path(tmp) / "shape"
         shape_work.mkdir()
@@ -2075,10 +2093,573 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
                             f"table agrees with Cause")
     result.note(f"the guide's first step verified {staged}")
     result.note("shape-only commands need a provisioned Redis authority or a live relay; "
-                "their argument vocabulary is checked, their behaviour is not")
+                "their argument vocabulary is checked here, their behaviour by "
+                "`--check docs-redis --redis-url` (not run by this check)")
     result.note("session started in an empty directory holding only the archive, PATH "
                 "narrowed to the system directories, cargo proven unfindable")
     return result
+
+
+# --------------------------------------------------------------------------
+# docs-redis: the guide's Redis-writing commands, executed (task row M6-C33)
+#
+# `docs` runs as a stranger with no Redis, so the commands that write the
+# Redis authority -- section 2.3's `activate-first-incarnation` and
+# `provision-catalog`, section 2.5's day-2 commands -- and `serve` and
+# `connect` are only argument-checked there.  `docs-redis` executes them,
+# **against this bundle's binaries**, with a disposable Redis the maintainer
+# supplies (`--redis-url redis://HOST:PORT[/DB]`, plaintext; the check puts
+# its own TLS forwarder in front, because `serve` accepts only `rediss://`).
+#
+# How, and what stands in for the outside world:
+#
+# * It first runs the whole `console` session exactly as `docs` does, then
+#   continues **in the directory the session left**: the rehearsal's device
+#   key, its certificate (signed by the rehearsal's throwaway CA), the client
+#   profile with that CA imported as its relay CA, and the records documents
+#   of sections 2.3 and 2.5 are the ones the guide's own commands produced.
+# * The relay's listener certificate is issued here by that same rehearsal
+#   CA (the guide says the rehearsal uses one CA for both), and the identity
+#   issuer is an RSA key from `openssl genpkey`, whose token this check signs
+#   with `openssl dgst`.  The relay configuration is the bundle's
+#   `examples/m1-relay.toml` with its placeholders filled in and its
+#   `boot_id` line deleted, as section 3.1 says to.
+# * Each `sh shape-only` command that writes Redis or serves is taken **from
+#   the guide**, in document order, and run with its `/etc/agent-tunnel/...`
+#   paths mapped to those files.  A path the map does not know is a red,
+#   not a skip.  What each must print is the text the guide's prose names.
+# * Before `provision-catalog`, the guide's own `serve` command must refuse
+#   the activated namespace with `class=unprovisioned` (section 2.3, M6-C34).
+# * After the writes, `serve` must reach `tunnel-relay listening`, `connect`
+#   must serve one echo through it (the export's canary followed by the bytes
+#   sent), the same request under an unprovisioned subject must be refused,
+#   and both must stop on SIGTERM as section 3.1 says.
+#
+# `recovery-observe`, `recover` and `rebind-redis-run` stay unexecuted (they
+# need a recovery approval or a Redis restart) and are counted as such.
+# Without `--redis-url` the check reports DID NOT RUN, never a pass.  Every
+# key it wrote is deleted, also on failure.
+# --------------------------------------------------------------------------
+
+#: The Redis-writing and serving shape-only commands this check executes.
+DOCS_REDIS_EXECUTED = {
+    ("tunnel-relay", "activate-first-incarnation"),
+    ("tunnel-relay", "provision-catalog"),
+    ("tunnel-relay", "add-user"),
+    ("tunnel-relay", "add-device"),
+    ("tunnel-relay", "add-service"),
+    ("tunnel-relay", "set-grant"),
+    ("tunnel-relay", "revoke-grant"),
+    ("tunnel-relay", "revoke-device"),
+    ("tunnel-relay", "revoke-credential"),
+    ("tunnel-relay", "serve"),
+    ("tunnel-client", "connect"),
+}
+#: What each one-shot command must print, from the guide's prose: (exit
+#: status, fragments that must all appear).  `revoke-credential` names a
+#: credential the catalog does not hold, so the guide's command is a refusal.
+DOCS_REDIS_EXPECT = {
+    "activate-first-incarnation": (0, ["Activated deployment incarnation",
+                                       "as the first incarnation of namespace"]),
+    "provision-catalog": (0, ["Provisioned namespace"]),
+    "add-user": (0, ["Added to namespace", "user=", "role="]),
+    "add-device": (0, ["Added to namespace", "device=", "credential="]),
+    "add-service": (0, ["Added to namespace", "service="]),
+    "set-grant": (0, ["grant in namespace", "revision="]),
+    "revoke-grant": (0, ["Revoked grant in namespace"]),
+    "revoke-device": (0, ["Revoked device in namespace"]),
+    "revoke-credential": (1, ["revoke-credential refused"]),
+}
+#: The guide's placeholder paths, and the files the session produced for them.
+DOCS_REDIS_PATHS = {
+    "/etc/agent-tunnel/relay.toml": "docs-redis/relay.toml",
+    "/etc/agent-tunnel/client.toml": "trial/docs-redis-client.toml",
+    "/etc/agent-tunnel/catalog.toml": "trial/catalog.toml",
+    "/etc/agent-tunnel/user-2.toml": "trial/user-2.toml",
+    "/etc/agent-tunnel/device-2.toml": "trial-2/device.toml",
+    "/etc/agent-tunnel/service-2.toml": "trial-2/service.toml",
+    "/etc/agent-tunnel/grant-2.toml": "trial-2/grant.toml",
+}
+DOCS_REDIS_ISSUER = "https://issuer.example.test/"
+DOCS_REDIS_AUDIENCE = "agent-tunnel"
+DOCS_REDIS_STEP_TIMEOUT = 30
+
+
+class DocsRedisFailure(Exception):
+    def __init__(self, witness: str, message: str):
+        super().__init__(message)
+        self.witness = witness
+
+
+def map_documented_paths(words: list[str], root: Path) -> list[str]:
+    """Replace every `/etc/agent-tunnel/...` word; an unknown one is refused."""
+    out = []
+    for word in words:
+        if word.startswith("/etc/"):
+            mapped = DOCS_REDIS_PATHS.get(word)
+            if mapped is None:
+                raise DocsRedisFailure(
+                    "unmapped-path",
+                    f"`{word}` has no file this check can stand in for; add it to "
+                    f"DOCS_REDIS_PATHS with the session file that plays its part")
+            word = str(root / mapped)
+        out.append(word)
+    return out
+
+
+def parse_plaintext_redis_url(url: str) -> tuple[str, int, int]:
+    match = re.fullmatch(r"redis://([^/:@]+):(\d+)(?:/(\d+))?/?", url or "")
+    if not match:
+        raise ValueError("--redis-url must be a plaintext redis://HOST:PORT[/DB] with no "
+                         "credentials; the check adds its own TLS forwarder")
+    return match.group(1), int(match.group(2)), int(match.group(3) or 0)
+
+
+def _resp(host: str, port: int, database: int, parts: list[str]) -> bytes:
+    import socket
+    request = b""
+    for command in (["SELECT", str(database)], parts):
+        request += f"*{len(command)}\r\n".encode()
+        for part in command:
+            data = part.encode()
+            request += f"${len(data)}\r\n".encode() + data + b"\r\n"
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                return reply
+            reply += chunk
+
+
+def namespace_keys(host: str, port: int, database: int, namespace: str) -> list[str]:
+    prefix = f"tunnel-catalog:{namespace}:"
+    text = _resp(host, port, database, ["KEYS", f"{prefix}*"]).decode(errors="replace")
+    return sorted(line for line in text.split("\r\n") if line.startswith(prefix))
+
+
+def delete_namespace(host: str, port: int, database: int, namespace: str) -> int:
+    keys = namespace_keys(host, port, database, namespace)
+    if keys:
+        _resp(host, port, database, ["DEL", *keys])
+    return len(keys)
+
+
+class TlsForwarder:
+    """A TLS listener in front of the plaintext Redis, so `rediss://` works."""
+
+    def __init__(self, cert: Path, key: Path, upstream: tuple[str, int]):
+        import socket
+        import ssl
+        import threading
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(str(cert), str(key))
+        self.upstream = upstream
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.stopped = False
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        import socket
+        import threading
+        while not self.stopped:
+            try:
+                client, _ = self.listener.accept()
+            except OSError:
+                return
+            try:
+                tls = self.context.wrap_socket(client, server_side=True)
+                server = socket.create_connection(self.upstream, timeout=5)
+                server.settimeout(None)
+            except OSError:
+                client.close()
+                continue
+            for source, sink in ((tls, server), (server, tls)):
+                threading.Thread(target=self._pump, args=(source, sink), daemon=True).start()
+
+    @staticmethod
+    def _pump(source, sink) -> None:
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                sink.sendall(data)
+        except OSError:
+            pass
+        for sock in (source, sink):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.stopped = True
+        self.listener.close()
+
+
+def _b64url(data: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _openssl(args: list[str], cwd: Path, env: dict[str, str], stdin: bytes | None = None) -> bytes:
+    completed = subprocess.run(["openssl", *args], cwd=str(cwd), env=env, input=stdin,
+                               capture_output=True, timeout=60, check=False)
+    if completed.returncode != 0:
+        raise DocsRedisFailure("fixture-setup-failed",
+                               f"openssl {args[0]} failed: "
+                               f"{completed.stderr.decode(errors='replace')[:200]}")
+    return completed.stdout
+
+
+def _set_key(document: str, key: str, value: str) -> str:
+    pattern = re.compile(rf"^{re.escape(key)} = .*$", re.M)
+    if not pattern.search(document):
+        raise DocsRedisFailure("fixture-setup-failed",
+                               f"examples/m1-relay.toml has no `{key} =` line to fill in")
+    return pattern.sub(lambda _: f"{key} = {value}", document, count=1)
+
+
+def _toml_string(path: Path) -> str:
+    return json.dumps(str(path))
+
+
+def _issue_token(key: Path, subject: str, work: Path, env: dict[str, str]) -> str:
+    import time
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "docs-redis"}).encode())
+    claims = _b64url(json.dumps({"iss": DOCS_REDIS_ISSUER, "aud": DOCS_REDIS_AUDIENCE,
+                                 "sub": subject, "iat": now, "exp": now + 300,
+                                 "scope": "echo:invoke"}).encode())
+    signing_input = f"{header}.{claims}".encode()
+    signature = _openssl(["dgst", "-sha256", "-sign", str(key)], work, env, stdin=signing_input)
+    return f"{header}.{claims}.{_b64url(signature)}"
+
+
+def _echo(port: int, ca: Path, path: str, token: str, body: bytes) -> tuple[int, bytes]:
+    import http.client
+    import ssl
+    context = ssl.create_default_context(cafile=str(ca))
+    # The rehearsal CA is the guide's `openssl req -x509` one, which carries
+    # no key identifiers on some openssl builds; Python's strict mode would
+    # refuse it where the relay's and the client's verifiers accept it.
+    context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=10)
+    try:
+        connection.request("POST", path, body=body, headers={
+            "Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"})
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+class _Background:
+    """A long-running documented command whose output lines are collected."""
+
+    def __init__(self, words: list[str], cwd: Path, env: dict[str, str], log: Path):
+        import threading
+        self.log = log
+        self.lines: list[str] = []
+        self.process = subprocess.Popen(words, cwd=str(cwd), env=env,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        with self.log.open("w") as handle:
+            for line in self.process.stdout:
+                self.lines.append(line.rstrip("\n"))
+                handle.write(line)
+
+    def wait_for(self, predicate, timeout: float) -> str | None:
+        import time
+        deadline = time.monotonic() + timeout
+        seen = 0
+        while time.monotonic() < deadline:
+            while seen < len(self.lines):
+                if predicate(self.lines[seen]):
+                    return self.lines[seen]
+                seen += 1
+            if self.process.poll() is not None:
+                self.reader.join(timeout=2)
+                return next((line for line in self.lines[seen:] if predicate(line)), None)
+            time.sleep(0.05)
+        return None
+
+    def stop(self, timeout: float = 20) -> int | None:
+        import signal
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+        try:
+            return self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+            return None
+        finally:
+            self.reader.join(timeout=2)
+
+
+def _prepare_deployment(root: Path, env: dict[str, str], redis_host: str, redis_port: int,
+                        database: int, namespace: str) -> dict:
+    """The files section 3.1 says an operator supplies, made for this rehearsal."""
+    base = root / "docs-redis"
+    base.mkdir()
+    ca, ca_key = root / "trial-ca" / "ca.pem", root / "trial-ca" / "ca-key.pem"
+    for needed in (ca, ca_key, root / "trial" / "client.toml", root / "trial" / "catalog.toml",
+                   root / "trial" / "device-cert.pem"):
+        if not needed.is_file():
+            raise DocsRedisFailure("session-state-missing",
+                                   f"the session did not leave {needed.relative_to(root)}; "
+                                   f"the guide's rehearsal changed shape")
+    # The relay's listener identity and the Redis TLS forwarder's, from the
+    # rehearsal CA (one CA for both, as section 2.1 says).
+    listener_key, listener_cert = base / "listener-key.pem", base / "listener-cert.pem"
+    (base / "listener-ext.cnf").write_text(
+        "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1,DNS:localhost\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
+    _openssl(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+              "-keyout", str(listener_key), "-out", str(base / "listener.csr")], base, env)
+    _openssl(["x509", "-req", "-in", str(base / "listener.csr"), "-CA", str(ca),
+              "-CAkey", str(ca_key), "-CAcreateserial", "-days", "1",
+              "-extfile", str(base / "listener-ext.cnf"), "-out", str(listener_cert)], base, env)
+    # The identity issuer stand-in and its one-key JWKS.
+    issuer_key = base / "issuer-key.pem"
+    _openssl(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+              "-out", str(issuer_key)], base, env)
+    modulus = _openssl(["rsa", "-in", str(issuer_key), "-noout", "-modulus"], base, env)
+    n = bytes.fromhex(modulus.decode().strip().split("=", 1)[1])
+    jwks = base / "jwks.json"
+    jwks.write_text(json.dumps({"keys": [{"kty": "RSA", "kid": "docs-redis", "alg": "RS256",
+                                          "use": "sig", "n": _b64url(n), "e": "AQAB"}]}))
+    forwarder = TlsForwarder(listener_cert, listener_key, (redis_host, redis_port))
+    consumer, device = _free_port(), _free_port()
+    relay = (root / "examples" / "m1-relay.toml").read_text()
+    relay = "\n".join(line for line in relay.split("\n") if not line.startswith("boot_id ="))
+    for key, value in (
+        ("consumer_bind", json.dumps(f"127.0.0.1:{consumer}")),
+        ("device_bind", json.dumps(f"127.0.0.1:{device}")),
+        ("oidc_issuer", json.dumps(DOCS_REDIS_ISSUER)),
+        ("oidc_jwks_path", _toml_string(jwks)),
+        ("redis_url", json.dumps(f"rediss://localhost:{forwarder.port}/{database}")),
+        ("redis_namespace", json.dumps(namespace)),
+        ("device_tls_cert_chain", _toml_string(listener_cert)),
+        ("device_tls_private_key", _toml_string(listener_key)),
+        ("device_tls_client_ca", _toml_string(ca)),
+        ("consumer_tls_cert_chain", _toml_string(listener_cert)),
+        ("consumer_tls_private_key", _toml_string(listener_key)),
+        ("deployment_incarnation", json.dumps(namespace)),
+    ):
+        relay = _set_key(relay, key, value)
+    (base / "relay.toml").write_text(f"redis_tls_root_ca_path = {_toml_string(ca)}\n{relay}")
+    client = (root / "trial" / "client.toml").read_text()
+    if "wss://relay.example.test/" not in client:
+        raise DocsRedisFailure("session-state-missing",
+                               "trial/client.toml no longer names wss://relay.example.test/")
+    # The profile's relative paths resolve from its own directory, so it stays
+    # in trial/ beside its credentials; DOCS_REDIS_PATHS maps the guide's
+    # client path to this file.
+    (root / "trial" / "docs-redis-client.toml").write_text(
+        client.replace("wss://relay.example.test/", f"wss://127.0.0.1:{device}/"))
+    catalog = tomllib.loads((root / "trial" / "catalog.toml").read_text())
+    canary = tomllib.loads(client)
+    exports = canary.get("exports", {})
+    return {
+        "forwarder": forwarder, "consumer": consumer, "ca": ca, "issuer_key": issuer_key,
+        "subject": catalog["user"]["oidc_subject"], "device": catalog["device"]["id"],
+        "service": catalog["service"]["id"],
+        "canary": next((table.get("device_canary") for table in exports.values()
+                        if isinstance(table, dict) and table.get("device_canary")), None),
+    }
+
+
+def check_docs_redis(bundle: Path, archive: Path | None = None, redis_url: str | None = None,
+                     doc: Path | None = None) -> Result:
+    if not redis_url:
+        return Result("docs-redis", False, ran=False,
+                      summary="no --redis-url was given, so the guide's Redis-writing "
+                              "commands, `serve` and `connect` were NOT RUN against this "
+                              "bundle; supply a disposable plaintext Redis")
+    try:
+        host, port, database = parse_plaintext_redis_url(redis_url)
+        pong = _resp(host, port, database, ["PING"])
+    except (ValueError, OSError) as error:
+        return Result("docs-redis", False, ran=False,
+                      summary=f"the Redis given with --redis-url is not usable: {error}")
+    if b"+PONG" not in pong:
+        return Result("docs-redis", False, ran=False,
+                      summary="the Redis given with --redis-url did not answer PING")
+    doc = doc or DOCS_OPERATOR
+    try:
+        session, shape, _ = classify_doc(read_exact(doc))
+    except DocFormatError as error:
+        return Result("docs-redis", False, summary=str(error), witness=error.witness)
+    nonce = sha256_bytes(os.urandom(16))[:12]
+    namespace = f"m6docs-{nonce}"
+    counts = {"executed": 0, "not_executed": 0}
+    echo_line = ""
+    with tempfile.TemporaryDirectory() as tmp:
+        home, work = Path(tmp) / "home", Path(tmp) / "download"
+        home.mkdir()
+        work.mkdir()
+        env = stranger_env(home)
+        try:
+            stage_archive(bundle, work, archive)
+        except FileNotFoundError as error:
+            return Result("docs-redis", False, ran=False, summary=str(error))
+        failed, _ = execute_session(session, work, env, "docs-redis")
+        if failed is not None:
+            return failed
+        # Resolved: the relay refuses TLS material under a symlinked path, and
+        # the temporary directory is one on macOS (`/var` -> `/private/var`).
+        root = (work / DOCS_ARCHIVE_NAME).resolve()
+        env = dict(env, PATH=f"{root / 'bin'}:{env['PATH']}")
+        deployment = None
+        background: list[_Background] = []
+        try:
+            deployment = _prepare_deployment(root, env, host, port, database, namespace)
+            serve_words = None
+            for command in shape:
+                words = shlex.split(command.text.replace("\\\n", " "))
+                key = tuple(words[:2])
+                where = f"docs/operator.md:{command.line} `{command.text[:70]}`"
+                if key not in DOCS_REDIS_EXECUTED:
+                    counts["not_executed"] += 1
+                    continue
+                mapped = map_documented_paths(words, root)
+                counts["executed"] += 1
+                if key == ("tunnel-relay", "serve"):
+                    serve_words = mapped
+                    relay = _Background(mapped, root, env, Path(tmp) / "serve.log")
+                    background.append(relay)
+                    if relay.wait_for(lambda line: line.startswith("tunnel-relay listening"),
+                                      DOCS_REDIS_STEP_TIMEOUT) is None:
+                        raise DocsRedisFailure("serve-not-listening",
+                                               f"{where} did not reach `tunnel-relay listening`: "
+                                               f"{relay.lines[-5:]!r}")
+                    continue
+                if key == ("tunnel-client", "connect"):
+                    device = _Background(mapped, root, env, Path(tmp) / "connect.log")
+                    background.append(device)
+                    echo_line = _echo_through(deployment, root, env, where, device)
+                    continue
+                if key == ("tunnel-relay", "provision-catalog"):
+                    _serve_refuses_unprovisioned(shape, root, env, host, port, database,
+                                                 namespace)
+                expected_status, fragments = DOCS_REDIS_EXPECT[words[1]]
+                completed = run(mapped, cwd=root, env=env, timeout=DOCS_REDIS_STEP_TIMEOUT)
+                output = completed.stdout + completed.stderr
+                if completed.returncode != expected_status:
+                    raise DocsRedisFailure("documented-redis-command-failed",
+                                           f"{where} exited {completed.returncode}, the guide "
+                                           f"says {expected_status}: {output.strip()[:240]!r}")
+                missing = [fragment for fragment in fragments if fragment not in output]
+                if missing:
+                    raise DocsRedisFailure("documented-redis-output-missing",
+                                           f"{where} did not print {missing!r}: "
+                                           f"{output.strip()[:240]!r}")
+            if serve_words is None or not echo_line:
+                raise DocsRedisFailure("documented-redis-command-missing",
+                                       "the guide no longer has a shape-only `serve` and "
+                                       "`connect` for this check to run")
+            for process, name, stopped in ((background[-1], "connect", None),
+                                           (background[0], "serve",
+                                            "tunnel-relay stopped: signal=SIGTERM")):
+                status = process.stop()
+                if name == "serve" and (status != 0 or stopped not in process.lines):
+                    raise DocsRedisFailure("serve-stop-failed",
+                                           f"serve did not stop on SIGTERM as section 3.1 says: "
+                                           f"exit {status}, last lines {process.lines[-3:]!r}")
+            background.clear()
+        except DocsRedisFailure as error:
+            return Result("docs-redis", False, summary=str(error), witness=error.witness)
+        finally:
+            for process in background:
+                process.stop(timeout=5)
+            if deployment is not None:
+                deployment["forwarder"].close()
+            removed = delete_namespace(host, port, database, namespace)
+    result = Result("docs-redis", True,
+                    summary=f"{counts['executed']} Redis-writing and serving shape-only "
+                            f"commands of docs/operator.md executed in document order "
+                            f"against this bundle and a disposable Redis; {echo_line}; "
+                            f"{counts['not_executed']} shape-only command(s) not executed "
+                            f"(they need a recovery approval or a Redis restart)")
+    result.note(f"namespace {namespace}: {removed} key(s) deleted afterwards")
+    result.note("the guide's `serve` refused the activated, unprovisioned namespace with "
+                "class=unprovisioned and wrote nothing (M6-C34)")
+    result.note("listener certificates and the identity issuer are this check's stand-ins, "
+                "issued by the rehearsal's throwaway CA and an openssl RSA key")
+    return result
+
+
+def _serve_refuses_unprovisioned(shape: list[DocCommand], root: Path, env: dict[str, str],
+                                 host: str, port: int, database: int, namespace: str) -> None:
+    """Section 2.3: `serve` before `provision-catalog` exits 1 and writes nothing."""
+    serve = next((c for c in shape if c.text.startswith("tunnel-relay serve ")), None)
+    if serve is None:
+        raise DocsRedisFailure("documented-redis-command-missing",
+                               "the guide has no shape-only `tunnel-relay serve`")
+    words = map_documented_paths(shlex.split(serve.text), root)
+    before = namespace_keys(host, port, database, namespace)
+    completed = run(words, cwd=root, env=env, timeout=DOCS_REDIS_STEP_TIMEOUT)
+    output = completed.stdout + completed.stderr
+    expected = "stage=authority_identity class=unprovisioned"
+    if completed.returncode != 1 or expected not in output:
+        raise DocsRedisFailure("serve-not-refused-before-provisioning",
+                               f"`serve` before `provision-catalog` exited "
+                               f"{completed.returncode} without `{expected}`: "
+                               f"{output.strip()[:240]!r}")
+    after = namespace_keys(host, port, database, namespace)
+    if after != before:
+        raise DocsRedisFailure("serve-not-refused-before-provisioning",
+                               f"the refused `serve` wrote {sorted(set(after) - set(before))!r}")
+
+
+def _echo_through(deployment: dict, root: Path, env: dict[str, str], where: str,
+                  device: _Background) -> str:
+    import time
+    token = _issue_token(deployment["issuer_key"], deployment["subject"], root, env)
+    payload = f"m6c33-docs-redis-{os.getpid()}".encode()
+    path = f"/v1/devices/{deployment['device']}/services/{deployment['service']}/echo"
+    deadline = time.monotonic() + DOCS_REDIS_STEP_TIMEOUT
+    status, body = 0, b""
+    while time.monotonic() < deadline:
+        try:
+            status, body = _echo(deployment["consumer"], deployment["ca"], path, token, payload)
+        except OSError as error:
+            status, body = 0, str(error).encode()
+        if status == 200:
+            break
+        time.sleep(0.25)
+    canary = (deployment["canary"] or "").encode()
+    if status != 200 or body != canary + payload:
+        raise DocsRedisFailure("echo-failed",
+                               f"{where}: the echo got HTTP {status} {body[:160]!r}, not the "
+                               f"export's canary followed by the {len(payload)} bytes sent; "
+                               f"connect printed {device.lines[-3:]!r}")
+    stranger = _issue_token(deployment["issuer_key"], "m6c33-unprovisioned-subject", root, env)
+    stranger_status, _ = _echo(deployment["consumer"], deployment["ca"], path, stranger, payload)
+    if stranger_status not in (401, 403, 404):
+        raise DocsRedisFailure("echo-failed",
+                               f"an unprovisioned subject got HTTP {stranger_status}; the 200 "
+                               f"above would not prove the provisioned grant")
+    return (f"echo status=200 bytes={len(body)} (canary {len(canary)} + payload "
+            f"{len(payload)}), stranger status={stranger_status}")
 
 
 CHECKS = {
@@ -2090,7 +2671,12 @@ CHECKS = {
     "cli": check_cli,
     "portability": check_portability,
     "docs": check_docs,
+    "docs-redis": check_docs_redis,
 }
+#: What `verify` runs when no `--check` is named.  `docs-redis` needs a
+#: disposable Redis the maintainer supplies, so it runs only when selected;
+#: selected without `--redis-url` it reports DID NOT RUN (task row M6-C33).
+DEFAULT_CHECKS = [name for name in CHECKS if name != "docs-redis"]
 
 
 # --------------------------------------------------------------------------
@@ -3333,11 +3919,67 @@ def control_docs_exit_source_unparsed(bundle: Path) -> tuple[bool, str]:
                           client_main=client_main)
 
 
+def control_docs_redis_without_redis(bundle: Path) -> tuple[bool, str]:
+    result = check_docs_redis(bundle, redis_url=None)
+    if result.ran or result.ok:
+        return False, f"docs-redis without a Redis reported ran={result.ran} ok={result.ok}"
+    return True, "without --redis-url, docs-redis reports DID NOT RUN, not a pass"
+
+
+def control_docs_redis_unmapped_path(bundle: Path) -> tuple[bool, str]:
+    root = Path("/nonexistent-root")
+    mapped = map_documented_paths(["tunnel-relay", "serve", "--config",
+                                   "/etc/agent-tunnel/relay.toml"], root)
+    if mapped[-1] != str(root / DOCS_REDIS_PATHS["/etc/agent-tunnel/relay.toml"]):
+        return False, f"a mapped path came back as {mapped[-1]!r}"
+    try:
+        map_documented_paths(["tunnel-relay", "serve", "--config",
+                              "/etc/agent-tunnel/renamed.toml"], root)
+    except DocsRedisFailure as error:
+        if error.witness == "unmapped-path":
+            return True, "a mapped path is rewritten; an unknown /etc path is refused by name"
+        return False, f"wrong witness {error.witness}"
+    return False, "an unknown /etc path was passed through"
+
+
+def control_docs_redis_provision_noop(bundle: Path, redis_url: str) -> tuple[bool, str]:
+    """`provision-catalog` replaced by a wrapper that prints success and writes
+    nothing: the next documented write, section 2.5's `add-user`, must then be
+    refused on the unprovisioned namespace, so the check goes red there."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        real = copy / "bin" / "tunnel-relay.real"
+        (copy / "bin" / "tunnel-relay").rename(real)
+        wrapper = copy / "bin" / "tunnel-relay"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = provision-catalog ] && [ \"$*\" = \"${*%--dry-run}\" ]; then\n"
+            "  echo 'Provisioned namespace (control: nothing written).'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exec \"$(dirname \"$0\")/tunnel-relay.real\" \"$@\"\n")
+        wrapper.chmod(0o755)
+        sums = copy / SHA256SUMS
+        lines = [line for line in sums.read_text().splitlines()
+                 if not line.endswith("  bin/tunnel-relay")]
+        lines.append(f"{sha256_file(wrapper)}  bin/tunnel-relay")
+        sums.write_text("\n".join(lines) + "\n")
+        result = check_docs_redis(copy, redis_url=redis_url)
+    if (result.ok or result.witness != "documented-redis-command-failed"
+            or "add-user refused" not in result.summary):
+        return False, (f"expected red with witness documented-redis-command-failed at "
+                       f"add-user, got ok={result.ok} witness={result.witness}: "
+                       f"{result.summary[:200]}")
+    return True, f"red for its own reason: {result.summary[:160]}"
+
+
 REFUSAL_CONTROLS = {
     "cargo unfindable: the check must not report ok",
+    "no Redis supplied: docs-redis must report DID NOT RUN",
 }
 
 UNIT_PROBES = {
+    "an unmapped /etc path in a documented Redis command is refused",
     "four cargo outcomes are four statuses, not one",
     "the lockfile parser is not universal",
     "the dynamic-dependency classifier's rule",
@@ -3424,6 +4066,20 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
          control_docs_exit_table_row_edited),
         ("the code's exit mapping moved under the table", control_docs_exit_source_edited),
         ("an exit mapping the parser cannot find", control_docs_exit_source_unparsed),
+    ],
+    "docs-redis": [
+        ("no Redis supplied: docs-redis must report DID NOT RUN",
+         control_docs_redis_without_redis),
+        ("an unmapped /etc path in a documented Redis command is refused",
+         control_docs_redis_unmapped_path),
+    ],
+}
+#: Witness controls of `docs-redis` that need the disposable Redis; they run
+#: only when `--self-test` is given `--redis-url`, and are counted as not run
+#: otherwise.
+REDIS_CONTROLS: dict[str, list[tuple[str, object]]] = {
+    "docs-redis": [
+        ("a provision-catalog that writes nothing", control_docs_redis_provision_noop),
     ],
 }
 
@@ -3649,7 +4305,14 @@ def unpack(archive: Path, destination: Path) -> Path:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     target = Path(args.bundle).resolve()
-    selected = [args.check] if args.check else list(CHECKS)
+    selected = [args.check] if args.check else list(DEFAULT_CHECKS)
+
+    def run_check(name: str, bundle: Path, archive: Path | None) -> Result:
+        if name == "docs-redis":
+            return check_docs_redis(bundle, archive=archive, redis_url=args.redis_url)
+        if name == "docs" and archive is not None:
+            return check_docs(bundle, archive=archive)
+        return CHECKS[name](bundle)
 
     if target.is_file():
         # The gate's own words are "download and unpack those artifacts into
@@ -3663,10 +4326,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 return 2
             print(f"unpacked {target.name} ({sha256_file(target)[:12]}) into a "
                   f"temporary directory as {bundle.name}")
-            results = [CHECKS[name](bundle, archive=target) if name == "docs"
-                       else CHECKS[name](bundle) for name in selected]
+            results = [run_check(name, bundle, target) for name in selected]
     elif target.is_dir():
-        results = [CHECKS[name](target) for name in selected]
+        results = [run_check(name, target, None) for name in selected]
     else:
         print(f"no bundle directory or archive at {target}", file=sys.stderr)
         return 2
@@ -3684,6 +4346,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         print(f"no bundle directory at {bundle}", file=sys.stderr)
         return 2
     selected = [args.check] if args.check else list(CONTROLS)
+    redis_not_run = 0
     failures = 0
     witness_total = 0
     probe_total = 0
@@ -3704,6 +4367,16 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 failures += 1
             kind = "probe  " if is_probe else ("refusal" if is_refusal else "control")
             print(f"  {'ok    ' if ok else 'FAILED'}  [{kind}] {label}: {detail}")
+        for label, control in REDIS_CONTROLS.get(check, []):
+            if not getattr(args, "redis_url", None):
+                redis_not_run += 1
+                print(f"  NOT RUN [control] {label}: needs --redis-url")
+                continue
+            witness_total += 1
+            ok, detail = control(bundle, args.redis_url)
+            if not ok:
+                failures += 1
+            print(f"  {'ok    ' if ok else 'FAILED'}  [control] {label}: {detail}")
     total = witness_total + probe_total + refusal_total
     # Reported as three numbers on purpose.  A single "17 of 17 controls" would
     # credit the suite with entries that never invoke a check, which is a
@@ -3718,6 +4391,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
           f"reader the check depends on and require it to report DID NOT RUN rather "
           f"than a pass, and {probe_total} unit probe(s) that exercise a pure "
           f"function's rule in both directions and invoke no check")
+    if redis_not_run:
+        print(f"{redis_not_run} Redis-backed witness control(s) NOT RUN: give --self-test "
+              f"--redis-url to run them")
     return 0 if failures == 0 else 1
 
 
@@ -3726,6 +4402,8 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--check", choices=sorted(CHECKS))
     parser.add_argument("--bundle")
+    parser.add_argument("--redis-url",
+                        help="a disposable plaintext redis://HOST:PORT[/DB] for docs-redis")
     sub = parser.add_subparsers(dest="command")
 
     notices = sub.add_parser("notices")
@@ -3739,6 +4417,8 @@ def main() -> int:
     verify = sub.add_parser("verify")
     verify.add_argument("--bundle", required=True)
     verify.add_argument("--check", choices=sorted(CHECKS))
+    verify.add_argument("--redis-url",
+                        help="a disposable plaintext redis://HOST:PORT[/DB] for docs-redis")
 
     args = parser.parse_args()
     if args.self_test:

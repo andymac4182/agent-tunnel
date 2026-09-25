@@ -48,11 +48,22 @@ so the check cannot run them. Only thirteen may be marked that way:
 and the seven day-2 catalog commands of section 2.5 (never with `--dry-run`,
 which contacts no Redis and is executed below). It
 checks only that the real binary accepts the documented subcommand and flags;
-**their runtime behaviour is not checked by this guide.** The provisioning
-and day-2 commands, `serve` and `connect` are instead run end to end, against
-a real Redis, by `scripts/m6-provisioning-verify.sh` (sections 2.3 and 2.5),
-and `connect`'s reconnect across a relay restart by
-`scripts/m6-reconnect-verify.sh` (section 3.1).
+**their runtime behaviour is not checked by `--check docs`.** A second check,
+`verify --check docs-redis --redis-url redis://HOST:PORT`, executes them
+against the same bundle with a disposable Redis you supply (task row M6-C33):
+it runs this guide's session, then, in the directory the session left, runs
+the shape-only provisioning and day-2 commands of sections 2.3 and 2.5 in
+document order, with `/etc/agent-tunnel/...` mapped to the rehearsal's own
+files, checks that `serve` refuses the namespace before `provision-catalog`
+(section 2.3), then runs `serve` and `connect` and one echo through them and
+stops both with SIGTERM. The relay's listener certificate and the identity
+issuer are stand-ins it makes with `openssl`. Without `--redis-url` it
+reports DID NOT RUN, never a pass. `recovery-observe`, `recover` and
+`rebind-redis-run` are not executed by it. `scripts/m6-provisioning-verify.sh`
+also runs the provisioning and day-2 commands, `serve` and `connect` end to end
+with cargo-built binaries (sections 2.3 and 2.5), and
+`scripts/m6-reconnect-verify.sh` runs `connect`'s reconnect across a relay
+restart (section 3.1).
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
@@ -465,10 +476,11 @@ starting it too early costs nothing and you run `provision-catalog` next
 (M6-C34). A `tunnel-relay` built before M6-C34 does not refuse; do not start
 one of those until `provision-catalog` has succeeded, because provisioning
 refuses a namespace holding any key other than the incarnation binding.
-**Shape-only:** both write Redis, which this guide's
-check does not have. `scripts/m6-provisioning-verify.sh` runs them, `serve`,
-`connect` and an echo end to end with these binaries and the two examples
-against a real Redis:
+**Shape-only:** both write Redis, which `--check docs` does not have.
+`--check docs-redis` runs them with this bundle's binaries against a
+disposable Redis ("How this guide is tested"), and
+`scripts/m6-provisioning-verify.sh` runs them, `serve`, `connect` and an echo
+end to end with cargo-built binaries and the two examples:
 
 ```sh shape-only
 tunnel-relay activate-first-incarnation --config /etc/agent-tunnel/relay.toml
@@ -683,7 +695,8 @@ Catalog change is valid for namespace agent-tunnel-m1: revoke-device tenant=1111
 ```
 
 Then, against your Redis, the writes. **Shape-only:** they write Redis, which
-this guide's check does not have. `scripts/m6-provisioning-verify.sh` runs
+`--check docs` does not have; `--check docs-redis` runs all seven in this
+order with this bundle's binaries. `scripts/m6-provisioning-verify.sh` runs
 the four additions, `revoke-grant` and `revoke-device` end to end against a
 real Redis while `serve` is running, and `revoke-credential`'s refusal of a
 credential that is no longer active:
