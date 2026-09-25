@@ -62,20 +62,22 @@ pub(crate) struct UdpFaultProxy {
 
 impl UdpFaultProxy {
     pub(crate) async fn bind(server_address: SocketAddr) -> Result<Self> {
-        let socket = Arc::new(
-            UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .await
-                .map_err(|error| {
-                    HarnessError::Http(format!("binding M7 production UDP proxy: {error}"))
-                })?,
-        );
+        // In a C11 child the bind also holds the TCP port with the same
+        // number, so no TCP source address can print as this endpoint.
+        let socket = crate::c11_capture::bind_twinned_loopback_udp()
+            .and_then(|socket| {
+                socket.set_nonblocking(true)?;
+                Ok(UdpSocket::from_std(socket)?)
+            })
+            .map_err(|error| {
+                HarnessError::Http(format!("binding M7 production UDP proxy: {error}"))
+            })?;
+        let socket = Arc::new(socket);
         let address = socket.local_addr().map_err(|error| {
             HarnessError::Http(format!("reading M7 production UDP proxy address: {error}"))
         })?;
-        let target_text = server_address.to_string();
-        let local_text = address.to_string();
-        crate::c11_capture::record_sentinel("private_endpoint", target_text.as_bytes())?;
-        crate::c11_capture::record_sentinel("private_endpoint", local_text.as_bytes())?;
+        crate::c11_capture::record_udp_endpoint_sentinel(server_address)?;
+        crate::c11_capture::record_udp_endpoint_sentinel(address)?;
         let drop_packets = Arc::new(AtomicBool::new(false));
         let drop_clients = Arc::new(Mutex::new(HashSet::new()));
         let cancel = CancellationToken::new();

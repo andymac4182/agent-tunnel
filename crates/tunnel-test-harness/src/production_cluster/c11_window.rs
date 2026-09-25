@@ -1474,6 +1474,36 @@ mod tests {
         assert!(!format!("{error:?}").contains(std::str::from_utf8(secret).unwrap()));
     }
 
+    /// M7-C122: the hosted C11 red was this shape.  A CLI's own TCP source
+    /// address in `connect-status` has the same text as a UDP private
+    /// endpoint when the two port numbers coincide.  The scan stays byte
+    /// exact and key blind, so it must still report the match; the fixture,
+    /// not the scanner, keeps the numbers from coinciding.
+    #[test]
+    fn an_endpoint_under_any_key_is_still_reported_exactly() {
+        let endpoint = "127.0.0.1:50588";
+        let sentinel = Sentinel::new(SentinelKind::PrivateEndpoint, endpoint.as_bytes()).unwrap();
+        let spec = C11RunSpec::new(
+            "run-m7-c122",
+            "source-1",
+            "build-1",
+            FaultStage::Owner,
+            RunOutcome::Success,
+            100,
+            ["managed_process_3_stdout"],
+            vec![sentinel],
+        )
+        .unwrap();
+        let mut window = C11Window::new(spec);
+        let line = br#"{"command":"connect-status","ok":true,"result":{"control_local_addr":"127.0.0.1:50588"}}"#;
+        let error = window.append("managed_process_3_stdout", line).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "sensitive private_endpoint value in managed_process_3_stdout"
+        );
+        assert!(!error.to_string().contains(endpoint));
+    }
+
     #[test]
     fn every_sensitive_category_is_scanned_without_value_disclosure() {
         for (kind, value) in [

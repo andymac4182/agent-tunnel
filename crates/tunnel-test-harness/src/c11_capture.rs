@@ -8,9 +8,10 @@
 //! values in a receipt or error.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
+    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Mutex, OnceLock},
@@ -32,6 +33,10 @@ static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 type RecordedSentinel = (PathBuf, u8, Vec<u8>);
 static RECORDED_SENTINELS: OnceLock<Mutex<BTreeSet<RecordedSentinel>>> = OnceLock::new();
+/// Upper bound on UDP private endpoints one C11 child may hold a TCP twin for.
+const MAX_UDP_ENDPOINT_TWINS: usize = 256;
+type TcpTwins = Mutex<BTreeMap<SocketAddr, TcpListener>>;
+static UDP_ENDPOINT_TWINS: OnceLock<TcpTwins> = OnceLock::new();
 
 /// Return the opt-in capture directory, if the current process is a C11
 /// child. Ordinary acceptance runs do not pay any I/O cost at all.
@@ -61,6 +66,104 @@ pub(crate) fn retire_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
 
 pub(crate) fn record_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
     record_manifest_entry(kind, value, false)
+}
+
+/// Hold, for the rest of this C11 child, the TCP port whose number equals the
+/// UDP private endpoint `address`.
+///
+/// TCP and UDP have separate port spaces, so a live UDP endpoint on
+/// `127.0.0.1:N` does not stop the operating system handing `N` to a TCP
+/// socket as its ephemeral source port.  A CLI reports its own TCP source
+/// addresses in `connect-status` (`control_local_addr`, `active_local_addr`,
+/// `candidate_local_addr`), and those print as the same `127.0.0.1:N` text as
+/// the UDP endpoint.  The scanner compares exact bytes, so that ordinary
+/// allocation reads as a disclosed UDP endpoint (M7-C122).  Holding a TCP
+/// listener on the same address removes `N` from the TCP ephemeral pool, so
+/// no later TCP socket in the run can be given it, and the exact scan stays
+/// as strict as before: a real disclosure of the UDP endpoint still matches.
+///
+/// Returns `Ok(false)` when a TCP socket already holds that port, so the
+/// caller can allocate a different UDP port.  Outside a C11 child this does
+/// nothing and returns `Ok(true)`.
+pub(crate) fn hold_udp_endpoint_tcp_twin(address: SocketAddr) -> Result<bool> {
+    match twin_registry() {
+        Some(twins) => hold_tcp_twin_in(twins, address),
+        None => Ok(true),
+    }
+}
+
+/// The process-wide twin registry, only in a C11 child.
+fn twin_registry() -> Option<&'static TcpTwins> {
+    capture_dir()?;
+    Some(UDP_ENDPOINT_TWINS.get_or_init(|| Mutex::new(BTreeMap::new())))
+}
+
+fn hold_tcp_twin_in(twins: &TcpTwins, address: SocketAddr) -> Result<bool> {
+    let mut twins = twins
+        .lock()
+        .map_err(|_| HarnessError::Process("C11 UDP endpoint twin set was poisoned".into()))?;
+    if twins.contains_key(&address) {
+        return Ok(true);
+    }
+    if twins.len() >= MAX_UDP_ENDPOINT_TWINS {
+        return Err(HarnessError::Process(
+            "C11 UDP endpoint twins exceeded their bounded limit".into(),
+        ));
+    }
+    match TcpListener::bind(address) {
+        Ok(listener) => {
+            twins.insert(address, listener);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(false),
+        Err(_) => Err(HarnessError::Process(
+            "C11 UDP endpoint TCP twin could not be bound".into(),
+        )),
+    }
+}
+
+/// Record a UDP private endpoint, holding its TCP twin first.
+///
+/// A UDP endpoint whose port number a live TCP socket already holds cannot be
+/// scanned exactly (see [`hold_udp_endpoint_tcp_twin`]), so that is a fixture
+/// error rather than a sentinel which may later match an unrelated TCP
+/// address.  Fixtures that allocate UDP endpoints hold the twin at allocation
+/// and pick another port instead.
+pub(crate) fn record_udp_endpoint_sentinel(address: SocketAddr) -> Result<()> {
+    if capture_dir().is_none() {
+        return Ok(());
+    }
+    if !hold_udp_endpoint_tcp_twin(address)? {
+        return Err(HarnessError::Process(
+            "C11 UDP private endpoint shares its port number with a live TCP socket".into(),
+        ));
+    }
+    record_sentinel("private_endpoint", address.to_string().as_bytes())
+}
+
+/// Bind a loopback UDP socket whose TCP twin port is held in a C11 child.
+///
+/// Outside a C11 child this is exactly one ordinary `bind(127.0.0.1:0)`.  A
+/// port whose twin is taken is released and another is drawn, within a fixed
+/// bound.
+pub(crate) fn bind_twinned_loopback_udp() -> Result<std::net::UdpSocket> {
+    bind_twinned_loopback_udp_in(twin_registry())
+}
+
+fn bind_twinned_loopback_udp_in(twins: Option<&TcpTwins>) -> Result<std::net::UdpSocket> {
+    const MAX_ATTEMPTS: usize = 64;
+    for _ in 0..MAX_ATTEMPTS {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let Some(twins) = twins else {
+            return Ok(socket);
+        };
+        if hold_tcp_twin_in(twins, socket.local_addr()?)? {
+            return Ok(socket);
+        }
+    }
+    Err(HarnessError::Process(
+        "C11 could not allocate a UDP port whose TCP twin was free".into(),
+    ))
 }
 
 fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Result<()> {
@@ -304,4 +407,72 @@ pub(crate) fn harden_capture_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn harden_capture_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TcpTwins, bind_twinned_loopback_udp_in, hold_tcp_twin_in};
+    use std::{
+        collections::BTreeMap,
+        net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+        sync::Mutex,
+    };
+
+    fn registry() -> TcpTwins {
+        Mutex::new(BTreeMap::new())
+    }
+
+    /// The mechanism behind M7-C122: a live UDP endpoint leaves the TCP port
+    /// with the same number free, so a TCP socket can be given it, and a CLI
+    /// then prints the same `127.0.0.1:N` text as the UDP sentinel.
+    #[test]
+    fn a_live_udp_endpoint_leaves_its_tcp_port_number_free() {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP bind");
+        let address = udp.local_addr().expect("UDP address");
+        let tcp = TcpListener::bind(address)
+            .expect("TCP and UDP port spaces are separate, so this bind succeeds");
+        assert_eq!(tcp.local_addr().expect("TCP address"), address);
+    }
+
+    #[test]
+    fn a_held_twin_takes_the_udp_port_number_out_of_the_tcp_pool() {
+        let twins = registry();
+        let udp = bind_twinned_loopback_udp_in(Some(&twins)).expect("twinned UDP bind");
+        let address = udp.local_addr().expect("UDP address");
+        let error = TcpListener::bind(address)
+            .expect_err("a held twin must leave no TCP socket able to take this port");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(twins.lock().expect("twins").contains_key(&address));
+        // Holding the same endpoint again is idempotent.
+        assert!(hold_tcp_twin_in(&twins, address).expect("hold again"));
+        assert_eq!(twins.lock().expect("twins").len(), 1);
+    }
+
+    #[test]
+    fn a_port_number_a_tcp_socket_already_holds_is_refused_for_a_redraw() {
+        let twins = registry();
+        // Find a TCP port whose UDP number is also free, then hold it on TCP.
+        let (tcp, udp) = (0..64)
+            .find_map(|_| {
+                let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+                let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
+                Some((tcp, udp))
+            })
+            .expect("a port free on both TCP and UDP");
+        let address: SocketAddr = udp.local_addr().expect("UDP address");
+        assert!(
+            !hold_tcp_twin_in(&twins, address).expect("hold attempt"),
+            "a port a TCP socket already holds cannot be twinned"
+        );
+        assert!(twins.lock().expect("twins").is_empty());
+        drop(tcp);
+    }
+
+    #[test]
+    fn outside_a_c11_child_the_bind_is_one_ordinary_bind() {
+        let udp = bind_twinned_loopback_udp_in(None).expect("UDP bind");
+        let address = udp.local_addr().expect("UDP address");
+        // Nothing was twinned, so the TCP port stays free as before.
+        TcpListener::bind(address).expect("no twin outside a C11 child");
+    }
 }

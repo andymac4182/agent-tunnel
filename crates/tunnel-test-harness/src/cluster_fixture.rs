@@ -100,7 +100,9 @@ impl LoopbackPortReservation {
         tcp.set_nonblocking(true)?;
         let tcp_address = tcp.local_addr()?;
 
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        // In a C11 child this also holds the TCP port with the same number, so
+        // no CLI's TCP source address can print as this UDP endpoint.
+        let udp = crate::c11_capture::bind_twinned_loopback_udp()?;
         udp.set_nonblocking(true)?;
         let udp_address = udp.local_addr()?;
 
