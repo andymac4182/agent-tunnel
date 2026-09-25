@@ -5818,6 +5818,7 @@ async fn start_relay(
         recovery: None,
         http_forward: None,
         redis_restart_continuity_seconds: None,
+        metrics_bind: None,
     };
     let mut options = RelayOptions::new(harness.production_oidc_verifier()?);
     options.node_id = node.node_id.clone();
