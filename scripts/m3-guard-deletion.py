@@ -1360,6 +1360,118 @@ RELEASE_RACE_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-11: a refused credential names the protected-resource metadata.**
+#: Without the header a standard MCP client that has no token cannot
+#: discover the authorization server, and nothing else in the relay would go
+#: red: the refusal's status, code and message are unchanged.
+RELAY_FORWARD = RELAY / "src" / "http" / "forward.rs"
+AUTHORIZATION_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "http::mcp_authorization_tests::",
+]
+AUTHORIZATION_CASES: list[Case] = [
+    Case(
+        "a refused http-forward credential carries the bearer challenge",
+        [
+            (
+                RELAY_FORWARD,
+                "                response\n"
+                "                    .headers_mut()\n"
+                "                    .insert(header::WWW_AUTHENTICATE, challenge);\n",
+                "                let _ = challenge;\n",
+            )
+        ],
+        frozenset(
+            {
+                "http::mcp_authorization_tests::"
+                "refused_credentials_carry_a_bearer_challenge_naming_the_resource_metadata"
+            }
+        ),
+    ),
+]
+
+#: **M3-16: a revoked principal's sessions end on the device, and only its
+#: own.**  Witnessed by the export tests driven through the in-process bridge.
+EXPORT_STDIO = EXPORT / "src" / "stdio.rs"
+EXPORT_HTTP_BACKEND = EXPORT / "src" / "http_backend.rs"
+REVOKED_SESSIONS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-mcp-fixture",
+    "--test",
+    "principal_binding",
+    "--locked",
+    "--no-fail-fast",
+]
+REVOKED_SESSIONS_CASES: list[Case] = [
+    Case(
+        "a revoked principal's stdio sessions are ended",
+        [
+            (
+                EXPORT_STDIO,
+                "            .filter(|(_, session)| session.binding.as_deref() == Some(binding))\n",
+                "            .filter(|_| false)\n",
+            )
+        ],
+        frozenset({"a_revoked_principal_loses_its_stdio_sessions_and_only_its_own"}),
+    ),
+    Case(
+        "a revoked principal's Streamable HTTP sessions are forgotten",
+        [
+            (
+                EXPORT_HTTP_BACKEND,
+                "            .retain(|_, entry| entry.binding.as_deref() != Some(binding));\n",
+                "            .retain(|_, _| true);\n",
+            )
+        ],
+        frozenset(
+            {"a_revoked_principal_loses_its_streamable_http_sessions_and_only_its_own"}
+        ),
+    ),
+]
+
+#: **M3-22: a live stream keeps its own rotation observations.**  The
+#: relay-wide ring can evict them within one rotation over more than 64
+#: streams.
+ACTOR_HTTP_STREAM = RELAY / "src" / "actor_http_stream.rs"
+STREAM_OBSERVATIONS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::http_stream::tests::a_rotation_over_many_streams",
+]
+STREAM_OBSERVATIONS_CASES: list[Case] = [
+    Case(
+        "a stream's rotation observation is kept with the stream",
+        [
+            (
+                ACTOR_HTTP_STREAM,
+                "    http.remember_observation(observation.clone());\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "actor::http_stream::tests::"
+                "a_rotation_over_many_streams_cannot_lose_a_live_streams_observation"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -1378,6 +1490,19 @@ SUITES: list[Suite] = [
     Suite("m3c33-m3c15-freeze-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
     Suite("m3c15-freeze-hold", [RELAY], FREEZE_HOLD_TEST, FREEZE_HOLD_CASES),
     Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
+    Suite("m3c11-authorization", [RELAY], AUTHORIZATION_TEST, AUTHORIZATION_CASES),
+    Suite(
+        "m3c16-revoked-sessions",
+        [EXPORT, FIXTURE],
+        REVOKED_SESSIONS_TEST,
+        REVOKED_SESSIONS_CASES,
+    ),
+    Suite(
+        "m3c22-stream-observations",
+        [RELAY],
+        STREAM_OBSERVATIONS_TEST,
+        STREAM_OBSERVATIONS_CASES,
+    ),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
