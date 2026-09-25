@@ -253,7 +253,10 @@ async fn main() -> ExitCode {
             expect(
                 "initialize",
                 initialized.protocol_version == ProtocolVersion::V1,
-                format!("protocol={:?}", initialized.protocol_version),
+                format!(
+                    "protocol={}",
+                    serde_json::to_value(&initialized.protocol_version).unwrap_or(Value::Null)
+                ),
             );
             let session = connection
                 .send_request(NewSessionRequest::new(cwd))

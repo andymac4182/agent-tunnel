@@ -866,56 +866,88 @@ impl Gate<'_> {
                 .await
                 .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
                 .unwrap_or_default();
-            if status == http::StatusCode::SERVICE_UNAVAILABLE && body.contains("not_dispatched") {
-                let coincides = self.freeze.coincides();
-                self.ledger.refusals.fetch_add(1, Ordering::SeqCst);
-                if coincides {
-                    self.ledger.retries.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    let mut slot = self
-                        .ledger
-                        .unexplained
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        *slot = Some(self.freeze.unexplained());
-                    }
-                }
-                if coincides && retries < NOT_DISPATCHED_RETRIES {
-                    retries += 1;
-                    sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
-                    continue;
-                }
+            if status == http::StatusCode::SERVICE_UNAVAILABLE
+                && body.contains("not_dispatched")
+                && self.note_refusal(&mut retries).await
+            {
+                continue;
             }
             return Ok((status, headers, body));
         }
     }
 
-    /// Open an SSE stream and hold it.
+    /// Count one `503 not_dispatched` refusal, correlate it against an
+    /// **observed** rotation freeze, and say whether to resend.
+    ///
+    /// One discipline for both verbs (task row M8-C15): a GET refused by a
+    /// freeze is the same refusal as a POST refused by one, and it must be
+    /// counted and correlated the same way rather than surfacing as a bare
+    /// non-200 that fails the run as though the route were broken.  The first
+    /// refusal that does not coincide is recorded and fails the run by name;
+    /// it is never resent.
+    async fn note_refusal(&self, retries: &mut u64) -> bool {
+        let coincides = self.freeze.coincides();
+        self.ledger.refusals.fetch_add(1, Ordering::SeqCst);
+        if coincides {
+            self.ledger.retries.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let mut slot = self
+                .ledger
+                .unexplained
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(self.freeze.unexplained());
+            }
+        }
+        if coincides && *retries < NOT_DISPATCHED_RETRIES {
+            *retries += 1;
+            sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
+            return true;
+        }
+        false
+    }
+
+    /// Open an SSE stream and hold it, resending a freeze refusal exactly as
+    /// [`Self::post`] does.
     async fn open_stream(
         &self,
         consumer: &AcpConsumer,
         extra: &[(&str, &str)],
     ) -> Result<(http::StatusCode, http::HeaderMap, Option<HeldStream>)> {
-        let request = acp_request(
-            "GET",
-            &self.base_uri,
-            &self.token,
-            &[&[("accept", "text/event-stream")][..], extra].concat(),
-            empty_stream(),
-        )?;
-        let response = consumer
-            .sender
-            .clone()
-            .send_request(request)
-            .await
-            .map_err(|error| HarnessError::Http(format!("ACP GET: {error}")))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        if status != http::StatusCode::OK {
+        let mut retries = 0u64;
+        loop {
+            let request = acp_request(
+                "GET",
+                &self.base_uri,
+                &self.token,
+                &[&[("accept", "text/event-stream")][..], extra].concat(),
+                empty_stream(),
+            )?;
+            let response = consumer
+                .sender
+                .clone()
+                .send_request(request)
+                .await
+                .map_err(|error| HarnessError::Http(format!("ACP GET: {error}")))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            if status == http::StatusCode::OK {
+                return Ok((status, headers, Some(HeldStream::hold(response))));
+            }
+            if status == http::StatusCode::SERVICE_UNAVAILABLE {
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                    .unwrap_or_default();
+                if body.contains("not_dispatched") && self.note_refusal(&mut retries).await {
+                    continue;
+                }
+            }
             return Ok((status, headers, None));
         }
-        Ok((status, headers, Some(HeldStream::hold(response))))
     }
 
     /// The case boundary, and the **only** place membership is re-signed.
