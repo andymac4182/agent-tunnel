@@ -72,7 +72,7 @@ m3-sdk-conformance: fixture stack up: relay :53323, device connected, backend st
   sdk=python mode=auto case=prompts/get result=pass messages=1+1
   sdk=python mode=legacy case=initialize-known-m3-47 result=pass backend_error=-32020 upstream_row=M3-47
   sdk=python mode=legacy case=cancellation result=pass client_outcome=cancelled server_marker=cancelled
-  sdk=python mode=legacy case=close-cancel result=known row=M3-48 error="ClosedResourceError: "
+  sdk=python mode=legacy case=close-cancel result=known row=M3-48 late_post_502=1
   sdk=curl case=origin-refused result=pass status=400 header=origin
   conformance scenario=tools-call-with-progress direct=pass(2/2) relay=pass(2/2)
   conformance scenario=dns-rebinding-protection direct=pass(2/2) relay=fail(0/2) ... expected_failure_row=M3-49
@@ -91,7 +91,10 @@ The script exits 0 only if all of these hold:
   red.
 
 A `result=known` line is neither a pass nor a failure. It names the open row
-that explains it.
+that explains it, and is printed only for that row's exact signature: the
+Python SDK's close raising only `ClosedResourceError`, with a POST answered
+`502` after the session `DELETE` on the wire. More than two known results
+(one per Python mode) fails the run.
 
 ## Point your own client at the relay
 
