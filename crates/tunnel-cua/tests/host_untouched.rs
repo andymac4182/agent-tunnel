@@ -32,32 +32,44 @@
 //! other three proofs cover the rest, and none of the four is sufficient
 //! alone.
 //!
-//! # The gap this test has, stated rather than hidden
+//! # The Win32 surface, and why the lockfile alone cannot cover it
 //!
 //! **`windows-sys` is already in this workspace's lockfile**, reached from
 //! `tokio`/`mio`/`socket2` and gated in their manifests behind
 //! `cfg(windows)`. `Cargo.lock` records the union of every target's
 //! dependencies and carries no `cfg` information, so a lockfile scan **cannot
 //! distinguish a Win32 binding that is compiled from one that is gated away**.
-//! Putting `windows-sys` on the denylist would therefore turn this test red on
-//! a fact that has nothing to do with CUA, and deleting the check to make it
-//! green would be exactly the cue-word deletion `AGENTS.md` forbids.
+//! Putting `windows-sys` on the name denylist would therefore turn this test
+//! red on a fact that has nothing to do with CUA, and deleting the check to
+//! make it green would be exactly the cue-word deletion `AGENTS.md` forbids.
 //!
-//! So the denylist below covers the macOS and Linux capture and event-posting
-//! surfaces — which are genuinely absent, and one of which (`core-graphics`)
-//! is the surface that matters on the host these chunks run on — and the Win32
-//! surface is covered instead by
-//! [`the_two_m5_crates_declare_only_allowlisted_dependencies`], which is a
-//! stronger check over a smaller scope. The residual hole — a *transitive*
-//! Win32 input dependency on a Windows build — is recorded as task row
-//! **M5-C04** rather than claimed closed. It is not reachable today, because
-//! no M5 crate depends on anything that could introduce one, but this test is
-//! not what shows that.
+//! **Task row M5-C04 recorded that gap, and the per-target walk below closes
+//! it at the level the lockfile could not reach.** `windows-sys` as a crate is
+//! harmless: its input and capture surface is **feature-gated**
+//! (`Win32_UI_Input_KeyboardAndMouse` is where `SendInput` lives,
+//! `Win32_Graphics_Gdi` is `BitBlt`, and so on). So instead of denying the
+//! crate by name, [`no_m5_crate_reaches_a_win32_input_or_capture_surface_on_any_target`]
+//! asks cargo for the resolve graph **with each target's `cfg` filters
+//! applied** (`cargo metadata --filter-platform <triple>`, which needs no
+//! toolchain for that target and no network), walks it from the M5 crates,
+//! and denies the input/capture **features** of the Win32 binding crates
+//! wherever they are reached, plus every name on [`DENIED`], per target. A
+//! transitive dependency introduced on a Windows build is exactly what that
+//! walk sees and the lockfile did not.
 //!
-//! This does not run `cargo tree`. A test that shelled out to cargo inside a
-//! cargo test run is fragile and slow; the lockfile is the same information
-//! and is what `cargo tree` reads. `tunnel-acp/tests/pin.rs` scans the
-//! lockfile for the same kind of reason.
+//! **What it still does not see**, and this is parity with the other
+//! platforms rather than a Windows-specific hole: a crate that declares its
+//! own `extern "system"` imports from `user32.dll` — or uses `windows-link`'s
+//! raw-dylib macro — without enabling a binding crate's feature. The same is
+//! true on macOS of a crate that hand-writes `extern` declarations against
+//! Quartz instead of depending on `core-graphics`. That is the "a process can
+//! do FFI" limit stated above; the other three proofs cover it.
+//!
+//! **This file now runs `cargo` for that one test**, and it is written to be
+//! reliable rather than avoided: `--offline --locked`, the same `cargo` binary
+//! running the test (`$CARGO`), and a failure that names what to run
+//! (`cargo fetch --locked`) instead of a skip. The rest of the file still
+//! reads the lockfile directly, as `tunnel-acp/tests/pin.rs` does.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -145,22 +157,339 @@ const DENIED: &[(&str, &str)] = &[
     ("x11rb", "X11 client"),
     ("xcb", "X11 client"),
     ("wayland-client", "Wayland client"),
-    // `winapi` is not here, and neither is `windows-sys`: see the module
+    // Windows-only input and capture wrappers. Genuinely absent from the
+    // lockfile, so they can be denied by name like the rest.
+    ("winput", "Win32 input synthesis"),
+    ("windows-capture", "Windows.Graphics.Capture screen capture"),
+    ("win-screenshot", "Win32 screen capture"),
+    // `winapi`, `windows` and `windows-sys` are not here: see the module
     // documentation. They are not absent from this workspace, they are gated
-    // behind `cfg(windows)` in crates the lockfile cannot express a `cfg` for,
-    // and M5-C04 records the residue.
+    // behind `cfg(windows)` in crates the lockfile cannot express a `cfg` for.
+    // Their input/capture surface is denied at the **feature** level, per
+    // target, by `WIN32_DENIED_FEATURES`.
 ];
 
-/// The Win32 binding crates this scan deliberately cannot cover, and the row
-/// that owns the gap.
+/// The Win32 binding crates that are **not** denied by name in the lockfile
+/// scan, because the lockfile cannot say whether they are compiled.
 ///
-/// Named as data so the limitation is discoverable from the test rather than
-/// only from a comment, and so a future reader who does close the gap has the
-/// list to work from.
-const WIN32_NOT_COVERED: &[&str] = &["winapi", "windows", "windows-sys"];
+/// Each one must have an entry in [`WIN32_DENIED_FEATURES`]; that is what
+/// makes the exclusion a narrowing to the feature level rather than a hole,
+/// and `the_win32_bindings_are_denied_by_feature_rather_than_silently_excluded`
+/// holds the two lists together.
+const WIN32_BINDINGS_NOT_NAME_DENIED: &[&str] = &["winapi", "windows", "windows-sys"];
 
-/// The row that owns [`WIN32_NOT_COVERED`].
+/// The row that recorded the gap and records how it was closed.
 const WIN32_GAP_ROW: &str = "M5-C04";
+
+/// The input and capture surface of each Win32 binding crate, as the
+/// **features** that gate it.
+///
+/// A feature matches if it equals an entry or extends it with `_` (so
+/// `Win32_UI_Input` also denies `Win32_UI_Input_KeyboardAndMouse`, where
+/// `SendInput` lives). `windows` and `windows-sys` share the Win32 naming;
+/// `windows` adds the WinRT namespaces. `winapi` names features by header.
+const WIN32_DENIED_FEATURES: &[(&str, &[&str])] = &[
+    (
+        "windows-sys",
+        &[
+            // SendInput, keyboard/pointer state, raw input.
+            "Win32_UI_Input",
+            // SetWindowsHookEx, SendMessage/PostMessage, window enumeration.
+            "Win32_UI_WindowsAndMessaging",
+            // UI Automation: drives controls without synthesising input.
+            "Win32_UI_Accessibility",
+            // GetDC/BitBlt: the classic screen capture.
+            "Win32_Graphics_Gdi",
+            // IDXGIOutputDuplication: desktop duplication capture.
+            "Win32_Graphics_Dxgi",
+            // Windows.Graphics.Capture interop.
+            "Win32_System_WinRT_Graphics_Capture",
+        ],
+    ),
+    (
+        "windows",
+        &[
+            "Win32_UI_Input",
+            "Win32_UI_WindowsAndMessaging",
+            "Win32_UI_Accessibility",
+            "Win32_Graphics_Gdi",
+            "Win32_Graphics_Dxgi",
+            "Win32_System_WinRT_Graphics_Capture",
+            // WinRT: Windows.Graphics.Capture and Windows.UI.Input (whose
+            // Preview.Injection namespace is InputInjector).
+            "Graphics_Capture",
+            "UI_Input",
+        ],
+    ),
+    (
+        "winapi",
+        &[
+            "winuser",
+            "wingdi",
+            "dxgi",
+            "dxgi1_2",
+            "dxgi1_3",
+            "dxgi1_4",
+            "dxgi1_5",
+            "dxgi1_6",
+            "uiautomationclient",
+            "uiautomationcore",
+            "uiautomationcoreapi",
+        ],
+    ),
+];
+
+/// Whether `feature` of `crate_name` opens an input or capture surface.
+fn denied_win32_feature(crate_name: &str, feature: &str) -> bool {
+    WIN32_DENIED_FEATURES
+        .iter()
+        .filter(|(name, _)| *name == crate_name)
+        .flat_map(|(_, features)| features.iter())
+        .any(|denied| {
+            feature == *denied
+                || feature
+                    .strip_prefix(denied)
+                    .is_some_and(|rest| rest.starts_with('_'))
+        })
+}
+
+/// The targets the per-target walk evaluates.
+///
+/// Both Windows ABIs and both Windows architectures, because their `cfg`
+/// graphs differ (`windows-sys`'s import-library crates are per target), plus
+/// the Linux and Apple hosts so the same denylist is applied with *their*
+/// `cfg` filters rather than the lockfile's union.
+const TARGETS: &[&str] = &[
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+];
+
+const M5_CRATES: &[&str] = &["tunnel-cua", "tunnel-cua-export", "tunnel-cua-fixture"];
+
+/// `cargo metadata` for one target, with that target's `cfg` filters applied
+/// to the resolve graph.
+///
+/// `--offline --locked`: this must never touch the network or rewrite the
+/// lockfile. It needs every package's sources in the local registry cache,
+/// including the Windows-only ones a non-Windows build never downloads, so a
+/// fresh machine needs `cargo fetch --locked` first. That failure is reported
+/// as a failure with that instruction, **not** as a skip: a check that passes
+/// when it could not run is the thing this file exists to avoid.
+fn cargo_metadata(target: &str) -> serde_json::Value {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+            "--filter-platform",
+            target,
+            "--manifest-path",
+        ])
+        .arg(workspace_root().join("Cargo.toml"))
+        .output()
+        .expect("cargo can be run from a test");
+    assert!(
+        output.status.success(),
+        "cargo metadata --filter-platform {target} failed ({}); if the error is a missing \
+         package, run `cargo fetch --locked` so the Windows-only sources are cached:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON")
+}
+
+/// One package the M5 crates reach on one target: its name and the features
+/// the resolver enabled on it for that target.
+struct Reached {
+    name: String,
+    version: String,
+    features: BTreeSet<String>,
+}
+
+/// Walk the target-filtered resolve graph from the M5 crates.
+///
+/// Normal and build edges are followed everywhere; dev edges only from the M5
+/// crates themselves, because their tests run on a Lane A host and nothing
+/// else's do here. Features are the workspace-unified set for the target,
+/// which is a **superset** of what building only the M5 crates would enable —
+/// the safe direction for a denylist, with a measured cost: a crate *outside*
+/// the M5 closure that enables `Win32_UI_Input` on the same `windows-sys`
+/// version also turns the check red (M5-C04 records that control). In a
+/// workspace built as one, that is the same compiled `windows-sys` the M5
+/// binaries link, so it is worth a look rather than a false alarm.
+fn m5_reach(metadata: &serde_json::Value) -> Vec<Reached> {
+    let packages = metadata["packages"].as_array().expect("a package list");
+    let package = |id: &str| {
+        packages
+            .iter()
+            .find(|package| package["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is in the resolve but not the package list"))
+    };
+    let nodes: std::collections::BTreeMap<&str, &serde_json::Value> = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("a resolve graph")
+        .iter()
+        .map(|node| (node["id"].as_str().expect("a node id"), node))
+        .collect();
+    let roots: Vec<&str> = metadata["workspace_members"]
+        .as_array()
+        .expect("workspace members")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|id| M5_CRATES.contains(&package(id)["name"].as_str().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        roots.len(),
+        M5_CRATES.len(),
+        "every M5 crate is a workspace member of the resolve"
+    );
+    let mut seen = BTreeSet::new();
+    let mut queue = roots.clone();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = nodes
+            .get(id)
+            .unwrap_or_else(|| panic!("{id} has no resolve node"));
+        for dependency in node["deps"].as_array().expect("a dependency list") {
+            let non_dev = dependency["dep_kinds"]
+                .as_array()
+                .expect("dependency kinds")
+                .iter()
+                .any(|kind| kind["kind"] != "dev");
+            if non_dev || roots.contains(&id) {
+                queue.push(dependency["pkg"].as_str().expect("a package id"));
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|id| {
+            let package = package(id);
+            Reached {
+                name: package["name"].as_str().unwrap_or_default().to_owned(),
+                version: package["version"].as_str().unwrap_or_default().to_owned(),
+                features: nodes[id]["features"]
+                    .as_array()
+                    .expect("a feature list")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// **M5-C04's closure.** On every target, with that target's `cfg` filters
+/// applied, nothing the M5 crates reach is a denied crate or enables a Win32
+/// input or capture feature.
+///
+/// The controls are in the same test so they cannot be skipped separately:
+/// the walk visits a non-trivial number of nodes on every target, it reaches
+/// `windows-sys` **on the Windows targets** with its real features read (so
+/// the feature check is looking at a populated set on the crate it exists
+/// for), and it does **not** reach `windows-sys` on the others even though the
+/// lockfile contains it — which is the `cfg` filtering the lockfile scan
+/// could not do.
+#[test]
+fn no_m5_crate_reaches_a_win32_input_or_capture_surface_on_any_target() {
+    let lockfile = lock_package_names();
+    assert!(
+        lockfile.contains("windows-sys"),
+        "the cfg control below needs windows-sys in the lockfile"
+    );
+    for target in TARGETS {
+        let reached = m5_reach(&cargo_metadata(target));
+        let windows_sys: Vec<&Reached> = reached
+            .iter()
+            .filter(|package| package.name == "windows-sys")
+            .collect();
+        let bindings: Vec<String> = reached
+            .iter()
+            .filter(|package| WIN32_BINDINGS_NOT_NAME_DENIED.contains(&package.name.as_str()))
+            .map(|package| {
+                format!(
+                    "{}@{} ({} features)",
+                    package.name,
+                    package.version,
+                    package.features.len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "{target}: walked {} packages from {M5_CRATES:?}; Win32 bindings reached: {bindings:?}",
+            reached.len()
+        );
+        assert!(
+            reached.len() > 30,
+            "{target}: the walk visited only {} packages; it is reading nothing",
+            reached.len()
+        );
+        for root in M5_CRATES {
+            assert!(
+                reached.iter().any(|package| package.name == *root),
+                "{target}: {root} is not in its own walk"
+            );
+        }
+
+        let named: Vec<String> = reached
+            .iter()
+            .filter(|package| DENIED.iter().any(|(name, _)| *name == package.name))
+            .map(|package| format!("{}@{}", package.name, package.version))
+            .collect();
+        assert!(
+            named.is_empty(),
+            "{target}: the M5 crates reach {named:?}, which is capable of input or capture"
+        );
+        let features: Vec<String> = reached
+            .iter()
+            .flat_map(|package| {
+                package
+                    .features
+                    .iter()
+                    .filter(|feature| denied_win32_feature(&package.name, feature))
+                    .map(move |feature| format!("{}@{}/{feature}", package.name, package.version))
+            })
+            .collect();
+        assert!(
+            features.is_empty(),
+            "{target}: the M5 crates reach a Win32 input or capture surface through {features:?}. \
+             A binding crate is harmless; these features are not. Features are unified across \
+             the workspace, so the crate that enabled one may be outside the M5 closure: find it \
+             with `cargo tree --target {target} -e features -i <crate>`. Either way this needs a \
+             task row and a safety argument, per AGENTS.md, not an edit to WIN32_DENIED_FEATURES."
+        );
+
+        if target.contains("-windows-") {
+            assert!(
+                !windows_sys.is_empty(),
+                "{target}: windows-sys is not reached, so the feature check saw nothing on the \
+                 crate it exists for"
+            );
+            assert!(
+                windows_sys
+                    .iter()
+                    .any(|package| package.features.contains("Win32_Foundation")),
+                "{target}: windows-sys is reached with no Win32_Foundation feature; the \
+                 feature list is not being read"
+            );
+        } else {
+            assert!(
+                windows_sys.is_empty(),
+                "{target}: windows-sys is reached on a non-Windows target, so the cfg filter \
+                 was not applied"
+            );
+        }
+    }
+}
 
 /// **The proof.** No crate capable of input synthesis or screen capture is
 /// anywhere in this workspace's dependency graph.
@@ -290,36 +619,62 @@ fn no_m5_crate_can_reach_a_crate_capable_of_input_or_capture() {
     );
 }
 
-/// The gap is real, and this test says so out loud so it cannot be forgotten.
+/// The Win32 bindings are excluded from the **name** denylist only because
+/// they are denied at the **feature** level, and this test holds the two
+/// together so the exclusion cannot outlive its cover.
 ///
-/// It asserts that a Win32 binding crate is **present in the lockfile at all**,
-/// so that if one ever leaves, the row it names has to be revisited rather than
-/// quietly outliving its reason.
+/// It asserts that a Win32 binding crate is **present in the lockfile at all**
+/// (the reason a name denial is impossible), that every excluded binding has a
+/// feature denial in [`WIN32_DENIED_FEATURES`], and that the feature matcher
+/// answers both ways.
 ///
-/// **What it does not assert, corrected after review said so.** It does not
-/// check that the edge is `cfg(windows)`-gated. It cannot: `Cargo.lock` carries
-/// no `cfg` information, which is the whole reason M5-C04 exists. So an
-/// **ungated** Win32 dependency — precisely the failure M5-C04 is about — would
-/// satisfy this test exactly as the gated one does. The design is right and is
-/// unclosable by a lockfile scan; only the earlier sentence overclaimed.
+/// **What it does not assert.** It does not check that any edge is
+/// `cfg(windows)`-gated; `Cargo.lock` cannot say. That question is answered by
+/// [`no_m5_crate_reaches_a_win32_input_or_capture_surface_on_any_target`],
+/// which reads cargo's per-target resolve graph instead. Before M5-C04 closed,
+/// this test was the whole of the Win32 story and an ungated Win32 dependency
+/// would have satisfied it; it is now the bookkeeping half.
 #[test]
-fn the_win32_binding_gap_is_recorded_rather_than_silently_excluded() {
+fn the_win32_bindings_are_denied_by_feature_rather_than_silently_excluded() {
     let packages = lock_package_names();
     assert!(
-        WIN32_NOT_COVERED
+        WIN32_BINDINGS_NOT_NAME_DENIED
             .iter()
             .any(|name| packages.contains(*name)),
         "a Win32 binding crate is no longer in the lockfile, so {WIN32_GAP_ROW}'s \
-         premise has changed: revisit the row and consider denylisting {WIN32_NOT_COVERED:?}"
+         premise has changed: consider denylisting {WIN32_BINDINGS_NOT_NAME_DENIED:?} by name"
     );
-    // None of them is on the denylist, which is the deliberate exclusion this
-    // test documents.
-    for name in WIN32_NOT_COVERED {
+    for name in WIN32_BINDINGS_NOT_NAME_DENIED {
+        // Not on the name denylist, which is the deliberate exclusion ...
         assert!(
             !DENIED.iter().any(|(denied, _)| denied == name),
-            "{name} is both denylisted and recorded as not covered; pick one"
+            "{name} is both denylisted by name and excluded; pick one"
+        );
+        // ... and covered at the feature level instead, which is what makes
+        // the exclusion a narrowing rather than a hole.
+        assert!(
+            WIN32_DENIED_FEATURES
+                .iter()
+                .any(|(crate_name, features)| crate_name == name && !features.is_empty()),
+            "{name} is excluded from the name denylist with no feature denial to cover it"
         );
     }
+    // The matcher answers both ways: the exact feature, a sub-feature, a
+    // sibling that merely shares a prefix without the `_` boundary, a feature
+    // every Windows build enables, and the right feature on the wrong crate.
+    assert!(denied_win32_feature("windows-sys", "Win32_UI_Input"));
+    assert!(denied_win32_feature(
+        "windows-sys",
+        "Win32_UI_Input_KeyboardAndMouse"
+    ));
+    assert!(denied_win32_feature(
+        "windows",
+        "UI_Input_Preview_Injection"
+    ));
+    assert!(denied_win32_feature("winapi", "winuser"));
+    assert!(!denied_win32_feature("windows-sys", "Win32_UI_InputX"));
+    assert!(!denied_win32_feature("windows-sys", "Win32_Foundation"));
+    assert!(!denied_win32_feature("tokio", "Win32_UI_Input"));
     // The row that owns the gap is a real row in `docs/tasks.md`.
     let tasks = std::fs::read_to_string(workspace_root().join("docs").join("tasks.md"))
         .expect("docs/tasks.md is readable");
