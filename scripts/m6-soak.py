@@ -83,9 +83,9 @@ def free_port() -> int:
 
 
 def run(args: list[str], cwd: Path | None = None, stdin: bytes | None = None,
-        check: bool = True) -> subprocess.CompletedProcess:
+        check: bool = True, timeout: float = 120) -> subprocess.CompletedProcess:
     completed = subprocess.run([str(a) for a in args], cwd=str(cwd) if cwd else None,
-                               input=stdin, capture_output=True, timeout=120, check=False)
+                               input=stdin, capture_output=True, timeout=timeout, check=False)
     if check and completed.returncode != 0:
         raise SystemExit(f"step failed ({completed.returncode}): {' '.join(map(str, args[:3]))}: "
                          f"{completed.stderr.decode(errors='replace')[-800:]}")
@@ -217,7 +217,8 @@ class Stack:
 
     # -- events
     def event(self, kind: str, **fields) -> None:
-        record = {"t": round(time.time(), 3), "at": now_iso(), "event": kind, **fields}
+        record = {"t": round(time.time(), 3), "at": now_iso(), "event": kind,
+                  "load1": round(os.getloadavg()[0], 2), **fields}
         self.events.write(json.dumps(record) + "\n")
         print(f"[{record['at']}] {kind} {json.dumps(fields)}", flush=True)
 
@@ -588,7 +589,7 @@ class Sampler(threading.Thread):
         self.handle = self.path.open("w", newline="")
         self.handle.write(f"# nonce={stack.nonce} head={head_sha()} samples\n")
         self.writer = csv.writer(self.handle)
-        self.writer.writerow(["t", "process", "pid", "rss_kib", "fds", *METRIC_SERIES])
+        self.writer.writerow(["t", "load1", "process", "pid", "rss_kib", "fds", *METRIC_SERIES])
 
     def run(self) -> None:
         tick = 0
@@ -601,7 +602,7 @@ class Sampler(threading.Thread):
                 if not proc or proc.poll() is not None:
                     continue
                 fds = fd_count(proc.pid) if tick % self.fd_every == 0 else ""
-                row = [now, name, proc.pid, rss_kib(proc.pid), fds]
+                row = [now, round(os.getloadavg()[0], 2), name, proc.pid, rss_kib(proc.pid), fds]
                 row += [metrics.get(s, "") if name == "relay" else "" for s in METRIC_SERIES]
                 self.writer.writerow(row)
             self.handle.flush()
@@ -883,6 +884,12 @@ def summarize_samples(path: Path) -> dict:
     series: dict[str, list[dict]] = {}
     for row in reader:
         series.setdefault(row["process"], []).append(row)
+    loads = [float(r["load1"]) for items in series.values() for r in items if r.get("load1")]
+    if loads:
+        out["host_load1"] = {"min": min(loads), "mean": round(statistics.fmean(loads), 2),
+                             "max": max(loads),
+                             "samples_above_20": sum(1 for x in loads if x > 20),
+                             "samples": len(loads)}
     for name, items in series.items():
         rss = [int(r["rss_kib"]) for r in items if r["rss_kib"].isdigit()]
         fds = [int(r["fds"]) for r in items if r["fds"].isdigit()]
@@ -921,13 +928,21 @@ def write_summary(run_dir: Path, summary: dict) -> None:
 
 # ------------------------------------------------------------ experiments
 
+def wait_for_quiet(max_load: float) -> None:
+    """Refuse to measure on a starved host: wait until the 1-minute load is below max_load."""
+    while os.getloadavg()[0] >= max_load:
+        print(f"[{now_iso()}] waiting: load1={os.getloadavg()[0]:.1f} >= {max_load}", flush=True)
+        time.sleep(30)
+
+
 def make_run(args: argparse.Namespace, name: str) -> tuple[Path, str]:
+    wait_for_quiet(args.max_load)
     nonce = uuid.uuid4().hex[:12]
     run_dir = Path(args.logs) / f"{name}-{time.strftime('%Y%m%dT%H%M%S')}-{nonce}"
     run_dir.mkdir(parents=True)
     (run_dir / "run.txt").write_text(
         f"nonce={nonce} head={head_sha()} experiment={name} started={now_iso()} "
-        f"bins={args.bin_dir} host={os.uname().nodename} cpus={os.cpu_count()} "
+        f"bins={args.bin_dir} bins_source_head={args.bin_head} host={os.uname().nodename} cpus={os.cpu_count()} "
         f"loadavg={os.getloadavg()} argv={sys.argv[1:]}\n")
     return run_dir, nonce
 
@@ -968,7 +983,7 @@ async def soak(args: argparse.Namespace) -> None:
 
         async def progress():
             while time.time() < until:
-                await asyncio.sleep(300)
+                await asyncio.sleep(max(0.0, min(300.0, until - time.time())))
                 sessions, rotations, _ = stack.device_sessions("a")
                 stack.event("progress", requests=rec.count, sessions=len(sessions),
                             rotations=rotations, relay_alive=stack.relay.poll() is None,
@@ -1099,7 +1114,8 @@ class DedicatedRedis:
 
     def __init__(self, nonce: str):
         self.name = f"m6-03-soak-chaos-{nonce}"
-        run(["docker", "run", "-d", "--rm", "--name", self.name, "--label",
+        # Docker on this shared host can take minutes to start a container.
+        run(timeout=600, args=["docker", "run", "-d", "--rm", "--name", self.name, "--label",
              f"m6-03-soak={nonce}", "-p", "127.0.0.1::6379", REDIS_IMAGE,
              "redis-server", "--appendonly", "yes", "--appendfsync", "always"])
         port = run(["docker", "port", self.name, "6379/tcp"]).stdout.decode().strip().splitlines()[0]
@@ -1115,13 +1131,13 @@ class DedicatedRedis:
         raise SystemExit("dedicated Redis did not answer PING")
 
     def pause(self) -> None:
-        run(["docker", "pause", self.name])
+        run(["docker", "pause", self.name], timeout=300)
 
     def unpause(self) -> None:
-        run(["docker", "unpause", self.name])
+        run(["docker", "unpause", self.name], timeout=300)
 
     def remove(self) -> None:
-        run(["docker", "rm", "-f", self.name], check=False)
+        run(["docker", "rm", "-f", self.name], check=False, timeout=600)
 
 
 async def chaos(args: argparse.Namespace) -> None:
@@ -1294,6 +1310,10 @@ def main() -> None:
         p.add_argument("--bin-dir", required=True)
         p.add_argument("--logs", required=True)
         p.add_argument("--redis", default="127.0.0.1:63790")
+        p.add_argument("--max-load", type=float, default=20.0,
+                       help="wait until the 1-minute load average is below this before starting")
+        p.add_argument("--bin-head", default="unrecorded",
+                       help="the commit the binaries in --bin-dir were built from")
         if name == "soak":
             p.add_argument("--duration", type=float, default=7200)
             p.add_argument("--echo-workers", type=int, default=4)
@@ -1315,6 +1335,12 @@ def main() -> None:
     if args.cmd == "forwarder":
         forwarder_main(args)
         return
+    # SIGTERM/SIGHUP unwind through every `finally`, so children are stopped
+    # and the namespace (and a chaos run's container) removed.
+    def _unwind(signum, _frame):
+        raise SystemExit(f"stopped by signal {signum}")
+    signal.signal(signal.SIGTERM, _unwind)
+    signal.signal(signal.SIGHUP, _unwind)
     asyncio.run({"soak": soak, "load": load, "chaos": chaos, "fairness": fairness}[args.cmd](args))
 
 
