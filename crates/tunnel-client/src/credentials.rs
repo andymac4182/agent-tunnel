@@ -395,35 +395,111 @@ fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialE
 /// Install every `(source, destination)` pair, or none of them (task row
 /// M6-C55).
 ///
-/// 1. Every destination is checked first; if any exists, the refusal names
-///    it and nothing has been written.
-/// 2. Each source is copied to a staging file beside its destination
-///    (`create_new`, then synced), so a destination never appears holding a
-///    partial file.
-/// 3. Each staging file is hard-linked to its destination.  `link` fails
-///    rather than replacing an existing name, so a destination created
-///    concurrently after step 1 is still never overwritten.
-/// 4. If any step fails, every destination linked by this call is removed
-///    again -- it did not exist before, because its link succeeded -- and
-///    every staging file is removed on every path.
+/// 1. Every destination is checked first.  One that already holds exactly
+///    its source's bytes is treated as installed and skipped -- the state a
+///    crash between two links leaves, so the same import re-run completes it
+///    (review of M6-C55); one that holds anything else is refused, naming it,
+///    and nothing has been written.
+/// 2. Staging files an earlier import left behind by crashing (named
+///    `.<file>.import-<pid>-<n>` beside the destination) are removed once
+///    they are more than [`STALE_STAGING_AGE`] old.
+/// 3. Each remaining source is copied to a staging file beside its
+///    destination (`create_new`, then synced), so a destination never appears
+///    holding a partial file.
+/// 4. Each staging file is hard-linked to its destination, and the directory
+///    is synced.  `link` fails rather than replacing an existing name, so a
+///    destination created concurrently after step 1 is still never
+///    overwritten.  A filesystem without hard links (exFAT, some SMB and FUSE
+///    mounts) falls back to writing the destination with `create_new`: still
+///    never overwriting, but a crash mid-write can leave a partial file, which
+///    the next import refuses by name rather than trusting.
+/// 5. If any step fails, every destination installed by this call is removed
+///    again -- it did not exist before, because its link or `create_new`
+///    succeeded -- and every staging file is removed on every path.
+///
+/// All-or-nothing therefore holds for every **refusal**; a **crash** can
+/// leave the first file installed and a staging file behind, which re-running
+/// the same import completes and cleans up.
 #[cfg(unix)]
 fn install_new_files(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
-    for (_, destination) in installs {
+    let mut pending = Vec::with_capacity(installs.len());
+    for (source, destination) in installs {
         match fs::symlink_metadata(destination) {
-            Ok(_) => return Err(CredentialError::AlreadyExists((*destination).to_owned())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                let installed = fs::read(destination).map_err(CredentialError::Io)?;
+                let wanted = fs::read(source).map_err(CredentialError::Io)?;
+                if installed != wanted {
+                    return Err(CredentialError::AlreadyExists((*destination).to_owned()));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                pending.push((*source, *destination));
+            }
             Err(error) => return Err(CredentialError::Io(error)),
         }
     }
-    stage_and_link(installs)
+    for (_, destination) in &pending {
+        remove_stale_staging(destination);
+    }
+    stage_and_link(&pending)
 }
 
-/// Steps 2 to 4 of [`install_new_files`], without its up-front check, so the
+/// How old a leftover staging file must be before an import removes it, so a
+/// concurrent import's live staging file is left alone.
+#[cfg(unix)]
+const STALE_STAGING_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Remove `.<file>.import-*` staging files beside `destination` that are
+/// older than [`STALE_STAGING_AGE`].  Best effort: a failure here leaves a
+/// stray file, never a changed credential.
+#[cfg(unix)]
+fn remove_stale_staging(destination: &Path) {
+    let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let prefix = format!(".{}.import-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_STAGING_AGE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Steps 3 to 5 of [`install_new_files`], without its up-front check, so the
 /// rollback can be exercised against a destination that appears after the
 /// check.
 #[cfg(unix)]
 fn stage_and_link(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
-    let mut staged: Vec<PathBuf> = Vec::with_capacity(installs.len());
+    stage_and_link_with(installs, |staging, destination| {
+        fs::hard_link(staging, destination)
+    })
+}
+
+/// [`stage_and_link`] with the linking step injected, so the copy fallback
+/// can be exercised on a filesystem that does support hard links.
+#[cfg(unix)]
+fn stage_and_link_with(
+    installs: &[(&Path, &Path)],
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<(), CredentialError> {
+    let mut staged: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(installs.len());
     let mut linked: Vec<PathBuf> = Vec::with_capacity(installs.len());
     let result = (|| {
         for (source, destination) in installs {
@@ -435,17 +511,20 @@ fn stage_and_link(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
                 .map_err(CredentialError::Io)?;
             let staging = staging_path(destination);
             write_new(&staging, &bytes, false)?;
-            staged.push(staging);
+            staged.push((staging, bytes));
         }
-        for ((_, destination), staging) in installs.iter().zip(&staged) {
-            fs::hard_link(staging, destination).map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    CredentialError::AlreadyExists((*destination).to_owned())
-                } else {
-                    CredentialError::Io(error)
+        for ((_, destination), (staging, bytes)) in installs.iter().zip(&staged) {
+            match link(staging, destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(CredentialError::AlreadyExists((*destination).to_owned()));
                 }
-            })?;
+                // No hard links here: write the destination directly, still
+                // with `create_new`, so it is never overwritten.
+                Err(_) => write_new(destination, bytes, false)?,
+            }
             linked.push((*destination).to_owned());
+            sync_parent(destination)?;
         }
         Ok(())
     })();
@@ -454,10 +533,22 @@ fn stage_and_link(installs: &[(&Path, &Path)]) -> Result<(), CredentialError> {
             let _ = fs::remove_file(destination);
         }
     }
-    for staging in &staged {
+    for (staging, _) in &staged {
         let _ = fs::remove_file(staging);
     }
     result
+}
+
+/// Sync the directory holding `path`, so a new link survives a crash.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), CredentialError> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(CredentialError::Io)
 }
 
 /// A staging name beside `destination`, unique to this process and call.
@@ -1193,6 +1284,89 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec!["second".to_owned()], "no staging file survives");
+    }
+
+    /// Review of M6-C55, crash recovery: a crash between the two links leaves
+    /// the certificate installed and a staging file behind.  Re-running the
+    /// same import treats the byte-identical certificate as installed,
+    /// installs the CA, and removes the stale staging file; a certificate
+    /// that differs is still refused.
+    #[test]
+    #[cfg(unix)]
+    fn a_rerun_after_a_crash_between_links_completes_the_import() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(material::DEVICE)]);
+        let fixture = ImportFixture::new(&key, &certificate);
+        let credentials = fixture.dir.path().join("credentials");
+        fs::create_dir_all(&credentials).expect("credential dir");
+        // The crash: the certificate was linked, the CA was not, and the
+        // staging file of the CA survived.
+        fs::write(&fixture.config.credentials.client_certificate, &certificate)
+            .expect("certificate from the crashed run");
+        let stale = credentials.join(".installed-ca.pem.import-1-0");
+        fs::write(&stale, "partial").expect("stale staging");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the staging file");
+
+        fixture.import().expect("the re-run completes the import");
+        assert_eq!(
+            fixture.installed(),
+            vec![
+                "installed-ca.pem".to_owned(),
+                "installed-cert.pem".to_owned()
+            ],
+            "the CA is installed and the stale staging file is gone"
+        );
+
+        // A certificate that differs from the one being imported is still a
+        // refusal, not an overwrite.
+        fs::remove_file(&fixture.config.credentials.server_ca).expect("move CA aside");
+        fs::write(&fixture.config.credentials.client_certificate, "another\n").expect("other");
+        assert!(matches!(
+            fixture.import(),
+            Err(CredentialError::AlreadyExists(path))
+                if path == fixture.config.credentials.client_certificate
+        ));
+        assert!(!fixture.config.credentials.server_ca.exists());
+    }
+
+    /// Review of M6-C55: on a filesystem without hard links the install
+    /// falls back to writing each destination with `create_new`, and still
+    /// installs both files and leaves no staging file.
+    #[test]
+    #[cfg(unix)]
+    fn without_hard_links_the_install_falls_back_to_a_no_clobber_write() {
+        let dir = tempdir().expect("temporary directory");
+        let first_source = dir.path().join("first-source");
+        let second_source = dir.path().join("second-source");
+        fs::write(&first_source, "first").expect("first source");
+        fs::write(&second_source, "second").expect("second source");
+        let out = dir.path().join("out");
+        let first = out.join("first");
+        let second = out.join("second");
+        stage_and_link_with(
+            &[(&first_source, &first), (&second_source, &second)],
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+        )
+        .expect("the fallback installs both");
+        assert_eq!(fs::read_to_string(&first).expect("first"), "first");
+        assert_eq!(fs::read_to_string(&second).expect("second"), "second");
+        let mut left: Vec<String> = fs::read_dir(&out)
+            .expect("destination directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["first".to_owned(), "second".to_owned()]);
     }
 
     /// M6-C54: an expired certificate is refused on import, before any file

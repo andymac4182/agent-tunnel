@@ -1254,7 +1254,24 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
 /// export or the consumer can observe, while refusing them -- the behaviour
 /// before M6-C58 -- failed every stock client's first request with an
 /// `HTTP_INVALID_HEAD` that did not say which header to remove.
-const DROPPED_CLIENT_HEADERS: [http::HeaderName; 2] = [header::USER_AGENT, header::ACCEPT_ENCODING];
+///
+/// Node's built-in `fetch` (undici; measured on the wire with Node 24.21.0,
+/// undici 7.29.1) also sends `accept-language: *` and `sec-fetch-mode: cors`
+/// on every request.  `accept-language` is a content-negotiation hint no
+/// export acts on, and `sec-fetch-mode` is advisory Fetch Metadata with no
+/// routing or credential authority; neither is forwarded.  A browser, which
+/// browser-capable endpoints would need, is still refused: it also sends
+/// `origin` (and `sec-fetch-site`/`sec-fetch-dest`), which stay unlisted.
+/// Python `httpx`'s defaults (`accept`, `accept-encoding`, `connection:
+/// keep-alive`, `user-agent`; `BaseClient.headers` in `httpx/_client.py`) are
+/// covered by the first two entries, the profiles' own `accept`, and the
+/// bridge's consumption of HTTP/1.1 `connection: keep-alive`.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 4] = [
+    header::USER_AGENT,
+    header::ACCEPT_ENCODING,
+    header::ACCEPT_LANGUAGE,
+    http::HeaderName::from_static("sec-fetch-mode"),
+];
 
 /// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
 /// them, in which case they are forwarded as that profile says.  Every other
@@ -1296,8 +1313,9 @@ pub(crate) fn first_unlisted_request_header(
         .keys()
         .map(http::HeaderName::as_str)
         .filter(|name| !CONSUMED_REQUEST_FIELDS.contains(name))
-        .find(|name| !policy.allows(name))
-        .filter(|name| name.len() <= 128)
+        // The first *nameable* unlisted header: one over the bound is skipped
+        // rather than leaving the refusal unnamed.
+        .find(|name| name.len() <= 128 && !policy.allows(name))
         .map(str::to_owned)
 }
 
@@ -2284,6 +2302,76 @@ mod tests {
     /// body.
     #[tokio::test]
     async fn a_stock_clients_default_headers_reach_an_mcp_export() {
+        // Review of M6-C58: the two stacks MCP clients are most often built
+        // on, with the headers they add by default.  Node `fetch` (undici):
+        // the exact header list captured on the wire from Node 24.21.0 /
+        // undici 7.29.1 for a `fetch` that set only `content-type` and
+        // `accept`.  Python `httpx`: `BaseClient.headers` defaults in
+        // `httpx/_client.py` (`Accept: */*` is replaced by the MCP SDK's own
+        // `accept`).
+        let node_fetch: &[(&str, &str)] = &[
+            ("host", "127.0.0.1"),
+            ("connection", "keep-alive"),
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+            ("accept-language", "*"),
+            ("sec-fetch-mode", "cors"),
+            ("user-agent", "node"),
+            ("accept-encoding", "gzip, deflate"),
+            ("content-length", "2"),
+        ];
+        let httpx: &[(&str, &str)] = &[
+            ("host", "127.0.0.1"),
+            ("accept", "application/json, text/event-stream"),
+            ("accept-encoding", "gzip, deflate"),
+            ("connection", "keep-alive"),
+            ("user-agent", "python-httpx/0.28.1"),
+            ("content-type", "application/json"),
+            ("content-length", "2"),
+        ];
+        for profile in tunnel_mcp::McpProfile::ALL {
+            let policies = profile
+                .policies(tunnel_mcp::McpLimits::default())
+                .expect("MCP profile");
+            for (client, headers) in [("node fetch", node_fetch), ("httpx", httpx)] {
+                let mut request = http::Request::post("/mcp").version(http::Version::HTTP_11);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request = request.header("mcp-protocol-version", profile.protocol_version());
+                if profile == tunnel_mcp::McpProfile::V2026_07_28 {
+                    request = request.header("mcp-method", "tools/list");
+                }
+                let mut parts = request.body(()).expect("request").into_parts().0;
+                strip_default_client_headers(&mut parts.headers, &policies.request.headers);
+                tunnel_http_bridge::normalize::request_head(&parts, &policies.request)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: {client}'s default head was refused: {error:?}",
+                            profile.id()
+                        )
+                    });
+            }
+        }
+        // Nit: a header over the name bound is skipped, and the next
+        // unlisted one is named instead of none.
+        let policies = tunnel_mcp::McpProfile::V2025_11_25
+            .policies(tunnel_mcp::McpLimits::default())
+            .expect("MCP profile");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_bytes(format!("x-{}", "a".repeat(200)).as_bytes()).unwrap(),
+            http::HeaderValue::from_static("1"),
+        );
+        headers.insert("x-short", http::HeaderValue::from_static("1"));
+        assert_eq!(
+            first_unlisted_request_header(&headers, &policies.request.headers).as_deref(),
+            Some("x-short")
+        );
+    }
+
+    #[tokio::test]
+    async fn curl_style_default_headers_reach_an_mcp_export() {
         for profile in tunnel_mcp::McpProfile::ALL {
             let policies = profile
                 .policies(tunnel_mcp::McpLimits::default())

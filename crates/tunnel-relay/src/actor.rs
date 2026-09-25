@@ -15106,8 +15106,10 @@ impl Relay {
         );
         let consumer_cancel = cancel.child_token();
         let device_cancel = cancel.child_token();
-        let consumer_socket_options = listener_options.consumer;
-        let device_socket_options = listener_options.device;
+        let mut consumer_socket_options = listener_options.consumer;
+        consumer_socket_options.listener.get_or_insert("consumer");
+        let mut device_socket_options = listener_options.device;
+        device_socket_options.listener.get_or_insert("device");
         let consumer_task = spawn_transport_listener(cancel.clone(), async move {
             tunnel_transport::serve_with_socket_options(
                 consumer_listener,

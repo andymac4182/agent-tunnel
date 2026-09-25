@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 
+pub mod log_limit;
 mod peer;
 mod peer_probe;
 mod server;
@@ -33,7 +34,7 @@ pub use server::{
     AcceptedSocketDiagnostics, AcceptedSocketOptions, DEFAULT_HANDSHAKE_TIMEOUT,
     DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_MAX_CONCURRENT_HANDSHAKES,
     DEFAULT_MAX_HTTP1_HEADERS, DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES, DEFAULT_MAX_HTTP2_STREAMS,
-    DEFAULT_PRE_REQUEST_TIMEOUT, ListenerTimeouts, TransportError, serve,
+    DEFAULT_PRE_REQUEST_TIMEOUT, ListenerTimeouts, TransportError, log_tls_refusal, serve,
     serve_with_listener_options, serve_with_socket_options,
 };
 pub use tls::{

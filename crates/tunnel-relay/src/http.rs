@@ -1174,10 +1174,13 @@ async fn echo(
                     match forwarded_consumer_bearer(&bearer_token, route.owner_token().clone()) {
                         Ok(value) => value,
                         Err(_) => {
+                            // The token was already accepted above; only
+                            // re-framing it for the owner failed.  Same text
+                            // as every other refused token (M6-C53).
                             return error_response(
                                 StatusCode::UNAUTHORIZED,
                                 "UNAUTHORIZED",
-                                "consumer authentication failed",
+                                CONSUMER_TOKEN_REFUSED,
                                 "not_dispatched",
                             );
                         }
@@ -2371,7 +2374,13 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
         OidcError::MissingKeyId | OidcError::UnknownKey => refused("kid"),
         OidcError::ClaimsRejected => refused("claims"),
         OidcError::UnknownConsumer => refused("identity"),
-        OidcError::InvalidConfiguration => refused("verifier_configuration"),
+        // The relay's own verifier configuration, not the consumer's token:
+        // a server-side fault, so the consumer is told it is unavailable.
+        OidcError::InvalidConfiguration => ConsumerRefusal {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "consumer authorization is unavailable",
+            stage: "verifier_configuration",
+        },
         OidcError::InsufficientScope => ConsumerRefusal {
             status: StatusCode::FORBIDDEN,
             message: "the consumer access token does not grant this route's scope",
@@ -2380,18 +2389,42 @@ pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
     }
 }
 
+/// The process-wide limit on credential-stage `consumer request refused`
+/// lines.  Every such stage is reachable before the consumer is identified --
+/// no token at all is one -- so anyone who can reach the consumer listener
+/// could otherwise set the growth rate of the relay's `info` log (review of
+/// M6-C52).  `grant` refusals, which follow authentication, are not limited.
+static CONSUMER_REFUSAL_LOG: std::sync::LazyLock<tunnel_transport::log_limit::RefusalLogLimiter> =
+    std::sync::LazyLock::new(tunnel_transport::log_limit::RefusalLogLimiter::with_defaults);
+
 /// Task row M6-C52: one bounded, payload-free line per refused consumer
-/// request.  Every field is a fixed label, a status or an identifier the
-/// relay resolved itself; the token, its claims, the request path and the
-/// body are never logged.
+/// request, rate limited per stage.  Every field is a fixed label, a status,
+/// a count or an identifier the relay resolved itself; the token, its claims,
+/// the request path and the body are never logged.
 pub(crate) fn log_consumer_refusal(route: &'static str, refusal: &ConsumerRefusal) {
+    log_consumer_refusal_with(&CONSUMER_REFUSAL_LOG, route, refusal);
+}
+
+/// [`log_consumer_refusal`] against an explicit limiter; returns whether the
+/// line was written.  An admitted line carries `suppressed`, the number of
+/// lines for its stage dropped since the previous one.
+pub(crate) fn log_consumer_refusal_with(
+    limiter: &tunnel_transport::log_limit::RefusalLogLimiter,
+    route: &'static str,
+    refusal: &ConsumerRefusal,
+) -> bool {
+    let Some(suppressed) = limiter.admit(refusal.stage) else {
+        return false;
+    };
     tracing::info!(
         phase = "consumer_refused",
         route,
         stage = refusal.stage,
         status = refusal.status.as_u16(),
+        suppressed,
         "consumer request refused"
     );
+    true
 }
 
 /// Task row M6-C52: an authenticated consumer refused by its grant.  The
@@ -4229,12 +4262,21 @@ fn control_refusal_close(error: &RelayError) -> Option<(Message, &'static str)> 
 /// so a device reaching a non-owner relay is told the same thing as one
 /// reaching the owner.  Every other refusal -- catalog, capacity, shutdown --
 /// may heal and is `503`, which the ingress keeps as an untyped close.
-/// Before M6-C38 every non-`OwnerBusy` refusal was `403`, so the ingress
-/// could not tell a refused identity from a transient owner failure.
+///
+/// **The statuses are chosen so a mixed-version cluster is safe during a
+/// rolling upgrade (review of M6-C38).**  An owner from before M6-C38 answers
+/// `409` for owner busy and `403` for *every* other refusal, a catalog outage
+/// included.  A refused identity is therefore `401` here, a status an older
+/// owner never sends for a control registration, and the ingress treats `403`
+/// as that older owner's catch-all: an untyped, retried close, exactly as
+/// before M6-C38.  So no new ingress can turn an old owner's transient
+/// refusal into a terminal exit, and the only cost of the mix is that an old
+/// owner's genuine identity refusal is still retried until it is upgraded.
+/// The protocol-major refusal (`426`) is likewise never sent by an old owner.
 fn forwarded_control_refusal_status(error: &RelayError) -> StatusCode {
     match error {
         RelayError::OwnerBusy => StatusCode::CONFLICT,
-        RelayError::Unauthorized => StatusCode::FORBIDDEN,
+        RelayError::Unauthorized => StatusCode::UNAUTHORIZED,
         RelayError::UnsupportedProtocolMajor => StatusCode::UPGRADE_REQUIRED,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -4246,9 +4288,11 @@ fn remote_control_refusal_close(error: &PeerRuntimeError) -> Option<(Message, &'
         PeerRuntimeError::RemoteStatus(StatusCode::CONFLICT) => {
             Some((owner_busy_close(), "owner_busy"))
         }
-        PeerRuntimeError::RemoteStatus(StatusCode::FORBIDDEN) => {
+        PeerRuntimeError::RemoteStatus(StatusCode::UNAUTHORIZED) => {
             Some((identity_rejected_close(), "identity_rejected"))
         }
+        // `403` is only ever an owner from before M6-C38, whose `403` also
+        // covers refusals that heal: keep it retryable (see above).
         PeerRuntimeError::RemoteStatus(StatusCode::UPGRADE_REQUIRED) => {
             Some((protocol_unsupported_close(), "protocol_major_unsupported"))
         }
@@ -5022,6 +5066,26 @@ mod tests {
             assert!(
                 remote_control_refusal_close(&PeerRuntimeError::RemoteStatus(status)).is_none(),
                 "{transient}"
+            );
+        }
+        // Review of M6-C38, mixed-version cluster: an owner from before
+        // M6-C38 answers `403` for every non-busy refusal, a catalog outage
+        // included, so a new ingress must keep `403` retryable.  Only `409`
+        // means the same thing to both versions.
+        assert!(
+            remote_control_refusal_close(&PeerRuntimeError::RemoteStatus(StatusCode::FORBIDDEN))
+                .is_none(),
+            "an old owner's catch-all 403 must not become a terminal close"
+        );
+        for error in [
+            RelayError::Unauthorized,
+            RelayError::UnsupportedProtocolMajor,
+            RelayError::Catalog("catalog unavailable".to_owned()),
+        ] {
+            assert_ne!(
+                forwarded_control_refusal_status(&error),
+                StatusCode::FORBIDDEN,
+                "{error}: a new owner never sends the old catch-all"
             );
         }
     }

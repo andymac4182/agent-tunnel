@@ -379,9 +379,55 @@ async fn every_route_gives_each_refusal_cause_one_status_and_one_truthful_messag
         }
     }
     assert!(!logs.contains("not-a-jwt"));
+
+    // Review of M6-C52: the credential stages are reachable with no
+    // credential at all, so a flood of them is rate limited per stage.  Sixty
+    // requests with no token are each refused, and at most the limiter's
+    // burst of lines is written for the `bearer` stage in its window (some of
+    // which the loop above already used).
+    captured.0.lock().expect("log buffer").clear();
+    for _ in 0..60 {
+        let (status, _) = send(address, "GET /v1/devices HTTP/1.1\r\n", None).await;
+        assert_eq!(status, 401);
+    }
+    let flood = captured.text();
+    let bearer_lines = flood
+        .lines()
+        .filter(|line| {
+            line.contains("consumer request refused") && line.contains("stage=\"bearer\"")
+        })
+        .count();
+    assert!(
+        bearer_lines <= tunnel_transport::log_limit::DEFAULT_REFUSAL_LOG_BURST as usize,
+        "{bearer_lines} bearer-stage lines for 60 unauthenticated requests"
+    );
     assert!(
         !logs.contains("consumer-refusal-stranger"),
         "claims are not logged"
     );
     let _ = std::io::stderr().flush();
+}
+
+/// Review of M6-C53: a verifier configuration fault is the relay's, not the
+/// consumer's, so it is `503`, never a `401` that blames the token.
+#[test]
+fn a_verifier_configuration_fault_is_unavailable_not_a_refused_token() {
+    let refusal =
+        super::classify_consumer_refusal(&tunnel_catalog::OidcError::InvalidConfiguration);
+    assert_eq!(refusal.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(refusal.message, CONSUMER_TOKEN_REFUSED);
+}
+
+/// Review of M6-C52: the limiter the relay's credential-stage lines go
+/// through admits its burst per stage and no more, and stages are separate.
+#[test]
+fn credential_stage_refusal_lines_are_rate_limited_per_stage() {
+    let limiter = tunnel_transport::log_limit::RefusalLogLimiter::new(4, Duration::from_secs(60));
+    let bearer = super::classify_consumer_refusal(&tunnel_catalog::OidcError::MissingBearer);
+    let token = super::classify_consumer_refusal(&tunnel_catalog::OidcError::InvalidToken);
+    let written = (0..200)
+        .filter(|_| super::log_consumer_refusal_with(&limiter, "unit", &bearer))
+        .count();
+    assert_eq!(written, 4);
+    assert!(super::log_consumer_refusal_with(&limiter, "unit", &token));
 }

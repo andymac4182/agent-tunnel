@@ -280,11 +280,18 @@ creates. Certificate renewal and self-service enrollment are not implemented
 [runtime.md](runtime.md#proposed-cli-surface); the renewal shape is an open
 owner decision, M6-C56 and M0-03).
 
-`credentials import` installs the certificate and the server CA together or
-not at all (M6-C55). It checks both destinations before writing either,
-writes each under a staging name beside it, and links it into place without
-replacing anything, so a refusal -- `refusing to overwrite` either file, or
-anything else -- leaves the profile exactly as it was. It refuses a certificate
+`credentials import` never leaves the profile half-updated by a **refusal**
+(M6-C55). It checks both destinations before writing either, writes each under
+a staging name beside it (`.<file>.import-<pid>-<n>`), and links it into place
+without replacing anything, so a refusal -- `refusing to overwrite` either
+file, or anything else -- leaves the profile exactly as it was. A **crash**
+between the two links can leave the certificate installed without the CA; run
+the same import again. It treats a destination that already holds exactly the
+file being imported as installed, installs the other, and removes staging
+files an earlier crash left behind. The install uses hard links; on a
+filesystem without them (exFAT, some SMB or FUSE mounts) it writes each file
+directly instead, still never overwriting one, and a crash mid-write there can
+leave a partial file that the next import refuses by name. It refuses a certificate
 that is already past its `notAfter` on this host's clock, which `connect` would
 only refuse later. A certificate whose `notBefore` is still ahead is imported
 with a warning on stderr naming that time, because a host whose clock is behind
@@ -512,14 +519,16 @@ rules, and each needs its own operation in the token's `scope`:
 
 * **MCP**: `/v1/devices/<device.id>/services/<service.id>/http/mcp`, scope
   `http:invoke`, speaking MCP's Streamable HTTP. The relay drops a request's
-  `User-Agent` and `Accept-Encoding` headers, which most HTTP clients send by
-  default, rather than refusing it; any other header the profile does not list
-  gets `400 HTTP_INVALID_HEAD` with the header's name in the body's `header`
-  field (M6-C58).
+  `User-Agent`, `Accept-Encoding`, `Accept-Language` and `Sec-Fetch-Mode`
+  headers rather than refusing it. That covers what curl, Python `httpx` and
+  Node's built-in `fetch` send by default. Any other header the profile does
+  not list gets `400 HTTP_INVALID_HEAD` with the header's name in the body's
+  `header` field (M6-C58); a browser, which also sends `Origin`, is still
+  refused.
 * **ACP**: `/v1/devices/<device.id>/services/<service.id>/http/acp`, scope
   `http:invoke`, over **HTTP/2** only. An HTTP/1.1 request gets `501
-  HTTP_UNSUPPORTED_FEATURE`. As for MCP, `User-Agent` and `Accept-Encoding`
-  are dropped and any other unlisted header is refused by name (M6-C58).
+  HTTP_UNSUPPORTED_FEATURE`. As for MCP, the same four headers are dropped
+  and any other unlisted header is refused by name (M6-C58).
 * **Filesystem**: `/v1/devices/<device.id>/services/<service.id>/fs`, scope
   `fs:connect`. A `GET` returns the export's descriptor. A WebSocket upgrade
   with subprotocol `agent-tunnel.9p.v1` opens a 9P2000.L session
@@ -1208,7 +1217,12 @@ What an operator can read today:
 
 **Refusals are logged at the default level** (M6-C52), one bounded line each,
 carrying fixed labels and identifiers only -- never a token, a claim, a path,
-a certificate or a body:
+a certificate or a body. The refusals anyone can cause without a credential
+-- every `consumer request refused` stage except `grant`, and every `TLS
+handshake refused` line -- are **rate limited**: at most 20 lines per stage or
+label in any 10 s, and the next line written for that stage carries
+`suppressed=N`, the number it replaced. `grant` refusals and `device session
+refused` lines come after authentication and are not limited:
 
 - `consumer request refused`, with `route` (`devices`, `services`, `echo`,
   `stream`, `http-forward`, `fs`), `stage` and `status`. The stage is
@@ -1221,7 +1235,8 @@ a certificate or a body:
   on a cluster relay, `control_forwarded`), `refusal` (`identity_rejected`,
   `credential_not_active`, `protocol_major_unsupported`, `owner_busy`) and
   `certificate_device`, the UUID in the TLS-verified certificate's role SAN.
-- `TLS handshake refused`, with `refusal`: `client_certificate_missing`,
+- `TLS handshake refused`, with `listener` (`consumer` or `device`) and
+  `refusal`: `client_certificate_missing`,
   `..._expired`, `..._not_yet_valid`, `..._unknown_issuer`,
   `..._bad_signature`, `..._revoked`, `..._wrong_purpose`, `..._invalid`, or
   `peer_refused_server_certificate` (with `_unknown_ca` or `_expired` when the
@@ -1256,7 +1271,10 @@ matches the key, owner-only permissions, certificate expiry, and whether
 `tunnel-deadman` is beside the client. It opens no network connection. **It
 always prints its full `result`, even when it fails** (M6-C07), so a
 half-provisioned machine can still see which checks passed. `not_run` means a
-check could not be attempted, which is different from `failed`:
+check could not be attempted, which is different from `failed`. Since M6-C44
+`result` also carries `device_identity`, an additive field (the report's
+`schema_version` stays `1`): `failed` with `CREDENTIAL_DEVICE_MISMATCH` means
+the profile's `device_id` does not name the certificate's device:
 
 ```console
 $ tunnel-client doctor --config trial/absent.toml --json; echo "exit=$?"

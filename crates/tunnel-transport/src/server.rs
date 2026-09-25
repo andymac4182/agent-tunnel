@@ -198,6 +198,9 @@ pub struct AcceptedSocketOptions {
     pub send_buffer_bytes: Option<u32>,
     /// Optional bounded sample of the actual accepted-socket buffer size.
     pub diagnostics: Option<AcceptedSocketDiagnostics>,
+    /// A fixed name for this listener (`consumer`, `device`) carried by its
+    /// TLS refusal log lines (M6-C52); `None` logs `unnamed`.
+    pub listener: Option<&'static str>,
 }
 
 /// Errors returned by the listener supervisor itself.  A malformed or
@@ -358,9 +361,10 @@ pub async fn serve_with_listener_options(
                 let acceptor = acceptor.clone();
                 let router = router.clone();
                 let connection_cancel = child_cancel.child_token();
+                let listener_name = socket_options.listener.unwrap_or("unnamed");
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = serve_connection(stream, acceptor, router, connection_cancel, timeouts).await {
+                    if let Err(error) = serve_connection(stream, acceptor, router, connection_cancel, timeouts, listener_name).await {
                         tracing::debug!(%remote_addr, ?error, "TLS/HTTP connection closed");
                     }
                     Ok::<(), TransportError>(())
@@ -474,6 +478,7 @@ async fn serve_connection(
     router: Router,
     cancel: CancellationToken,
     timeouts: ListenerTimeouts,
+    listener: &'static str,
 ) -> Result<(), TransportError> {
     let handshake = timeout(timeouts.handshake_timeout, acceptor.accept(stream));
     let tls_stream = match tokio::select! {
@@ -488,9 +493,11 @@ async fn serve_connection(
             // my device refused", so it is logged at the default level with a
             // fixed label; anything else (a scanner, a health check's bare
             // TCP close) stays at debug.
+            // Any peer that can reach the listener can trigger it, so the
+            // line is rate limited per label (review of M6-C52).
             match tls_refusal_label(&error) {
                 Some(refusal) => {
-                    tracing::info!(phase = "tls_refused", refusal, "TLS handshake refused")
+                    log_tls_refusal(&TLS_REFUSAL_LOG, listener, refusal);
                 }
                 None => tracing::debug!(?error, "TLS handshake rejected"),
             }
@@ -557,6 +564,34 @@ async fn serve_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+/// The process-wide limit on `TLS handshake refused` lines.
+static TLS_REFUSAL_LOG: std::sync::LazyLock<crate::log_limit::RefusalLogLimiter> =
+    std::sync::LazyLock::new(crate::log_limit::RefusalLogLimiter::with_defaults);
+
+/// Write one `TLS handshake refused` line for `refusal` on `listener` unless
+/// `limiter` suppresses it; returns whether it was written.  An admitted line
+/// carries `suppressed`, the number of lines for this label the limiter
+/// dropped since the previous one.
+pub fn log_tls_refusal(
+    limiter: &crate::log_limit::RefusalLogLimiter,
+    listener: &'static str,
+    refusal: &'static str,
+) -> bool {
+    match limiter.admit(refusal) {
+        Some(suppressed) => {
+            tracing::info!(
+                phase = "tls_refused",
+                listener,
+                refusal,
+                suppressed,
+                "TLS handshake refused"
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -631,6 +666,17 @@ mod tests {
     /// scanner, a load balancer's bare TCP close -- gets none and stays at
     /// debug.  The labels are the only thing logged, so no certificate
     /// content can reach the line.
+    /// Review of M6-C52: a peer that presents no client certificate, as fast
+    /// as it likes, gets at most the limiter's burst of lines per window.
+    #[test]
+    fn tls_refusal_lines_are_rate_limited() {
+        let limiter = crate::log_limit::RefusalLogLimiter::new(5, Duration::from_secs(60));
+        let written = (0..500)
+            .filter(|_| log_tls_refusal(&limiter, "device", "client_certificate_missing"))
+            .count();
+        assert_eq!(written, 5);
+    }
+
     #[test]
     fn only_certificate_refusals_are_labelled_for_the_default_log() {
         use rustls::{AlertDescription, CertificateError, Error};
@@ -868,6 +914,7 @@ mod tests {
             AcceptedSocketOptions {
                 send_buffer_bytes: Some(TEST_SEND_BUFFER_BYTES),
                 diagnostics: Some(diagnostics.clone()),
+                listener: None,
             },
         ));
 
@@ -912,6 +959,7 @@ mod tests {
             AcceptedSocketOptions {
                 send_buffer_bytes: Some(0),
                 diagnostics: None,
+                listener: None,
             },
         ));
 
