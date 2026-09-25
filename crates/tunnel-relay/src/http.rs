@@ -2404,6 +2404,7 @@ static CONSUMER_REFUSAL_LOG: std::sync::LazyLock<tunnel_transport::log_limit::Re
 /// a count or an identifier the relay resolved itself; the token, its claims,
 /// the request path and the body are never logged.
 pub(crate) fn log_consumer_refusal(route: &'static str, refusal: &ConsumerRefusal) {
+    crate::metrics::count_consumer_refusal(route, refusal.stage);
     log_consumer_refusal_with(&CONSUMER_REFUSAL_LOG, route, refusal);
 }
 
@@ -2438,6 +2439,7 @@ pub(crate) fn log_consumer_grant_refusal(
     device_id: Uuid,
     service_id: Option<Uuid>,
 ) {
+    crate::metrics::count_consumer_refusal(crate::metrics::route_label(route), "grant");
     tracing::info!(
         phase = "consumer_refused",
         route,

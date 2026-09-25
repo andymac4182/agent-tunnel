@@ -26,8 +26,9 @@
 //! [`CatalogConnectionFailure`] (or `timeout`).
 
 use std::{
+    collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -57,6 +58,10 @@ pub(crate) struct AuthorityReadiness {
     /// Milliseconds since `origin` until which the relay is ready; `0` is
     /// never ready.
     ready_until_ms: AtomicU64,
+    /// Checks run, for the private metrics listener (M6-C24).
+    checks: AtomicU64,
+    /// Failed checks by fixed failure class; the class set is closed.
+    failures: Mutex<BTreeMap<&'static str, u64>>,
 }
 
 impl AuthorityReadiness {
@@ -67,6 +72,8 @@ impl AuthorityReadiness {
         let readiness = Self {
             origin: Instant::now(),
             ready_until_ms: AtomicU64::new(0),
+            checks: AtomicU64::new(0),
+            failures: Mutex::new(BTreeMap::new()),
         };
         readiness.mark_ready();
         readiness
@@ -90,6 +97,25 @@ impl AuthorityReadiness {
     /// Whether the last check succeeded recently enough.  Reads one atomic.
     pub(crate) fn is_ready(&self) -> bool {
         self.now_ms() < self.ready_until_ms.load(Ordering::Acquire)
+    }
+
+    /// Checks run so far.
+    pub(crate) fn checks(&self) -> u64 {
+        self.checks.load(Ordering::Relaxed)
+    }
+
+    /// Failed checks by fixed failure class.
+    pub(crate) fn failures(&self) -> BTreeMap<&'static str, u64> {
+        self.failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count_failure(&self, class: &'static str) {
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = failures.entry(class).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     /// Start the check loop for `catalog`; it stops when `cancel` fires.
@@ -121,6 +147,7 @@ async fn check_loop(catalog: SharedCatalog, state: Arc<AuthorityReadiness>) {
     let mut failing: Option<&'static str> = None;
     loop {
         ticker.tick().await;
+        state.checks.fetch_add(1, Ordering::Relaxed);
         match check_once(&catalog).await {
             Ok(()) => {
                 state.mark_ready();
@@ -130,6 +157,7 @@ async fn check_loop(catalog: SharedCatalog, state: Arc<AuthorityReadiness>) {
             }
             Err(class) => {
                 state.mark_unready();
+                state.count_failure(class);
                 if failing != Some(class) {
                     tracing::warn!(class, "relay Redis authority unavailable; not ready");
                     failing = Some(class);

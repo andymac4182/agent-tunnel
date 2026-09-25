@@ -821,6 +821,12 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
     let options = RelayOptions::new(oidc);
     let consumer_listener = TcpListener::bind(config.consumer_bind).await?;
     let device_listener = TcpListener::bind(config.device_bind).await?;
+    // M6-C24: the private metrics listener, bound with the others so a busy
+    // or refused address stops startup before anything serves.
+    let metrics_listener = match config.metrics_bind {
+        Some(address) => Some(TcpListener::bind(address).await?),
+        None => None,
+    };
     let consumer_cert = fs::read(&config.consumer_tls_cert_chain)?;
     let consumer_key = fs::read(&config.consumer_tls_private_key)?;
     let consumer_ca = config
@@ -845,7 +851,12 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
             device_tls,
         )
         .await
-        .map(Serving::Cluster);
+        .map(|cluster| {
+            if let Some(listener) = metrics_listener {
+                start_metrics(&cluster.running, listener);
+            }
+            Serving::Cluster(cluster)
+        });
     }
     let running = config
         .start(
@@ -861,6 +872,9 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         "tunnel-relay listening: consumer={} device={}",
         running.consumer_addr, running.device_addr
     );
+    if let Some(listener) = metrics_listener {
+        start_metrics(&running, listener);
+    }
     let continuity = continuity.map(|(catalog, interval)| {
         eprintln!(
             "tunnel-relay Redis restart continuity: interval_seconds={}",
@@ -869,6 +883,22 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         ContinuityTask::spawn(catalog, interval)
     });
     Ok(Serving::Single(running, continuity))
+}
+
+/// Serve the private metrics listener (M6-C24) and say where, once.  It
+/// stops with the relay; a failure of the listener itself is reported and
+/// does not stop the relay, whose public listeners are unaffected.
+fn start_metrics(running: &tunnel_relay::RunningRelay, listener: TcpListener) {
+    match listener.local_addr() {
+        Ok(address) => eprintln!("tunnel-relay metrics listening: metrics={address}"),
+        Err(_) => eprintln!("tunnel-relay metrics listening"),
+    }
+    let task = running.serve_metrics(listener);
+    tokio::spawn(async move {
+        if !matches!(task.await, Ok(Ok(()))) {
+            eprintln!("tunnel-relay: metrics listener stopped unexpectedly");
+        }
+    });
 }
 
 /// The continuity token loop and the supervisor that watches it (M6-C65

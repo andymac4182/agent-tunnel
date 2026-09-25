@@ -4269,3 +4269,177 @@ async fn m6c67_single_relay_readyz_follows_the_redis_authority() {
     drop(fixture);
     drop(redis);
 }
+
+// ---------------------------------------------------------------------------
+// Task row M6-C24: a private, payload-free metrics listener.
+// ---------------------------------------------------------------------------
+
+/// One plain-HTTP `GET` to the private metrics listener: `(status, body)`.
+async fn m6c24_scrape(metrics: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let exchange = async {
+        let mut stream = TcpStream::connect(metrics).await.ok()?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {metrics}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.ok()?;
+        Some(String::from_utf8_lossy(&reply).into_owned())
+    };
+    let reply = tokio::time::timeout(STEP_DEADLINE, exchange)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = reply
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The value of one unlabelled or exactly-labelled series, if present.
+fn m6c24_value(text: &str, series: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        line.strip_prefix(series)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .and_then(|value| value.trim().parse().ok())
+    })
+}
+
+/// A provisioned relay with `metrics_bind` on loopback, one connected device,
+/// one served echo carrying a canary payload and one request refused for a
+/// canary subject.  The scrape must report the session, the dispatch, the
+/// refusal and the authority state, and must contain none of the canaries or
+/// the identifiers the relay knows (tenant, device, service, namespace,
+/// issuer, Redis URL, token).  The public consumer listener must still answer
+/// `/metrics` with `404`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
+    let metrics = free_port();
+    let fixture = provision_and_serve_with(
+        "m6c24-metrics",
+        None,
+        ServiceKind::Echo,
+        ProvisionOptions {
+            redis_url: None,
+            relay_top_level: format!("metrics_bind = \"{metrics}\"\n"),
+            skip_stage_cases: true,
+        },
+    )
+    .await;
+    let nonce = fixture.nonce.clone();
+    let records: toml::Value = toml::from_str(
+        &fs::read_to_string(repository().join("examples/m6-catalog.toml")).expect("records"),
+    )
+    .expect("parse records");
+    let tenant = records["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+    let token = access_token(&fixture.issuer_key, &fixture.subject);
+
+    // One served echo with a canary payload.
+    let payload = format!("m6c24-canary-payload-{nonce}");
+    let mut device = Device::start(&fixture);
+    let started = Instant::now();
+    loop {
+        device.ensure_running();
+        let (status, body) =
+            echo_once(&fixture, &token, fixture.device, fixture.service, &payload).await;
+        if status == 200 {
+            assert_eq!(String::from_utf8_lossy(&body), format!("{CANARY}{payload}"));
+            break;
+        }
+        assert!(
+            started.elapsed() < M6C65_RECOVERY_DEADLINE,
+            "echo not served: HTTP {status}; connect log: {}",
+            device.log()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // One request refused for a subject with no catalog user.
+    let subject = format!("m6c24-canary-subject-{nonce}");
+    let stranger = access_token(&fixture.issuer_key, &subject);
+    let (refused, _) = echo_once(
+        &fixture,
+        &stranger,
+        fixture.device,
+        fixture.service,
+        "m6c24-refused",
+    )
+    .await;
+    assert!(matches!(refused, 401 | 403), "HTTP {refused}");
+
+    let (status, text) = m6c24_scrape(metrics, "/metrics").await;
+    assert_eq!(status, 200, "{text}");
+    for (series, least) in [
+        ("tunnel_relay_ready", 1),
+        ("tunnel_relay_authority_ready", 1),
+        ("tunnel_relay_authority_checks_total", 1),
+        ("tunnel_relay_device_sessions", 1),
+        ("tunnel_relay_application_dispatches_total", 1),
+        (
+            "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"identity\"}",
+            1,
+        ),
+    ] {
+        let value = m6c24_value(&text, series).unwrap_or_else(|| panic!("no {series}:\n{text}"));
+        assert!(value >= least, "{series} = {value}:\n{text}");
+    }
+    assert_eq!(m6c24_value(&text, "tunnel_relay_device_sessions"), Some(1));
+    let redis_url = env::var("TEST_REDIS_URL").unwrap_or_default();
+    for canary in [
+        payload.as_str(),
+        subject.as_str(),
+        stranger.as_str(),
+        token.as_str(),
+        fixture.subject.as_str(),
+        tenant.as_str(),
+        &fixture.device.to_string(),
+        &fixture.service.to_string(),
+        fixture.namespace.as_str(),
+        nonce.as_str(),
+        ISSUER,
+        redis_url.as_str(),
+        "m6c24-canary",
+        "127.0.0.1",
+    ] {
+        assert!(
+            canary.is_empty() || !text.contains(canary),
+            "the scrape leaked `{canary}`:\n{text}"
+        );
+    }
+    // Only `/metrics` is served there; nothing is on the public listener.
+    assert_eq!(m6c24_scrape(metrics, "/readyz").await.0, 404);
+    let public = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "GET",
+        "/metrics",
+        "",
+        &[],
+        b"",
+    )
+    .await
+    .expect("public /metrics");
+    assert_eq!(public.0, 404, "/metrics must stay off the public listener");
+    println!(
+        "m6c24-metrics ok nonce={nonce} series={} bytes={} sessions=1 refusal_identity>=1",
+        text.lines().filter(|line| !line.starts_with('#')).count(),
+        text.len()
+    );
+    drop(device);
+    drop(fixture);
+}

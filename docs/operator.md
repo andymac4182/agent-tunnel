@@ -94,7 +94,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | A Redis restart in place that keeps its data (one relay) | Supported: a serving relay with `redis_restart_continuity_seconds` re-binds by itself on a durable Redis (`appendfsync always`); a relay started after the restart needs `tunnel-relay rebind-redis-run` once (section 4). A Redis that came back empty or older than the relay's last token is refused. **Failover to a replica, or a restore: not supported this way** | M6-C65 |
-| Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
+| Metrics and audit log | Metrics: a minimal, opt-in, unauthenticated listener on a loopback or private address (`metrics_bind`, section 5). Audit log: **not supported in this alpha** | M6-C24 |
 | One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
 
 ## 1. Download and verify
@@ -1239,12 +1239,51 @@ old relays are stopped; the relay cannot verify it.
 
 ## 5. Metrics, logs and audit retention
 
-**There is no metrics endpoint and no audit log in this alpha** (M6-C24). The
-relay does not serve `/metrics`, and a gate asserts that it stays unserved
-(`crates/tunnel-test-harness/src/production_cluster/i04_fail_closed.rs`). The
-metrics list in [runtime.md](runtime.md#debugging-and-deployment-contract) is a
-design contract, not a delivered surface. The relay's peer-fault diagnostics
-snapshot exists in-process for the test gates and is not exposed to operators.
+**There is no audit log in this alpha, and metrics are a minimal, opt-in,
+private surface** (M6-C24). The public consumer and device listeners do not
+serve `/metrics`, and a gate asserts that it stays off them
+(`crates/tunnel-test-harness/src/production_cluster/i04_fail_closed.rs`).
+
+**Private metrics listener.** Set `metrics_bind` at the top level of the relay
+configuration, for example `metrics_bind = "127.0.0.1:9464"`, to open a
+separate plain-HTTP listener that serves only `GET /metrics` in the Prometheus
+text format; every other path is `404`. It is off by default. It has **no
+authentication**, so `serve` and `check-serve-config` refuse any address that
+is not loopback (`127.0.0.0/8`, `::1`) or private (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`, which includes Fly's `fdaa::`
+private network), refuse `0.0.0.0` and `::`, and refuse the consumer or device
+address. Keep it reachable only by your scraper. `serve` prints
+`tunnel-relay metrics listening: metrics=ADDRESS`. One scrape runs at a time (a
+concurrent one gets `503`), and each waits at most 2 s for the relay's
+snapshot. **A relay binary older than this change refuses a configuration
+that names `metrics_bind`** (unknown field), so remove the key before rolling
+back.
+
+The series, all prefixed `tunnel_relay_`: `build_info{version}`, `ready`
+(what `/readyz` answers), and on a relay without `[cluster]`
+`authority_ready`, `authority_checks_total` and
+`authority_check_failures_total{class}` (section 3.2); the gauges
+`device_sessions`, `device_sockets`, `streams`, `sessions_rotating`,
+`sessions_owner_write_unknown`, `queue_bytes` and `replay_bytes` over the live
+sessions this relay owns; the counters `application_dispatches_total`,
+`control_registration_conflicts_total` (devices refused `owner_busy`),
+`consumer_write_timeouts_total`, `consumer_refusals_total{route,stage}` (the
+refusal stages below, counted even when their log line was rate limited, for
+the whole process), `peer_faults_total{stage}` and
+`peer_fault_causes_total{cause}`. Every value is a count, a gauge or a byte
+total, and every label value is a fixed word from a closed set: **no tenant,
+device, session, connection, stream or request identifier, subject, issuer,
+token, URL, path, endpoint, error text or payload is ever in a scrape.** A
+unit test seeds canaries into every identifier field of the relay snapshot
+and a process test sends a canary payload and a canary subject through a real
+relay, and both fail if any of them reaches the scrape (both were shown red by
+a deliberate leak). Counters restart from zero with the process.
+
+This covers only part of the metrics list in
+[runtime.md](runtime.md#debugging-and-deployment-contract): rotation duration,
+overlap time, credit stalls, peer RTT and request latency are not measured
+yet, device TLS and session refusals are logged but not counted, and the
+peer-fault series count only what the relay's diagnostics already record.
 
 What an operator can read today:
 
@@ -1252,6 +1291,7 @@ What an operator can read today:
 | --- | --- | --- |
 | Relay log | stderr of `tunnel-relay serve`, JSON lines, level from `RUST_LOG` | Bounded warnings and errors, session admission and closure, and one line per refusal (below). No retention or rotation: that is your log shipper's job |
 | `/livez`, `/readyz` | Consumer listener | Section 3.2 |
+| `/metrics` | The private `metrics_bind` listener, when configured | Aggregate counters and gauges, above |
 | `connect --json` | stdout of `tunnel-client connect` | One JSON object per lifecycle change: session, epoch, generation, connection IDs, rotation and recovery progress and deadlines, and the **local socket addresses** of the control, active and candidate connections. No payloads or credentials |
 | `doctor --json` | Section 6 | Local checks only |
 

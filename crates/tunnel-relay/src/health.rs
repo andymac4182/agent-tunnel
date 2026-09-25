@@ -51,13 +51,19 @@ where
             get(move || {
                 let peer = readiness_peer.clone();
                 let authority = authority.clone();
-                async move {
-                    let ready = peer.as_ref().is_none_or(|runtime| runtime.is_ready())
-                        && authority.as_ref().is_none_or(|state| state.is_ready());
-                    ready_response(ready)
-                }
+                async move { ready_response(relay_ready(peer.as_ref(), authority.as_ref())) }
             }),
         )
+}
+
+/// The one readiness decision `/readyz` answers and the private metrics
+/// listener reports: the peer runtime's (cluster) and the Redis authority's
+/// (single relay, M6-C67), each only when present.
+pub(crate) fn relay_ready(
+    peer: Option<&Arc<PeerRuntime>>,
+    authority: Option<&Arc<AuthorityReadiness>>,
+) -> bool {
+    peer.is_none_or(|runtime| runtime.is_ready()) && authority.is_none_or(|state| state.is_ready())
 }
 
 /// Return a process-only liveness response. This must not consult Redis,
