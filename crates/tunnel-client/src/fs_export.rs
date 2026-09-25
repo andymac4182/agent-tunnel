@@ -1022,16 +1022,17 @@ mod tests {
     }
 
     /// Task row M4-21, as narrowed on review: the request deadline bounds a
-    /// **stall**, not a transfer. Sixteen pipelined 16 KiB reads drained at
-    /// 64 KiB/s take about four seconds -- four times the 1-second deadline
-    /// configured here -- and the session must survive them, because credit
-    /// keeps arriving. The first implementation measured from each request's
-    /// admission and closed this consumer after one second.
+    /// **stall**, not a transfer. Four pipelined 60 KiB reads drained at
+    /// 32 KiB/s take about 7.5 seconds, and **each single reply** takes about
+    /// two -- twice the 1-second deadline configured here -- so the session
+    /// survives only if every credit grant restarts the clock, not merely the
+    /// start of each reply. The first implementation measured from each
+    /// request's admission and closed this consumer after its first reply.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_slow_but_steady_consumer_keeps_its_session() {
-        const READS: u16 = 16;
-        const COUNT: u32 = 16 * 1_024;
+        const READS: u16 = 4;
+        const COUNT: u32 = 60 * 1_024;
         let (mut consumer, task, _root) =
             opened_session(READS as usize * COUNT as usize, 1, 65_536, 8_192).await;
         for index in 0..READS {
@@ -1047,7 +1048,7 @@ mod tests {
         let mut answered = 0_u16;
         let mut bytes = 0_usize;
         while answered < READS {
-            match consumer.next(Some(64 * 1_024)).await {
+            match consumer.next(Some(32 * 1_024)).await {
                 Seen::Reply(frame) => match frame.message {
                     tunnel_fs_ninep::Message::Rread { data } => {
                         bytes += data.len();
@@ -1055,11 +1056,12 @@ mod tests {
                     }
                     other => panic!("expected Rread, got {other:?}"),
                 },
+                Seen::Close(code) => panic!("the session closed {code} after {answered} replies"),
                 other => panic!("the session ended after {answered} replies: {other:?}"),
             }
         }
         assert!(
-            started.elapsed() > std::time::Duration::from_secs(2),
+            started.elapsed() > std::time::Duration::from_secs(4),
             "the drain must outlast the deadline for this to prove anything"
         );
         assert_eq!(bytes, READS as usize * COUNT as usize);
