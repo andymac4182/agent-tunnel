@@ -233,7 +233,7 @@ CLEANUP+=("kill ${SSH_PID} 2>/dev/null")
 owner=""
 for _ in $(seq 1 40); do
   kill -0 "${SSH_PID}" 2>/dev/null || die "ssh reverse forward exited"
-  owner="$(gexec sudo ss -Hltnp "sport = :${GUEST_PORT}" 2>/dev/null | grep -o 'users:(("[a-z-]*"' | sort -u | tr '\n' ' ')"
+  owner="$(gexec sudo ss -Hltnp "sport = :${GUEST_PORT}" 2>/dev/null | grep -o 'users:(("[a-z-]*"' | sort -u | tr '\n' ' ' || true)"
   [ -n "${owner}" ] && break
   sleep 0.5
 done
