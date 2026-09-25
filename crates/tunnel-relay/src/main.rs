@@ -153,8 +153,10 @@ impl StopSignal {
 ///
 /// Installing the handlers replaces an inherited `SIG_IGN` as well, for the
 /// reason `docs/runtime.md` gives under "Stopping `connect` and `serve`": a stop request
-/// is honoured whatever disposition the process inherited. SIGHUP is not
-/// handled.
+/// is honoured whatever disposition the process inherited. SIGHUP is not a
+/// stop request: a cluster relay handles it separately, as its peer-key
+/// rotation trigger ([`RekeyTrigger`], M8-C46), and any other relay leaves it
+/// at the inherited disposition.
 struct StopSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,

@@ -760,6 +760,27 @@ impl RekeyFixture {
         }
     }
 
+    /// The warnings and rotation lines a relay logged, last twenty, for a
+    /// failure message.  Payload-free: the relay logs identifiers only.
+    fn notable(&self, label: &str) -> String {
+        let stderr = self
+            .processes
+            .iter()
+            .find(|slot| slot.label == label)
+            .map(|slot| String::from_utf8_lossy(&slot.process.stderr()).into_owned())
+            .unwrap_or_default();
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| {
+                line.contains("WARN")
+                    || line.contains("ERROR")
+                    || line.contains("peer identity")
+                    || line.contains("unready")
+            })
+            .collect();
+        lines[lines.len().saturating_sub(20)..].join(" | ")
+    }
+
     fn b_stderr(&self) -> String {
         self.processes
             .iter()
@@ -813,7 +834,15 @@ impl RekeyFixture {
             match self.echo_via_a(phase).await {
                 Ok(()) => return Ok(attempts),
                 Err(error) if Instant::now() >= end => {
-                    bail!("{phase}: the canary never succeeded ({attempts} attempts): {error}")
+                    let directory = match self.catalog()?.read_signed_memberships().await {
+                        Ok(records) => format!("{} records", records.len()),
+                        Err(error) => format!("unreadable: {error:?}"),
+                    };
+                    bail!(
+                        "{phase}: the canary never succeeded ({attempts} attempts): {error}; membership directory {directory}; relay-a: {}; relay-b: {}",
+                        self.notable("relay-a"),
+                        self.notable("relay-b")
+                    )
                 }
                 Err(_) => sleep(POLL_INTERVAL).await,
             }

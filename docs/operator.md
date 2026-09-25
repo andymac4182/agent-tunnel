@@ -1079,6 +1079,57 @@ relay has accepted, so a restarted relay cannot be fed an older signed snapshot.
 `recovery.fence_path` records the highest recovery approval consumed. Starting
 each relay is the `serve` command from section 3.1.
 
+### 3.4 Rotating a relay's peer key without a restart
+
+A cluster relay can replace its private HTTP/3 peer certificate and key while
+it serves (task rows M8-C45, M8-C46; the design is in
+[cluster.md](cluster.md#certificate-and-key-lifecycle)). Like the rest of
+section 3.3 it needs the membership publisher this alpha does not ship: the
+relay stages and serves a successor, but only your publisher can approve it.
+
+1. Issue the successor certificate for the **same node** under the same relay
+   peer CA, covering the same server names. Put its chain and key where the
+   relay can read them and name them in the relay's `[cluster]` section, then
+   restart once so the configuration is loaded (or set them before the
+   relay's next planned start):
+
+   ```toml
+   peer_tls_next_cert_chain = "/etc/agent-tunnel/peer-next-chain.pem"
+   peer_tls_next_private_key = "/etc/agent-tunnel/peer-next-key.pem"
+   # Optional; these are the defaults.
+   # peer_rekey_convergence_seconds = 61   # record lifetime + clock skew
+   # peer_rekey_overlap_seconds = 600
+   ```
+
+2. Send the relay `SIGHUP`. It reads the two files, validates them, and logs
+   the successor's public digest; nothing is served with it yet:
+
+   ```console
+   $ kill -HUP "$(pgrep -f 'tunnel-relay serve')"
+   tunnel-relay: peer identity staged: staged_spki_sha256=<64 hex>; it serves once a signed membership record approves it for 61s
+   ```
+
+   A refusal names why (`peer rekey refused: ...`) and changes nothing.
+   `SIGHUP` on a relay with no `peer_tls_next_*` configured logs that and
+   changes nothing. A relay without `[cluster]` does not handle `SIGHUP`.
+
+3. Publish the relay's signed record approving **both** keys. After the hold,
+   the relay logs `peer identity switched` and new handshakes in both
+   directions present the successor; connections already open keep serving.
+4. Publish the record approving **only** the successor. The relay logs
+   `previous peer identity retired` with `cause="withdrawn"` and stays Ready;
+   peers close their connections under the old key, so a stream riding one is
+   interrupted and must be retried.
+5. Before the relay's next restart, point `peer_tls_cert_chain` and
+   `peer_tls_private_key` at the successor's files and remove
+   `peer_tls_next_*` (a restarted relay serves what `peer_tls_cert_chain`
+   names, and would fail closed on the retired key).
+
+Do not publish the successor-only record before step 3's switch: a relay whose
+**served** key the record stops approving fails closed, as it always has. The
+trigger, the hold and the overlap are applied by default pending owner
+confirmation (2026-09-25).
+
 ## 4. Service installation, upgrade, backup and recovery
 
 **Example service units are in `examples/service/` of the source tree**
@@ -1158,7 +1209,7 @@ Every setting follows from how the binaries stop and reconnect
 
 A non-cluster `serve` stopped while serving, with a device connected,
 printed its `stopping` and `stopped` lines and exited `0` for both SIGTERM
-and SIGINT (dogfood run; M6-C60). SIGHUP is not handled by either binary; neither reloads its configuration.
+and SIGINT (dogfood run; M6-C60). SIGHUP is not handled by `connect` or by a non-cluster `serve`; a cluster `serve` handles it only to stage a configured successor peer identity (section 3.4). Neither binary reloads its configuration.
 runtime.md lists what is measured and what is not; in short, the handshake,
 startup and backoff phases, a live stop and a reconnect across a relay
 restart are measured on the real binaries, the second-signal and bound logic

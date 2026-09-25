@@ -20,7 +20,8 @@ use rcgen::{
 use tokio::{sync::watch, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tunnel_transport::{
-    ApprovedPeerPins, PeerClient, PeerDestination, PeerIdentityError, PeerServer,
+    ApprovedPeerPins, MAX_ROTATION_DRAINING_CONNECTIONS, PeerClient, PeerDestination,
+    PeerIdentityError, PeerServer,
     PeerTransportError, PeerTransportLimits, RotatingPeerIdentity, SharedPeerPins, SpkiSha256,
     StagedPeerIdentity, TlsIdentity, spki_sha256_from_der,
 };
@@ -211,6 +212,22 @@ fn client(
 
 async fn body_of(mut stream: tunnel_transport::PeerClientStream) -> TestResult<String> {
     stream.finish().await?;
+    read_body(stream).await
+}
+
+/// Open a request and end its (empty) request body at once, so a server
+/// that answers later never meets an unfinished request.
+async fn open_finished(
+    pool: &PeerClient,
+    destination: &PeerDestination,
+    path: &str,
+) -> TestResult<tunnel_transport::PeerClientStream> {
+    let mut stream = pool.open(destination.clone(), get(path)).await?;
+    stream.finish().await?;
+    Ok(stream)
+}
+
+async fn read_body(mut stream: tunnel_transport::PeerClientStream) -> TestResult<String> {
     let response = timeout(CASE_TIMEOUT, stream.recv_response()).await??;
     if response.status() != StatusCode::OK {
         return Err(format!("unexpected status {}", response.status()).into());
@@ -319,6 +336,70 @@ async fn a_client_install_drains_the_superseded_connection_and_dials_with_the_su
     assert_eq!(pool.draining_connection_count(), 0);
 
     server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_drain_set_is_bounded_and_a_full_set_keeps_the_predecessor_serving() -> TestResult {
+    // M7-C154.  Five destinations each carry an in-flight stream on a
+    // generation-1 connection when the local identity changes.  Four drain
+    // and redial under the successor; the fifth finds the bounded drain set
+    // full and keeps using its predecessor -- which the overlap still
+    // approves -- rather than tearing its stream down or exceeding the bound.
+    let pki = Pki::new("rotation drain-bound CA");
+    let first = pki.peer("relay-ingress");
+    let second = pki.peer("relay-ingress");
+    let (release_tx, release) = watch::channel(false);
+    let mut servers = Vec::new();
+    for index in 0..=MAX_ROTATION_DRAINING_CONNECTIONS {
+        let leaf = pki.peer(&format!("relay-owner-{index}"));
+        let identity = RotatingPeerIdentity::new(pki.staged(&leaf));
+        let server = Server::start(&pki, &identity, &[first.spki, second.spki], release.clone());
+        servers.push((server, leaf.spki));
+    }
+    let local = RotatingPeerIdentity::new(pki.staged(&first));
+    let server_pins: Vec<SpkiSha256> = servers.iter().map(|(_, spki)| *spki).collect();
+    let pool = client(&pki, &local, &server_pins, true);
+    let mut held = Vec::new();
+    for (server, _) in &servers {
+        held.push(open_finished(&pool, &server.destination, "/hold").await?);
+    }
+    local.install(pki.staged(&second))?;
+    let mut bodies = Vec::new();
+    for (server, _) in &servers {
+        let stream = pool
+            .open(server.destination.clone(), get("/who"))
+            .await
+            .map_err(|error| format!("who open: {error}"))?;
+        bodies.push(body_of(stream).await.map_err(|error| format!("who body: {error}"))?);
+    }
+    release_tx.send(true)?;
+    let successors = bodies
+        .iter()
+        .filter(|body| **body == second.spki.to_hex())
+        .count();
+    assert_eq!(successors, MAX_ROTATION_DRAINING_CONNECTIONS);
+    assert_eq!(bodies.last(), Some(&first.spki.to_hex()));
+    for (index, stream) in held.into_iter().enumerate() {
+        let body = read_body(stream)
+            .await
+            .map_err(|error| format!("held body {index}: {error}"))?;
+        assert_eq!(body, first.spki.to_hex());
+    }
+    // Once the drained connections have closed, the fifth destination drains
+    // too and moves to the successor.
+    let deadline = std::time::Instant::now() + CASE_TIMEOUT;
+    while pool.draining_connection_count() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let last = &servers.last().expect("five servers").0;
+    assert_eq!(
+        body_of(pool.open(last.destination.clone(), get("/who")).await?).await?,
+        second.spki.to_hex()
+    );
+    for (server, _) in servers {
+        server.stop().await;
+    }
     Ok(())
 }
 

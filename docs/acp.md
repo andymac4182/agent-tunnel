@@ -932,6 +932,36 @@ connection and started a child.
 
   **Not claimed**: that an ACP stream survives a key rotation — it does not,
   and the case asserts the teardown.
+- **Genuine peer-key rotation** (task rows **M8-C24**, **M8-C45**; M8-05's
+  first discriminator). The paragraph above says a genuine rotation needs a
+  relay that really re-keys; the product now has one. Every fixture relay
+  serves and dials through a replaceable identity slot and a `PeerRekey`
+  state machine, exactly as `tunnel-relay serve` does, and the case
+  `genuine-peer-key-rotation` drives it on the owner: it **stages** a second
+  certificate for relay-a (not served while no record approves it),
+  **publishes** the owner's record approving both keys, opens a held ACP turn
+  **and** a flooded, unread forwarded stream on the non-owner ingress, and only
+  then starts the owner's tick loop. The owner **switches** after its
+  convergence hold; both live streams are shown serving two reconcile
+  intervals later, and a fresh handshake to the owner is admitted by a dialer
+  approving only the successor and refused by one approving only the
+  predecessor. The case then **withdraws** the predecessor: the ingress
+  attributes the held turn's teardown to the key (`["membership_revoked"]`,
+  exact), the turn ends with no `stopReason`, the owner retires the predecessor
+  because the record withdrew it — and the owner **stays Ready throughout**,
+  sampled every 25 ms for the whole case, latching no `membership_revoked` of
+  its own. That last pair is the discriminator M8-C24 named: it is exactly
+  what the phantom-successor arm above cannot show. A whole ACP turn then
+  completes across the rotated route, and the owner is rotated back the same
+  way so later cases meet the cluster they expect.
+
+  **Not claimed**: that an in-flight stream survives the *withdrawal*. The
+  owner does not GOAWAY-drain inbound connections under the predecessor, so the
+  held turn rides the ingress's connection to the old key until the withdrawal
+  closes it (M8-C47). Nor that both forwarding segments were **saturated** at
+  one instant while the key changed — the flooded stream shows forwarding
+  under load survives the switch, not a saturation threshold, and M8-05's
+  third discriminator is unchanged.
 - **The request direction of the ingress→owner peer hop was driven to its
   credit window**, and the owner→device segment was measured beside it. This is
   narrower than an earlier draft of this section claimed, and the correction is
