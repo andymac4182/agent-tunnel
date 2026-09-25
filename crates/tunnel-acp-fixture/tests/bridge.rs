@@ -159,6 +159,24 @@ async fn a_posted_batch_is_refused_with_501_and_never_reaches_an_agent() {
 /// live sessions" is what carries that to the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport() {
+    batch_refusal_ends_the_transport("batch").await;
+}
+
+/// M8-C34.  The same refusal when it is **slow**: the agent waits 3 seconds
+/// before writing its batch, longer than the 2.5-second quiet window the test
+/// above once read with.  That window expired on a loaded host before the
+/// child had been refused and reaped, the test dropped the stream, and the
+/// export correctly ended the connection by the *subscriber-loss* rule instead
+/// -- so `end_with_child` never ran and the test failed on the counters of an
+/// ending it had caused itself.  The stream is now held until it ends, bounded
+/// only by the test's step deadline; this case fails every time against a
+/// quiet-window read, not one run in a hundred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_batch_refusal_still_ends_the_transport_by_the_childs_rule() {
+    batch_refusal_ends_the_transport("batch:3000").await;
+}
+
+async fn batch_refusal_ends_the_transport(directive: &str) {
     let workspace = workspace();
     let export = acp_export(workspace.path());
     let profile = Arc::new(export.profile_policies().expect("profile"));
@@ -181,7 +199,7 @@ async fn the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport
             "jsonrpc": "2.0",
             "id": "prompt-1",
             "method": "session/prompt",
-            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": "batch"}]},
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": directive}]},
         })))
         .expect("request");
     let accepted = send(&export, &profile, request).await;
@@ -193,7 +211,11 @@ async fn the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport
     //
     // Three separate observations, because "the batch did not arrive" alone
     // would also be true of a stream that simply went quiet.
-    let (payloads, ending) = within(collect_stream(session_stream)).await;
+    //
+    // **Held until it ends** (M8-C34), never abandoned after a quiet spell:
+    // abandoning it is itself a subscriber loss, which ends the transport by a
+    // different rule than the one under test.
+    let (payloads, ending) = within(collect_until_end(session_stream)).await;
     assert!(
         !payloads.iter().any(|payload| payload.starts_with(b"[")),
         "the SSE stream never carries a batch: {payloads:?}"
@@ -665,6 +687,136 @@ async fn output_credit_stalls_are_bounded_and_the_event_is_never_skipped() {
     assert_eq!(
         diagnostics.messages_dropped_on_closed_stream, 0,
         "nothing was dropped and continued past: {diagnostics:?}"
+    );
+    export.shutdown();
+}
+
+/// M8-C27.  A turn's result must never overtake the updates the agent wrote
+/// before it.
+///
+/// `docs/acp.md`: "Accept remaining updates until that response."  That is
+/// only possible if the response arrives **after** them.  The agent writes
+/// its updates and then its response on one stdout, in that order, and the
+/// reader forwards them in that order; the defect was that the prompt's result
+/// did not travel the same way.  A separate task put it on the session stream
+/// directly, racing the dispatcher that was still delivering the updates, and
+/// the consumer could read the turn as finished with updates still to come.
+///
+/// **The race is made deterministic rather than waited for.**  The session
+/// stream is subscribed directly against the export and not read, so its
+/// queue fills at [`tunnel_acp_export::STREAM_BACKLOG`] and the dispatcher
+/// parks on the next update, with the rest of the turn's updates behind it in
+/// the dispatcher's own queue.  The agent's response then resolves the
+/// prompt.  Only after the export has **classified the turn** — the counter
+/// the prompt task bumps on the line before it sends — does the test start
+/// reading.  A result sent anywhere but behind those updates is then observed
+/// out of order every time, not one run in fifty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_result_is_never_delivered_ahead_of_its_own_updates() {
+    let workspace = workspace();
+    let export = acp_export(workspace.path());
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+
+    // Subscribed, and deliberately not read yet: directly against the export,
+    // for the reason `output_credit_stalls_are_bounded_and_the_event_is_never_skipped`
+    // gives -- the gate-2 carrier would drain the queue into its own credit.
+    let parked = export
+        .handle(
+            get_session(&connection, &session.id)
+                .map(|_| tunnel_http_bridge::ChannelBody::full(Bytes::new())),
+        )
+        .await
+        .expect("the session GET is answered");
+    assert_eq!(parked.status(), StatusCode::OK);
+
+    // Enough updates to fill everything downstream of the dispatcher -- the
+    // session target's queue, the one message the stream pump holds, and the
+    // response body's own queue -- and park the dispatcher on the next one,
+    // with eight more waiting behind it in the dispatcher's queue.  Fewer than
+    // that queue holds, so the agent is never blocked from writing its
+    // response.
+    let downstream = tunnel_acp_export::STREAM_BACKLOG + 1 + tunnel_acp_export::STREAM_QUEUE;
+    let updates = downstream + 1 + 8;
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-ordered",
+            "method": "session/prompt",
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": format!("updates:{updates}")}]},
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    // The turn is finished and classified: the result exists and is on its
+    // way.  Then give it a generous moment to be queued wherever it goes.
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.terminals_succeeded == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.terminals_succeeded, 1,
+        "the turn finished while its stream was parked: {diagnostics:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Now read, in arrival order, until the result.
+    let mut body = std::pin::pin!(parked.into_body());
+    let mut buffer = Vec::new();
+    let order = within(async {
+        loop {
+            let frame = body
+                .frame()
+                .await
+                .expect("the stream stays open until the result")
+                .expect("the stream does not error");
+            if let Ok(data) = frame.into_data() {
+                buffer.extend_from_slice(&data);
+            }
+            let order: Vec<String> = sse_payloads(&buffer)
+                .iter()
+                .filter_map(|payload| serde_json::from_slice::<Value>(payload).ok())
+                .map(|value| {
+                    value
+                        .pointer("/params/update/content/text")
+                        .and_then(Value::as_str)
+                        .map_or_else(
+                            || {
+                                value
+                                    .pointer("/result/stopReason")
+                                    .and_then(Value::as_str)
+                                    .map_or_else(|| "<other>".to_owned(), |stop| format!("result:{stop}"))
+                            },
+                            ToOwned::to_owned,
+                        )
+                })
+                .collect();
+            if order.iter().any(|entry| entry.starts_with("result:")) {
+                return order;
+            }
+        }
+    })
+    .await;
+
+    let expected: Vec<String> = (0..updates)
+        .map(|index| format!("chunk-{index}"))
+        .chain(std::iter::once("result:end_turn".to_owned()))
+        .collect();
+    assert_eq!(
+        order, expected,
+        "every update the agent wrote before its response reaches the stream \
+         before the turn's result, in the agent's order"
     );
     export.shutdown();
 }
@@ -1408,6 +1560,28 @@ enum Ending {
 async fn collect_stream(response: http::Response<ChannelBody>) -> (Vec<Vec<u8>>, Ending) {
     let (raw, ending) = collect_raw(response).await;
     (sse_payloads(&raw), ending)
+}
+
+/// Read a stream until it **errors or ends**, with no quiet window.
+///
+/// For a test whose subject is how the stream ends: dropping the body after a
+/// quiet spell is a subscriber loss, which is a different ending (M8-C34).  The
+/// caller bounds the whole read with [`within`], so a stream that never ends is
+/// a named failure rather than a hang.
+async fn collect_until_end(response: http::Response<ChannelBody>) -> (Vec<Vec<u8>>, Ending) {
+    let mut body = std::pin::pin!(response.into_body());
+    let mut buffer = Vec::new();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    buffer.extend_from_slice(&data);
+                }
+            }
+            Some(Err(_)) => return (sse_payloads(&buffer), Ending::Errored),
+            None => return (sse_payloads(&buffer), Ending::Eof),
+        }
+    }
 }
 
 async fn collect_raw(response: http::Response<ChannelBody>) -> (Vec<u8>, Ending) {

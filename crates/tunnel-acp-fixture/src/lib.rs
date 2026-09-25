@@ -23,7 +23,7 @@
 //! | `permission:<n>` | the same, but `n` requests at once, so the pending-callback bound is reachable from one turn |
 //! | `oversized:<bytes>` | one stdout line of `<bytes>` filler with no newline in it |
 //! | `malformed` | one stdout line that is not JSON |
-//! | `batch` | one stdout line that is a JSON-RPC **array** (M8-C02) |
+//! | `batch` | one stdout line that is a JSON-RPC **array** (M8-C02); `batch:<ms>` waits that long first (M8-C34) |
 //! | `stderr-flood:<bytes>` | write `<bytes>` to stderr, then finish |
 //! | `detach:<file>` | start a descendant that calls `setsid` and survives its process group, then finish |
 //! | `exit:<code>` | finish the turn, then exit by itself — the one end of life that runs none of the supervisor's kill path |
@@ -321,6 +321,12 @@ async fn run_directive(
         "batch" => {
             // A JSON-RPC batch frame (M8-C02): the pinned SDK preserves these,
             // the pinned RFD revision answers 501, and this profile refuses.
+            // `batch:<ms>` waits that long first, so a test can reproduce a
+            // loaded host's slow refusal on demand (M8-C34) instead of waiting
+            // for one.
+            if let Some(delay) = argument.and_then(|value| value.parse::<u64>().ok()) {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             let _ = out
                 .send(
                     json!([
