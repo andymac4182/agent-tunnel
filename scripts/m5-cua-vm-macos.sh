@@ -108,7 +108,11 @@ known_hosts() {
   local vm="$1" ip key kh="${STATE}/known_hosts.d/${1}"
   mkdir -p "${STATE}/known_hosts.d"
   ip="$("${TART}" ip "${vm}")"
-  case "${ip}" in 192.168.64.*) ;; *) die "unexpected guest address ${ip}; expected Tart's private NAT network";; esac
+  case "${ip}" in
+    192.168.64.1) die "guest address ${ip} is the host's side of Tart's NAT network; refusing" ;;
+    192.168.64.*) ;;
+    *) die "unexpected guest address ${ip}; expected Tart's private NAT network" ;;
+  esac
   key="$(gexec "${vm}" cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')"
   case "${key}" in "ssh-ed25519 "?*) ;; *) die "could not read the guest's ed25519 host key";; esac
   echo "${ip} ${key}" >"${kh}"
@@ -399,7 +403,11 @@ cmd_probe() {
   mkdir -p "${out}"
   local ip lport
   ip="$("${TART}" ip "${vm}")"
-  case "${ip}" in 192.168.64.*) ;; *) die "unexpected guest address ${ip}; expected Tart's private NAT network";; esac
+  case "${ip}" in
+    192.168.64.1) die "guest address ${ip} is the host's side of Tart's NAT network; refusing" ;;
+    192.168.64.*) ;;
+    *) die "unexpected guest address ${ip}; expected Tart's private NAT network" ;;
+  esac
   { echo "nonce=$(uuidgen) head=$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown) vm=${vm} expect=${expect}"
     cat "${STATE}/clones/${vm}" 2>/dev/null || true
     "${TART}" get "${vm}" --format json; } >"${out}/run.txt"

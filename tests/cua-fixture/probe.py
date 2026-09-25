@@ -28,9 +28,11 @@ READ_ONLY_COMMANDS = ("version", "get_screen_size", "get_cursor_position", "scre
 # State queries only some backends register (the Cua Driver backend does).
 # Both are captures/reads, never input; probed only when advertised.
 OPTIONAL_READ_ONLY = ("get_desktop_state", "get_capture_scope_state")
-# With --permission-reads (the macOS guest): reads whose outcome depends on a
-# TCC grant. Accessibility gates the AX tree; the screenshot above covers
-# Screen Recording. Recorded as outcome and shape only, never the tree itself.
+# With --permission-reads (the macOS guest): reads whose outcome is expected to
+# depend on a TCC grant. Measured 2026-09-26 (M5-C32): without Accessibility the
+# native AX tree still answers success, so this records the outcome for
+# comparison with a granted run; it is not a permission check. Recorded as
+# outcome and shape only, never the tree itself.
 PERMISSION_READS = ("get_accessibility_tree",)
 
 

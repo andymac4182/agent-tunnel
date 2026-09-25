@@ -19,7 +19,7 @@ m5-cua-vm-macos: NEXT (a person, at the VM's window): grant Screen Recording and
 ## Permission-denied run (works now)
 
 ```sh
-scripts/m5-cua-vm-macos.sh cycle cua-mac-d1 --from denied --expect denied                        # 2x display
+scripts/m5-cua-vm-macos.sh cycle cua-mac-d1 --from denied --expect denied                        # 2x display: 1280x800pt comes up as 1024x768 points at scale 2.0 (unexplained)
 scripts/m5-cua-vm-macos.sh cycle cua-mac-d2 --from denied --expect denied --display 1280x800px   # 1x display
 ```
 
@@ -30,7 +30,7 @@ Expected output: `preflight: screen_recording=False accessibility=False`. Each o
 Follow [the owner steps](../testing.md#owner-granting-the-permissions-once-by-hand-in-cua-macos-golden-only), then:
 
 ```sh
-scripts/m5-cua-vm-macos.sh cycle cua-mac-g1 --from golden --expect granted
+scripts/m5-cua-vm-macos.sh cycle cua-mac-g1 --from golden --expect granted   # 2x: 1024x768 points, see above
 ```
 
 Expected output: `preflight: screen_recording=True accessibility=True`, no "refusing" lines, `screenshot-*.png` files in the evidence directory, and `cycle complete`.
