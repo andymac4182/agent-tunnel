@@ -137,14 +137,23 @@ impl Fault {
 
     fn diagnostic_matches(self, lower: &str) -> bool {
         match self {
-            Self::InvalidMembership
-            | Self::MissingMembership
-            | Self::ExpiredMembership
-            | Self::ConflictingCheckpoint => {
+            Self::InvalidMembership | Self::ExpiredMembership | Self::ConflictingCheckpoint => {
                 // The public readiness surface deliberately redacts the
-                // verifier detail. These cases share membership_rejected;
-                // each fixture mutation has its own precondition assertion.
+                // verifier detail. These cases share membership_rejected:
+                // a record failed verification (bad signature, expired, or
+                // below the checkpoint's minimum version); each fixture
+                // mutation has its own precondition assertion.
                 lower.contains("reason=membership_rejected")
+                    && lower.contains("category=membership")
+            }
+            Self::MissingMembership => {
+                // Every record that is present verified; this relay's own is
+                // simply absent. That is missing_local_membership, the same
+                // reason as a checkpoint that does not name this node -- not
+                // membership_rejected, which is reserved for evidence that
+                // failed verification and therefore withdraws peer trust
+                // (M7-C86, docs/cluster.md).
+                lower.contains("reason=missing_local_membership")
                     && lower.contains("category=membership")
             }
             Self::InvalidCheckpoint | Self::MissingCheckpoint => {

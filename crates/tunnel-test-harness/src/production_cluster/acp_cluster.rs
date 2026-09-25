@@ -476,7 +476,7 @@ pub struct AcpClusterEvidence {
     ///
     /// The withdrawn key is the owner's *own* serving key and the incoming one
     /// is a phantom no certificate presents, so the key arm also takes the
-    /// owner's membership runtime through `MembershipRejected`, which
+    /// owner's membership runtime through `MissingLocalKey` (M7-C86), which
     /// invalidates every admission the owner holds — including its admission
     /// of the ingress. These two fields are the owner's own decision about the
     /// ingress, so a reader can see that the key arm tears down from both ends
@@ -2271,7 +2271,7 @@ impl Gate<'_> {
     /// fixture certificate presents, so the key the key arm withdraws is the
     /// owner's **own serving key** and its replacement is a phantom.  The
     /// owner's own membership runtime therefore cannot find its local key in
-    /// the record it just reconciled, takes the `MembershipRejected` branch of
+    /// the record it just reconciled, takes the `MissingLocalKey` branch (M7-C86) of
     /// `membership_runtime.rs`, goes **Unready**, and invalidates *every*
     /// admission it holds — including its admission of the ingress — with the
     /// same `MembershipRevoked`.  The run's own logs say so: a
