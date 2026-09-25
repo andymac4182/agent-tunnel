@@ -218,24 +218,26 @@ mod tests {
         assert_eq!(validated.subject, "consumer-a");
         assert!(validated.scopes.contains("echo:invoke"));
 
+        // M6-C52/M6-C53: a correctly signed token whose registered claims
+        // are refused is `ClaimsRejected`, a stage of its own.
         let expired = fixture.issue_expired("consumer-a").expect("expired token");
         assert!(matches!(
             rejected(verifier.validate_token(&expired)),
-            OidcError::InvalidToken
+            OidcError::ClaimsRejected
         ));
         let wrong_issuer = fixture
             .issue_with_wrong_issuer("consumer-a")
             .expect("wrong issuer token");
         assert!(matches!(
             rejected(verifier.validate_token(&wrong_issuer)),
-            OidcError::InvalidToken
+            OidcError::ClaimsRejected
         ));
         let wrong_audience = fixture
             .issue_with_wrong_audience("consumer-a")
             .expect("wrong audience token");
         assert!(matches!(
             rejected(verifier.validate_token(&wrong_audience)),
-            OidcError::InvalidToken
+            OidcError::ClaimsRejected
         ));
         let not_yet_valid = fixture
             .issue_with(
@@ -248,7 +250,7 @@ mod tests {
             .expect("future nbf token");
         assert!(matches!(
             rejected(verifier.validate_token(&not_yet_valid)),
-            OidcError::InvalidToken
+            OidcError::ClaimsRejected
         ));
         let already_valid = fixture
             .issue_with(

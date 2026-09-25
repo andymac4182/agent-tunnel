@@ -969,7 +969,7 @@ async fn list_devices(State(state): State<HttpState>, headers: HeaderMap) -> Res
     let Ok(_permit) = state.admission.clone().try_acquire_owned() else {
         return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
-    let principal = match authenticate(&state, &headers, None).await {
+    let principal = match authenticate(&state, &headers, None, "devices").await {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -998,7 +998,7 @@ async fn list_services(
     let Ok(_permit) = state.admission.clone().try_acquire_owned() else {
         return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
-    let principal = match authenticate(&state, &headers, None).await {
+    let principal = match authenticate(&state, &headers, None, "services").await {
         Ok(principal) => principal,
         Err(response) => return response,
     };
@@ -1072,7 +1072,7 @@ async fn echo(
     {
         Ok(value) => value,
         Err(error) => {
-            return consumer_authentication_response(&error);
+            return consumer_authentication_response(&error, "echo");
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -1092,6 +1092,7 @@ async fn echo(
             Err(response) => return response,
         };
     if grant.valid_until <= Utc::now() || !grant.permissions.allows(crate::ECHO_OPERATION) {
+        log_consumer_grant_refusal("echo", &validated.consumer, device_id, Some(service_id));
         return error_response(
             StatusCode::FORBIDDEN,
             "FORBIDDEN",
@@ -1431,7 +1432,7 @@ async fn echo_stream(
     {
         Ok(value) => value,
         Err(error) => {
-            return consumer_authentication_response(&error);
+            return consumer_authentication_response(&error, "stream");
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -1454,6 +1455,7 @@ async fn echo_stream(
         || grant.valid_until <= Utc::now()
         || validated.expires_at <= Utc::now()
     {
+        log_consumer_grant_refusal("stream", &validated.consumer, device_id, Some(service_id));
         return error_response(
             StatusCode::FORBIDDEN,
             "FORBIDDEN",
@@ -2274,6 +2276,7 @@ pub(crate) async fn service_and_grant_of_type(
         .await
         .map_err(catalog_error)?
         .ok_or_else(|| {
+            log_consumer_grant_refusal(service_type, consumer, device_id, Some(service_id));
             error_response(
                 StatusCode::FORBIDDEN,
                 "FORBIDDEN",
@@ -2288,6 +2291,7 @@ async fn authenticate(
     state: &HttpState,
     headers: &HeaderMap,
     scope: Option<&str>,
+    route: &'static str,
 ) -> Result<tunnel_catalog::AuthenticatedConsumer, Response> {
     let authorization = bearer(headers);
     let (Some(catalog), Some(oidc)) = (state.catalog.as_ref(), state.oidc.as_ref()) else {
@@ -2305,35 +2309,124 @@ async fn authenticate(
             .map(|value| value.consumer),
         None => oidc.authenticate(&**catalog, authorization, None).await,
     }
-    .map_err(|error| consumer_authentication_response(&error))
+    .map_err(|error| consumer_authentication_response(&error, route))
 }
 
-/// Map a consumer authentication failure onto its public response.
+/// One consumer credential refusal, classified once for every route (task
+/// rows M6-C53 and M6-C52).
 ///
-/// A credential the relay evaluated and rejected is `401 UNAUTHORIZED`.  A
-/// failure to reach the catalog is not: the credential was never evaluated, so
-/// reporting it as a rejection tells a consumer holding perfectly good
-/// credentials that they were refused, and is indistinguishable at the HTTP
-/// boundary from a real refusal.  That case takes the
-/// `AUTHORIZATION_UNAVAILABLE` boundary this module already defines for an
-/// absent catalog, which is the same condition reached a moment later.
+/// `status` and `message` are what the consumer is told; each route renders
+/// them in its own documented code vocabulary (the flat body's
+/// `UNAUTHORIZED`/`FORBIDDEN`/`AUTHORIZATION_UNAVAILABLE`, the filesystem
+/// contract's `UNAUTHENTICATED`/`ACCESS_DENIED`/`BACKEND_UNAVAILABLE`), so the
+/// same cause gets the same status and the same message on every route.
+/// `stage` is logged by the relay and never sent: the consumer is not told
+/// which check failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsumerRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: &'static str,
+    pub(crate) stage: &'static str,
+}
+
+/// The message for every presented-but-refused credential.  It is true of
+/// each such cause and names none of them.
+pub(crate) const CONSUMER_TOKEN_REFUSED: &str = "the consumer access token was not accepted";
+
+/// Classify one consumer authentication failure.
 ///
-/// Both remain `not_dispatched`: neither reaches an owner.
-fn consumer_authentication_response(error: &OidcError) -> Response {
-    if matches!(error, OidcError::Catalog(_)) {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AUTHORIZATION_UNAVAILABLE",
-            "consumer authorization is unavailable",
-            "not_dispatched",
-        );
+/// * No bearer credential at all is `401` "a consumer access token is
+///   required" -- and only that; before M6-C53 the filesystem route said so
+///   of every refused token, including a validly signed one.
+/// * A presented credential the relay evaluated and refused -- malformed,
+///   badly signed, unknown key, refused claims, unknown consumer -- is `401`
+///   with one message that does not say which check failed.
+/// * A credential whose signature, claims and consumer all passed but that
+///   lacks the route's scope is `403`: the token is fine, the route is not
+///   in it (RFC 6750 section 3.1, `insufficient_scope`).  The verifier checks
+///   scope only after the identity lookup, so this is never said of an
+///   unknown consumer.
+/// * A catalog the relay could not reach is `503`: the credential was never
+///   evaluated, and reporting a rejection would tell a consumer holding good
+///   credentials that they were refused.
+pub(crate) fn classify_consumer_refusal(error: &OidcError) -> ConsumerRefusal {
+    let refused = |stage| ConsumerRefusal {
+        status: StatusCode::UNAUTHORIZED,
+        message: CONSUMER_TOKEN_REFUSED,
+        stage,
+    };
+    match error {
+        OidcError::Catalog(_) => ConsumerRefusal {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "consumer authorization is unavailable",
+            stage: "identity_lookup_unavailable",
+        },
+        OidcError::MissingBearer => ConsumerRefusal {
+            status: StatusCode::UNAUTHORIZED,
+            message: "a consumer access token is required",
+            stage: "bearer",
+        },
+        OidcError::InvalidToken => refused("token"),
+        OidcError::DisallowedAlgorithm => refused("algorithm"),
+        OidcError::MissingKeyId | OidcError::UnknownKey => refused("kid"),
+        OidcError::ClaimsRejected => refused("claims"),
+        OidcError::UnknownConsumer => refused("identity"),
+        OidcError::InvalidConfiguration => refused("verifier_configuration"),
+        OidcError::InsufficientScope => ConsumerRefusal {
+            status: StatusCode::FORBIDDEN,
+            message: "the consumer access token does not grant this route's scope",
+            stage: "scope",
+        },
     }
-    error_response(
-        StatusCode::UNAUTHORIZED,
-        "UNAUTHORIZED",
-        "consumer authentication failed",
-        "not_dispatched",
-    )
+}
+
+/// Task row M6-C52: one bounded, payload-free line per refused consumer
+/// request.  Every field is a fixed label, a status or an identifier the
+/// relay resolved itself; the token, its claims, the request path and the
+/// body are never logged.
+pub(crate) fn log_consumer_refusal(route: &'static str, refusal: &ConsumerRefusal) {
+    tracing::info!(
+        phase = "consumer_refused",
+        route,
+        stage = refusal.stage,
+        status = refusal.status.as_u16(),
+        "consumer request refused"
+    );
+}
+
+/// Task row M6-C52: an authenticated consumer refused by its grant.  The
+/// tenant, device and service are catalog identifiers already resolved for
+/// this principal.
+pub(crate) fn log_consumer_grant_refusal(
+    route: &str,
+    consumer: &tunnel_catalog::AuthenticatedConsumer,
+    device_id: Uuid,
+    service_id: Option<Uuid>,
+) {
+    tracing::info!(
+        phase = "consumer_refused",
+        route,
+        stage = "grant",
+        status = StatusCode::FORBIDDEN.as_u16(),
+        tenant_id = %consumer.tenant_id,
+        device_id = %device_id,
+        service_id = ?service_id,
+        "consumer request refused"
+    );
+}
+
+/// Map a consumer authentication failure onto the flat-body routes' public
+/// response, and log it (M6-C52).  Every outcome remains `not_dispatched`:
+/// none reaches an owner.
+fn consumer_authentication_response(error: &OidcError, route: &'static str) -> Response {
+    let refusal = classify_consumer_refusal(error);
+    log_consumer_refusal(route, &refusal);
+    let code = match refusal.status {
+        StatusCode::SERVICE_UNAVAILABLE => "AUTHORIZATION_UNAVAILABLE",
+        StatusCode::FORBIDDEN => "FORBIDDEN",
+        _ => "UNAUTHORIZED",
+    };
+    error_response(refusal.status, code, refusal.message, "not_dispatched")
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -5312,9 +5405,10 @@ mod consumer_authentication_status_tests {
         // The credential was never evaluated, so calling it rejected tells a
         // consumer holding good credentials that they were refused, and is
         // indistinguishable at the HTTP boundary from a real refusal.
-        let response = consumer_authentication_response(&OidcError::Catalog(
-            CatalogError::Conflict("catalog unreachable"),
-        ));
+        let response = consumer_authentication_response(
+            &OidcError::Catalog(CatalogError::Conflict("catalog unreachable")),
+            "unit",
+        );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -5328,15 +5422,18 @@ mod consumer_authentication_status_tests {
     async fn an_evaluated_credential_is_still_rejected_as_unauthorized() {
         // The other direction matters just as much: an availability status
         // must not start swallowing genuine credential rejections.
+        // `InsufficientScope` is no longer among them: since M6-C53 it is a
+        // `403`, asserted in `consumer_refusal_tests`.
         for error in [
+            OidcError::MissingBearer,
             OidcError::InvalidToken,
+            OidcError::ClaimsRejected,
             OidcError::DisallowedAlgorithm,
             OidcError::MissingKeyId,
             OidcError::UnknownKey,
-            OidcError::InsufficientScope,
             OidcError::UnknownConsumer,
         ] {
-            let response = consumer_authentication_response(&error);
+            let response = consumer_authentication_response(&error, "unit");
             assert_eq!(
                 response.status(),
                 StatusCode::UNAUTHORIZED,
@@ -5354,3 +5451,6 @@ mod consumer_authentication_status_tests {
 
 #[cfg(test)]
 mod tenant_admission_tests;
+
+#[cfg(test)]
+mod consumer_refusal_tests;

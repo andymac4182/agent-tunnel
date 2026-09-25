@@ -55,7 +55,7 @@ cargo test -p tunnel-relay --test m6_reconnect_process --locked -- --ignored --n
 cat "$scratch/reconnect.log"
 for needle in "test result: ok. 8 passed" "m6c23-reconnect ok label=restart nonce=" \
   "m6c23-reconnect ok label=late-relay nonce=" "m6c23-reconnect ok label=not-yet-valid nonce=" \
-  "m6c23-reconnect ok label=expired nonce=" "m6c23-reconnect ok label=identity nonce=" "relay_refusal_logged=true" "m6c38-protocol ok nonce=" "m6c23-reconnect ok label=issuer nonce=" \
+  "m6c23-reconnect ok label=expired nonce=" "relay_tls_refusal_logged=true" "m6c23-reconnect ok label=identity nonce=" "relay_refusal_logged=true" "m6c38-protocol ok nonce=" "m6c23-reconnect ok label=issuer nonce=" \
   "m6c68-liveness ok label=cut-path nonce=" \
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/reconnect.log"; then

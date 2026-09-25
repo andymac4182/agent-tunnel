@@ -909,8 +909,10 @@ async fn device_hello_unsupported_or_missing_major_is_refused_before_state() {
         .register_forwarded_control(device.clone(), DEVICE_SPKI.to_owned(), hello)
         .await;
     match outcome {
-        Err(crate::RelayError::Protocol(_)) => {}
-        Err(other) => panic!("expected a typed protocol outcome, got {other:?}"),
+        // M6-C38: the refusal is its own typed variant, so the device can be
+        // closed with `PROTOCOL_UNSUPPORTED` rather than a dropped socket.
+        Err(crate::RelayError::UnsupportedProtocolMajor) => {}
+        Err(other) => panic!("expected the typed protocol-major refusal, got {other:?}"),
         Ok(_) => panic!("an unsupported protocol major must be refused"),
     }
 
@@ -949,8 +951,10 @@ async fn device_hello_unsupported_or_missing_major_is_refused_before_state() {
         .register_forwarded_control(device, DEVICE_SPKI.to_owned(), zero_major)
         .await
     {
-        Err(crate::RelayError::Protocol(_)) => {}
-        Err(other) => panic!("expected a typed protocol outcome, got {other:?}"),
+        // M6-C38: the refusal is its own typed variant, so the device can be
+        // closed with `PROTOCOL_UNSUPPORTED` rather than a dropped socket.
+        Err(crate::RelayError::UnsupportedProtocolMajor) => {}
+        Err(other) => panic!("expected the typed protocol-major refusal, got {other:?}"),
         Ok(_) => panic!("a zero protocol major must be refused"),
     }
 

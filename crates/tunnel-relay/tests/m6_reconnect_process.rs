@@ -1140,7 +1140,7 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
     let deployment = Deployment::provision("expired").await;
     let now = unix_now();
     deployment.reissue_device_certificate(now - 172_800, now - 3_600);
-    let relay = deployment.serve("serve");
+    let (relay, relay_log) = deployment.serve_logged("serve");
     let mut client = deployment.connect();
     let exit = client.wait_exit("expired certificate");
     let events: Vec<Value> = client
@@ -1157,9 +1157,16 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
         "{events:?}"
     );
     assert!(client.states("backoff").is_empty(), "{events:?}");
+    // M6-C52: the relay's side of the same refusal, at its default level.
+    let refusal = wait_for_log_line(&relay_log, "TLS handshake refused");
+    assert!(
+        refusal.contains("\"refusal\":\"client_certificate_expired\""),
+        "{refusal}"
+    );
     drop(relay);
     println!(
-        "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0 \
+         relay_tls_refusal_logged=true",
         deployment.nonce
     );
 }

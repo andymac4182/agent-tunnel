@@ -478,6 +478,69 @@ mod tests {
         );
     }
 
+    /// M6-C63: the memory catalog records `last_seen_at` exactly where the
+    /// Redis scripts do -- a successful claim and renewal, never a stale one.
+    #[tokio::test]
+    async fn memory_owner_claim_and_renewal_record_last_seen() {
+        let mut records = fixture();
+        for device in &mut records.devices {
+            device.last_seen_at = None;
+        }
+        let catalog = MemoryCatalog::new();
+        catalog.seed_fixture(&records).await.unwrap();
+        let device = &records.devices[0];
+        let consumer = catalog
+            .resolve_consumer("https://issuer.example", "alice", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let seen = || async {
+            catalog
+                .list_devices_filtered(&consumer, &DeviceListFilter::default(), Utc::now())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|summary| summary.device_id == device.device_id)
+                .unwrap()
+                .last_seen_at
+        };
+        assert_eq!(seen().await, None);
+        let claim = catalog
+            .claim_owner(&OwnerClaimRequest {
+                deployment_incarnation: "inc-1".into(),
+                tenant_id: device.tenant_id,
+                device_id: device.device_id,
+                node_id: "node-a".into(),
+                boot_id: "boot-a".into(),
+                session_id: "session-a".into(),
+                lease_expires_at: Utc::now() + Duration::seconds(10),
+            })
+            .await
+            .unwrap();
+        let claimed = seen().await.expect("claim records last_seen_at");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            catalog
+                .renew_owner(&claim.token, Utc::now() + Duration::seconds(10))
+                .await
+                .unwrap()
+        );
+        let renewed = seen().await.expect("renewal keeps it");
+        assert!(renewed > claimed);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let stale = OwnerToken {
+            session_id: "stale".into(),
+            ..claim.token.clone()
+        };
+        assert!(
+            !catalog
+                .renew_owner(&stale, Utc::now() + Duration::seconds(10))
+                .await
+                .unwrap()
+        );
+        assert_eq!(seen().await, Some(renewed));
+    }
+
     #[tokio::test]
     async fn memory_grant_revisions_and_owner_fencing_are_monotonic() {
         let catalog = MemoryCatalog::new();

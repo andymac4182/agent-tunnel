@@ -1242,6 +1242,103 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
     headers.remove(header::COOKIE);
 }
 
+/// Request headers every stock HTTP client sends by default that carry no
+/// authority and that no pinned profile forwards (task row M6-C58).
+///
+/// `user-agent` identifies the consumer's HTTP stack, which the export has no
+/// use for and the tunnel has no reason to disclose to a device.
+/// `accept-encoding` asks for a content coding the tunnel never applies: the
+/// device always asks its backend for `identity` and refuses any other
+/// response coding (`docs/mcp.md`), and `identity` is acceptable to every
+/// client whatever it sent.  Dropping either therefore changes nothing the
+/// export or the consumer can observe, while refusing them -- the behaviour
+/// before M6-C58 -- failed every stock client's first request with an
+/// `HTTP_INVALID_HEAD` that did not say which header to remove.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 2] = [header::USER_AGENT, header::ACCEPT_ENCODING];
+
+/// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
+/// them, in which case they are forwarded as that profile says.  Every other
+/// unlisted header is still refused by the codec, as `docs/http-forwarding.md`
+/// requires.
+pub(crate) fn strip_default_client_headers(
+    headers: &mut http::HeaderMap,
+    policy: &tunnel_http_forward::HeaderPolicy,
+) {
+    for name in DROPPED_CLIENT_HEADERS {
+        if !policy.allows(name.as_str()) {
+            headers.remove(name);
+        }
+    }
+}
+
+/// Transport fields the bridge consumes itself rather than forwarding, and
+/// `content-encoding`, which it screens by value; none of them is ever the
+/// header an allowlist refusal is about.
+const CONSUMED_REQUEST_FIELDS: [&str; 7] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "expect",
+    "content-encoding",
+];
+
+/// The first request header the profile does not allowlist, for naming it in
+/// the refusal (task row M6-C58).  Header names are bounded, lowercase HTTP
+/// tokens by the time they get here, and the name is returned only to the
+/// consumer that sent it; the value is never read.
+pub(crate) fn first_unlisted_request_header(
+    headers: &http::HeaderMap,
+    policy: &tunnel_http_forward::HeaderPolicy,
+) -> Option<String> {
+    headers
+        .keys()
+        .map(http::HeaderName::as_str)
+        .filter(|name| !CONSUMED_REQUEST_FIELDS.contains(name))
+        .find(|name| !policy.allows(name))
+        .filter(|name| name.len() <= 128)
+        .map(str::to_owned)
+}
+
+/// The ingress refusal of a request head the codec refused.  For a header
+/// the profile does not allowlist, the body names it (M6-C58):
+/// `{"error":{"code":"HTTP_INVALID_HEAD","execution":"not_dispatched",
+/// "header":"x-example"}}`; every other refusal keeps the documented
+/// two-field body.
+fn ingress_head_rejection(
+    error: tunnel_http_bridge::NormalizeError,
+    headers: &http::HeaderMap,
+    policy: &tunnel_http_forward::HeaderPolicy,
+) -> Response {
+    let named = match error {
+        tunnel_http_bridge::NormalizeError::Codec(
+            tunnel_http_forward::CodecError::InvalidHeader(
+                tunnel_http_forward::HeaderRule::NotAllowed
+                | tunnel_http_forward::HeaderRule::Forbidden
+                | tunnel_http_forward::HeaderRule::Unsupported,
+            ),
+        ) => first_unlisted_request_header(headers, policy),
+        _ => None,
+    };
+    let Some(name) = named else {
+        return rejection_response(error).map(axum::body::Body::new);
+    };
+    let body = serde_json::json!({
+        "error": {
+            "code": error.code().as_str(),
+            "execution": "not_dispatched",
+            "header": name,
+        }
+    });
+    let mut response = (error.status(), axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 /// The typed name of the relay-only principal binding header.  The literal
 /// is a valid lowercase HTTP token, which `tunnel_mcp`'s profile tables also
 /// prove by building their policies from it.
@@ -1368,7 +1465,7 @@ pub(crate) async fn http_forward_route(
         .await
     {
         Ok(value) => value,
-        Err(error) => return consumer_authentication_response(&error),
+        Err(error) => return consumer_authentication_response(&error, "http-forward"),
     };
     let bearer_token = forwarded_bearer_token(headers).to_owned();
     let Ok(device_id) = parse_uuid(&device) else {
@@ -1396,6 +1493,12 @@ pub(crate) async fn http_forward_route(
         || grant.valid_until <= now
         || validated.expires_at <= now
     {
+        crate::http::log_consumer_grant_refusal(
+            "http-forward",
+            &validated.consumer,
+            device_id,
+            Some(service_id),
+        );
         return error_response(
             StatusCode::FORBIDDEN,
             "FORBIDDEN",
@@ -1451,6 +1554,7 @@ pub(crate) async fn http_forward_route(
     };
     parts.uri = uri;
     strip_public_credentials(&mut parts.headers);
+    strip_default_client_headers(&mut parts.headers, &export.profile.request.headers);
     // M3-04: the device cannot see the authenticated principal, so the
     // ingress — the only endpoint that verified the consumer credential —
     // hands it an opaque per-principal binding.  A consumer that presents the
@@ -1490,7 +1594,7 @@ pub(crate) async fn http_forward_route(
             .handle
             .http_forward_diagnostics()
             .record_ingress_rejection();
-        return rejection_response(error).map(axum::body::Body::new);
+        return ingress_head_rejection(error, &parts.headers, &export.profile.request.headers);
     }
     let request = http::Request::from_parts(parts, body);
 
@@ -1505,7 +1609,7 @@ pub(crate) async fn http_forward_route(
                 return error_response(
                     StatusCode::UNAUTHORIZED,
                     "UNAUTHORIZED",
-                    "credential expired",
+                    "consumer token expired before dispatch",
                     "not_dispatched",
                 );
             }
@@ -2171,6 +2275,75 @@ mod tests {
         let ids = [Uuid::nil(), Uuid::max(), Uuid::nil(), Uuid::max()];
         let derived = principal_binding(ids[0], ids[1], ids[2], ids[3]);
         assert_eq!(principal_binding_value(&derived).to_str().unwrap(), derived);
+    }
+
+    /// M6-C58: a stock HTTP client's default request headers.  Every MCP
+    /// profile admits the request once the ingress has dropped `user-agent`
+    /// and `accept-encoding`, and refused it before; a header neither
+    /// dropped nor allowlisted is still refused, now with its name in the
+    /// body.
+    #[tokio::test]
+    async fn a_stock_clients_default_headers_reach_an_mcp_export() {
+        for profile in tunnel_mcp::McpProfile::ALL {
+            let policies = profile
+                .policies(tunnel_mcp::McpLimits::default())
+                .expect("MCP profile");
+            let stock = || {
+                let mut request = http::Request::post("/mcp")
+                    .version(http::Version::HTTP_11)
+                    .header("host", "relay.example.test")
+                    .header("user-agent", "curl/8.7.1")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("accept-encoding", "gzip, deflate, br, zstd")
+                    .header("content-type", "application/json")
+                    .header("content-length", "2")
+                    .header("mcp-protocol-version", profile.protocol_version());
+                if profile == tunnel_mcp::McpProfile::V2026_07_28 {
+                    request = request.header("mcp-method", "tools/list");
+                }
+                request.body(()).expect("request").into_parts().0
+            };
+            let unstripped = stock();
+            assert!(
+                tunnel_http_bridge::normalize::request_head(&unstripped, &policies.request)
+                    .is_err(),
+                "{}: the codec refuses user-agent and accept-encoding themselves",
+                profile.id()
+            );
+            let mut stripped = stock();
+            strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
+            assert!(!stripped.headers.contains_key("user-agent"));
+            assert!(!stripped.headers.contains_key("accept-encoding"));
+            tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}: a stock client's head was refused: {error:?}",
+                        profile.id()
+                    )
+                });
+
+            // Anything else unlisted is still refused, and named.
+            let mut extra = stock();
+            strip_default_client_headers(&mut extra.headers, &policies.request.headers);
+            extra
+                .headers
+                .insert("x-m6c58-probe", http::HeaderValue::from_static("synthetic"));
+            let error = tunnel_http_bridge::normalize::request_head(&extra, &policies.request)
+                .expect_err("an unlisted header is refused");
+            let response = ingress_head_rejection(error, &extra.headers, &policies.request.headers);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+            assert_eq!(body["error"]["code"], "HTTP_INVALID_HEAD", "{body}");
+            assert_eq!(body["error"]["execution"], "not_dispatched", "{body}");
+            assert_eq!(body["error"]["header"], "x-m6c58-probe", "{body}");
+            assert!(
+                !body.to_string().contains("synthetic"),
+                "the value is never echoed: {body}"
+            );
+        }
     }
 
     /// Gate 5: a service selects its profile only through the catalog

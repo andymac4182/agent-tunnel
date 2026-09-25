@@ -391,7 +391,8 @@ fn consumer_tls(server_ca_pem: &str) -> Result<rustls::ClientConfig, String> {
 }
 
 /// One HTTPS request to the relay's consumer listener with the caller's
-/// headers, bounded by [`STEP_DEADLINE`].  Sends no `User-Agent` (M6-C58).
+/// headers, bounded by [`STEP_DEADLINE`].  Sends no `User-Agent` of its own; the MCP gate adds a
+/// stock client's default headers explicitly (M6-C58).
 async fn consumer_request(
     consumer: SocketAddr,
     server_ca_pem: &str,
@@ -1320,6 +1321,42 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         "step stranger: an unprovisioned subject got HTTP {stranger_status}"
     );
 
+    // M6-C63: while the device is connected the listing says when it was
+    // last seen.  Before M6-C63 nothing in the shipped relay wrote it, so a
+    // device that had just served the echo above was listed `null`.
+    let (list_status, _, listing) = consumer_request(
+        consumer,
+        &pki.ca_pem,
+        "GET",
+        "/v1/devices",
+        &token,
+        &[],
+        b"",
+    )
+    .await
+    .expect("step device listing");
+    assert_eq!(list_status, 200, "step device listing");
+    let listing: serde_json::Value = serde_json::from_slice(&listing).expect("listing JSON");
+    let listed = listing
+        .as_array()
+        .and_then(|devices| {
+            devices
+                .iter()
+                .find(|entry| entry["device_id"] == device.to_string())
+        })
+        .unwrap_or_else(|| panic!("step device listing: {device} not listed: {listing}"));
+    let last_seen = listed["last_seen_at"].as_str().unwrap_or_else(|| {
+        panic!("step device listing: a connected device has no last_seen_at: {listed}")
+    });
+    let last_seen = chrono::DateTime::parse_from_rfc3339(last_seen)
+        .expect("last_seen_at is RFC 3339")
+        .with_timezone(&chrono::Utc);
+    let age = chrono::Utc::now() - last_seen;
+    assert!(
+        age < chrono::Duration::seconds(60) && age > chrono::Duration::seconds(-5),
+        "step device listing: last_seen_at {last_seen} is not the live session's"
+    );
+
     drop(_device);
 
     // --- M6-C32: identity refusals are terminal and say so. ---
@@ -1408,7 +1445,8 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
     let removed = delete_namespace(upstream, database, &namespace);
     println!(
         "m6c21-e2e ok nonce={nonce} namespace={namespace} echo_status={status} \
-         echo_bytes={} stranger_status={stranger_status} keys_removed={removed}",
+         echo_bytes={} stranger_status={stranger_status} last_seen_listed=true \
+         keys_removed={removed}",
         body.len()
     );
 }
@@ -1941,6 +1979,62 @@ async fn m6c57_provisioned_mcp_service_answers_initialize_and_a_tool_call() {
          echo call in its fresh workspace"
     );
 
+    // 4. M6-C58: a stock HTTP client's default headers.  curl's own
+    // `User-Agent` and a browser-style `Accept-Encoding` ride along with a
+    // `tools/list`, and the export answers it: the ingress drops both rather
+    // than refusing the request.  Before M6-C58 this was `400
+    // HTTP_INVALID_HEAD`, naming nothing.
+    let mut stock_headers = session_headers.clone();
+    stock_headers.push(("user-agent", "curl/8.7.1"));
+    stock_headers.push(("accept-encoding", "gzip, deflate, br"));
+    let (list_status, _, body) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &token,
+        &stock_headers,
+        br#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+    )
+    .await
+    .expect("step mcp tools/list with stock client headers");
+    assert_eq!(
+        list_status,
+        200,
+        "step mcp tools/list with stock client headers: {}; {}",
+        String::from_utf8_lossy(&body),
+        context()
+    );
+    let listed = jsonrpc_reply(&body, &serde_json::json!(3)).unwrap_or_else(|| {
+        panic!(
+            "step mcp tools/list: no JSON-RPC reply with id 3: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    assert!(
+        listed["result"]["tools"].is_array(),
+        "step mcp tools/list: {listed}"
+    );
+    // A header that is neither dropped nor allowlisted is still refused
+    // before admission, and the refusal now names it.
+    let mut probe_headers = stock_headers.clone();
+    probe_headers.push(("x-m6c58-probe", "synthetic"));
+    let (probe_status, _, body) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &token,
+        &probe_headers,
+        br#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+    )
+    .await
+    .expect("step mcp unlisted header");
+    let probe: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    assert_eq!(probe_status, 400, "step mcp unlisted header: {probe}");
+    assert_eq!(probe["error"]["code"], "HTTP_INVALID_HEAD", "{probe}");
+    assert_eq!(probe["error"]["header"], "x-m6c58-probe", "{probe}");
+
     // Control: the same initialize with a token for an unprovisioned
     // subject is refused, so the 200 above was the provisioned grant's.
     let stranger =
@@ -1967,7 +2061,8 @@ async fn m6c57_provisioned_mcp_service_answers_initialize_and_a_tool_call() {
     println!(
         "m6c57-mcp ok nonce={nonce} namespace={namespace} initialize=200 \
          notification={notification_status} tools_call={status} marker_echoed=true \
-         backend_invocations={backend_invocations} stranger_status={stranger_status}"
+         backend_invocations={backend_invocations} stranger_status={stranger_status} \
+         stock_client_headers={list_status} unlisted_header_named={probe_status}"
     );
 }
 
