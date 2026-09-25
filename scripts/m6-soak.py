@@ -710,13 +710,16 @@ class HttpConn:
 def classify(status: int, body: bytes) -> tuple[str, str]:
     if status == 200:
         return "", ""
+    # The relay's flat-body routes answer {"code","execution",...}; the
+    # http-forward gateway nests the same pair under "error".
     try:
         value = json.loads(body)
-        error = value.get("error", {}) if isinstance(value, dict) else {}
-        if isinstance(error, dict):
-            return str(error.get("code", f"HTTP_{status}")), str(error.get("execution", ""))
     except ValueError:
-        pass
+        value = None
+    if isinstance(value, dict):
+        error = value.get("error") if isinstance(value.get("error"), dict) else value
+        if "code" in error:
+            return str(error["code"]), str(error.get("execution", ""))
     return f"HTTP_{status}", ""
 
 
@@ -751,6 +754,7 @@ class Worker:
     async def once(self) -> None:
         self.seq += 1
         t0 = time.time()
+        body = b""
         start = time.perf_counter()
         user = self.stack.users[self.user]["subject"]
         try:
@@ -778,7 +782,12 @@ class Worker:
             self.mcp_session = None
             status, code, execution, ok = 0, f"CONN_{type(error).__name__}", "", False
         latency = (time.perf_counter() - start) * 1000
-        self.rec.add(t0, self.kind, self.worker_id, latency, status, code, execution, ok)
+        # An unclassified refusal keeps a short printable prefix of its body
+        # (a relay or fixture error text, never a request payload).
+        detail = ""
+        if code.startswith("HTTP_") and status and status != 200:
+            detail = re.sub(r"[^ -~]", "?", body[:80].decode("latin-1"))
+        self.rec.add(t0, self.kind, self.worker_id, latency, status, code, execution, ok, detail)
 
     async def mcp_call(self, token: str):
         base = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
@@ -869,6 +878,8 @@ def summarize_rows(rows: list[tuple], kind: str | None = None, phase: str | None
             key = r[6] or f"HTTP_{r[5]}"
             if r[7]:
                 key += f"/{r[7]}"
+            if key.startswith("HTTP_") and len(r) > 9 and r[9]:
+                key += f" [{r[9][:48]}]"
             codes[key] = codes.get(key, 0) + 1
     span = (max(r[0] for r in sel) - min(r[0] for r in sel)) if len(sel) > 1 else 0
     return {
