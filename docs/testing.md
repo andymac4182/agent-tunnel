@@ -33,6 +33,8 @@ Configuration tests must preserve these defaults and reject invalid values:
 - Listener `handshake_timeout` defaults to 10 seconds, `pre_request_timeout` to 15 seconds and `http1_header_read_timeout` to 10 seconds. Each accepts 100 ms–300 seconds inclusive, and the cross-field rule is `http1_header_read_timeout <= pre_request_timeout`. A zero value is rejected rather than treated as "disabled", and an invalid value must return a typed error and release the listener instead of accepting connections with an unbounded permit. See the [bounded listener connection permits](runtime.md#bounded-listener-connection-permits) contract.
 - Empty/default and partial configuration, unknown or duplicate keys, incorrect types, negative/overflowing values, valid boundaries, and the checked-in examples must be covered. Add boundary and cross-field cases whenever an invariant changes.
 
+**A logged result counts only if it names the run that wrote it (M6-C16).** Concurrent agents in one session share a scratchpad directory, so a generic name such as `bundle.log` or `verify.log` can hold another worker's older output, in the right format, at the path the reader expects. Write each run's output to a new, unique name -- a nonce of label, UTC time and process id -- and put the nonce and the commit (`head=`) inside the file, as the first and last lines. Before quoting a figure from a file, check that its nonce and head are the run you started; a file that cannot be attributed is unmeasured. Scripts that choose their own output location do the same: the `m6-*-verify.sh` scripts use `mktemp -d`, `m7-local-source-parity-build.sh` makes a new `run-*` directory, and `m7-gates-parallel.sh` makes `gates-<label>-<UTC>-<pid>` with a `run.txt` stamp (`scripts/test_scratch_log_names.py` fails if two runs with one label share a directory).
+
 ## Repeatable M7 harness commands
 
 Build the workspace binaries with `cargo build --workspace --locked` before
@@ -2232,7 +2234,8 @@ empty-pin-set refusal (M7-C83), which shares that body's code and execution but 
 message and a 5000 ms hint, and is never resent. The owner-not-ready body
 outside a freeze reaches its case unchanged. Refusals and resends are printed with the evidence
 (M3-30: on a hosted runner the rotation-span case starts inside the first
-freeze). Everything else on the path is production: relay-c's public route, the
+freeze; since M3-34 that case anchors on a completed rotation instead of
+relying on this resend). Everything else on the path is production: relay-c's public route, the
 peer HTTP/3 hop, relay-a's owner actor, the rotating device data WebSocket and
 `tunnel-client`'s configured `[exports.<service>.mcp]` stdio exports.
 
@@ -2331,9 +2334,17 @@ boundaries at most every 15 s (defect M7-C80).
   `session_idle_seconds` (M3-16). The Streamable HTTP export has the same
   setting for its own session table, so an abandoned session there is
   forgotten rather than held for ever.
-* **rotation-span.** One call is held open until the owner has completed three
-  scheduled rotations, then released: it must answer 200 exactly once with the
-  fixture's exact text, on the same device session, with one dispatch. This
+* **rotation-span.** The case first waits for the owner to complete one
+  scheduled rotation and anchors on it: the owner starts the next one only a
+  whole interval later, so the session and the call are sent while no freeze
+  can begin, wherever the schedule stood when the case started (M3-34). One
+  call is then held open until the owner has completed three more scheduled
+  rotations, then released: it must answer 200 exactly once with the
+  fixture's exact text, on the same device session, with one dispatch. Once
+  its hold has started, the owner must still be `active` with the anchor's
+  completed count, so the call provably reached the device before any rotation
+  it is credited with began; a call refused into a freeze and resent until
+  after it fails that rule rather than being counted as spanning it. This
   case is also the validator's control for the revocation withdrawal above: an
   identical held call that is never revoked stays open far longer than the
   five-second withdrawal bound and is answered.
@@ -2456,6 +2467,37 @@ For CUA, pin each supported backend profile separately. Use recorded synthetic c
 Actual computer-use tests run only in a dedicated disposable VM or isolated test computer with synthetic content. Never target a contributor's live desktop or a normal CI runner desktop. A person grants any required OS screen recording, accessibility, or interactive-session permissions during test-image setup; tests verify both permission-granted and permission-denied behavior without trying to bypass those prompts.
 
 The GUI fixture should display a known test window, unique screen markers, a text field, and a click counter. Check screenshot dimensions and markers, targeted input, expected field contents, one click per operation, cancellation, unsupported capabilities, and lost permissions. Use screenshots containing only fixture content as test artifacts. Record OS, display scale, keyboard layout, backend version, and granted permissions with each run. Do not infer Windows/macOS/Linux feature parity from the success of a single backend on one OS.
+
+### Disposable Linux CUA VM (Apple Silicon host)
+
+The owner approved on 2026-09-25 running CUA in a VM on the owner's Apple Silicon laptop, **never** against the laptop's own desktop. [`scripts/m5-cua-vm.sh`](../scripts/m5-cua-vm.sh) builds and drives that VM with [Tart](https://tart.run) (Apple Virtualization framework). It is the Linux half of the M5-03 proposal; macOS and Windows guests are not built yet.
+
+**Safety boundary.** Every screen capture and input event happens inside the guest. The script never starts `cua-computer-server`, a VNC server, a screenshot tool or a tunnel CUA export on the macOS host, and nothing requires granting the host Terminal or any host process Screen Recording or Accessibility. The server binds `127.0.0.1` inside the guest; the host reaches it only through an SSH forward over Tart's private NAT network (`192.168.64.0/24`), and [`probe.py`](../tests/cua-fixture/probe.py) refuses any base URL other than the host end of that forward. The forward uses a free host port chosen per run, and the script refuses to send any request unless the `ssh` process is alive and is the **only** listener on that port (`lsof -sTCP:LISTEN`), so nothing else on the host can receive the probe. SSH authenticates the guest against a per-run `known_hosts` holding the guest's ed25519 host key, read over the hypervisor channel with `tart exec`; there is no `StrictHostKeyChecking=no`. The probe sends no input. Screen content is the synthetic fixture only, and `probe.py` enforces it: unless all four screenshot corners are exactly the fixture's marker colours (read from `fixture_app.py`), it writes neither the PNG nor any pixel value and exits 3, which fails the run.
+
+**Golden image `cua-golden`.** Cloned from the official `ghcr.io/cirruslabs/ubuntu` image, pinned by digest in the script (Ubuntu 24.04.4 LTS, arm64); 4 vCPU, 4 GB RAM, the image's 20 GB disk (the owner cap is 4 vCPU, 4 GB and 25 GB). [`provision-guest.sh`](../tests/cua-fixture/provision-guest.sh) runs inside the guest and installs:
+
+- Xorg (modesetting on virtio-gpu, not Xvfb, per M5-03) at 1280x800, openbox, and getty autologin of an unprivileged, password-locked `cua` user straight into `startx`;
+- the fixture app [`fixture_app.py`](../tests/cua-fixture/fixture_app.py): a fullscreen Tk window titled `agentuplink-cua-fixture` with 40 px corner markers (red top-left, green top-right, blue bottom-left, magenta bottom-right), a yellow centre marker, a text field and a click counter. It writes what it actually received to `/tmp/cua-fixture/state.json`, so a test can check the application side effect rather than a transport acknowledgement;
+- `cua-computer-server==0.3.46` with the `driver` and `vnc` extras into `/opt/cua-server` by `pip install --require-hashes --no-deps --only-binary :all:` from [`requirements-linux-aarch64.lock`](../tests/cua-fixture/requirements-linux-aarch64.lock). The script refuses to build unless the lock's two `cua-computer-server` hashes are exactly `WHEEL_SHA256` and `SDIST_SHA256` from `crates/tunnel-http-forward/src/cua_pin.rs`. Every other dependency is hash-locked too; the lock was generated with `uv pip compile --generate-hashes --python-version 3.12 --python-platform aarch64-manylinux_2_39` (glibc 2.39 is Ubuntu 24.04's; `cua-driver` 0.22.2 ships only a `manylinux_2_31` aarch64 wheel, which the default `manylinux_2_28` target rejects). **Wheels only, with one named exception:** of the 109 locked packages only `evdev` 2.0.0 (a Linux dependency of `pynput`) publishes no wheel, so it alone is built from its hashed sdist, with `--no-build-isolation` against `setuptools` 84.0.0 from the separately hash-locked, wheel-only [`requirements-build-linux-aarch64.lock`](../tests/cua-fixture/requirements-build-linux-aarch64.lock); no unhashed build dependency is fetched;
+- `x11vnc` for the VNC backend, bound to guest loopback and started only by the launcher when that backend is selected. The launcher also sets `CUA_TELEMETRY_ENABLED=false`: `cua-core` 0.3.1 sends PostHog and OpenTelemetry events by default.
+
+**Commands.** Tart **2.38.0** was installed from the notarised GitHub release asset `tart.tar.gz` (SHA-256 `1712be82b687cc27792d5a2bae3f36fcb5e5dea4d5772231f5508dea567999e2`, the digest GitHub reports for the asset, re-hashed locally), signed `Developer ID Application: Cirrus Labs, Inc.`, Team ID `9M2P8L4D89`, accepted by `spctl` as a notarised Developer ID. The `cirruslabs/cli` Homebrew tap fails under Homebrew 7 and still carries 2.32.1. Put `tart` on `PATH` or set `TART`; the script refuses any `tart --version` other than the pinned 2.38.0. `golden`, `create`, `run` and `probe` check free space on the filesystem holding Tart's storage (`TART_HOME`, default `~/.tart`) and abort if the step would leave less than 20 GiB. `cycle` stops and deletes its clone on any exit, and `golden` stops the golden VM on any exit, including a failed step.
+
+```sh
+scripts/m5-cua-vm.sh golden            # build cua-golden once (~5 min; ~5 GiB on disk, shared with Tart's OCI cache)
+scripts/m5-cua-vm.sh cycle cua-run-1   # clone, boot, probe every backend, stop, delete
+scripts/m5-cua-vm.sh create NAME && scripts/m5-cua-vm.sh run NAME   # keep a clone up
+scripts/m5-cua-vm.sh probe NAME        # read-only probe; evidence under ~/.local/state/agentuplink-m5-cua-vm/runs/
+scripts/m5-cua-vm.sh destroy NAME
+scripts/m5-cua-vm.sh destroy-golden    # remove the golden image and the cached base image
+```
+
+Runs always use a clone (`tart clone` is an APFS copy-on-write clone, so a clone costs only the blocks the guest writes); the script refuses to run or probe `cua-golden` itself. `probe` records per variant: `/status`, `/commands` (names, aliases, parameters), and `/cmd` `version`, `get_screen_size`, `get_cursor_position` and `screenshot`, with the PNG's dimensions and the pixel colour at each marker, beside `xdpyinfo` and the manifest from [`guest-manifest.sh`](../tests/cua-fixture/guest-manifest.sh) (OS, kernel, display, DPI, keyboard layout, package versions, lock digest). The variants are `native`, `native` with the ignored `--width/--height` flags, `native` with `UNAVAILABLE_WITHOUT_CONTAINER_NAME=1`, `vnc`, and `cua-driver`.
+
+**A black root framebuffer is an environment failure.** On this image an X `GetImage` of the root window (PIL `ImageGrab`, which the native Linux backend uses, and ImageMagick `import`) returned an all-black frame until something forced an Expose of every window; `x11vnc` starting or `xrefresh` cleared it. The session therefore runs `xrefresh` once the fixture maps, and `run` does not report a guest up until a root capture inside the guest shows the red marker. Why the first paint is missing from the root image was not established.
+
+**Not covered yet.** No input is sent and the tunnel device does not run in the guest: there is no `aarch64-unknown-linux-gnu` release artifact and the CLI does not yet wire a CUA export (M5-03). No macOS or Windows guest exists, and the guest's display runs at identity scale, so it cannot answer M5-C19's non-identity question on its own.
+
 
 ## Soak, chaos, and load experiments
 

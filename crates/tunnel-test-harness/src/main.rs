@@ -2885,8 +2885,10 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.revocation.revoked_session_unreachable,
                     );
                     println!(
-                        "M3 MCP isolation rotation-span: rotations={} status={} exact={} invocations={} session_stable={}",
+                        "M3 MCP isolation rotation-span: rotations={} dispatched_between_rotations={} anchor_to_dispatch_ms={} status={} exact={} invocations={} session_stable={}",
                         evidence.rotation_span.rotations_spanned,
+                        evidence.rotation_span.dispatched_between_rotations,
+                        evidence.rotation_span.anchor_to_dispatch_ms,
                         evidence.rotation_span.status,
                         evidence.rotation_span.result_exact,
                         evidence.rotation_span.invocations,
