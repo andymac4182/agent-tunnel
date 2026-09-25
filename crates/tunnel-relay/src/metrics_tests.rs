@@ -178,3 +178,103 @@ fn m6c24_an_unknown_grant_route_is_other() {
     assert_eq!(route_label("echo"), "echo");
     assert_eq!(route_label("m6c24-canary-service-type"), "other");
 }
+
+/// A router that answers `GET /metrics` with a fixed body, for the listener
+/// bound tests below (no relay actor needed).
+fn fixed_router() -> Router {
+    Router::new().route("/metrics", get(|| async { "ok\n" }))
+}
+
+async fn bounded_listener() -> (
+    std::net::SocketAddr,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<Result<(), std::io::Error>>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(serve_bounded(listener, fixed_router(), cancel.clone()));
+    (address, cancel, task)
+}
+
+/// Read until the peer closes; `true` when it closed within `within`.
+async fn closed_within(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0_u8; 1024];
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+async fn scrape_status(address: std::net::SocketAddr) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: metrics\r\n\r\n")
+        .await
+        .expect("write");
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply)).await;
+    String::from_utf8_lossy(&reply)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// PR #158 review: a client that connects and sends nothing is closed after
+/// the request-head deadline, not held open indefinitely.
+#[tokio::test]
+async fn m6c24_an_idle_metrics_connection_is_closed_after_the_head_deadline() {
+    let (address, cancel, task) = bounded_listener().await;
+    let mut idle = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    let started = std::time::Instant::now();
+    assert!(
+        closed_within(&mut idle, HEADER_TIMEOUT + Duration::from_secs(2)).await,
+        "an idle metrics connection was still open after {:?}",
+        started.elapsed()
+    );
+    assert!(scrape_status(address).await.contains("200"));
+    cancel.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+/// PR #158 review: the listener holds at most `MAX_CONNECTIONS`; one more is
+/// closed at once, and a scrape works again as soon as a slot frees.
+#[tokio::test]
+async fn m6c24_metrics_connections_beyond_the_cap_are_closed_at_accept() {
+    let (address, cancel, task) = bounded_listener().await;
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        held.push(
+            tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect"),
+        );
+    }
+    // Let the listener accept and hold the first `MAX_CONNECTIONS`.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut extra = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    assert!(
+        closed_within(&mut extra, Duration::from_millis(500)).await,
+        "a connection beyond the cap of {MAX_CONNECTIONS} was held open"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(scrape_status(address).await.contains("200"));
+    cancel.cancel();
+    task.await.expect("join").expect("serve");
+}

@@ -604,8 +604,11 @@ Each Redis connection the relay opens at startup, and each recovery
 connection, gets **10 seconds** to open, covering the DNS lookup, TCP
 connect, TLS handshake and `AUTH`. After that, each command gets 2 seconds
 (M6-C73). A lane that reconnects inside a running relay, for example after a
-Redis restart, still has only 2 seconds for the whole reconnect, DNS lookup
-included (M6-C74). On a fresh Fly machine the first lookup of a `.internal`
+Redis restart, gets the same 10 seconds for the whole reconnect, DNS lookup
+included, and runs it outside the lane lock: other callers on that lane are
+not queued behind it and still fail closed after their own 2 seconds while it
+runs (M6-C74). A relay built before M6-C74 gave a lane reconnect only 2
+seconds. On a fresh Fly machine the first lookup of a `.internal`
 name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
 one-second default, so that lookup alone failed `activate-first-incarnation`
 with `stage=connection_establishment class=timeout`.
@@ -1255,9 +1258,13 @@ private network), refuse `0.0.0.0` and `::`, and refuse the consumer or device
 address. Keep it reachable only by your scraper. `serve` prints
 `tunnel-relay metrics listening: metrics=ADDRESS`. One scrape runs at a time (a
 concurrent one gets `503`), and each waits at most 2 s for the relay's
-snapshot. **A relay binary older than this change refuses a configuration
+snapshot. The listener holds at most 4 connections and closes any beyond
+that at once; each must send its request within 2 s, serves one request
+(no keep-alive) and is closed after 10 s at most, so an idle client cannot
+hold one open. **A relay binary older than this change refuses a configuration
 that names `metrics_bind`** (unknown field), so remove the key before rolling
-back.
+back. That includes the image currently deployed on Fly, `main-77bfd28`
+([deploy-fly.md](deploy-fly.md)).
 
 The series, all prefixed `tunnel_relay_`: `build_info{version}`, `ready`
 (what `/readyz` answers), and on a relay without `[cluster]`

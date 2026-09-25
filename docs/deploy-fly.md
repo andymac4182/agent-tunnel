@@ -24,8 +24,13 @@ connection gets 10 s. **The relay now runs `main-77bfd28`**, built from
 `77bfd28` (M6-C91's entrypoint) with these deploy files. It replaced
 `main-af23c2f` in place on 2026-09-24, which had replaced `main-721ed2a`
 earlier that day, with no re-provisioning; M6-C65 continuity is on
-(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). A lane reconnect inside a running relay still has
-2 s (M6-C74), which matters after a Redis restart (section 6.4).
+(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). In that image a lane reconnect inside a running relay still
+has only 2 s (M6-C74), which matters after a Redis restart (section 6.4); a
+build with M6-C74 gives it the full 10 s, outside the lane lock.
+**`main-77bfd28` refuses a relay configuration that names `metrics_bind`**
+(M6-C24, unknown field): do not add the key to `relay.toml` until the
+deployed image has M6-C24, and remove it before rolling back to
+`main-77bfd28` or any older image.
 
 Every `fly` command below is one the owner runs, in
 order, and each one that costs money is marked **Costs money**. The prices are
@@ -750,10 +755,13 @@ reconnect by themselves; a reconnect can wait out the previous session's
 owner lease, up to 30 s. Measured locally with `docker restart` and with
 `docker kill` then `docker start` of an AOF Redis and the shipped binaries
 (`scripts/m6-redis-restart-verify.sh`): the echo was served again 0.3 to 54 s
-after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
-the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
-that fails the attempt and the relay tries again on its next token, every
-5 s. While Redis is down or refused every consumer call gets `503`
+after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect. With M6-C74 it gets the
+full 10 s connection budget, DNS lookup of `agentuplink-redis.internal`
+included, and runs outside the lane lock, so other callers on that lane
+fail closed after their own 2 s instead of queueing behind it; a reconnect
+that still fails is retried on the next token, every 5 s. The deployed
+`main-77bfd28` predates M6-C74 and gives the whole reconnect only 2 s, so a
+lookup slower than that fails the attempt there. While Redis is down or refused every consumer call gets `503`
 `AUTHORIZATION_UNAVAILABLE`; `/readyz` answers `503` with M6-C67's fix and
 still answers ready on an image built before it.
 

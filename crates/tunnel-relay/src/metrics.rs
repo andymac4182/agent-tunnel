@@ -18,7 +18,12 @@
 //!
 //! **Bounds.** One scrape at a time (a concurrent one gets `503`); the actor
 //! snapshot is bounded by [`SNAPSHOT_DEADLINE`]; the body's size is bounded by
-//! the closed label sets.
+//! the closed label sets.  The listener itself ([`serve_bounded`]) holds at
+//! most [`MAX_CONNECTIONS`] connections, closing any beyond that at accept;
+//! each must send its request head within [`HEADER_TIMEOUT`], serves one
+//! request (no keep-alive) and is closed after [`CONNECTION_TIMEOUT`] however
+//! far it got, so an idle or slow client cannot hold a connection open
+//! (PR #158 review).
 
 use std::{
     collections::BTreeMap,
@@ -42,6 +47,74 @@ use crate::{
 
 /// The longest a scrape waits for the relay actor's snapshot.
 pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Connections the metrics listener holds at once; one beyond this is
+/// closed as soon as it is accepted.
+pub(crate) const MAX_CONNECTIONS: usize = 4;
+
+/// The longest a connection may take to send its request head.
+pub(crate) const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The longest any metrics connection stays open, request and response
+/// included.  Longer than one scrape's snapshot deadline plus the head.
+pub(crate) const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve `router` on `listener` until `cancel`, with the bounds above.
+///
+/// Plain HTTP/1.1 through hyper, one request per connection.  A connection
+/// over [`MAX_CONNECTIONS`] is dropped at accept, which closes it; the
+/// request-head deadline is hyper's `header_read_timeout`; the whole
+/// connection runs under [`CONNECTION_TIMEOUT`] and stops at `cancel`.
+/// Accept errors (for example a descriptor limit) are retried after a short
+/// pause rather than ending the listener.
+pub(crate) async fn serve_bounded(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), std::io::Error> {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let accepted = tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let router = router.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let service = hyper::service::service_fn(
+                move |request: axum::http::Request<hyper::body::Incoming>| {
+                    let router = router.clone();
+                    async move {
+                        tower::ServiceExt::oneshot(router, request.map(axum::body::Body::new)).await
+                    }
+                },
+            );
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
+                .keep_alive(false);
+            let connection =
+                builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                _ = tokio::time::timeout(CONNECTION_TIMEOUT, connection) => {}
+            }
+        });
+    }
+}
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 

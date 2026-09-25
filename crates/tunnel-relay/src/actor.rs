@@ -14733,7 +14733,9 @@ impl RunningRelay {
     /// until this relay is cancelled.  Plain HTTP, `GET /metrics` only, with
     /// aggregate, payload-free series (see `metrics.rs`); it shares no route
     /// with the public consumer or device listeners.  The caller decides the
-    /// address; `serve` accepts only a loopback or private one.
+    /// address; `serve` accepts only a loopback or private one.  Connections
+    /// are capped, and each has a request-head and a lifetime deadline
+    /// ([`crate::metrics::serve_bounded`]).
     pub fn serve_metrics(&self, listener: TcpListener) -> JoinHandle<Result<(), std::io::Error>> {
         let router = crate::metrics::router(
             self.handle.clone(),
@@ -14741,11 +14743,7 @@ impl RunningRelay {
             self.authority.clone(),
         );
         let cancel = self.cancel.child_token();
-        tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move { cancel.cancelled().await })
-                .await
-        })
+        tokio::spawn(crate::metrics::serve_bounded(listener, router, cancel))
     }
 
     /// Return the same redacted, in-process diagnostics as [`RelayHandle`].
