@@ -28,6 +28,10 @@ READ_ONLY_COMMANDS = ("version", "get_screen_size", "get_cursor_position", "scre
 # State queries only some backends register (the Cua Driver backend does).
 # Both are captures/reads, never input; probed only when advertised.
 OPTIONAL_READ_ONLY = ("get_desktop_state", "get_capture_scope_state")
+# With --permission-reads (the macOS guest): reads whose outcome depends on a
+# TCC grant. Accessibility gates the AX tree; the screenshot above covers
+# Screen Recording. Recorded as outcome and shape only, never the tree itself.
+PERMISSION_READS = ("get_accessibility_tree",)
 
 
 def http(method: str, url: str, body: dict | None = None, timeout: float = 60.0):
@@ -64,6 +68,22 @@ def elide(value, limit: int = 256):
     if isinstance(value, list):
         return [elide(v, limit) for v in value]
     return value
+
+
+def summarise(record: dict) -> dict:
+    """Outcome and shape of a /cmd result: status, success, error text, keys.
+
+    Drops every value except a bounded error string, so an accessibility tree
+    (window and element names) never reaches the evidence.
+    """
+    out = {k: record[k] for k in ("http_status", "framing") if k in record}
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        out["success"] = payload.get("success")
+        if payload.get("error") is not None:
+            out["error"] = str(payload["error"])[:300]
+        out["payload_keys"] = sorted(payload)
+    return out
 
 
 def find_keys(value, needle: str, path: str = "") -> list[str]:
@@ -149,6 +169,8 @@ def main() -> int:
     ap.add_argument("--label", required=True, help="backend/variant label for the record")
     ap.add_argument("--out-dir")
     ap.add_argument("--marker-size", type=int, default=40)
+    ap.add_argument("--permission-reads", action="store_true",
+                    help="also record the outcome (not the content) of PERMISSION_READS")
     args = ap.parse_args()
     base = args.base_url.rstrip("/")
     if not base.startswith("http://127.0.0.1:"):
@@ -184,6 +206,12 @@ def main() -> int:
             results[name] = {"advertised": False}
             continue
         results[name] = cmd(base, name)
+    if args.permission_reads:
+        # Before the fixture-marker gate, so a denied run still records them.
+        ev["permission_reads"] = {
+            name: summarise(cmd(base, name)) if name in cmds else {"advertised": False}
+            for name in PERMISSION_READS
+        }
     shot = results.get("screenshot", {})
     payload = shot.get("payload", {})
     if payload.get("success") and payload.get("image_data"):

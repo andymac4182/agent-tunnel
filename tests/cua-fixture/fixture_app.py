@@ -33,6 +33,25 @@ BACKGROUND = "#202020"
 STATE_PATH = os.environ.get("CUA_FIXTURE_STATE", "/tmp/cua-fixture/state.json")
 
 
+def activate_on_macos(root: tk.Tk) -> None:
+    """Bring the fixture in front of Finder's desktop in the macOS guest.
+
+    launchd starts the fixture in the background, and an inactive Tk app's
+    fullscreen window leaves the menu bar drawn over its top edge, where two
+    of the corner markers are. Activating the app hides the menu bar. PyObjC
+    is present in the guest's server venv, which is what runs the fixture on
+    macOS; elsewhere this is never called.
+    """
+    root.attributes("-topmost", True)
+    root.lift()
+    try:
+        from AppKit import NSApplication  # type: ignore[import-not-found]
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except ImportError:
+        pass
+
+
 class Fixture:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -40,6 +59,8 @@ class Fixture:
         root.title(TITLE)
         root.configure(background=BACKGROUND)
         root.attributes("-fullscreen", True)
+        if sys.platform == "darwin":
+            activate_on_macos(root)
         root.update_idletasks()
         self.width = root.winfo_screenwidth()
         self.height = root.winfo_screenheight()
