@@ -1747,16 +1747,19 @@ mod tests {
         );
     }
 
-    /// A resolver that answers after `delay` with the fake authority's
-    /// address, standing in for the cold DNS lookup measured on a fresh Fly
-    /// machine (M6-C73), and counts its lookups.
-    struct DelayedResolver {
-        delay: Duration,
+    /// A resolver that answers with the fake authority's address only once
+    /// the test releases it, standing in for the cold DNS lookup measured on
+    /// a fresh Fly machine (M6-C73), and counts its lookups.  The test, not
+    /// a wall-clock delay, decides when the reconnect can finish (M6-C117:
+    /// a fixed delay let the reconnect land inside a late caller's deadline
+    /// on Windows' coarse timers).
+    struct GatedResolver {
+        release: tokio::sync::watch::Receiver<bool>,
         address: std::net::SocketAddr,
         lookups: Arc<AtomicUsize>,
     }
 
-    impl redis::io::AsyncDNSResolver for DelayedResolver {
+    impl redis::io::AsyncDNSResolver for GatedResolver {
         fn resolve<'a, 'b: 'a>(
             &'a self,
             _host: &'b str,
@@ -1765,7 +1768,8 @@ mod tests {
         {
             Box::pin(async move {
                 self.lookups.fetch_add(1, Ordering::AcqRel);
-                tokio::time::sleep(self.delay).await;
+                let mut release = self.release.clone();
+                let _ = release.wait_for(|released| *released).await;
                 Ok(Box::new(std::iter::once(self.address))
                     as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
             })
@@ -1821,8 +1825,9 @@ mod tests {
         let slow_client =
             redis::Client::open(format!("redis://m6c74-cold-dns.invalid:{}/", server.port))
                 .expect("slow-resolver URL");
-        let config = connection_config(REDIS_CONNECT_TIMEOUT).set_dns_resolver(DelayedResolver {
-            delay: SLOW_RECONNECT,
+        let (release_resolver, release) = tokio::sync::watch::channel(false);
+        let config = connection_config(REDIS_CONNECT_TIMEOUT).set_dns_resolver(GatedResolver {
+            release,
             address: std::net::SocketAddr::from(([127, 0, 0, 1], server.port)),
             lookups: Arc::clone(&lookups),
         });
@@ -1876,7 +1881,25 @@ mod tests {
             "concurrent callers share one single-flight reconnect"
         );
 
-        // The reconnect outlives its callers and is installed.
+        // The reconnect outlives its callers: it is still in flight, held at
+        // the resolver, after every caller has given up.  Only now, and not
+        // before it has run for SLOW_RECONNECT (longer than any caller's
+        // deadline), is the lookup answered (M6-C117).
+        tokio::time::sleep_until(reconnect_started + SLOW_RECONNECT).await;
+        {
+            let state = lane.state.lock().await;
+            assert!(
+                state.connection.is_none(),
+                "nothing installed before the lookup answers"
+            );
+            assert!(
+                state.reconnect.is_some(),
+                "the reconnect is still in flight"
+            );
+        }
+        release_resolver.send_replace(true);
+
+        // The reconnect then completes and is installed.
         loop {
             if lane.state.lock().await.connection.is_some() {
                 break;
