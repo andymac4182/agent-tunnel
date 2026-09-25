@@ -195,6 +195,7 @@ Remote mode is therefore not proven green end to end (task row M6-C129).
 | `Docker is not running or not answering` | Docker Desktop is stopped, or did not answer `docker info` in 10 s | Start it; wait until `docker info` answers promptly |
 | `port N is in use` | Another process holds a demo port | Stop it, or set the matching `DEMO_*_PORT` |
 | `cargo build failed` | Toolchain or network | Read `scripts/demo/.build.log`; `cargo build --locked` needs crates.io once |
+| `up.sh` stops with 'no marker file' | A `.state` directory from a pre-fix version | Run `rm -rf scripts/demo/.state` once |
 | `Docker not answering: docker run did not start agentuplink-demo-redis (status 124 ...)` | Docker Desktop did not answer in 120 s. Seen while the machine ran several other agents' container builds (load average about 150): `docker run -d` hung for over 20 minutes | Wait until `docker run --rm alpine:3 true` answers in seconds, then `up.sh`. On the presenter's own Mac, restarting Docker Desktop also works; on a shared machine it restarts everyone's containers |
 | `a container named agentuplink-demo-redis exists without the agentuplink.demo=1 label` | Something else took the demo's name | `down.sh` will not remove it; rename or remove it yourself, or set `DEMO_REDIS_CONTAINER` |
 | `Redis did not answer PING over TLS` | Image missing and no network, or Docker slow | `docker pull redis:8.4.0-alpine`, then `up.sh` again |
