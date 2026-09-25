@@ -1585,6 +1585,10 @@ struct M2Actor {
     control_queue: OutboundQueue,
     pending_critical_controls: VecDeque<PendingCriticalControl>,
     pending_critical_control_bytes: usize,
+    /// The latest unanswered WebSocket Ping on the control socket, answered
+    /// best-effort: at most one is retained, the next Ping replaces it, and
+    /// it has no deadline, so a late Pong can never end the session.
+    pending_control_pong: Option<Message>,
     data_budget: Arc<QueueBudget>,
     events: mpsc::Sender<ActorEvent>,
     /// Registered in-process HTTP exports and their diagnostics.
@@ -1776,6 +1780,7 @@ async fn run_m2_session(
         control_queue,
         pending_critical_controls: VecDeque::new(),
         pending_critical_control_bytes: 0,
+        pending_control_pong: None,
         data_budget,
         events: events_tx.clone(),
         http_handlers,
@@ -1865,6 +1870,9 @@ async fn run_m2_session(
                     break Err(error);
                 }
                 if let Err(error) = actor.flush_pending_critical_controls() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_control_pong() {
                     break Err(error);
                 }
                 if let Err(error) = actor.flush_pending_pongs() {
@@ -2758,6 +2766,34 @@ impl M2Actor {
         }
     }
 
+    /// Offer the retained control-socket WebSocket Pong to the writer queue.
+    /// It is not ordered behind a deferred OPEN or spilled critical response
+    /// (WebSocket control frames carry no application ordering), but while
+    /// an OPEN waits for its atomic pair the Pong never takes a slot the pair
+    /// needs. A full queue keeps the Pong for the next timer tick; it has no
+    /// deadline and is replaced by the next Ping, so it can be late or lost
+    /// but never ends the session.
+    fn flush_pending_control_pong(&mut self) -> Result<(), ClientError> {
+        let Some(pong) = self.pending_control_pong.take() else {
+            return Ok(());
+        };
+        if self.pending_open.is_some() && self.control_queue.capacity() <= 2 {
+            self.pending_control_pong = Some(pong);
+            return Ok(());
+        }
+        match self
+            .control_queue
+            .try_send_with_deadline(pong.clone(), None)
+        {
+            Ok(()) => Ok(()),
+            Err(ClientError::QueueLimit) => {
+                self.pending_control_pong = Some(pong);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn is_rotation_journal_message(message: &ControlMessage) -> bool {
         matches!(
             message,
@@ -3457,7 +3493,15 @@ impl M2Actor {
             Message::Binary(_) => Err(ClientError::Protocol(
                 "binary message on control socket".to_owned(),
             )),
-            Message::Ping(payload) => self.send_critical_message(Message::Pong(payload), None),
+            Message::Ping(payload) => {
+                // A WebSocket Pong is a liveness hint, not an ordered
+                // response: the relay evicts only after a full idle window
+                // with no inbound frame at all. Answer it best-effort rather
+                // than through the critical spill, whose deadline would end
+                // the session if an OPEN stayed deferred for too long.
+                self.pending_control_pong = Some(Message::Pong(payload));
+                self.flush_pending_control_pong()
+            }
             Message::Pong(_) | Message::Frame(_) => Ok(()),
             Message::Close(_) => Err(self.control_lost_error("control socket closed".to_owned())),
         }
@@ -9035,6 +9079,7 @@ mod tests {
             control_queue,
             pending_critical_controls: VecDeque::new(),
             pending_critical_control_bytes: 0,
+            pending_control_pong: None,
             data_budget,
             events,
             http_handlers: HttpHandlers::default(),
@@ -13260,6 +13305,73 @@ mod tests {
         ));
     }
 
+    /// M6-C75: a relay WebSocket Ping on the control socket that arrives
+    /// while an OPEN waits for its atomic pair must not inherit the critical
+    /// response deadline. `DualDeadline` reads the std clocks, so the test
+    /// waits out the real 5 s critical deadline instead of pausing tokio time.
+    #[tokio::test]
+    async fn control_websocket_ping_behind_pending_open_never_ends_the_session() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("queue pressure should defer one bounded OPEN");
+        assert!(actor.pending_open.is_some());
+        actor
+            .handle_control_message(Message::Ping(vec![1].into()))
+            .await
+            .expect("a WebSocket Ping behind a pending OPEN is accepted");
+        actor
+            .handle_control_message(Message::Ping(vec![2].into()))
+            .await
+            .expect("a second WebSocket Ping replaces the first");
+
+        // No flush for longer than the critical response deadline. The
+        // critical spill and the retained Pong are inspected while the OPEN
+        // is still the head; the OPEN's own operation deadline is a separate
+        // bounded path, exercised only afterwards.
+        tokio::time::sleep(M2_CRITICAL_CONTROL_TIMEOUT + Duration::from_millis(250)).await;
+        actor
+            .flush_pending_critical_controls()
+            .expect("a late WebSocket Pong must not end the session");
+        actor
+            .flush_pending_control_pong()
+            .expect("a retained WebSocket Pong must not end the session");
+        assert!(actor.pending_open.is_some());
+        assert!(actor.pending_critical_controls.is_empty());
+        assert!(matches!(
+            &actor.pending_control_pong,
+            Some(Message::Pong(payload)) if payload.as_ref() == [2]
+        ));
+        // The Pong never took the slot the OPEN pair is waiting for.
+        assert_eq!(control_receiver.len(), 15);
+
+        let mut pongs = Vec::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            if let Message::Pong(payload) = &item.message {
+                pongs.push(payload.to_vec());
+            }
+        }
+        actor
+            .flush_pending_open()
+            .expect("a drained queue resolves the deferred OPEN");
+        actor
+            .flush_pending_control_pong()
+            .expect("the retained Pong should reach the writer queue");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_control_pong.is_none());
+        while let Ok(item) = control_receiver.try_recv() {
+            if let Message::Pong(payload) = &item.message {
+                pongs.push(payload.to_vec());
+            }
+        }
+        assert_eq!(pongs, vec![vec![2_u8]]);
+    }
+
     #[tokio::test]
     async fn critical_control_expiry_is_observed_while_open_pair_waits() {
         let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
@@ -13470,8 +13582,11 @@ mod tests {
         );
     }
 
+    /// M6-C75: at full control capacity a raw WebSocket Ping is answered
+    /// best-effort -- retained outside the critical spill, with no deadline,
+    /// and delivered once the queue has room.
     #[tokio::test]
-    async fn raw_websocket_ping_spills_at_full_control_capacity() {
+    async fn raw_websocket_ping_is_retained_best_effort_at_full_control_capacity() {
         let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
             test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
         fill_control_queue_before_open(&mut actor)
@@ -13494,14 +13609,11 @@ mod tests {
         actor
             .handle_control_message(Message::Ping(b"ws-ping".to_vec().into()))
             .await
-            .expect("raw WebSocket PING must use the bounded critical spill");
+            .expect("raw WebSocket PING is retained best-effort, not failed");
         assert_eq!(control_receiver.len(), 16);
-        assert_eq!(actor.pending_critical_controls.len(), 1);
+        assert!(actor.pending_critical_controls.is_empty());
         assert!(matches!(
-            actor
-                .pending_critical_controls
-                .front()
-                .map(|pending| &pending.message),
+            &actor.pending_control_pong,
             Some(Message::Pong(payload)) if payload.as_ref() == b"ws-ping"
         ));
 
@@ -13521,9 +13633,9 @@ mod tests {
             .try_recv()
             .expect("second OPEN response should drain");
         actor
-            .flush_pending_critical_controls()
-            .expect("raw WebSocket PONG should drain after the OPEN pair");
-        assert!(actor.pending_critical_controls.is_empty());
+            .flush_pending_control_pong()
+            .expect("raw WebSocket PONG should drain once the queue has room");
+        assert!(actor.pending_control_pong.is_none());
 
         let mut saw_pong = false;
         while let Ok(item) = control_receiver.try_recv() {
