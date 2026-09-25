@@ -289,6 +289,16 @@ pub fn plan(
         return Err(Dispatch::NotDispatched(NotDispatched::NotPermitted));
     }
 
+    // 2b. A display the backend can select (M5-C12). No pinned backend
+    //     declares a display on `screenshot` or `get_screen_size`, so any
+    //     index but the default would be answered from the default display
+    //     under the requested label. Refused by name, before anything is sent.
+    if let Params::Capture { display } | Params::ScreenInfo { display } = request.params()
+        && !schema::SELECTABLE_DISPLAYS.contains(display)
+    {
+        return Err(Dispatch::NotDispatched(NotDispatched::DisplayNotSelectable));
+    }
+
     // 3. The exclusive input lease, and 4. the capture identity. Only for
     //    operations that act; a `capture` from a second session is not refused
     //    here, which is the shared-reads half of the contract.
@@ -316,9 +326,18 @@ pub fn plan(
         return Ok(Planned::AnswerLocally { operation });
     };
 
+    // `command_payload` refuses only a coordinate whose capture has no
+    // declared scale, which `resolve_capture` has already refused above; the
+    // mapping is here so that a future caller skipping that step still fails
+    // closed rather than defaulting.
+    let payload = command_payload(command, request.params(), capture).map_err(|refusal| {
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Capture(
+            refusal,
+        )))
+    })?;
     Ok(Planned::Dispatch {
         command,
-        payload: command_payload(command, request.params(), capture),
+        payload,
         operation,
     })
 }
@@ -342,8 +361,7 @@ fn resolve_capture<'a>(
     let resolved = match params {
         Params::Click { capture, point, .. }
         | Params::DoubleClick { capture, point }
-        | Params::Move { capture, point }
-        | Params::Scroll { capture, point, .. } => Some(
+        | Params::Move { capture, point } => Some(
             context
                 .captures
                 .resolve_point(*capture, context.target, *point)
@@ -364,7 +382,13 @@ fn resolve_capture<'a>(
                     .map_err(refuse)?,
             )
         }
-        Params::TypeText { .. } | Params::PressKey { .. } | Params::Hotkey { .. } => None,
+        // `scroll` carries no coordinate since M5-C13: the pinned backends
+        // take wheel amounts only and scroll at the cursor, so there is no
+        // point to resolve and none to pretend to confine.
+        Params::Scroll { .. }
+        | Params::TypeText { .. }
+        | Params::PressKey { .. }
+        | Params::Hotkey { .. } => None,
         Params::Describe
         | Params::Capture { .. }
         | Params::ScreenInfo { .. }
@@ -410,14 +434,23 @@ pub fn dispatch_command(operation: Operation, params: &Params) -> Option<&'stati
 /// re-derives the table from the re-fetched source. See `docs/tasks.md`
 /// M5-C06 for the six names this function used to send on `drag` and `scroll`
 /// that upstream silently dropped, and for the one it still sends knowingly.
-#[must_use]
-pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureIdentity>) -> Value {
-    let convert = |point: Point| {
-        capture.map_or((point.x, point.y), |identity| {
-            identity.to_backend_point(point)
-        })
+///
+/// # Errors
+/// [`crate::capture::CaptureRefusal::ScaleUndeclared`] when `capture` is an
+/// identity with no declared scale and the operation carries a coordinate.
+/// There is no default scale, on purpose (M5-C14).
+pub fn command_payload(
+    command: &str,
+    params: &Params,
+    capture: Option<&CaptureIdentity>,
+) -> Result<Value, crate::capture::CaptureRefusal> {
+    let convert = |point: Point| match capture {
+        None => Ok((point.x, point.y)),
+        Some(identity) => identity
+            .to_backend_point(point)
+            .ok_or(crate::capture::CaptureRefusal::ScaleUndeclared),
     };
-    match params {
+    Ok(match params {
         // **`display` is sent knowing the released dispatcher discards it**,
         // and that is recorded rather than hidden: see
         // `cua_pin::PARAMETERS_KNOWINGLY_DISCARDED`. No pinned backend
@@ -436,7 +469,7 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
         Params::Click { point, .. }
         | Params::DoubleClick { point, .. }
         | Params::Move { point, .. } => {
-            let (x, y) = convert(*point);
+            let (x, y) = convert(*point)?;
             json!({"command": command, "params": {"x": x, "y": y}})
         }
         // Upstream `drag` takes a **path**: `List[Tuple[int, int]]`, with the
@@ -444,8 +477,8 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
         // spelling of this operation's from/to, and both ends were already
         // bounds-checked against the capture by `resolve_capture`.
         Params::Drag { from, to, .. } => {
-            let (start_x, start_y) = convert(*from);
-            let (end_x, end_y) = convert(*to);
+            let (start_x, start_y) = convert(*from)?;
+            let (end_x, end_y) = convert(*to)?;
             json!({"command": command, "params": {
                 "path": [[start_x, start_y], [end_x, end_y]],
             }})
@@ -455,10 +488,12 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
         // `x`/`y` and the deltas as `dx`/`dy` -- which is what this did --
         // scrolled by the *coordinate* and discarded the deltas entirely.
         // There is no parameter on any pinned backend that scrolls at a
-        // point; the point is still resolved and bounds-checked above,
-        // because the lease and capture authority are ours to enforce, but it
-        // cannot be expressed to the backend. Filed as M5-C13.
-        Params::Scroll { dx, dy, .. } => {
+        // point, so since M5-C13 the consumer schema takes no point either:
+        // a request naming one is refused rather than validated and dropped.
+        // The sign is passed through unchanged; positive `dy` is up on every
+        // pinned backend that states a convention
+        // (`cua_pin::SCROLL_SIGN_CONVENTION`).
+        Params::Scroll { dx, dy } => {
             json!({"command": command, "params": {"x": dx, "y": dy}})
         }
         // **The one place `Keystrokes::as_str` is called.** It goes into a
@@ -474,7 +509,7 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
                 "keys": keys.iter().map(crate::schema::Keystrokes::as_str).collect::<Vec<_>>(),
             }})
         }
-    }
+    })
 }
 
 /// Build the `/cmd` body for a discovery command that is not a
@@ -551,12 +586,7 @@ mod tests {
                 from: point,
                 to: Point::new(9, 10),
             },
-            Params::Scroll {
-                capture,
-                point,
-                dx: 0,
-                dy: -3,
-            },
+            Params::Scroll { dx: 0, dy: -3 },
             Params::TypeText {
                 text: Keystrokes::new("abc"),
             },
@@ -599,7 +629,8 @@ mod tests {
             let pinned = cua_pin::parameters_for(command)
                 .unwrap_or_else(|| panic!("{command} is dispatched but has no pinned schema"));
 
-            let payload = command_payload(command, params, None);
+            let payload = command_payload(command, params, None)
+                .expect("no capture means no scale to be missing");
             let sent = payload["params"]
                 .as_object()
                 .expect("every payload carries a params object");
@@ -651,7 +682,8 @@ mod tests {
         let mut rendered = String::new();
         for params in &one_of_every_params_variant() {
             if let Some(command) = dispatch_command(operation_of(params), params) {
-                let payload = command_payload(command, params, None);
+                let payload = command_payload(command, params, None)
+                    .expect("no capture means no scale to be missing");
                 for name in payload["params"].as_object().expect("params object").keys() {
                     for (refused_command, refused) in cua_pin::PARAMETERS_NEVER_TO_SEND {
                         assert!(
@@ -772,14 +804,13 @@ mod tests {
             (
                 "capture",
                 "screenshot",
-                json!({"display": 3}),
-                // **`display` is accepted from the consumer and not sent.**
-                // No pinned backend declares it on `screenshot`, so it was
-                // discarded upstream and selects nothing there. It is still
-                // sent -- knowingly, and recorded as such -- because removing
-                // it would give the consumer no display selection either,
-                // while the fixture does use it. M5-C12.
-                json!({"command": "screenshot", "params": {"display": 3}}),
+                json!({"display": 0}),
+                // **`display` is sent knowing it is discarded.** No pinned
+                // backend declares it on `screenshot`, and since M5-C12 the
+                // only index that plans at all is the default, so what is
+                // sent is always 0. See
+                // `a_display_no_pinned_backend_can_select_is_refused_before_dispatch`.
+                json!({"command": "screenshot", "params": {"display": 0}}),
             ),
             (
                 "screen_info",
@@ -850,13 +881,13 @@ mod tests {
             ),
             (
                 "scroll",
-                json!({"capture": c, "x": 1, "y": 2, "dx": 0, "dy": -3}),
+                json!({"dx": 0, "dy": -3}),
                 "scroll",
                 // **The deltas, under the names upstream declares.** `x`/`y`
-                // on `scroll` are wheel amounts; sending the point there and
-                // the deltas as `dx`/`dy` scrolled by `(1, 2)` and dropped
-                // `(0, -3)` entirely. The point is still validated against
-                // the capture, it simply cannot be expressed -- M5-C13.
+                // on `scroll` are wheel amounts; sending a point there and
+                // the deltas as `dx`/`dy` scrolled by the point and dropped
+                // the deltas entirely (M5-C06). Since M5-C13 the consumer
+                // cannot name a point at all.
                 json!({"x": 0, "y": -3}),
             ),
             (
@@ -1052,10 +1083,7 @@ mod tests {
                 "drag",
                 json!({"capture": capture.value(), "x": 0, "y": 0, "to_x": 1, "to_y": 1}),
             ),
-            (
-                "scroll",
-                json!({"capture": capture.value(), "x": 0, "y": 0, "dx": 0, "dy": 1}),
-            ),
+            ("scroll", json!({"dx": 0, "dy": 1})),
             ("type_text", json!({"text": "x"})),
             ("press_key", json!({"key": "a"})),
             ("hotkey", json!({"keys": ["a"]})),
@@ -1217,10 +1245,7 @@ mod tests {
             ("type_text", json!({"text": ""})),
             ("press_key", json!({"key": "a b"})),
             ("hotkey", json!({"keys": []})),
-            (
-                "scroll",
-                json!({"capture": c, "x": 0, "y": 0, "dx": 99999, "dy": 0}),
-            ),
+            ("scroll", json!({"dx": 99999, "dy": 0})),
         ] {
             match world.plan(SESSION, operation, params.clone()) {
                 Err(Dispatch::NotDispatched(_)) => {}
@@ -1233,6 +1258,105 @@ mod tests {
                 other => panic!("expected a NotDispatched, got {other:?}"),
             }
         }
+    }
+
+    /// **M5-C13: `scroll` no longer promises a position it cannot express.**
+    ///
+    /// Every pinned backend's `scroll(x, y)` takes two wheel *amounts* and
+    /// scrolls wherever the cursor is; no pinned command takes a position and
+    /// a delta. The consumer-facing schema used to take a capture and a point,
+    /// bounds-check the point, and then drop it -- so `scroll(capture, point,
+    /// dy)` read as "scroll here" and meant "scroll wherever the cursor is".
+    /// The contract is narrowed: `scroll` takes `dx`/`dy` only, and a request
+    /// that still names a position is refused before dispatch rather than
+    /// silently not honoured. A consumer that wants to scroll at a point
+    /// sends `move` (validated against its capture) and then `scroll`, and
+    /// gets an explicit outcome for each.
+    #[test]
+    fn a_scroll_that_names_a_position_is_refused_rather_than_silently_not_honoured() {
+        let (world, capture) = World::ready(SESSION);
+        let c = capture.value();
+        assert_eq!(
+            world.plan(
+                SESSION,
+                "scroll",
+                json!({"capture": c, "x": 1, "y": 2, "dx": 0, "dy": -3}),
+            ),
+            Err(Dispatch::NotDispatched(NotDispatched::Schema(
+                SchemaError::UnknownMember
+            ))),
+            "a position no pinned backend can express must be refused, not dropped"
+        );
+        for position_only in [json!({"x": 1, "dy": -3}), json!({"capture": c, "dy": -3})] {
+            assert_eq!(
+                world.plan(SESSION, "scroll", position_only.clone()),
+                Err(Dispatch::NotDispatched(NotDispatched::Schema(
+                    SchemaError::UnknownMember
+                ))),
+                "{position_only}"
+            );
+        }
+
+        // **The control: the narrowed form dispatches**, carrying exactly the
+        // two amounts under the names upstream declares, so the refusals
+        // above are about the position and not about `scroll` as a whole.
+        let Planned::Dispatch { payload, .. } = world
+            .plan(SESSION, "scroll", json!({"dx": 0, "dy": -3}))
+            .expect("a scroll by amounts alone plans a dispatch")
+        else {
+            panic!("scroll dispatches");
+        };
+        assert_eq!(
+            payload,
+            json!({"command": "scroll", "params": {"x": 0, "y": -3}})
+        );
+
+        // And it is still an input operation: it needs the lease, even though
+        // it no longer needs a capture.
+        let unleased = World::new();
+        assert_eq!(
+            unleased.plan(SESSION, "scroll", json!({"dx": 0, "dy": -3})),
+            lease_refusal(LeaseRefusal::NotHeld)
+        );
+    }
+
+    /// **M5-C12: a display no pinned backend can select is refused, by name.**
+    ///
+    /// No pinned 0.3.46 handler's `screenshot` or `get_screen_size` takes a
+    /// display; the released dispatcher discards the member and captures
+    /// whatever the backend's default is. A consumer that asked for display 3
+    /// used to be answered from that default, with an identity labelled 3.
+    #[test]
+    fn a_display_no_pinned_backend_can_select_is_refused_before_dispatch() {
+        let world = World::new();
+        for operation in ["capture", "screen_info"] {
+            for display in [1, 3, crate::schema::MAX_DISPLAY] {
+                let planned = world.plan(SESSION, operation, json!({ "display": display }));
+                assert_eq!(
+                    planned,
+                    Err(Dispatch::NotDispatched(NotDispatched::DisplayNotSelectable)),
+                    "{operation} display={display}"
+                );
+            }
+            // **The control.** The backend's default display is still
+            // reachable, both by omitting the member and by naming it, so the
+            // refusal above is about the index and not the operation.
+            for params in [json!({}), json!({"display": 0})] {
+                assert!(
+                    matches!(
+                        world.plan(SESSION, operation, params.clone()),
+                        Ok(Planned::Dispatch { .. })
+                    ),
+                    "{operation} {params}"
+                );
+            }
+        }
+        // A refused display is retryable -- nothing was sent -- and it is
+        // not the schema's refusal: the index is well-formed, the backend
+        // simply cannot honour it.
+        let refused = Dispatch::NotDispatched(NotDispatched::DisplayNotSelectable);
+        assert!(refused.retry_is_safe_for(Operation::Capture));
+        assert!(!refused.reached_the_backend());
     }
 
     /// The discovery entry point cannot be used to send an arbitrary command.

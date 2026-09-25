@@ -28,7 +28,7 @@ fn minimal_params(operation: Operation) -> &'static str {
             r#"{"capture":1,"x":0,"y":0}"#
         }
         Operation::Drag => r#"{"capture":1,"x":0,"y":0,"to_x":1,"to_y":1}"#,
-        Operation::Scroll => r#"{"capture":1,"x":0,"y":0,"dx":0,"dy":1}"#,
+        Operation::Scroll => r#"{"dx":0,"dy":1}"#,
         Operation::TypeText => r#"{"text":"a"}"#,
         Operation::PressKey => r#"{"key":"a"}"#,
         Operation::Hotkey => r#"{"keys":["a"]}"#,
@@ -115,30 +115,18 @@ fn keystroke_and_coordinate_parameters_are_bounded_and_fail_closed() {
     assert!(request("hotkey", r#"{"keys":["cmd","a b"]}"#.to_owned()).is_err());
 
     // Scroll deltas: signed, bounded both ways.
-    assert!(
-        request(
-            "scroll",
-            format!(r#"{{"capture":1,"x":0,"y":0,"dx":0,"dy":{MAX_SCROLL_DELTA}}}"#)
-        )
-        .is_ok()
-    );
+    assert!(request("scroll", format!(r#"{{"dx":0,"dy":{MAX_SCROLL_DELTA}}}"#)).is_ok());
     assert_eq!(
         request(
             "scroll",
-            format!(
-                r#"{{"capture":1,"x":0,"y":0,"dx":0,"dy":{}}}"#,
-                MAX_SCROLL_DELTA + 1
-            )
+            format!(r#"{{"dx":0,"dy":{}}}"#, MAX_SCROLL_DELTA + 1)
         ),
         Err(SchemaError::OutOfRange { name: "dy" })
     );
     assert_eq!(
         request(
             "scroll",
-            format!(
-                r#"{{"capture":1,"x":0,"y":0,"dx":{},"dy":0}}"#,
-                -MAX_SCROLL_DELTA - 1
-            )
+            format!(r#"{{"dx":{},"dy":0}}"#, -MAX_SCROLL_DELTA - 1)
         ),
         Err(SchemaError::OutOfRange { name: "dx" })
     );

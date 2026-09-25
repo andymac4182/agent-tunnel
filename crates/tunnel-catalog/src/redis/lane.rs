@@ -1050,6 +1050,138 @@ mod tests {
         AuthorityLane::new(client.clone(), connection, run_id, Arc::clone(group))
     }
 
+    /// A lane whose startup connection has no redis-rs response timeout, so
+    /// a stalled reply can only be observed by the lane's own outer deadline
+    /// in [`AuthorityLane::execute`].  With the production configuration the
+    /// two deadlines are equal and which one fires is decided by timer ticks
+    /// and scheduling (M7-C113, M5-C17); this makes the outer one certain.
+    /// The lane's own reconnects still use the production configuration.
+    async fn lane_with_outer_deadline_only(
+        client: &redis::Client,
+        run_id: &str,
+        group: &Arc<LaneGroup>,
+    ) -> AuthorityLane {
+        let config = redis::AsyncConnectionConfig::new().set_response_timeout(None);
+        let connection = tokio::time::timeout(
+            TEST_DEADLINE,
+            client.get_multiplexed_async_connection_with_config(&config),
+        )
+        .await
+        .expect("bounded startup connection")
+        .expect("startup connection without a response timeout");
+        AuthorityLane::new(
+            client.clone(),
+            connection,
+            run_id.to_owned(),
+            Arc::clone(group),
+        )
+    }
+
+    /// Queue [`QUEUED_CALLERS`] pings behind a reply that takes
+    /// [`QUEUED_REPLY_DELAY`] and require that every one succeeds, well
+    /// inside the authority deadline, on the one connection the lane holds.
+    ///
+    /// Run twice by the test below: on the outer-deadline-only startup
+    /// connection, and again on the lane's own reconnected connection, which
+    /// carries the **production** redis-rs response timeout. The second run is
+    /// the review follow-up to M5-C17: the rewrite had moved the whole
+    /// queued-caller phase onto a connection with no redis-rs timeout, so the
+    /// production configuration's queueing was no longer measured.
+    async fn assert_queued_callers_share_one_connection(
+        server: &FakeAuthority,
+        lane: &Arc<AuthorityLane>,
+        context: &str,
+    ) {
+        let accepted = server.accepted();
+        server.set_reply_delay(QUEUED_REPLY_DELAY);
+        let started = tokio::time::Instant::now();
+        let mut callers = JoinSet::new();
+        for _ in 0..QUEUED_CALLERS {
+            let lane = Arc::clone(lane);
+            callers.spawn(async move { ping(&lane).await });
+        }
+        let mut replies = Vec::with_capacity(QUEUED_CALLERS);
+        while let Some(joined) = callers.join_next().await {
+            replies.push(joined.expect("queued caller task"));
+        }
+        let elapsed = started.elapsed();
+        let failures: Vec<String> = replies
+            .iter()
+            .filter_map(|reply| reply.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{context}: {} of {QUEUED_CALLERS} queued callers failed after {elapsed:?} \
+             although every reply took {QUEUED_REPLY_DELAY:?}: {failures:?}",
+            failures.len()
+        );
+        assert!(
+            elapsed < REDIS_OPERATION_TIMEOUT,
+            "{context}: queued callers took {elapsed:?}; the lane serialized them behind \
+             each other"
+        );
+        assert_eq!(
+            server.accepted(),
+            accepted,
+            "{context}: queueing must not open connections"
+        );
+        server.set_reply_delay(Duration::ZERO);
+    }
+
+    /// Drive one stalled command and require that it is reported as a
+    /// timeout, is never retried or reconnected in place, and *releases* the
+    /// lane: the release is read from the lane itself (the group loss
+    /// generation it advances and the empty connection slot), not inferred
+    /// from how many connections the fake authority later accepts.
+    async fn assert_stall_times_out_and_releases(
+        server: &FakeAuthority,
+        lane: &AuthorityLane,
+        group: &LaneGroup,
+        context: &str,
+    ) {
+        let accepted = server.accepted();
+        let generation = group.loss_generation.load(Ordering::Acquire);
+        server.set_reply_delay(STALLED_REPLY_DELAY);
+        let stalled_started = tokio::time::Instant::now();
+        match ping(lane).await {
+            Err(CatalogError::Database(error)) => assert!(
+                timed_out(&error) && !error.is_connection_dropped(),
+                "{context}: stalled authority reported {error} instead of a timeout"
+            ),
+            other => panic!("{context}: stalled authority reported {other:?} instead of a timeout"),
+        }
+        assert!(
+            stalled_started.elapsed() >= REDIS_OPERATION_TIMEOUT,
+            "{context}: the authority deadline fired before the documented bound"
+        );
+        assert_eq!(
+            group.loss_generation.load(Ordering::Acquire),
+            generation + 1,
+            "{context}: the timed-out command must release the lane's connection"
+        );
+        assert!(
+            lane.state.lock().await.connection.is_none(),
+            "{context}: the lane kept a connection that still owes the stalled reply"
+        );
+        assert_eq!(
+            server.accepted(),
+            accepted,
+            "{context}: a timeout never reconnects in place"
+        );
+        server.set_reply_delay(Duration::ZERO);
+        assert_eq!(
+            ping(lane).await.unwrap_or_else(|error| panic!(
+                "{context}: the command after a timeout must re-verify the primary: {error}"
+            )),
+            "PONG"
+        );
+        assert_eq!(
+            server.accepted(),
+            accepted + 1,
+            "{context}: exactly one fresh connection replaces the released one"
+        );
+    }
+
     async fn ping(lane: &AuthorityLane) -> Result<String, CatalogError> {
         tokio::time::timeout(TEST_DEADLINE, lane.query::<String>(&redis::cmd("PING")))
             .await
@@ -1171,67 +1303,41 @@ mod tests {
     /// two-second "authority timeout" that Redis never caused.  A genuinely
     /// stalled reply and a severed connection must still fail closed, with
     /// distinguishable transport classes and no reconnect in place.
+    ///
+    /// M5-C17: the stalled reply is driven twice.  First on a startup
+    /// connection without a redis-rs response timeout, so the lane's outer
+    /// deadline is certain to be the one that fires -- the path that kept the
+    /// connection before f3aaba9 and failed this test only when load let the
+    /// outer timer win a tick race.  Then on the lane's own reconnected
+    /// connection, where the production configuration makes the two
+    /// deadlines equal and either may fire.  Each stall must release the lane.
     #[tokio::test]
     async fn queued_callers_are_measured_against_the_authority_not_the_queue() {
         let server = FakeAuthority::start_with_reply_delay("lane-run-a", QUEUED_REPLY_DELAY).await;
         let client = redis::Client::open(server.url()).expect("fake authority URL");
         let group = Arc::new(LaneGroup::default());
-        let lane = Arc::new(verified_lane(&client, "lane-run-a", &group).await);
+        let lane = Arc::new(lane_with_outer_deadline_only(&client, "lane-run-a", &group).await);
         assert_eq!(server.accepted(), 1);
 
-        let started = tokio::time::Instant::now();
-        let mut callers = JoinSet::new();
-        for _ in 0..QUEUED_CALLERS {
-            let lane = Arc::clone(&lane);
-            callers.spawn(async move { ping(&lane).await });
-        }
-        let mut replies = Vec::with_capacity(QUEUED_CALLERS);
-        while let Some(joined) = callers.join_next().await {
-            replies.push(joined.expect("queued caller task"));
-        }
-        let elapsed = started.elapsed();
-        let failures: Vec<String> = replies
-            .iter()
-            .filter_map(|reply| reply.as_ref().err().map(ToString::to_string))
-            .collect();
-        assert!(
-            failures.is_empty(),
-            "{} of {QUEUED_CALLERS} queued callers failed after {elapsed:?} although every \
-             reply took {QUEUED_REPLY_DELAY:?}: {failures:?}",
-            failures.len()
-        );
-        assert!(
-            elapsed < REDIS_OPERATION_TIMEOUT,
-            "queued callers took {elapsed:?}; the lane serialized them behind each other"
-        );
-        assert_eq!(server.accepted(), 1, "queueing must not open connections");
+        assert_queued_callers_share_one_connection(
+            &server,
+            &lane,
+            "outer-deadline-only connection",
+        )
+        .await;
 
         // A reply that genuinely exceeds the deadline is a timeout, reported
         // as such rather than as a severed connection.  The stalled command
         // is never retried; the lane releases the connection so the next
         // command re-verifies the primary before it is trusted again.
-        server.set_reply_delay(STALLED_REPLY_DELAY);
-        let stalled_started = tokio::time::Instant::now();
-        match ping(&lane).await {
-            Err(CatalogError::Database(error)) => assert!(
-                timed_out(&error) && !error.is_connection_dropped(),
-                "stalled authority reported {error} instead of a timeout"
-            ),
-            other => panic!("stalled authority reported {other:?} instead of a timeout"),
-        }
-        assert!(
-            stalled_started.elapsed() >= REDIS_OPERATION_TIMEOUT,
-            "the authority deadline fired before the documented bound"
-        );
-        assert_eq!(server.accepted(), 1, "a timeout never reconnects in place");
-        server.set_reply_delay(Duration::ZERO);
-        assert_eq!(
-            ping(&lane)
-                .await
-                .expect("the command after a timeout re-verifies the same primary"),
-            "PONG"
-        );
+        assert_stall_times_out_and_releases(&server, &lane, &group, "outer deadline").await;
         assert_eq!(server.accepted(), 2);
+        assert_stall_times_out_and_releases(&server, &lane, &group, "production deadlines").await;
+        assert_eq!(server.accepted(), 3);
+        // The lane now holds its own reconnected connection, which carries the
+        // production redis-rs response timeout: queueing is measured there too.
+        assert_queued_callers_share_one_connection(&server, &lane, "production connection").await;
+        assert_eq!(server.accepted(), 3);
 
         // A severed connection is a transport loss, never a timeout, and the
         // discovering command fails closed exactly once.
@@ -1245,14 +1351,14 @@ mod tests {
         }
         assert_eq!(
             server.accepted(),
-            2,
+            3,
             "the discovering command never reconnects"
         );
         assert_eq!(
             ping(&lane).await.expect("the next command reconnects"),
             "PONG"
         );
-        assert_eq!(server.accepted(), 3);
+        assert_eq!(server.accepted(), 4);
         server.shutdown().await;
     }
 

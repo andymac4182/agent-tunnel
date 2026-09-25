@@ -53,7 +53,8 @@ pub enum Operation {
     Move,
     /// Press at one capture coordinate, move, release at another.
     Drag,
-    /// Scroll at a capture coordinate by a bounded delta.
+    /// Scroll by a bounded wheel delta, at the cursor. **No position**: no
+    /// pinned backend can express one (M5-C13).
     Scroll,
     /// Type a string. **Never logged, anywhere.** See
     /// [`crate::schema::Keystrokes`].
@@ -207,8 +208,12 @@ impl Operation {
     #[must_use]
     pub const fn needs_capture_identity(self) -> bool {
         match self {
-            Self::Click | Self::DoubleClick | Self::Move | Self::Drag | Self::Scroll => true,
-            Self::Describe
+            Self::Click | Self::DoubleClick | Self::Move | Self::Drag => true,
+            // `scroll` takes wheel amounts only since M5-C13: the pinned
+            // backends scroll at the cursor, so there is no coordinate here
+            // to be stale about. It still mutates, and still needs the lease.
+            Self::Scroll
+            | Self::Describe
             | Self::Capture
             | Self::ScreenInfo
             | Self::CursorPosition

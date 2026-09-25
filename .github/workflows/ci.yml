@@ -40,6 +40,13 @@ jobs:
         run: cargo +1.95.0 fmt --all -- --check
       - name: Check lints
         run: cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Populate the cargo registry cache for every target
+        # `tunnel-cua/tests/host_untouched.rs` runs `cargo metadata --offline
+        # --filter-platform` for Windows, Linux and Apple triples (M5-C04). A
+        # build only downloads the host's packages, so without this the
+        # Windows-only sources are missing on Linux/macOS runners and that
+        # test fails -- by design, rather than skipping.
+        run: cargo +1.95.0 fetch --locked
       - name: Run tests
         # `--no-fail-fast`: one failing test binary no longer hides every one
         # after it. The first hosted runs after the billing block each showed

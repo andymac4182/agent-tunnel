@@ -2183,10 +2183,6 @@
       "the pinned parameter table may disagree with the payload builder"
     ],
     [
-      "m5c7",
-      "the scroll deltas may be dropped for the cursor point"
-    ],
-    [
       "m5c8",
       "a present sentinel helper cannot be reported as missing"
     ]

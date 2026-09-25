@@ -105,8 +105,9 @@ pub const CMD_MEDIA_TYPE: &str = "text/plain";
 pub const SCREEN_WIDTH: u16 = 128;
 /// The synthetic screen height.
 pub const SCREEN_HEIGHT: u16 = 96;
-/// The marker seed for display 0. Display *n* uses `IMAGE_SEED + n`, so two
-/// displays produce images of identical length and entirely different markers.
+/// The marker seed for display 0 with unchanged content. A content change
+/// (`CaptureScaleKnob::set_content`) adds its offset, so two captures either
+/// side of it have identical length and entirely different markers.
 pub const IMAGE_SEED: u32 = 0x5EED_0001;
 /// The synthetic cursor position.
 pub const CURSOR: (u32, u32) = (17, 23);
@@ -524,21 +525,34 @@ impl CaptureAuthorityKnob {
 /// not tell a device that applies the scale from one that forwards the pixel
 /// unchanged. At 200 the fixture serves a 256x192 image of its 128x96 screen,
 /// and a click at pixel (100, 80) must arrive at (50, 40).
+///
+/// **The scale is not on the wire, and that is the point of M5-C14.** No
+/// pinned backend reports a scale, so the fixture no longer does either: at
+/// 200 it serves a 256x192 PNG and says nothing else, exactly as a real 2x
+/// display would. A device that assumed 1x would click at (100, 80); the
+/// device must be *told* the scale (`DeviceState::declare_scale_percent`) or
+/// refuse the coordinate.
+///
+/// It also carries the screen's **content**: a seed offset, so a test can
+/// change what is on the screen without changing its geometry. That is what
+/// the proof-4 control uses since M5-C12 made a second display unreachable.
 #[derive(Clone, Debug)]
 pub struct CaptureScaleKnob {
     percent: Arc<Mutex<u32>>,
+    content: Arc<Mutex<u32>>,
 }
 
 impl Default for CaptureScaleKnob {
     fn default() -> Self {
         Self {
             percent: Arc::new(Mutex::new(tunnel_cua::capture::IDENTITY_SCALE_PERCENT)),
+            content: Arc::new(Mutex::new(0)),
         }
     }
 }
 
 impl CaptureScaleKnob {
-    /// Report captures at this scale, as a percentage. 100 is 1x.
+    /// Serve captures at this scale, as a percentage. 100 is 1x.
     pub fn set(&self, percent: u32) {
         *self
             .percent
@@ -546,9 +560,26 @@ impl CaptureScaleKnob {
             .expect("the knob mutex is never poisoned by fixture code") = percent;
     }
 
+    /// Change what is on the synthetic screen: later captures are seeded with
+    /// `IMAGE_SEED + display + offset`. Geometry is unchanged, so two captures
+    /// either side of a change have identical length and different markers.
+    pub fn set_content(&self, offset: u32) {
+        *self
+            .content
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code") = offset;
+    }
+
     fn get(&self) -> u32 {
         *self
             .percent
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code")
+    }
+
+    fn content(&self) -> u32 {
+        *self
+            .content
             .lock()
             .expect("the knob mutex is never poisoned by fixture code")
     }
@@ -827,9 +858,12 @@ async fn handle_cmd(
                 stream,
                 json!({
                     "success": false,
-                    "width": SCREEN_WIDTH,
-                    "height": SCREEN_HEIGHT,
-                    "image_hex": "00",
+                    "image_data": encode_base64(&synthetic_png(
+                        u32::from(SCREEN_WIDTH),
+                        u32::from(SCREEN_HEIGHT),
+                        &[],
+                    )),
+                    "format": tunnel_cua::image::PNG_FORMAT,
                 }),
             )
             .await
@@ -842,6 +876,7 @@ async fn handle_cmd(
                     display,
                     capture_authority.get(),
                     capture_scale.get(),
+                    capture_scale.content(),
                 ),
             )
             .await
@@ -856,6 +891,7 @@ fn success_payload(
     display: Option<u32>,
     capture_authority: Option<bool>,
     capture_scale: u32,
+    content: u32,
 ) -> Value {
     let display = display.unwrap_or(0);
     match command {
@@ -879,18 +915,20 @@ fn success_payload(
             }
             payload
         }
+        // **The released shapes, member for member (M5-C14).** Every pinned
+        // handler answers `get_screen_size` with `{"size": {"width",
+        // "height"}}` and `get_cursor_position` with `{"position": {"x",
+        // "y"}}`. The fixture used to flatten both, which no backend does.
         "get_screen_size" => json!({
             "success": true,
-            "width": SCREEN_WIDTH,
-            "height": SCREEN_HEIGHT,
+            "size": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
         }),
         "get_cursor_position" => json!({
             "success": true,
-            "x": CURSOR.0,
-            "y": CURSOR.1,
+            "position": {"x": CURSOR.0, "y": CURSOR.1},
         }),
         "screenshot" => {
-            let seed = IMAGE_SEED.wrapping_add(display);
+            let seed = IMAGE_SEED.wrapping_add(display).wrapping_add(content);
             // The image is the screen at the reported scale, so `width` and
             // `height` are always the image's own pixel dimensions. A device
             // that read them as points would place every coordinate wrong on a
@@ -903,21 +941,30 @@ fn success_payload(
             let height = SCREEN_HEIGHT * scale;
             let image = tunnel_cua::marker::encode(width, height, seed)
                 .expect("the fixture's own dimensions are valid");
+            // **The released shape, and nothing else (M5-C14).** macOS, Linux,
+            // Windows and Android answer `{success, image_data, format}`:
+            // base64 PNG bytes and the format name. There is no `width`, no
+            // `height` and no scale -- this fixture used to send all three,
+            // which is why a device reading them looked correct here and
+            // issued no identity at all against a released backend.
+            //
+            // The PNG is a real container: signature, a valid `IHDR` with a
+            // correct CRC (so the device reads the dimensions the way it must
+            // from a real capture), the marker in a private ancillary chunk,
+            // and `IEND`. It has no `IDAT`, so it is not a decodable picture
+            // -- and a real capture has no marker chunk, so it fails proof 4.
+            //
+            // **The seed is deliberately not on the wire.** A test must know
+            // what it asked for and derive the seed itself; see
+            // `marker::verify`.
             json!({
                 "success": true,
-                "width": width,
-                "height": height,
-                "scale_percent": capture_scale,
-                // **The seed is deliberately not on the wire.** An earlier
-                // revision shipped it, which invited a future test to verify
-                // an image against the seed that travelled with it -- the
-                // precise thing `marker::verify` refuses to do, and the reason
-                // its own seed field is never consulted. A test must know
-                // which display it asked for and derive the seed itself.
-                //
-                // Hex rather than base64, so the fixture needs no encoder
-                // dependency and a test can decode it with `from_hex` below.
-                "image_hex": to_hex(&image),
+                "image_data": encode_base64(&synthetic_png(
+                    u32::from(width),
+                    u32::from(height),
+                    &image,
+                )),
+                "format": tunnel_cua::image::PNG_FORMAT,
             })
         }
         // Every other registered command is an input command. The fixture
@@ -928,32 +975,88 @@ fn success_payload(
     }
 }
 
-/// Lowercase hex, so a synthetic image can travel in JSON without a base64
-/// dependency.
+/// The private ancillary PNG chunk that carries the synthetic marker.
+///
+/// Lowercase first letter: ancillary, so a PNG reader may skip it. Lowercase
+/// second: private. Uppercase third: the reserved bit, as the specification
+/// requires. Lowercase fourth: safe to copy.
+pub const MARKER_CHUNK: [u8; 4] = *b"tnMk";
+
+/// Wrap a synthetic marker in a PNG container: signature, `IHDR` (8-bit RGB),
+/// the marker in [`MARKER_CHUNK`], `IEND`. Every chunk carries a correct CRC.
 #[must_use]
-pub fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).expect("a nibble is a hex digit"));
-        out.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("a nibble is a hex digit"));
-    }
-    out
+pub fn synthetic_png(width: u32, height: u32, marker: &[u8]) -> Vec<u8> {
+    let mut png = tunnel_cua::image::PNG_SIGNATURE.to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    // Bit depth 8, colour type 2 (RGB), deflate, adaptive filtering, no
+    // interlace.
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    push_chunk(&mut png, *b"IHDR", &ihdr);
+    push_chunk(&mut png, MARKER_CHUNK, marker);
+    push_chunk(&mut png, *b"IEND", &[]);
+    png
 }
 
-/// The inverse of [`to_hex`].
+fn push_chunk(png: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+    let length = u32::try_from(data.len()).expect("a synthetic chunk fits in u32");
+    png.extend_from_slice(&length.to_be_bytes());
+    let start = png.len();
+    png.extend_from_slice(&kind);
+    png.extend_from_slice(data);
+    let crc = tunnel_cua::image::crc32(&png[start..]);
+    png.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// The marker a capture's `image_data` carries, or `None` if it is not a PNG
+/// holding exactly one [`MARKER_CHUNK`] with a correct CRC.
+///
+/// A real capture fails here: it is a PNG with no marker chunk.
 #[must_use]
-pub fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
+pub fn marker_from_image_data(image_data: &str) -> Option<Vec<u8>> {
+    let png = tunnel_cua::image::decode_base64(image_data)?;
+    let mut rest = png.strip_prefix(&tunnel_cua::image::PNG_SIGNATURE[..])?;
+    let mut found = None;
+    while !rest.is_empty() {
+        let length = usize::try_from(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+        let kind = rest.get(4..8)?;
+        let data = rest.get(8..8 + length)?;
+        let crc = u32::from_be_bytes(rest.get(8 + length..12 + length)?.try_into().ok()?);
+        if tunnel_cua::image::crc32(&rest[4..8 + length]) != crc {
+            return None;
+        }
+        if kind == MARKER_CHUNK {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(data.to_vec());
+        }
+        rest = &rest[12 + length..];
     }
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let high = char::from(pair[0]).to_digit(16)?;
-        let low = char::from(pair[1]).to_digit(16)?;
-        out.push(u8::try_from(high * 16 + low).ok()?);
+    found
+}
+
+/// Standard base64 with padding, so the fixture emits `image_data` exactly as
+/// the released handlers do (`base64.b64encode(...).decode()`).
+#[must_use]
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let value = (u32::from(group[0]) << 16)
+            | (u32::from(*group.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*group.get(2).unwrap_or(&0));
+        for position in 0..4 {
+            if position <= group.len() {
+                let index = (value >> (18 - 6 * position)) & 0x3f;
+                out.push(char::from(ALPHABET[index as usize]));
+            } else {
+                out.push('=');
+            }
+        }
     }
-    Some(out)
+    out
 }
 
 /// Write one `data: <JSON>\n\n` event under a 200, with `text/plain` — the
