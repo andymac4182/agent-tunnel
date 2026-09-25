@@ -77,7 +77,7 @@ def cmd_tls_forward(args) -> int:
         finally:
             writer.close()
 
-    async def handle(client_reader, client_writer):
+    async def serve_one(client_reader, client_writer):
         try:
             up_reader, up_writer = await asyncio.open_connection(host, int(port))
         except OSError:
@@ -86,7 +86,7 @@ def cmd_tls_forward(args) -> int:
         await asyncio.gather(pump(client_reader, up_writer), pump(up_reader, client_writer))
 
     async def main():
-        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=context)
+        server = await asyncio.start_server(serve_one, "127.0.0.1", 0, ssl=context)
         bound = server.sockets[0].getsockname()[1]
         with open(args.portfile + ".tmp", "w") as handle:
             handle.write(str(bound))
