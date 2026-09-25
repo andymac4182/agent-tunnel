@@ -1740,6 +1740,12 @@ struct ClientConnection {
     planned_remote_closing: CancellationToken,
     driver: Mutex<Option<JoinHandle<Result<(), PeerTransportError>>>>,
     pin_watcher: Mutex<Option<JoinHandle<()>>>,
+    /// The local peer identity generation read immediately before this
+    /// connection's handshake began (0 when the client has no rotating
+    /// identity).  Read *before* the dial, so a rotation racing the handshake
+    /// can only make a connection look older than it is -- which retires it
+    /// early -- and never newer.
+    local_generation: u64,
     _connection_permit: OwnedSemaphorePermit,
 }
 
@@ -2144,7 +2150,24 @@ impl PeerConnectionHandle {
 struct PeerPoolState {
     connections: Mutex<HashMap<PeerDestination, Arc<ClientConnection>>>,
     dial_locks: Mutex<HashMap<PeerDestination, Arc<DialEntry>>>,
+    /// Connections established under a superseded local peer identity that
+    /// still carry in-flight streams.  Bounded by
+    /// [`MAX_ROTATION_DRAINING_CONNECTIONS`]; each is closed when its streams
+    /// finish, at the drain budget, or when its generation is retired.
+    draining: StdMutex<Vec<DrainingConnection>>,
 }
+
+struct DrainingConnection {
+    connection: std::sync::Weak<ClientConnection>,
+    local_generation: u64,
+}
+
+/// The most connections a client keeps draining under a superseded local
+/// peer identity at once (`docs/cluster.md`: "at most four additional
+/// key-rotation replacement connections per node").  When the bound is
+/// reached, a destination keeps using its predecessor connection -- whose key
+/// is still approved during the overlap -- instead of tearing it down.
+pub const MAX_ROTATION_DRAINING_CONNECTIONS: usize = 4;
 
 struct DialEntry {
     lock: Mutex<()>,
@@ -2238,6 +2261,7 @@ pub struct PeerClient {
     connections: Arc<Semaphore>,
     state: Arc<PeerPoolState>,
     cancel: CancellationToken,
+    local_identity: Option<Arc<crate::RotatingPeerIdentity>>,
 }
 
 impl PeerClient {
@@ -2268,10 +2292,131 @@ impl PeerClient {
             state: Arc::new(PeerPoolState {
                 connections: Mutex::new(HashMap::new()),
                 dial_locks: Mutex::new(HashMap::new()),
+                draining: StdMutex::new(Vec::new()),
             }),
             cancel: CancellationToken::new(),
             limits,
+            local_identity: None,
         })
+    }
+
+    /// Track the rotating local identity this client's endpoint presents.
+    ///
+    /// The endpoint's client configuration must resolve its certificate
+    /// through the same [`crate::RotatingPeerIdentity`]
+    /// ([`crate::RotatingPeerIdentity::quinn_client_config`]).  With it, a
+    /// pooled connection established under an older generation is not used
+    /// for new streams once the identity changes: it moves to a bounded drain
+    /// set and a fresh connection presents the current identity.
+    #[must_use]
+    pub fn with_local_identity(mut self, identity: Arc<crate::RotatingPeerIdentity>) -> Self {
+        self.local_identity = Some(identity);
+        self
+    }
+
+    fn local_generation(&self) -> u64 {
+        self.local_identity
+            .as_ref()
+            .map_or(0, |identity| identity.generation())
+    }
+
+    /// Move `connection` into the bounded drain set, or refuse when the set
+    /// is full.  A drained connection closes when its last stream lease is
+    /// returned, at the drain budget, or when its generation is retired.
+    fn begin_rotation_drain(&self, connection: &Arc<ClientConnection>) -> bool {
+        let mut draining = match self.state.draining.lock() {
+            Ok(draining) => draining,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        draining.retain(|entry| entry.connection.strong_count() > 0);
+        if draining
+            .iter()
+            .any(|entry| std::ptr::eq(entry.connection.as_ptr(), Arc::as_ptr(connection)))
+        {
+            return true;
+        }
+        if draining.len() >= MAX_ROTATION_DRAINING_CONNECTIONS {
+            return false;
+        }
+        draining.push(DrainingConnection {
+            connection: Arc::downgrade(connection),
+            local_generation: connection.local_generation,
+        });
+        drop(draining);
+        let weak = Arc::downgrade(connection);
+        let permits = connection.stream_permits.clone();
+        let permit_count = u32::try_from(self.limits.max_streams_per_connection).unwrap_or(u32::MAX);
+        let budget = self.limits.drain_timeout;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + budget;
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = timeout_at(deadline, permits.acquire_many_owned(permit_count)) => {}
+            }
+            if let Some(connection) = weak.upgrade() {
+                let _ = connection
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await;
+            }
+        });
+        true
+    }
+
+    /// Close every connection -- pooled or draining -- established under a
+    /// local identity generation older than `generation`, and return how many
+    /// were closed.  In-flight streams on them end with a transport error.
+    pub async fn retire_local_generations_before(&self, generation: u64) -> usize {
+        let mut retired: Vec<Arc<ClientConnection>> = Vec::new();
+        {
+            let mut draining = match self.state.draining.lock() {
+                Ok(draining) => draining,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            draining.retain(|entry| {
+                if entry.local_generation < generation {
+                    if let Some(connection) = entry.connection.upgrade() {
+                        retired.push(connection);
+                    }
+                    false
+                } else {
+                    entry.connection.strong_count() > 0
+                }
+            });
+        }
+        {
+            let mut pooled = self.state.connections.lock().await;
+            let stale: Vec<PeerDestination> = pooled
+                .iter()
+                .filter(|(_, connection)| connection.local_generation < generation)
+                .map(|(destination, _)| destination.clone())
+                .collect();
+            for destination in stale {
+                if let Some(connection) = pooled.remove(&destination) {
+                    retired.push(connection);
+                }
+            }
+        }
+        let count = retired.len();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for connection in retired {
+            let _ = connection.shutdown_until(deadline).await;
+        }
+        count
+    }
+
+    /// The number of connections still draining under a superseded local
+    /// peer identity.  Bounded by [`MAX_ROTATION_DRAINING_CONNECTIONS`].
+    #[must_use]
+    pub fn draining_connection_count(&self) -> usize {
+        let draining = match self.state.draining.lock() {
+            Ok(draining) => draining,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        draining
+            .iter()
+            .filter(|entry| entry.connection.strong_count() > 0)
+            .count()
     }
 
     /// Return a pooled connection, dialing at most once concurrently for this
@@ -2311,26 +2456,43 @@ impl PeerClient {
             };
 
         let result: Result<PeerConnectionHandle, PeerTransportError> = async {
-            if let Some(connection) =
-                with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                    .await?
+            let local_generation = self.local_generation();
+            let usable = with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
+                .await?
+                .get(&destination)
+                .filter(|connection| {
+                    connection.connection.close_reason().is_none()
+                        && !connection.cancel.is_cancelled()
+                        && current_pins.verify(&connection.identity).is_ok()
+                })
+                .cloned();
+            if let Some(connection) = usable {
+                // Same local identity: reuse.  A superseded local identity:
+                // drain the predecessor and dial with the current one -- unless
+                // the bounded drain set is full, in which case the predecessor
+                // (still approved during the overlap) keeps serving.
+                if connection.local_generation >= local_generation
+                    || !self.begin_rotation_drain(&connection)
+                {
+                    return Ok(PeerConnectionHandle { inner: connection });
+                }
+                let mut pooled =
+                    with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
+                        .await?;
+                if pooled
                     .get(&destination)
-                    .filter(|connection| {
-                        connection.connection.close_reason().is_none()
-                            && !connection.cancel.is_cancelled()
-                            && current_pins.verify(&connection.identity).is_ok()
-                    })
-                    .cloned()
-            {
-                return Ok(PeerConnectionHandle { inner: connection });
-            }
-
-            let previous =
-                with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                    .await?
-                    .remove(&destination);
-            if let Some(previous) = previous {
-                previous.shutdown_until(deadline).await?;
+                    .is_some_and(|current| Arc::ptr_eq(current, &connection))
+                {
+                    pooled.remove(&destination);
+                }
+            } else {
+                let previous =
+                    with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
+                        .await?
+                        .remove(&destination);
+                if let Some(previous) = previous {
+                    previous.shutdown_until(deadline).await?;
+                }
             }
 
             // Connection-pool exhaustion is a typed capacity condition and must
@@ -2582,6 +2744,7 @@ impl PeerClient {
                 planned_remote_closing,
                 driver: Mutex::new(Some(driver_task)),
                 pin_watcher: Mutex::new(Some(pin_watcher)),
+                local_generation,
                 _connection_permit: connection_permit,
             });
             with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
@@ -4164,6 +4327,7 @@ mod tests {
         let state = Arc::new(PeerPoolState {
             connections: Mutex::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
+            draining: StdMutex::new(Vec::new()),
         });
         let destination = PeerDestination::new("127.0.0.1:1".parse().unwrap(), "peer.test");
         let entry = Arc::new(DialEntry::new());

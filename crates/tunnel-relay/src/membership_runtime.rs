@@ -923,6 +923,62 @@ pub struct MembershipRuntime {
     state: Mutex<RuntimeState>,
     version_store: Option<Arc<MembershipVersionStateStore>>,
     started: AtomicBool,
+    /// The SPKI digest this process currently presents on new peer
+    /// handshakes, and therefore the one its readiness is bound to.  Starts
+    /// at `config.local_spki_sha256`; only
+    /// [`MembershipRuntime::switch_local_serving_spki`] changes it, under the
+    /// reconcile gate and only to a key the verified record approves now
+    /// (task rows M8-C28, M8-C45).
+    local_serving_spki: Mutex<Option<String>>,
+}
+
+/// How the current verified record for this relay treats one of its own
+/// candidate SPKI digests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalKeyApproval {
+    /// The runtime is not Ready, so no local key is approved.
+    NotReady,
+    /// No current record for this node lists the key.
+    Absent,
+    /// The record lists the key as revoked.
+    Revoked,
+    /// The record lists the key, but not for this instant.
+    OutsideWindow,
+    /// The record approves the key now.
+    Approved {
+        /// The verified record version that approves it.
+        record_version: u64,
+    },
+}
+
+impl LocalKeyApproval {
+    #[must_use]
+    pub const fn is_approved(self) -> bool {
+        matches!(self, Self::Approved { .. })
+    }
+
+    /// A bounded label for diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotReady => "not_ready",
+            Self::Absent => "absent",
+            Self::Revoked => "revoked",
+            Self::OutsideWindow => "outside_window",
+            Self::Approved { .. } => "approved",
+        }
+    }
+}
+
+/// Why a switch of the locally served peer identity was refused.
+#[derive(Debug)]
+pub enum LocalServingSwitchError<E> {
+    /// The digest is not a lower-case SHA-256 hex SPKI pin.
+    InvalidDigest,
+    /// The verified record does not approve the key now.
+    NotApproved(LocalKeyApproval),
+    /// The transport refused to install the identity.
+    Install(E),
 }
 
 impl fmt::Debug for MembershipRuntime {
@@ -1024,7 +1080,6 @@ impl MembershipRuntime {
                 .map_err(MembershipRuntimeError::Membership)?;
         }
         Ok(Arc::new(Self {
-            config,
             catalog,
             authority,
             cancellation: CancellationToken::new(),
@@ -1043,9 +1098,102 @@ impl MembershipRuntime {
                 callback: None,
                 last_persisted_version_state: persisted_version_state,
             }),
+            local_serving_spki: Mutex::new(config.local_spki_sha256.clone()),
+            config,
             version_store,
             started: AtomicBool::new(false),
         }))
+    }
+
+    /// The SPKI digest this process's readiness is currently bound to.
+    #[must_use]
+    pub fn local_serving_spki(&self) -> Option<String> {
+        self.local_serving_spki
+            .lock()
+            .expect("local serving SPKI mutex poisoned")
+            .clone()
+    }
+
+    /// How the current verified record for this node treats `spki` now.
+    ///
+    /// Reads retained verified state only; it never fetches or verifies
+    /// anything and grants nothing.
+    #[must_use]
+    pub fn local_key_approval(&self, spki: &str) -> LocalKeyApproval {
+        let now = Utc::now();
+        let state = self.state.lock().expect("membership state mutex poisoned");
+        Self::local_key_approval_locked(&state, &self.config.node_id, spki, now)
+    }
+
+    fn local_key_approval_locked(
+        state: &RuntimeState,
+        node_id: &str,
+        spki: &str,
+        now: DateTime<Utc>,
+    ) -> LocalKeyApproval {
+        if !matches!(state.readiness, MembershipReadiness::Ready) {
+            return LocalKeyApproval::NotReady;
+        }
+        let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
+            return LocalKeyApproval::NotReady;
+        };
+        let Some(minimum) = checkpoint.checkpoint().minimum_versions.get(node_id).copied() else {
+            return LocalKeyApproval::Absent;
+        };
+        let Some(membership) = state
+            .verifier
+            .retained_memberships()
+            .into_iter()
+            .find(|membership| {
+                membership.node_id() == node_id && membership.record().record_version >= minimum
+            })
+        else {
+            return LocalKeyApproval::Absent;
+        };
+        let mut listed = LocalKeyApproval::Absent;
+        for key in membership.keys().iter().filter(|key| key.spki_sha256 == spki) {
+            if key.revoked {
+                return LocalKeyApproval::Revoked;
+            }
+            if key.not_before <= now && key.expires_at >= now && membership.record().expires_at >= now
+            {
+                return LocalKeyApproval::Approved {
+                    record_version: membership.record().record_version,
+                };
+            }
+            listed = LocalKeyApproval::OutsideWindow;
+        }
+        listed
+    }
+
+    /// Bind readiness to `spki` and run `install` -- which makes the transport
+    /// present that identity on new handshakes -- as one step.
+    ///
+    /// Holds the reconcile gate, so no reconciliation pass reads the local
+    /// digest half-way through, and refuses unless the current verified
+    /// record approves `spki` at this instant.  `install` runs only after
+    /// that check; if it fails, readiness stays bound to the previous digest.
+    /// Readiness is never satisfied by a *staged* key: only by the one being
+    /// served (task row M8-C45).
+    pub async fn switch_local_serving_spki<E>(
+        &self,
+        spki: &str,
+        install: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), LocalServingSwitchError<E>> {
+        if !is_spki_digest(spki) {
+            return Err(LocalServingSwitchError::InvalidDigest);
+        }
+        let _reconcile_guard = self.reconcile_gate.lock().await;
+        let approval = self.local_key_approval(spki);
+        if !approval.is_approved() {
+            return Err(LocalServingSwitchError::NotApproved(approval));
+        }
+        install().map_err(LocalServingSwitchError::Install)?;
+        *self
+            .local_serving_spki
+            .lock()
+            .expect("local serving SPKI mutex poisoned") = Some(spki.to_owned());
+        Ok(())
     }
 
     /// Install or replace the process-local invalidation callback.
@@ -1180,7 +1328,7 @@ impl MembershipRuntime {
     /// to the peer transport policy and does not itself grant admission.
     #[must_use]
     pub fn local_peer_identity(&self) -> Option<PeerIdentity> {
-        self.config.local_spki_sha256.clone().map(|spki_sha256| {
+        self.local_serving_spki().map(|spki_sha256| {
             PeerIdentity::new(&self.config.node_id, &self.config.boot_id, spki_sha256)
         })
     }
@@ -1512,7 +1660,11 @@ impl MembershipRuntime {
         // replace the identity proof for this process.  A known, non-revoked
         // local key that has expired is an expiry boundary; a missing,
         // revoked, or not-yet-active local pin remains a membership rejection.
-        let local_spki = self.config.local_spki_sha256.as_deref();
+        // The digest currently served, read under the reconcile gate this
+        // pass holds, so a concurrent identity switch is either wholly before
+        // or wholly after this pass.
+        let local_serving_spki = self.local_serving_spki();
+        let local_spki = local_serving_spki.as_deref();
         let local_key = local_spki.and_then(|spki| {
             local_membership.keys().iter().find(|key| {
                 !key.revoked

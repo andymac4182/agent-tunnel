@@ -10,6 +10,7 @@
 
 pub mod log_limit;
 mod peer;
+mod peer_identity;
 mod peer_probe;
 mod server;
 mod tls;
@@ -18,7 +19,7 @@ pub use peer::{
     DEFAULT_PEER_BODY_CHUNK_BYTES, DEFAULT_PEER_CONNECTION_BODY_BYTES, DEFAULT_PEER_CONNECTIONS,
     DEFAULT_PEER_DESTINATIONS, DEFAULT_PEER_HANDSHAKE_TIMEOUT, DEFAULT_PEER_HEADER_BYTES,
     DEFAULT_PEER_STREAM_BODY_BYTES, DEFAULT_PEER_STREAM_TIMEOUT,
-    DEFAULT_PEER_STREAMS_PER_CONNECTION, MAX_DYNAMIC_PEER_PINS, PeerBodyChunk, PeerClient,
+    DEFAULT_PEER_STREAMS_PER_CONNECTION, MAX_DYNAMIC_PEER_PINS, MAX_ROTATION_DRAINING_CONNECTIONS, PeerBodyChunk, PeerClient,
     PeerClientRecv, PeerClientSend, PeerClientStream, PeerConnectionHandle, PeerDestination,
     PeerHandlerFuture, PeerOpenProgress, PeerPinSnapshot, PeerPolicyRejected,
     PeerPoolConnectionStats, PeerPoolStats, PeerRequestHandler, PeerRequestPolicy, PeerServer,
@@ -26,6 +27,7 @@ pub use peer::{
     PeerServerStats, PeerServerStream, PeerTransportError, PeerTransportLimits,
     PeerTransportOpenStage, SharedPeerPins, serve_peer,
 };
+pub use peer_identity::{PeerIdentityError, RotatingPeerIdentity, StagedPeerIdentity};
 pub use peer_probe::{
     ApprovedPeerPins, PeerProbeError, PeerProbeLimits, PeerProbeResponse, peer_probe,
     serve_peer_probe,

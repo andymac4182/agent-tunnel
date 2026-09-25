@@ -385,6 +385,25 @@ pub struct ClusterConfig {
     pub checkpoint_timeout_seconds: u64,
     #[serde(default = "default_cluster_clock_skew_seconds")]
     pub max_clock_skew_seconds: u64,
+
+    /// Optional successor peer certificate chain and private key for a live
+    /// peer-key rotation (task row M8-C46).  Both or neither.  The relay reads
+    /// them only when the operator sends `SIGHUP`, validates them against
+    /// `peer_tls_client_ca`, and stages them; nothing is served with them
+    /// until a verified signed membership record approves their SPKI.
+    #[serde(default)]
+    pub peer_tls_next_cert_chain: Option<PathBuf>,
+    #[serde(default)]
+    pub peer_tls_next_private_key: Option<PathBuf>,
+    /// How long a staged successor's SPKI must stay approved by the verified
+    /// record before new handshakes present it.  Defaults to
+    /// `membership_record_lifetime_seconds + max_clock_skew_seconds`.
+    #[serde(default)]
+    pub peer_rekey_convergence_seconds: Option<u64>,
+    /// How long the predecessor may keep serving after the switch before the
+    /// relay retires it locally.  Defaults to 600 (`docs/cluster.md`).
+    #[serde(default)]
+    pub peer_rekey_overlap_seconds: Option<u64>,
 }
 
 impl ClusterConfig {
@@ -495,6 +514,39 @@ impl ClusterConfig {
         if self.membership_refresh_seconds > self.membership_record_lifetime_seconds {
             return Err(ConfigError::Invalid(
                 "cluster.membership_refresh_seconds must not exceed the record lifetime",
+            ));
+        }
+        match (&self.peer_tls_next_cert_chain, &self.peer_tls_next_private_key) {
+            (None, None) => {}
+            (Some(chain), Some(key)) => {
+                validate_config_path(chain, "cluster.peer_tls_next_cert_chain")?;
+                validate_config_path(key, "cluster.peer_tls_next_private_key")?;
+                if chain == &self.peer_tls_cert_chain || key == &self.peer_tls_private_key {
+                    return Err(ConfigError::Invalid(
+                        "cluster.peer_tls_next_* must name files distinct from the current peer identity",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "cluster.peer_tls_next_cert_chain and cluster.peer_tls_next_private_key must be set together",
+                ));
+            }
+        }
+        if let Some(seconds) = self.peer_rekey_convergence_seconds
+            && (seconds < self.membership_reconcile_seconds.saturating_mul(2)
+                || seconds > MAX_CLUSTER_REKEY_CONVERGENCE_SECONDS)
+        {
+            return Err(ConfigError::Invalid(
+                "cluster.peer_rekey_convergence_seconds must be at least twice the reconcile interval and at most 3600",
+            ));
+        }
+        if let Some(seconds) = self.peer_rekey_overlap_seconds
+            && (seconds < self.peer_drain_timeout_seconds
+                || seconds > MAX_CLUSTER_REKEY_OVERLAP_SECONDS)
+        {
+            return Err(ConfigError::Invalid(
+                "cluster.peer_rekey_overlap_seconds must be at least the peer drain timeout and at most 600",
             ));
         }
         Ok(())
@@ -1135,6 +1187,8 @@ const MAX_CLUSTER_IDLE_TIMEOUT_SECONDS: u64 = 60;
 const MAX_CLUSTER_DRAIN_SECONDS: u64 = 30;
 const MAX_CLUSTER_CHECKPOINT_TIMEOUT_SECONDS: u64 = 2;
 const MAX_CLUSTER_CLOCK_SKEW_SECONDS: u64 = 1;
+const MAX_CLUSTER_REKEY_CONVERGENCE_SECONDS: u64 = 3600;
+const MAX_CLUSTER_REKEY_OVERLAP_SECONDS: u64 = 600;
 
 fn default_membership_record_lifetime_seconds() -> u64 {
     MAX_CLUSTER_RECORD_LIFETIME_SECONDS
