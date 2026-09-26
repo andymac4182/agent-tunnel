@@ -9256,12 +9256,13 @@ impl RelayActor {
             rotation.last_message_id = message.message_id().to_owned();
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
+        // ACKs owed on the retired carrier now go out on the activated one
+        // (flow control; independent of the held records' order).
+        self.retry_owed_acks(key);
         // The candidate is now the active carrier and the relay writer has
         // resumed on the new generation (phase Retiring).  Emit every frame
         // held while the writer was frozen, each with the continuing sequence.
         self.flush_frozen_writes(key);
-        // ACKs owed on the retired carrier now go out on the activated one.
-        self.retry_owed_acks(key);
         // Then admit the OPENs held across the freeze, in arrival order.
         self.service_held_scope(&key.scope(), tokio::time::Instant::now());
     }
