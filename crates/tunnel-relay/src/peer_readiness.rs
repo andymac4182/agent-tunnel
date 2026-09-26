@@ -473,6 +473,19 @@ impl PeerReadiness {
         target: &PeerRouteTarget,
         probe: PeerProbeState,
     ) -> Result<bool, PeerReadinessError> {
+        self.record_probe_locked(revision, target, probe, None)
+    }
+
+    /// Publish one probe outcome and its proof, if any, in one locked
+    /// section, so no interleaved `mark_route_unreachable` or reset can leave
+    /// an `Unreachable` route carrying a proof.
+    fn record_probe_locked(
+        &self,
+        revision: PeerReadinessRevision,
+        target: &PeerRouteTarget,
+        probe: PeerProbeState,
+        proven_spki: Option<&str>,
+    ) -> Result<bool, PeerReadinessError> {
         let key = target.key();
         let mut state = self.state.lock().expect("peer readiness mutex poisoned");
         if state.revision != revision {
@@ -485,7 +498,9 @@ impl PeerReadiness {
             return Err(PeerReadinessError::UnknownRoute);
         }
         required.state = probe;
-        required.proven_spki = None;
+        required.proven_spki = proven_spki
+            .filter(|_| probe == PeerProbeState::Reachable)
+            .map(str::to_owned);
         required.last_probe = (probe == PeerProbeState::Reachable).then(Instant::now);
         required.available_capacity = match probe {
             PeerProbeState::Reachable => Some(1),
@@ -510,17 +525,12 @@ impl PeerReadiness {
         {
             return Err(PeerReadinessError::UnknownRoute);
         }
-        let published = self.record_probe_at(revision, target, PeerProbeState::Reachable)?;
-        if published {
-            let key = target.key();
-            let mut state = self.state.lock().expect("peer readiness mutex poisoned");
-            if state.revision == revision
-                && let Some(required) = state.routes.get_mut(&key)
-            {
-                required.proven_spki = Some(observed_spki.to_owned());
-            }
-        }
-        Ok(published)
+        self.record_probe_locked(
+            revision,
+            target,
+            PeerProbeState::Reachable,
+            Some(observed_spki),
+        )
     }
 
     /// Return the current route-set revision.
@@ -744,6 +754,67 @@ mod tests {
             .replace_required_routes([target_with_pins("relay-a", &["bb"])])
             .expect("replacement route set");
         assert!(!readiness.is_ready(), "the proven key was retired");
+    }
+
+    /// Whether any installed route still carries a probe proof. The proof is
+    /// internal state, deliberately absent from every public snapshot.
+    fn route_carries_proof(readiness: &PeerReadiness) -> bool {
+        readiness
+            .state
+            .lock()
+            .expect("peer readiness mutex poisoned")
+            .routes
+            .values()
+            .any(|route| route.proven_spki.is_some())
+    }
+
+    /// An unreachable mark withdraws the proof with the reachability: a
+    /// later overlap record must not resurrect the route.
+    #[test]
+    fn an_unreachable_route_is_not_revived_by_an_overlap_record() {
+        let (readiness, old) = ready_with_one_route(true);
+        readiness.mark_route_unreachable(&old);
+        assert!(!readiness.is_ready());
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(
+            !readiness.is_ready(),
+            "M8-C30: an overlap record revived a route marked unreachable"
+        );
+        assert!(
+            !route_carries_proof(&readiness),
+            "M8-C30: an unreachable route kept its probe proof"
+        );
+    }
+
+    /// A probe reset withdraws the proof too.
+    #[test]
+    fn a_reset_route_is_not_revived_by_an_overlap_record() {
+        let (readiness, _) = ready_with_one_route(true);
+        readiness.reset_route_probes();
+        readiness.set_available_capacity(1);
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(!readiness.is_ready(), "a reset route is not ready");
+        assert!(
+            !route_carries_proof(&readiness),
+            "M8-C30: a reset route kept its probe proof"
+        );
+    }
+
+    /// A proof binds to one route: a record that moves the peer's endpoint is
+    /// a different route and must be probed afresh.
+    #[test]
+    fn an_endpoint_change_resets_a_proven_route() {
+        let (readiness, _) = ready_with_one_route(true);
+        let mut moved = target_with_pins("relay-a", &["aa"]);
+        moved.peer_endpoint = "10.0.0.99:8443".to_owned();
+        readiness
+            .replace_required_routes([moved])
+            .expect("moved route set");
+        assert!(!readiness.is_ready(), "a moved endpoint kept the old proof");
     }
 
     /// Without a recorded proof the old rule stands: any pin change resets.
