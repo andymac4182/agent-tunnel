@@ -512,6 +512,24 @@ impl CleanupDispatcher {
         }
     }
 
+    /// Queue the item `take` yields only if the worker has room for it now;
+    /// returns `false`, without calling `take`, when the queue is full or
+    /// closed, so the caller can leave the item where it is (task row
+    /// M6-C179).  `take` returning `None` also returns `false`.
+    fn enqueue_if_room(&self, take: impl FnOnce() -> Option<OwnerCleanupItem>) -> bool {
+        let Ok(permit) = self.tx.try_reserve() else {
+            return false;
+        };
+        let Some(item) = take() else {
+            return false;
+        };
+        // Reserved before the send, as in `enqueue`.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(item);
+        self.notify.notify_one();
+        true
+    }
+
     fn fail_closed(&self, tenant_id: Uuid, device_id: Uuid, state: &'static str) {
         if !self.overflowed.swap(true, Ordering::AcqRel) {
             tracing::error!(
@@ -599,7 +617,9 @@ fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, 
 /// spawned; the task arms it in place through its [`ClaimHandoff`], and the
 /// command carries only the handoff.  A guard leaves the registry only by
 /// being taken: by the actor when it handles the command, by `close_all`
-/// (which hands every guard still parked to the still-live cleanup worker),
+/// (which hands parked guards to the still-live cleanup worker while its
+/// bounded queue has room, then releases the rest itself against the catalog
+/// within the same shutdown deadline, task row M6-C179),
 /// or, once the actor has ended, by [`StrandedClaimRelease`], which releases
 /// it directly against the catalog.  Dropping a handoff never drops its guard.
 /// Bounded by the registrations the actor admitted (`max_devices`).
@@ -650,6 +670,12 @@ impl ClaimHandoffs {
         if let Some(guard) = lock_handoffs(&self.slots).guards.get_mut(&id) {
             arm(guard);
         }
+    }
+
+    /// Close the registry: a later deposit keeps its guard with its own
+    /// handoff.  Guards already parked stay parked.
+    fn close(&self) {
+        lock_handoffs(&self.slots).closed = true;
     }
 
     /// Close the registry and take the next armed guard's cleanup item,
@@ -802,12 +828,12 @@ fn log_stranded_release(released: usize, abandoned: usize) {
             released,
             abandoned,
             timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
-            "owner claims stranded behind an ended relay actor exceeded the release deadline; lease expiry is the fencing fallback"
+            "owner claims still parked when the relay actor ended exceeded the release deadline; lease expiry is the fencing fallback"
         );
     } else if released > 0 {
         tracing::warn!(
             released,
-            "owner claims stranded behind an ended relay actor were released"
+            "owner claims still parked when the relay actor ended were released"
         );
     }
 }
@@ -15352,8 +15378,11 @@ impl RelayActor {
     /// dropped response channel.  Anything else is dropped here exactly as
     /// the previous unconditional drain dropped it: a queued registration or
     /// attach command still loses its response sender (the caller observes
-    /// `RelayError::Shutdown`) and still routes its owner-claim guard through
-    /// cleanup.
+    /// `RelayError::Shutdown`).  Dropping a registration command no longer
+    /// drops its owner-claim guard: the command carries only a
+    /// [`ClaimHandoff`], the guard stays parked in [`ClaimHandoffs`], and
+    /// `close_all`'s parked-guard sweep releases it (task rows M6-C170,
+    /// M6-C178 and M6-C179).
     fn apply_terminal_command_during_drain(&mut self, command: Command) {
         match command {
             Command::CloseEchoStream {
@@ -15385,8 +15414,9 @@ impl RelayActor {
     async fn close_all(&mut self) {
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
         // Stop every background result sender before the actor stops draining
-        // commands.  Any queued registration command is dropped with its
-        // owner-claim guard, which routes the exact token through cleanup.
+        // commands.  A queued registration command dropped by the drain
+        // leaves its owner-claim guard parked in `ClaimHandoffs`; the
+        // parked-guard sweep below releases the exact token or claim.
         self.options.shutdown.cancel();
         self.rx.close();
         // The drain used to discard every queued command, so a consumer close
@@ -15419,21 +15449,56 @@ impl RelayActor {
             let remaining = std::mem::replace(&mut self.background_tasks, JoinSet::new());
             drop(remaining);
         }
-        // Hand every owner-claim guard still parked (a registration whose
-        // result was dropped in the drain above, or whose task was aborted) to
-        // the cleanup worker while it is still live (task rows M6-C170 and
-        // M6-C178).  This also closes the registry, so a later deposit keeps
+        // Hand owner-claim guards still parked (a registration whose result
+        // was dropped in the drain above, or whose task was aborted) to the
+        // cleanup worker while it is still live (task rows M6-C170 and
+        // M6-C178), but only while its bounded queue has room.  Up to
+        // `max_devices` guards can be parked and the queue holds
+        // `CLEANUP_QUEUE_CAPACITY`; a guard taken out of the registry and
+        // refused by a full queue used to be left to lease expiry (task row
+        // M6-C179).  Whatever does not fit now stays parked and is released
+        // below, after the worker has shut down, within this same deadline.
+        // The registry is closed first either way, so a later deposit keeps
         // its guard with its own handoff.
+        self.claim_handoffs.close();
         if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
-            while let Some(item) = self.claim_handoffs.take_next_after_end() {
-                dispatcher.enqueue(item);
-            }
+            while dispatcher.enqueue_if_room(|| self.claim_handoffs.take_next_after_end()) {}
         }
         self.cleanup_dispatcher.take();
         if let Some(cleanup) = self.cleanup.take()
             && !cleanup.shutdown_until(deadline).await
         {
             self.background_failure.store(true, Ordering::Release);
+        }
+        // Release the guards the worker's queue had no room for, directly
+        // against the catalog and fenced exactly as the worker releases them,
+        // within what is left of this same deadline (task row M6-C179).  One
+        // deadline covers the worker's drain and this release, so an ordinary
+        // shutdown with more parked guards than the queue holds stays inside
+        // `CLEANUP_SHUTDOWN_TIMEOUT`, and so inside `RunningRelay::shutdown`'s
+        // overall bound, instead of adding the supervisor's own fresh
+        // deadline after it.  What does not fit is taken out, counted, and
+        // left to lease expiry; the supervisor then finds nothing parked.
+        let catalog = &self.catalog;
+        let (released, abandoned) =
+            release_parked_until(&self.claim_handoffs, deadline, |item| async move {
+                release_cleanup_item(catalog, &item).await
+            })
+            .await;
+        if abandoned > 0 {
+            tracing::error!(
+                released,
+                abandoned,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
+                "owner claims beyond the cleanup queue exceeded the relay shutdown deadline; lease expiry is the fencing fallback"
+            );
+        } else if released > 0 {
+            tracing::info!(
+                released,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                "owner claims beyond the cleanup queue were released at relay shutdown"
+            );
         }
     }
 

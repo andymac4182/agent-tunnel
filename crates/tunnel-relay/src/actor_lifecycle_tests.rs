@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -151,6 +151,7 @@ struct HeldCatalog {
     renew_started: Arc<AtomicBool>,
     release_renew: Arc<Notify>,
     hold_renew: Arc<AtomicBool>,
+    release_delay_ms: Arc<AtomicU64>,
 }
 
 impl HeldCatalog {
@@ -166,6 +167,7 @@ impl HeldCatalog {
             renew_started: Arc::new(AtomicBool::new(false)),
             release_renew: Arc::new(Notify::new()),
             hold_renew: Arc::new(AtomicBool::new(false)),
+            release_delay_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -315,6 +317,10 @@ impl Catalog for HeldCatalog {
     }
 
     async fn release_owner(&self, token: &OwnerToken) -> Result<bool, CatalogError> {
+        let delay = self.release_delay_ms.load(Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         self.inner.release_owner(token).await
     }
 
@@ -703,6 +709,182 @@ async fn an_actor_aborted_while_a_claim_is_in_flight_releases_that_claim() {
         "a claim committed by a registration task aborted with its actor must be released, \
          not left fenced until its lease expires"
     );
+}
+
+/// Commit `count` synthetic owner claims in `catalog` and park an armed
+/// guard for each in `handle`'s registry, as registrations whose results
+/// were dropped would leave them (task row M6-C179).  The guards are built on
+/// a dispatcher of their own: every guard is taken out of the registry
+/// disarmed, so that dispatcher must never receive an item.
+async fn park_committed_claims(
+    handle: &RelayHandle,
+    catalog: &HeldCatalog,
+    count: usize,
+) -> (Uuid, Vec<Uuid>, super::CleanupWorker) {
+    let tenant_id = Uuid::from_u128(0xC179_0001);
+    let user_id = Uuid::from_u128(0xC179_0002);
+    let device_ids: Vec<Uuid> = (0..count)
+        .map(|index| Uuid::from_u128(0xC179_1000 + index as u128))
+        .collect();
+    let now = Utc::now();
+    let fixture = CatalogFixture {
+        tenants: vec![TenantRecord {
+            tenant_id,
+            display_name: "c179-tenant".to_owned(),
+            active: true,
+        }],
+        users: vec![UserRecord {
+            user_id,
+            display_name: "C179 User".to_owned(),
+        }],
+        memberships: vec![MembershipRecord {
+            tenant_id,
+            user_id,
+            role: MembershipRole::Member,
+            active: true,
+        }],
+        devices: device_ids
+            .iter()
+            .map(|&device_id| FixtureDevice {
+                tenant_id,
+                device_id,
+                owner_user_id: user_id,
+                display_name: "C179 Device".to_owned(),
+                active: true,
+                last_seen_at: Some(now),
+            })
+            .collect(),
+        ..CatalogFixture::default()
+    };
+    catalog
+        .seed_fixture(&fixture)
+        .await
+        .expect("seed C179 catalog fixture");
+    let spare = super::CleanupWorker::spawn(Arc::new(catalog.inner.clone()));
+    for &device_id in &device_ids {
+        let claim = catalog
+            .inner
+            .claim_owner(&OwnerClaimRequest {
+                deployment_incarnation: "c179".to_owned(),
+                tenant_id,
+                device_id,
+                node_id: "c179-node".to_owned(),
+                boot_id: "c179-boot".to_owned(),
+                session_id: format!("c179-session-{device_id}"),
+                lease_expires_at: Utc::now() + ChronoDuration::seconds(30),
+            })
+            .await
+            .expect("commit a synthetic owner claim");
+        let mut guard = super::OwnerClaimCleanup::new(spare.dispatcher());
+        guard.arm_token(claim.token);
+        // Dropping a handoff whose guard is parked leaves the guard parked.
+        drop(handle.claim_handoffs.deposit(Some(guard)));
+    }
+    assert_eq!(handle.claim_handoffs.parked(), count);
+    (tenant_id, device_ids, spare)
+}
+
+async fn still_claimed(catalog: &HeldCatalog, tenant_id: Uuid, device_ids: &[Uuid]) -> usize {
+    let mut claimed = 0_usize;
+    for &device_id in device_ids {
+        if catalog
+            .inner
+            .current_owner(tenant_id, device_id, Utc::now())
+            .await
+            .expect("read C179 owner")
+            .is_some()
+        {
+            claimed += 1;
+        }
+    }
+    claimed
+}
+
+/// **Task row M6-C179.** `close_all` can find up to `max_devices` guards
+/// parked, and the cleanup worker's queue holds `CLEANUP_QUEUE_CAPACITY`.
+/// Every guard it took out of the registry and could not queue used to be
+/// logged and left fenced until its lease expired.  The overflow now stays
+/// parked until the worker has shut down and is then released.
+/// `tokio::test` runs on one thread, so the worker cannot drain while
+/// `close_all` fills its queue: without the fix exactly the guards past the
+/// capacity stay claimed.  The lease is 30 s; the bound is 5 s.
+#[tokio::test]
+async fn close_all_releases_more_parked_claims_than_the_cleanup_queue_holds() {
+    const PARKED: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, spare) = park_committed_claims(&handle, &catalog, PARKED).await;
+
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown with a full cleanup queue is bounded");
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    assert_eq!(handle.claim_handoffs.parked(), 0, "nothing is left parked");
+
+    let claimed = still_claimed(&catalog, tenant_id, &device_ids).await;
+    assert_eq!(
+        claimed,
+        0,
+        "{claimed} of {PARKED} parked claims were left fenced until lease expiry \
+         (cleanup queue capacity {})",
+        super::CLEANUP_QUEUE_CAPACITY
+    );
+    assert_eq!(
+        spare.dispatcher().pending.load(Ordering::Acquire),
+        0,
+        "a taken guard is disarmed and queues nothing itself"
+    );
+    spare.shutdown().await;
+}
+
+/// **Task row M6-C179, shutdown budget.** The overflow past the cleanup
+/// queue is released within `close_all`'s own `CLEANUP_SHUTDOWN_TIMEOUT`,
+/// shared with the worker's drain, not in a fresh deadline of the
+/// supervisor's after it; otherwise an ordinary shutdown with more parked
+/// guards than the queue holds could take twice that, past
+/// `RunningRelay::shutdown`'s overall bound.  Each release takes 60 ms of
+/// paused time: the worker's 64 take 3.84 s, and the 69 left over would take
+/// a further 4.14 s.  So the release must stop at the 5 s deadline, having
+/// released more than the worker alone could, and leave the rest counted.
+#[tokio::test(start_paused = true)]
+async fn close_all_releases_the_overflow_within_one_shutdown_deadline() {
+    const PARKED: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, spare) = park_committed_claims(&handle, &catalog, PARKED).await;
+    catalog.release_delay_ms.store(60, Ordering::Release);
+
+    let started = tokio::time::Instant::now();
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    let elapsed = started.elapsed();
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    assert!(
+        elapsed <= super::CLEANUP_SHUTDOWN_TIMEOUT + Duration::from_millis(200),
+        "the overflow release took {elapsed:?}, past the {:?} shutdown deadline",
+        super::CLEANUP_SHUTDOWN_TIMEOUT
+    );
+    assert_eq!(handle.claim_handoffs.parked(), 0, "nothing is left parked");
+    catalog.release_delay_ms.store(0, Ordering::Release);
+    let released = PARKED - still_claimed(&catalog, tenant_id, &device_ids).await;
+    assert!(
+        released > super::CLEANUP_QUEUE_CAPACITY,
+        "only {released} of {PARKED} released: the overflow was not released within the deadline"
+    );
+    spare.shutdown().await;
 }
 
 #[tokio::test]
