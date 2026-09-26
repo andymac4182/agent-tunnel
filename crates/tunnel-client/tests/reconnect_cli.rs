@@ -451,10 +451,15 @@ fn base64(bytes: &[u8]) -> String {
 /// `CREDENTIAL_ERROR` "unknown issuer" instead of `TRANSPORT_ERROR`, as
 /// hosted Linux run 36237768855 did once.
 ///
-/// Port 1 cannot be handed out that way: it is below every platform's
-/// ephemeral range, so no bind of port 0 returns it, and it is privileged, so
-/// an unprivileged process cannot bind it explicitly either.  A dial to it is
-/// refused at once (`exit_codes_cli.rs` relies on the same).  Holding a
+/// Port 1 cannot be handed out that way: it is below every default
+/// ephemeral range, so no bind of port 0 in this binary can return it, and
+/// nothing in this binary binds it explicitly.  That is the whole guarantee.
+/// It is not a privilege guarantee: port 1 is privileged only on Linux for a
+/// non-root process outside a container; macOS lets an ordinary user bind the
+/// wildcard address on it, and root or a container can bind it anywhere, so a
+/// process outside this binary could still answer on it.  A dial to it is
+/// otherwise refused at once (`exit_codes_cli.rs` relies on the same).  This
+/// file is `#![cfg(unix)]`.  Holding a
 /// freshly picked port bound but never listening was tried first and
 /// rejected: Linux resets a SYN to such a port, but macOS drops it, so the
 /// dial timed out instead of being refused (measured locally).
@@ -657,8 +662,8 @@ fn delay_ms(event: &Value) -> u64 {
 
 /// Task row M6-C177: the refused target is refused, and no socket in this
 /// binary can be given it.  A `FakeRelay` binds `127.0.0.1:0`, which only
-/// ever returns a port from the ephemeral range, and an unprivileged process
-/// cannot bind a port below 1024 explicitly.  A helper that picks a port by
+/// ever returns a port from the ephemeral range, and nothing in this binary
+/// binds a port below 1024 explicitly.  A helper that picks a port by
 /// binding port 0 and releasing it again (as the old `refused_url` did) is
 /// red here: its port is ephemeral.
 #[test]

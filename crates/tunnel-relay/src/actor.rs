@@ -618,7 +618,8 @@ fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, 
 /// command carries only the handoff.  A guard leaves the registry only by
 /// being taken: by the actor when it handles the command, by `close_all`
 /// (which hands parked guards to the still-live cleanup worker while its
-/// bounded queue has room, and leaves the rest parked, task row M6-C179),
+/// bounded queue has room, then releases the rest itself against the catalog
+/// within the same shutdown deadline, task row M6-C179),
 /// or, once the actor has ended, by [`StrandedClaimRelease`], which releases
 /// it directly against the catalog.  Dropping a handoff never drops its guard.
 /// Bounded by the registrations the actor admitted (`max_devices`).
@@ -827,12 +828,12 @@ fn log_stranded_release(released: usize, abandoned: usize) {
             released,
             abandoned,
             timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
-            "owner claims stranded behind an ended relay actor exceeded the release deadline; lease expiry is the fencing fallback"
+            "owner claims still parked when the relay actor ended exceeded the release deadline; lease expiry is the fencing fallback"
         );
     } else if released > 0 {
         tracing::warn!(
             released,
-            "owner claims stranded behind an ended relay actor were released"
+            "owner claims still parked when the relay actor ended were released"
         );
     }
 }
@@ -15455,10 +15456,8 @@ impl RelayActor {
         // `max_devices` guards can be parked and the queue holds
         // `CLEANUP_QUEUE_CAPACITY`; a guard taken out of the registry and
         // refused by a full queue used to be left to lease expiry (task row
-        // M6-C179).  Whatever does not fit now stays parked, and the actor's
-        // supervisor releases it against the catalog, fenced exactly as the
-        // worker would, once this worker has shut down
-        // (`StrandedClaimRelease`, bounded by `CLEANUP_SHUTDOWN_TIMEOUT`).
+        // M6-C179).  Whatever does not fit now stays parked and is released
+        // below, after the worker has shut down, within this same deadline.
         // The registry is closed first either way, so a later deposit keeps
         // its guard with its own handoff.
         self.claim_handoffs.close();
@@ -15470,6 +15469,36 @@ impl RelayActor {
             && !cleanup.shutdown_until(deadline).await
         {
             self.background_failure.store(true, Ordering::Release);
+        }
+        // Release the guards the worker's queue had no room for, directly
+        // against the catalog and fenced exactly as the worker releases them,
+        // within what is left of this same deadline (task row M6-C179).  One
+        // deadline covers the worker's drain and this release, so an ordinary
+        // shutdown with more parked guards than the queue holds stays inside
+        // `CLEANUP_SHUTDOWN_TIMEOUT`, and so inside `RunningRelay::shutdown`'s
+        // overall bound, instead of adding the supervisor's own fresh
+        // deadline after it.  What does not fit is taken out, counted, and
+        // left to lease expiry; the supervisor then finds nothing parked.
+        let catalog = &self.catalog;
+        let (released, abandoned) =
+            release_parked_until(&self.claim_handoffs, deadline, |item| async move {
+                release_cleanup_item(catalog, &item).await
+            })
+            .await;
+        if abandoned > 0 {
+            tracing::error!(
+                released,
+                abandoned,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
+                "owner claims beyond the cleanup queue exceeded the relay shutdown deadline; lease expiry is the fencing fallback"
+            );
+        } else if released > 0 {
+            tracing::info!(
+                released,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                "owner claims beyond the cleanup queue were released at relay shutdown"
+            );
         }
     }
 
