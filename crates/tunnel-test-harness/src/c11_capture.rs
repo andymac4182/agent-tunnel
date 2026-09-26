@@ -422,15 +422,44 @@ mod tests {
         Mutex::new(BTreeMap::new())
     }
 
+    /// Fresh UDP ports tried before a TCP bind on the same number must succeed.
+    const TCP_ON_UDP_NUMBER_ATTEMPTS: usize = 16;
+
+    /// Bind TCP on the port number of a freshly drawn UDP socket.
+    ///
+    /// Another test or process can already hold the TCP port with that number
+    /// (the M7-C122 mechanism itself), so a port refused with `AddrInUse` is
+    /// skipped and a fresh UDP port drawn.  Any other error fails at once, and
+    /// the test fails when no port in the bound gives a TCP bind, so it cannot
+    /// pass without one TCP socket actually sharing a live UDP port number.
+    fn bind_tcp_on_a_live_udp_number(
+        mut draw_udp: impl FnMut() -> UdpSocket,
+    ) -> (UdpSocket, TcpListener) {
+        for _ in 0..TCP_ON_UDP_NUMBER_ATTEMPTS {
+            let udp = draw_udp();
+            let address = udp.local_addr().expect("UDP address");
+            match TcpListener::bind(address) {
+                Ok(tcp) => return (udp, tcp),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("TCP bind on a UDP port number failed: {error:?}"),
+            }
+        }
+        panic!(
+            "no UDP port in {TCP_ON_UDP_NUMBER_ATTEMPTS} attempts left its TCP port number free"
+        );
+    }
+
     /// The mechanism behind M7-C122: a live UDP endpoint leaves the TCP port
     /// with the same number free, so a TCP socket can be given it, and a CLI
     /// then prints the same `127.0.0.1:N` text as the UDP sentinel.
     #[test]
     fn a_live_udp_endpoint_leaves_its_tcp_port_number_free() {
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP bind");
+        // TCP and UDP port spaces are separate, so a TCP bind on a live UDP
+        // port number succeeds whenever no TCP socket already holds it.
+        let (udp, tcp) = bind_tcp_on_a_live_udp_number(|| {
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP bind")
+        });
         let address = udp.local_addr().expect("UDP address");
-        let tcp = TcpListener::bind(address)
-            .expect("TCP and UDP port spaces are separate, so this bind succeeds");
         assert_eq!(tcp.local_addr().expect("TCP address"), address);
     }
 
@@ -470,9 +499,13 @@ mod tests {
 
     #[test]
     fn outside_a_c11_child_the_bind_is_one_ordinary_bind() {
-        let udp = bind_twinned_loopback_udp_in(None).expect("UDP bind");
-        let address = udp.local_addr().expect("UDP address");
-        // Nothing was twinned, so the TCP port stays free as before.
-        TcpListener::bind(address).expect("no twin outside a C11 child");
+        // Nothing is twinned, so the TCP port stays free as before.  A held
+        // twin would refuse every attempt with AddrInUse and fail the bound.
+        let (udp, tcp) =
+            bind_tcp_on_a_live_udp_number(|| bind_twinned_loopback_udp_in(None).expect("UDP bind"));
+        assert_eq!(
+            tcp.local_addr().expect("TCP address"),
+            udp.local_addr().expect("UDP address")
+        );
     }
 }
