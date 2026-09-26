@@ -305,8 +305,11 @@ EXPECTED_GUARD_ANCHORS = {
     # acp ("found 151"), then 151.  **164** after relay-rekey (#183) added its
     # peer-key rotation cases, measured on integration branch
     # `integrate-2026-09-26f` and on #183's own tip `5eb1805f`: 165 fails
-    # naming acp ("found 164"), then 164.
-    "acp-guard-deletion.py": 164,
+    # naming acp ("found 164"), then 164.  **166** after M8-C12 split the
+    # shared subscription bound and added one `m8c3` case per direction;
+    # measured on branch `fix-c12-c170`: 167 fails naming acp ("found 166"),
+    # then 166.
+    "acp-guard-deletion.py": 166,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.

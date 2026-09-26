@@ -78,6 +78,9 @@ mod freeze_hold;
 use freeze_hold::sleep_until_hold_deadline;
 pub(crate) use freeze_hold::{ROTATION_FREEZE_ECHO_CODE, ROTATION_FREEZE_RETRY_AFTER_MS};
 
+#[path = "actor_connector_rejected.rs"]
+mod connector_rejected;
+
 #[path = "actor_http_stream.rs"]
 mod http_stream;
 pub(crate) use http_stream::{
@@ -561,6 +564,290 @@ impl Drop for OwnerClaimCleanup {
     }
 }
 
+/// Release one cleanup item against the catalog, fenced exactly as the
+/// cleanup worker does: a token is released only while it is still the
+/// current owner, and a claim request only after a lookup finds that exact
+/// identity.  Never releases a claim another owner now holds.
+async fn release_cleanup_item(catalog: &SharedCatalog, item: &OwnerCleanupItem) {
+    match item {
+        OwnerCleanupItem::Token(owner) => release_owner_bounded(catalog, owner).await,
+        OwnerCleanupItem::Claim(request) => release_claim_bounded(catalog, request).await,
+    }
+}
+
+fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, ClaimHandoffSlots> {
+    // A panic elsewhere must not stop an ended actor's claims being released.
+    slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Owner-claim guards for registrations in flight (task rows M6-C170 and
+/// M6-C178).
+///
+/// A registration task used to hold its `OwnerClaimCleanup` itself and then
+/// move it into `Command::RegisterResolved`.  Both places lose the claim when
+/// the actor panics or is aborted: the actor's `rx` drops before its cleanup
+/// worker, so a queued command's guard was enqueued on a worker that was then
+/// aborted (the item lost, `pending` left incremented); a command stored after
+/// that drain was never dropped at all (the M6-C158/M6-C162 mechanism); and a
+/// task aborted mid-claim with the actor's `JoinSet` dropped its guard into
+/// the same dead worker.  In each case the committed claim stayed fenced until
+/// its lease expired.
+///
+/// The guard is now parked here by the actor, unarmed, before the task is
+/// spawned; the task arms it in place through its [`ClaimHandoff`], and the
+/// command carries only the handoff.  A guard leaves the registry only by
+/// being taken: by the actor when it handles the command, by `close_all`
+/// (which hands every guard still parked to the still-live cleanup worker),
+/// or, once the actor has ended, by [`StrandedClaimRelease`], which releases
+/// it directly against the catalog.  Dropping a handoff never drops its guard.
+/// Bounded by the registrations the actor admitted (`max_devices`).
+#[derive(Clone, Default)]
+struct ClaimHandoffs {
+    slots: Arc<Mutex<ClaimHandoffSlots>>,
+}
+
+#[derive(Default)]
+struct ClaimHandoffSlots {
+    next: u64,
+    closed: bool,
+    guards: HashMap<u64, OwnerClaimCleanup>,
+}
+
+impl ClaimHandoffs {
+    /// Park a guard.  Once the registry is closed (the actor has ended or is
+    /// closing) the guard stays with the handoff instead, and dropping the
+    /// handoff drops the guard, which queues its cleanup as before.
+    fn deposit(&self, guard: Option<OwnerClaimCleanup>) -> ClaimHandoff {
+        let Some(guard) = guard else {
+            return ClaimHandoff::empty();
+        };
+        let mut slots = lock_handoffs(&self.slots);
+        if slots.closed {
+            drop(slots);
+            return ClaimHandoff {
+                registry: None,
+                id: 0,
+                local: Some(guard),
+            };
+        }
+        let id = slots.next;
+        slots.next = slots.next.wrapping_add(1);
+        slots.guards.insert(id, guard);
+        ClaimHandoff {
+            registry: Some(self.clone()),
+            id,
+            local: None,
+        }
+    }
+
+    fn remove(&self, id: u64) -> Option<OwnerClaimCleanup> {
+        lock_handoffs(&self.slots).guards.remove(&id)
+    }
+
+    fn with_parked(&self, id: u64, arm: impl FnOnce(&mut OwnerClaimCleanup)) {
+        if let Some(guard) = lock_handoffs(&self.slots).guards.get_mut(&id) {
+            arm(guard);
+        }
+    }
+
+    /// Close the registry and take the next armed guard's cleanup item,
+    /// disarming the guard so it queues nothing itself.  Unarmed guards are
+    /// discarded on the way.
+    fn take_next_after_end(&self) -> Option<OwnerCleanupItem> {
+        loop {
+            let mut guard = {
+                let mut slots = lock_handoffs(&self.slots);
+                slots.closed = true;
+                let id = slots.guards.keys().next().copied()?;
+                slots.guards.remove(&id)?
+            };
+            if let Some(item) = guard.item.take() {
+                return Some(item);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn parked(&self) -> usize {
+        lock_handoffs(&self.slots).guards.len()
+    }
+}
+
+/// A registration's claim on its parked guard.  See [`ClaimHandoffs`].
+struct ClaimHandoff {
+    registry: Option<ClaimHandoffs>,
+    id: u64,
+    local: Option<OwnerClaimCleanup>,
+}
+
+impl ClaimHandoff {
+    fn empty() -> Self {
+        Self {
+            registry: None,
+            id: 0,
+            local: None,
+        }
+    }
+
+    /// Arm, re-arm or disarm the guard where it is parked.  A guard already
+    /// taken by the actor's end is not re-created: its release has already
+    /// been attempted, and lease expiry is the fallback for anything later.
+    fn update(&mut self, arm: impl FnOnce(&mut OwnerClaimCleanup)) {
+        if let Some(local) = self.local.as_mut() {
+            arm(local);
+        } else if let Some(registry) = &self.registry {
+            registry.with_parked(self.id, arm);
+        }
+    }
+
+    fn arm_request(&mut self, request: OwnerClaimRequest) {
+        self.update(|guard| guard.arm_request(request));
+    }
+
+    fn arm_token(&mut self, owner: OwnerToken) {
+        self.update(|guard| guard.arm_token(owner));
+    }
+
+    fn disarm(&mut self) {
+        self.update(OwnerClaimCleanup::disarm);
+    }
+
+    /// The actor's side: take the guard if nobody else has.
+    fn take(&mut self) -> Option<OwnerClaimCleanup> {
+        if let Some(local) = self.local.take() {
+            return Some(local);
+        }
+        self.registry.take()?.remove(self.id)
+    }
+}
+
+impl Drop for ClaimHandoff {
+    fn drop(&mut self) {
+        // A parked guard stays parked: `close_all` or the actor's supervisor
+        // takes it.  Dropping it here would enqueue it on a cleanup worker that
+        // may be about to be aborted with the actor, which is how a command
+        // drained from an ending actor's queue lost its claim.
+        if self.registry.is_some() {
+            return;
+        }
+        drop(self.local.take());
+    }
+}
+
+/// Release every armed guard still parked, one at a time, against `release`,
+/// within one overall `deadline`.  Returns `(released, abandoned)`: whatever
+/// was in flight or still parked when the deadline passed is abandoned to
+/// lease expiry, taken out of the registry, and counted.
+async fn release_parked_until<F, Fut>(
+    handoffs: &ClaimHandoffs,
+    deadline: tokio::time::Instant,
+    mut release: F,
+) -> (usize, usize)
+where
+    F: FnMut(OwnerCleanupItem) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut released = 0_usize;
+    let mut in_flight = false;
+    let finished = tokio::time::timeout_at(deadline, async {
+        while let Some(item) = handoffs.take_next_after_end() {
+            in_flight = true;
+            release(item).await;
+            in_flight = false;
+            released = released.saturating_add(1);
+        }
+    })
+    .await
+    .is_ok();
+    if finished {
+        return (released, 0);
+    }
+    let mut abandoned = usize::from(in_flight);
+    while handoffs.take_next_after_end().is_some() {
+        abandoned = abandoned.saturating_add(1);
+    }
+    (released, abandoned)
+}
+
+/// Held by the actor task's supervisor: once the actor has ended, release
+/// every owner claim still parked in [`ClaimHandoffs`] directly against the
+/// catalog (task rows M6-C170 and M6-C178).  The actor's cleanup worker ended
+/// with it, so a guard dropped now would find no worker.  Bounded overall by
+/// `CLEANUP_SHUTDOWN_TIMEOUT`; what does not fit is left to lease expiry and
+/// counted in the log.
+struct StrandedClaimRelease {
+    handoffs: ClaimHandoffs,
+    catalog: SharedCatalog,
+}
+
+impl StrandedClaimRelease {
+    async fn release(&self) -> (usize, usize) {
+        let catalog = &self.catalog;
+        let (released, abandoned) = release_parked_until(
+            &self.handoffs,
+            tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT,
+            |item| async move { release_cleanup_item(catalog, &item).await },
+        )
+        .await;
+        log_stranded_release(released, abandoned);
+        (released, abandoned)
+    }
+}
+
+fn log_stranded_release(released: usize, abandoned: usize) {
+    if abandoned > 0 {
+        tracing::error!(
+            released,
+            abandoned,
+            timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
+            "owner claims stranded behind an ended relay actor exceeded the release deadline; lease expiry is the fencing fallback"
+        );
+    } else if released > 0 {
+        tracing::warn!(
+            released,
+            "owner claims stranded behind an ended relay actor were released"
+        );
+    }
+}
+
+impl Drop for StrandedClaimRelease {
+    fn drop(&mut self) {
+        // Reached with parked guards only when the supervisor was aborted
+        // before `release` ran (or during it).
+        let mut items = Vec::new();
+        while let Some(item) = self.handoffs.take_next_after_end() {
+            items.push(item);
+        }
+        if items.is_empty() {
+            return;
+        }
+        // Logged before spawning: `try_current` can succeed while the runtime
+        // is shutting down, and a spawn then is silently dropped.
+        tracing::error!(
+            count = items.len(),
+            "owner claims stranded behind an aborted relay actor; releasing on the runtime, lease expiry is the fencing fallback"
+        );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let catalog = self.catalog.clone();
+            runtime.spawn(async move {
+                let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
+                let mut released = 0_usize;
+                let total = items.len();
+                let _ = tokio::time::timeout_at(deadline, async {
+                    for item in &items {
+                        release_cleanup_item(&catalog, item).await;
+                        released = released.saturating_add(1);
+                    }
+                })
+                .await;
+                log_stranded_release(released, total.saturating_sub(released));
+            });
+        }
+    }
+}
+
 /// Serializes owner-lease cleanup behind one bounded queue.
 ///
 /// Closing a session must not retain one `JoinHandle` per close until relay
@@ -597,14 +884,7 @@ impl CleanupWorker {
         let worker_catalog = catalog.clone();
         let task = tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
-                match item {
-                    OwnerCleanupItem::Token(owner) => {
-                        release_owner_bounded(&worker_catalog, &owner).await;
-                    }
-                    OwnerCleanupItem::Claim(request) => {
-                        release_claim_bounded(&worker_catalog, &request).await;
-                    }
-                }
+                release_cleanup_item(&worker_catalog, &item).await;
                 worker_pending.fetch_sub(1, Ordering::AcqRel);
             }
         });
@@ -862,7 +1142,9 @@ async fn release_claim_bounded(catalog: &SharedCatalog, request: &OwnerClaimRequ
 
 /// Deliver a result from an actor-owned background task without allowing a
 /// full command queue to strand that task during shutdown.  Dropping the
-/// command also drops any owner-claim cleanup guard carried by it.
+/// command leaves its owner-claim guard parked in [`ClaimHandoffs`], where
+/// `close_all` or, after the actor has ended, [`StrandedClaimRelease`] finds it
+/// (task rows M6-C170 and M6-C178).
 async fn send_background_command(
     cancel: &CancellationToken,
     command_tx: &mpsc::Sender<Command>,
@@ -2093,6 +2375,8 @@ struct DeviceSession {
     /// (M7-C92).  Bounded with `pending` by the retained-stream factor at
     /// admission; see [`UnaryTombstone`].
     unary_tombstones: HashMap<u64, UnaryTombstone>,
+    /// M7-C160: this session's own budget of `connector rejected` lines.
+    connector_rejected_log: connector_rejected::RejectedLogWindow,
     streams: HashMap<u64, M2Stream>,
     /// Highest stream ID whose authenticated owner FORGET completed. Stream
     /// IDs never reuse, so late frames at or below this watermark are stale
@@ -2210,7 +2494,8 @@ enum Command {
         hello: Hello,
         data_connection_id: String,
         response: oneshot::Sender<Result<ControlRegistration, RelayError>>,
-        owner_cleanup: Option<OwnerClaimCleanup>,
+        /// The owner-claim guard, parked outside the channel (M6-C170).
+        owner_cleanup: ClaimHandoff,
         result: Box<RegisterResolvedResult>,
     },
     RegisterForwardedControl {
@@ -2416,6 +2701,8 @@ pub struct RelayHandle {
     background_failure: Arc<AtomicBool>,
     actor_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     maintenance_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(test)]
+    claim_handoffs: ClaimHandoffs,
 }
 
 impl RelayHandle {
@@ -2438,6 +2725,11 @@ impl RelayHandle {
         let actor_task_slot = Arc::new(Mutex::new(None));
         let maintenance_task_slot = Arc::new(Mutex::new(None));
         let consumer_chunk_reads = Arc::new(AtomicU64::new(0));
+        let claim_handoffs = ClaimHandoffs::default();
+        let stranded_claims = StrandedClaimRelease {
+            handoffs: claim_handoffs.clone(),
+            catalog: catalog.clone(),
+        };
         let handle = Self {
             tx: tx.clone(),
             cancel: options.shutdown.clone(),
@@ -2454,6 +2746,8 @@ impl RelayHandle {
             background_failure: background_failure.clone(),
             actor_task: actor_task_slot.clone(),
             maintenance_task: maintenance_task_slot.clone(),
+            #[cfg(test)]
+            claim_handoffs: claim_handoffs.clone(),
         };
         let actor = RelayActor {
             options,
@@ -2464,6 +2758,7 @@ impl RelayHandle {
             terminal_cleanup_overflowed: terminal_cleanup.overflowed.clone(),
             terminal_cleanup_notify: terminal_cleanup.notify.clone(),
             sessions: HashMap::new(),
+            connector_rejected_tenants: Default::default(),
             registering: HashSet::new(),
             pending_registering: HashSet::new(),
             tickets: HashMap::new(),
@@ -2486,6 +2781,7 @@ impl RelayHandle {
             http_maintenance: HttpMaintenance::default(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
+            claim_handoffs: claim_handoffs.clone(),
             background_tasks: JoinSet::new(),
             background_failure,
             shutting_down: false,
@@ -2497,12 +2793,19 @@ impl RelayHandle {
         let actor_completion = CompletionOnDrop::actor(actor_completion);
         let actor_task = tokio::spawn(async move {
             let completion = actor_completion;
+            let stranded_claims = stranded_claims;
             let failed = AssertUnwindSafe(actor.run()).catch_unwind().await.is_err();
             // Any actor termination leaves the listener pair without an
             // owner, including a normal explicit shutdown or a terminal
             // cleanup overflow.  Propagate it to every relay task.
             actor_cancel.cancel();
             completion.completion.mark_done(failed);
+            // A registration result stranded in the ended actor's channel
+            // still holds a committed owner claim (task row M6-C170).  Release
+            // it now rather than leave it fenced until its lease expires.
+            // After `mark_done`, so no reply wait is held up by catalog I/O;
+            // `shutdown()` joins this task, so it returns only after this.
+            stranded_claims.release().await;
         });
         *actor_task_slot
             .lock()
@@ -3276,6 +3579,8 @@ struct RelayActor {
     terminal_cleanup_overflowed: Arc<AtomicBool>,
     terminal_cleanup_notify: Arc<Notify>,
     sessions: HashMap<DeviceScope, DeviceSession>,
+    /// M7-C160: each tenant's budget of `connector rejected` lines.
+    connector_rejected_tenants: connector_rejected::TenantRejectedLogs,
     /// Registrations that have already resolved a catalog tenant and are
     /// being admitted through the peer path.
     registering: HashSet<DeviceScope>,
@@ -3336,6 +3641,8 @@ struct RelayActor {
     http_maintenance: HttpMaintenance,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
+    /// Owner-claim guards in transit to this actor (task row M6-C170).
+    claim_handoffs: ClaimHandoffs,
     background_tasks: JoinSet<()>,
     background_failure: Arc<AtomicBool>,
     shutting_down: bool,
@@ -3509,9 +3816,10 @@ impl RelayActor {
                 hello,
                 data_connection_id,
                 response,
-                owner_cleanup,
+                mut owner_cleanup,
                 result,
             } => {
+                let owner_cleanup = owner_cleanup.take();
                 self.finish_register_control(
                     RegistrationTarget {
                         device_id,
@@ -3828,9 +4136,13 @@ impl RelayActor {
         let data_connection_id = wire::random_token();
         let cluster_profile = options.cluster.is_some();
         let cancel = self.options.shutdown.clone();
-        let cleanup_dispatcher = self.cleanup_dispatcher.clone();
+        // Parked before the task exists, so a task aborted mid-claim with the
+        // actor leaves its armed guard where the actor's end finds it (task
+        // row M6-C178).
+        let mut owner_cleanup = self
+            .claim_handoffs
+            .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
         self.spawn_background(async move {
-            let mut owner_cleanup = cleanup_dispatcher.map(OwnerClaimCleanup::new);
             let result = async {
                 let at = Utc::now();
                 let device_identity = catalog
@@ -3859,20 +4171,14 @@ impl RelayActor {
                     session_id,
                     lease_expires_at,
                 };
-                if let Some(cleanup) = owner_cleanup.as_mut() {
-                    cleanup.arm_request(owner_request.clone());
-                }
+                owner_cleanup.arm_request(owner_request.clone());
                 let claim = match catalog.claim_owner(&owner_request).await {
                     Ok(claim) => {
-                        if let Some(cleanup) = owner_cleanup.as_mut() {
-                            cleanup.arm_token(claim.token.clone());
-                        }
+                        owner_cleanup.arm_token(claim.token.clone());
                         claim
                     }
                     Err(CatalogError::OwnerBusy) => {
-                        if let Some(cleanup) = owner_cleanup.as_mut() {
-                            cleanup.disarm();
-                        }
+                        owner_cleanup.disarm();
                         return Err(RegisterControlFailure::OwnerBusy);
                     }
                     Err(error) => {
@@ -3996,9 +4302,13 @@ impl RelayActor {
         let data_connection_id = wire::random_token();
         let cluster_profile = options.cluster.is_some();
         let cancel = self.options.shutdown.clone();
-        let cleanup_dispatcher = self.cleanup_dispatcher.clone();
+        // Parked before the task exists, so a task aborted mid-claim with the
+        // actor leaves its armed guard where the actor's end finds it (task
+        // row M6-C178).
+        let mut owner_cleanup = self
+            .claim_handoffs
+            .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
         self.spawn_background(async move {
-            let mut owner_cleanup = cleanup_dispatcher.map(OwnerClaimCleanup::new);
             let result = async {
                 let at = Utc::now();
                 let session_id = wire::random_token();
@@ -4014,20 +4324,14 @@ impl RelayActor {
                     session_id,
                     lease_expires_at,
                 };
-                if let Some(cleanup) = owner_cleanup.as_mut() {
-                    cleanup.arm_request(owner_request.clone());
-                }
+                owner_cleanup.arm_request(owner_request.clone());
                 let claim = match catalog.claim_owner(&owner_request).await {
                     Ok(claim) => {
-                        if let Some(cleanup) = owner_cleanup.as_mut() {
-                            cleanup.arm_token(claim.token.clone());
-                        }
+                        owner_cleanup.arm_token(claim.token.clone());
                         claim
                     }
                     Err(CatalogError::OwnerBusy) => {
-                        if let Some(cleanup) = owner_cleanup.as_mut() {
-                            cleanup.disarm();
-                        }
+                        owner_cleanup.disarm();
                         return Err(RegisterControlFailure::OwnerBusy);
                     }
                     Err(error) => {
@@ -4485,6 +4789,7 @@ impl RelayActor {
                 next_stream_id: 1,
                 pending: HashMap::new(),
                 unary_tombstones: HashMap::new(),
+                connector_rejected_log: connector_rejected::RejectedLogWindow::default(),
                 streams: HashMap::new(),
                 forgotten_stream_through: 0,
                 owner_forget_deadline: None,
@@ -11306,6 +11611,16 @@ impl RelayActor {
                 if rejected.session_id != key.session_id || rejected.epoch != key.epoch {
                     return;
                 }
+                // M7-C160: what the diagnostic below reports, captured before
+                // this REJECTED changes the session.
+                let rotation_phase = self.session_for(&key).and_then(|session| {
+                    session
+                        .rotation
+                        .as_ref()
+                        .map(|rotation| rotation.state.phase())
+                });
+                let mut matched = "none";
+                let mut relay_code = "none";
                 let mut unary_rejected = false;
                 if let Some(session) = self.session_mut(&key)
                     && session
@@ -11352,6 +11667,8 @@ impl RelayActor {
                     } else {
                         "DEVICE_REJECTED"
                     };
+                    matched = "unary";
+                    relay_code = code;
                     let _ = pending.response.send(EchoOutcome::Failure {
                         code,
                         execution: "not_dispatched",
@@ -11372,6 +11689,7 @@ impl RelayActor {
                     .and_then(|session| session.streams.get(&rejected.stream_id))
                     .is_some_and(|stream| stream.operation_id == rejected.operation_id);
                 if rejected_m2 {
+                    matched = "stream";
                     let pending = self
                         .session_for(&key)
                         .and_then(|session| session.streams.get(&rejected.stream_id))
@@ -11382,6 +11700,7 @@ impl RelayActor {
                                 && stream.open_message_id == rejected.reply_to
                         });
                     if pending {
+                        relay_code = "stream_closed";
                         let final_state = ResumeDirectionState {
                             stream_id: rejected.stream_id,
                             ..ResumeDirectionState::default()
@@ -11399,6 +11718,50 @@ impl RelayActor {
                         let _ = self.flush_owner_stream_forgets(&key);
                     }
                 }
+                // Only a live session's REJECTED reaches here; charge its
+                // session and tenant budgets (M7-C160).
+                let live_tenants: std::collections::HashSet<Uuid> =
+                    if self.connector_rejected_tenants.contains(&key.tenant_id) {
+                        std::collections::HashSet::new()
+                    } else {
+                        self.sessions.keys().map(|scope| scope.tenant_id).collect()
+                    };
+                let Some(session) = self
+                    .sessions
+                    .get_mut(&key.scope())
+                    .filter(|session| session.key == key)
+                else {
+                    return;
+                };
+                let session_log = &mut session.connector_rejected_log;
+                let tenant_log = self
+                    .connector_rejected_tenants
+                    .budget(key.tenant_id, |tenant| live_tenants.contains(tenant));
+                connector_rejected::log_connector_rejected(
+                    connector_rejected::RejectedLogBudgets {
+                        session: session_log,
+                        tenant: tenant_log,
+                    },
+                    &connector_rejected::ConnectorRejectedContext {
+                        tenant_id: &key.tenant_id,
+                        device_id: &key.device_id,
+                        session_id: &key.session_id,
+                        epoch: key.epoch,
+                        stream_id: rejected.stream_id,
+                        // Echoed by the device: logged only when it equals
+                        // the relay's own record for this stream.
+                        operation_id: if matched == "none" {
+                            "unmatched"
+                        } else {
+                            &rejected.operation_id
+                        },
+                        rotation_phase,
+                        matched,
+                        relay_code,
+                    },
+                    &rejected.code,
+                    &rejected.reason,
+                );
             }
             ControlMessage::AuthorizationInvalidated(invalidated) => {
                 if invalidated.session_id != key.session_id || invalidated.epoch != key.epoch {
@@ -15056,6 +15419,16 @@ impl RelayActor {
             let remaining = std::mem::replace(&mut self.background_tasks, JoinSet::new());
             drop(remaining);
         }
+        // Hand every owner-claim guard still parked (a registration whose
+        // result was dropped in the drain above, or whose task was aborted) to
+        // the cleanup worker while it is still live (task rows M6-C170 and
+        // M6-C178).  This also closes the registry, so a later deposit keeps
+        // its guard with its own handoff.
+        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
+            while let Some(item) = self.claim_handoffs.take_next_after_end() {
+                dispatcher.enqueue(item);
+            }
+        }
         self.cleanup_dispatcher.take();
         if let Some(cleanup) = self.cleanup.take()
             && !cleanup.shutdown_until(deadline).await
@@ -17413,6 +17786,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
@@ -17449,6 +17823,7 @@ mod stream_identity_tests {
             terminal_cleanup_overflowed: dispatcher.overflowed.clone(),
             terminal_cleanup_notify: dispatcher.notify.clone(),
             sessions,
+            connector_rejected_tenants: Default::default(),
             registering: Default::default(),
             pending_registering: Default::default(),
             tickets: Default::default(),
@@ -17471,6 +17846,7 @@ mod stream_identity_tests {
             http_maintenance: super::HttpMaintenance::default(),
             cleanup_dispatcher: None,
             cleanup: None,
+            claim_handoffs: super::ClaimHandoffs::default(),
             background_tasks: tokio::task::JoinSet::new(),
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutting_down: false,
@@ -19383,6 +19759,7 @@ mod stream_identity_tests {
                     next_stream_id: 1,
                     pending: HashMap::new(),
                     unary_tombstones: HashMap::new(),
+                    connector_rejected_log: Default::default(),
                     streams: HashMap::new(),
                     forgotten_stream_through: 0,
                     owner_forget_deadline: None,
@@ -23334,6 +23711,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
@@ -25260,6 +25638,10 @@ mod owner_write_tests;
 #[cfg(test)]
 #[path = "actor_stranded_reply_tests.rs"]
 mod stranded_reply_tests;
+
+#[cfg(test)]
+#[path = "actor_stranded_claim_tests.rs"]
+mod stranded_claim_tests;
 
 #[cfg(test)]
 mod cleanup_tests {

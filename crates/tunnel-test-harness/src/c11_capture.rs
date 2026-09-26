@@ -411,7 +411,10 @@ pub(crate) fn harden_capture_directory(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TcpTwins, bind_twinned_loopback_udp_in, hold_tcp_twin_in};
+    use super::{
+        TcpTwins, UDP_ENDPOINT_TWINS, bind_twinned_loopback_udp, bind_twinned_loopback_udp_in,
+        capture_dir, hold_tcp_twin_in,
+    };
     use std::{
         collections::BTreeMap,
         net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
@@ -507,5 +510,71 @@ mod tests {
             tcp.local_addr().expect("TCP address"),
             udp.local_addr().expect("UDP address")
         );
+    }
+
+    /// Set only on the subprocess the M7-C166 test spawns.
+    const TWIN_GATE_PROBE: &str = "C11_TWIN_GATE_PROBE";
+    const TWIN_GATE_CHILD: &str = "c11_capture::tests::m7c166_twin_gate_child";
+    /// Printed by the child after its assertions, so the parent can prove the
+    /// child test ran rather than being filtered out or skipped.
+    const TWIN_GATE_WITNESS: &str = "m7c166-twin-gate-child-ran";
+
+    /// M7-C166: the real gate that decides whether a process is a C11 child.
+    ///
+    /// `bind_twinned_loopback_udp()` chooses its registry through
+    /// `twin_registry()`, which reads `C11_INNER_CAPTURE_DIR` and creates a
+    /// process-wide registry once.  So the probe runs in a fresh copy of this
+    /// test binary with that variable removed: no other test can have created
+    /// the registry there, and the parent's environment cannot leak in.
+    ///
+    /// The re-exec runs the test binary directly, so a custom Cargo target
+    /// runner (`target.<triple>.runner`) is not honoured for the child.
+    #[test]
+    fn m7c166_outside_a_c11_child_the_real_gate_holds_no_twin() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([TWIN_GATE_CHILD, "--exact", "--ignored", "--nocapture"])
+            .args(["--test-threads", "1"])
+            .env_remove("C11_INNER_CAPTURE_DIR")
+            .env(TWIN_GATE_PROBE, "1")
+            .output()
+            .expect("spawn the twin-gate probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "twin-gate probe failed: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains(TWIN_GATE_WITNESS) && stdout.contains("test result: ok. 1 passed;"),
+            "twin-gate probe did not run: {stdout}{stderr}"
+        );
+    }
+
+    /// The child half of the M7-C166 test; run only by that test.
+    #[test]
+    #[ignore = "run as a subprocess by m7c166_outside_a_c11_child_the_real_gate_holds_no_twin"]
+    fn m7c166_twin_gate_child() {
+        // Only the M7-C166 parent sets the probe.  Under `--include-ignored`
+        // this test runs in the ordinary process, where other tests may have
+        // created the registry; return without the witness, so the parent's
+        // check cannot be satisfied here.
+        if std::env::var_os(TWIN_GATE_PROBE).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return;
+        }
+        assert!(capture_dir().is_none(), "the probe must not be a C11 child");
+        // The real entry point, not `bind_twinned_loopback_udp_in(None)`.
+        let (udp, tcp) = bind_tcp_on_a_live_udp_number(|| {
+            bind_twinned_loopback_udp().expect("UDP bind outside a C11 child")
+        });
+        assert_eq!(
+            tcp.local_addr().expect("TCP address"),
+            udp.local_addr().expect("UDP address")
+        );
+        assert!(
+            UDP_ENDPOINT_TWINS.get().is_none(),
+            "outside a C11 child the twin registry must never be created"
+        );
+        println!("{TWIN_GATE_WITNESS}");
     }
 }
