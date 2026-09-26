@@ -721,6 +721,62 @@ READINESS_PINS_CASES: list[Case] = [
     ),
 ]
 
+#: **M8-C30: a peer's route keeps its probe proof across a pin-set change
+#: that still approves the proven key.**  Defeated, a staged overlap key
+#: resets the route to `Pending` and withdraws public readiness until the
+#: next probe pass -- the window `verify-m8-acp-cluster` refused requests in.
+PEER_READINESS = RELAY / "src" / "peer_readiness.rs"
+ROUTE_PROOF_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "peer_readiness::tests",
+]
+
+ROUTE_PROOF_CASES: list[Case] = [
+    Case(
+        "a proven route survives a pin addition that keeps its key approved",
+        [
+            (
+                PEER_READINESS,
+                "                previous.target.same_pins(&target)\n"
+                "                    || previous.proven_spki.as_ref().is_some_and(|proven| {",
+                "                previous.target.same_pins(&target)\n"
+                "                    || false && previous.proven_spki.as_ref().is_some_and(|proven| {",
+            )
+        ],
+        frozenset(
+            {
+                "peer_runtime::peer_readiness::tests::"
+                "a_pin_addition_keeps_a_route_proven_with_a_still_approved_key"
+            }
+        ),
+    ),    Case(
+        # An unreachable mark must withdraw the proof with the reachability,
+        # or a later overlap record could preserve evidence for a route the
+        # request path had just seen fail.
+        "an unreachable mark withdraws the route's probe proof",
+        [
+            (
+                PEER_READINESS,
+                "            required.available_capacity = None;\n"
+                "            required.proven_spki = None;\n",
+                "            required.available_capacity = None;\n",
+            )
+        ],
+        frozenset(
+            {
+                "peer_runtime::peer_readiness::tests::"
+                "an_unreachable_route_is_not_revived_by_an_overlap_record"
+            }
+        ),
+    ),
+]
+
 #: **M7-C92 and M7-C93: the finite (unary) echo on an M2 session.**  M7-C92
 #: made the relay issue the owner `STREAM_FORGET` that releases a finite
 #: echo's connector OPEN journal entry, without which a device session
@@ -1923,6 +1979,7 @@ SUITES: list[Suite] = [
     Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
     Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
+    Suite("m8c30-route-proof", [RELAY], ROUTE_PROOF_TEST, ROUTE_PROOF_CASES),
     Suite("m7c92-unary-echo", [RELAY], UNARY_ECHO_TEST, UNARY_ECHO_CASES),
     Suite(
         "m7c97-retiring-admission",
