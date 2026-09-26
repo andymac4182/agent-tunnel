@@ -5263,8 +5263,8 @@ impl M2Actor {
 
     /// Whether a failed `STREAM_FORGET` proof may be retained for the
     /// bounded revalidation window: it may converge from the owner's final
-    /// ACK, or everything the owner asserts already holds and only this
-    /// connector's own sender is behind (task row M6-C121).
+    /// ACK, or only this connector's deferred output for the stream is
+    /// behind (task row M6-C121).
     fn stream_forget_proof_may_still_complete(
         &self,
         forget: &tunnel_protocol::rotation_control::StreamForget,
@@ -5273,15 +5273,15 @@ impl M2Actor {
             || self.stream_forget_connector_sender_lagging(forget)
     }
 
-    /// Whether the proof fails only because this connector's own sender has
-    /// not finished: its terminal not yet emitted, sequenced frames not yet
-    /// written, or deferred output for the stream still queued, while every
-    /// owner assertion, the receive side and the credit relation hold (task
-    /// row M6-C121).  That evidence is incomplete, not contradictory: under
-    /// a consumer flood the connector's data writer is the one that lags.
-    /// Once the revalidation window expires it ends the session as the
-    /// retryable expiry, never as a terminal `PROTOCOL_ERROR` that stops
-    /// `connect`.
+    /// Whether the proof fails only because this connector still holds
+    /// deferred output for the stream (`pending_outputs`) behind an emitted,
+    /// not yet acknowledged C2R terminal, while the full validation holds
+    /// with that output and the owner's ACK treated as pending (task row
+    /// M6-C121).  That is the shape measured under a consumer flood: the
+    /// connector's data writer lags.  Once the revalidation window expires
+    /// it ends the session as the retryable expiry, never as a terminal
+    /// `PROTOCOL_ERROR` that stops `connect`.  A terminal never emitted, or
+    /// sequenced frames never written, stays a contradiction.
     fn stream_forget_connector_sender_lagging(
         &self,
         forget: &tunnel_protocol::rotation_control::StreamForget,
@@ -5364,20 +5364,20 @@ impl M2Actor {
         // The connector must already have emitted its own terminal.  Only the
         // relay's final ACK/replay release and bounded carrier debt may still
         // converge on this side of the independent data/control channels.
-        if local_sender.reorder_frames != 0 || local_sender.reorder_bytes != 0 {
-            return false;
-        }
+        // The owner publishes STREAM_FORGET only after it has received this
+        // connector's C2R terminal, so a terminal not yet emitted, or
+        // sequenced frames not yet written, contradicts the proof in every
+        // mode (review of PR #182).
         if local_sender.send_terminal.is_none()
             || local_sender.send_terminal_sequence != Some(local_sender.last_emitted)
+            || local_sender.reorder_frames != 0
+            || local_sender.reorder_bytes != 0
             || !stream
                 .sequence
                 .ready_frames(Direction::ConnectorToRelay)
                 .is_empty()
         {
-            if !allow_sender_lag {
-                return false;
-            }
-            sender_lag = true;
+            return false;
         }
         let sender_ack_pending = local_sender.peer_acked < local_sender.last_emitted
             || local_sender.replay_floor.is_some()
@@ -5418,13 +5418,15 @@ impl M2Actor {
     }
 
     /// `validate_stream_forget_with`, and with `connector_sender_pending`
-    /// also treating this connector's own sender as unfinished: its terminal
-    /// not yet emitted, sequenced frames not yet written and deferred output
-    /// still queued (task row M6-C121).  Every other check -- the owner's
-    /// evidence, the receive side, the sender's reorder state, adapter input
-    /// debt, the pure sequence reconciliation and the owner snapshot's own
-    /// invariants -- runs as in the final validation.  It only classifies a
-    /// proof for retention and expiry and never authorizes reclamation.
+    /// also treating this connector's deferred output for the stream
+    /// (`pending_outputs`) as pending, besides the owner's final ACK (task
+    /// row M6-C121).  The connector's C2R terminal must still have been
+    /// emitted with nothing sequenced left unwritten, and every other check
+    /// -- the owner's evidence, the receive side, the sender's reorder
+    /// state, adapter input debt, the pure sequence reconciliation and the
+    /// owner snapshot's own invariants -- runs as in the final validation.
+    /// It only classifies a proof for retention and expiry and never
+    /// authorizes reclamation.
     fn validate_stream_forget_mode(
         &self,
         forget: &tunnel_protocol::rotation_control::StreamForget,
@@ -5478,7 +5480,6 @@ impl M2Actor {
             forget.direction,
             &forget.final_state,
             awaiting_owner_ack,
-            connector_sender_pending,
         )?;
         if !stream.pending.is_empty()
             || stream.pending_bytes != 0
@@ -5515,13 +5516,7 @@ impl M2Actor {
         direction: Direction,
         final_state: &ResumeDirectionState,
     ) -> Result<(), ClientError> {
-        Self::validate_owner_stream_forget_state_with(
-            sequence,
-            direction,
-            final_state,
-            false,
-            false,
-        )
+        Self::validate_owner_stream_forget_state_with(sequence, direction, final_state, false)
     }
 
     /// Validate the owner's sender-direction proof against the connector's local
@@ -5538,7 +5533,6 @@ impl M2Actor {
         direction: Direction,
         final_state: &ResumeDirectionState,
         awaiting_owner_ack: bool,
-        connector_sender_pending: bool,
     ) -> Result<(), ClientError> {
         if direction != Direction::RelayToConnector {
             return Err(ClientError::Protocol(
@@ -5581,14 +5575,13 @@ impl M2Actor {
         let local_sender = local.direction(Direction::ConnectorToRelay);
         let sender_acknowledged = local_sender.peer_acked == local_sender.last_emitted
             && local_sender.replay_floor.is_none();
-        if (local_sender.send_terminal.is_none() && !connector_sender_pending)
+        if local_sender.send_terminal.is_none()
             || (!sender_acknowledged && !awaiting_owner_ack)
             || local_sender.reorder_frames != 0
             || local_sender.reorder_bytes != 0
-            || (!sequence
+            || !sequence
                 .ready_frames(Direction::ConnectorToRelay)
                 .is_empty()
-                && !connector_sender_pending)
         {
             return Err(ClientError::Protocol(
                 "STREAM_FORGET connector sender evidence is incomplete".to_owned(),
@@ -11464,23 +11457,90 @@ mod tests {
         assert_eq!(actor.forgotten_stream_through, 0);
     }
 
-    /// M6-C121: under a consumer flood, `connect` once exited with the
-    /// terminal `PROTOCOL_ERROR` "STREAM_FORGET connector sender evidence is
-    /// incomplete".  That message is the final validator's: the owner's R2C
-    /// evidence and the receive side matched, and only this connector's own
-    /// sender had not finished.  Here the owner's proof is complete and
-    /// consistent while the connector's C2R terminal has not been emitted
-    /// yet (its writer is the side that lags under a flood).  Because the
-    /// full validation -- reconciliation and the owner snapshot's own
-    /// invariants included -- passes with only this connector's sender
-    /// treated as pending, the FORGET must be retained for the bounded
-    /// revalidation window, never reclaim the stream early, and on expiry
-    /// end the session with the retryable expiry, so `connect` reconnects
-    /// instead of exiting.  The invalid-snapshot probe below is the same
-    /// shape with a contradiction and stays a protocol error.
+    /// M6-C121, the measured shape: under a consumer flood the owner's
+    /// STREAM_FORGET arrived while this connector had emitted its C2R
+    /// terminal (not yet acknowledged) and still held deferred output for
+    /// the stream in `pending_outputs`.  `stream_forget_proof_may_converge`
+    /// refused any deferred output outright, so `connect` exited with the
+    /// terminal "STREAM_FORGET connector sender evidence is incomplete".
+    /// The full validation holds with that output and the owner's ACK
+    /// pending, so the FORGET must be held for the bounded window, never
+    /// reclaim the stream, and expire as the retryable M6-C105 outcome.
     #[tokio::test]
-    async fn m6c121_a_forget_ahead_of_the_connectors_own_sender_is_never_terminal() {
+    async fn m6c121_a_forget_with_deferred_output_behind_an_emitted_terminal_is_held_then_retryable()
+     {
         let stream_id = 47;
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(stream_id);
+        let (mut actor, _key, _carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        actor.pending_outputs.push_back(PendingOutput {
+            stream_id,
+            kind: FrameKind::Data,
+            payload: b"deferred".to_vec(),
+            reset_reason: None,
+        });
+        actor.pending_output_bytes = 8;
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-m6c121-deferred".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        assert!(
+            !actor.stream_forget_proof_may_converge(&forget),
+            "the M6-C105 precondition alone refuses deferred output"
+        );
+        actor
+            .handle_control(ControlMessage::StreamForget(forget))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "deferred output behind an emitted terminal must not end connect: {}",
+                    error.safe_message()
+                )
+            });
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| pending.proof_pending && pending.proof_deadline.is_some())
+        );
+        actor
+            .retry_pending_forget_barriers()
+            .expect("within the window the proof stays retained");
+        assert!(actor.streams.contains_key(&stream_id));
+
+        actor
+            .pending_forgets
+            .get_mut(&stream_id)
+            .expect("proof remains retained")
+            .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+        let error = actor
+            .retry_pending_forget_barriers()
+            .expect_err("an expired proof still ends the session");
+        assert!(error.retryable(), "{error:?}");
+        assert!(is_expired_forget_proof(&error), "{error:?}");
+        assert!(actor.streams.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+    }
+
+    /// M6-C121, review of PR #182: the owner publishes STREAM_FORGET only
+    /// after it has received this connector's C2R terminal, so a FORGET
+    /// that arrives before the connector emitted one is a contradiction
+    /// even when the owner's own R2C proof is consistent.  It must stay a
+    /// non-retryable `PROTOCOL_ERROR`, never a held or retryable proof.
+    #[tokio::test]
+    async fn m6c121_a_forget_before_the_connector_emitted_its_terminal_stays_a_protocol_error() {
+        let stream_id = 49;
         let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
         let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
         let relay_fin = Frame::fin(1, 1, stream_id, 1, 0);
@@ -11512,56 +11572,25 @@ mod tests {
         stream.sequence = connector;
         stream.input_fin = true;
         actor.streams.insert(stream_id, stream);
-        let forget = tunnel_protocol::rotation_control::StreamForget {
-            message_id: "forget-m6c121".to_owned(),
-            reply_to: String::new(),
-            session_id: "session".to_owned(),
-            epoch: 1,
-            stream_id,
-            operation_id: "operation".to_owned(),
-            direction: Direction::RelayToConnector,
-            final_state,
-        };
-        assert!(
-            matches!(
-                actor.validate_stream_forget(&forget),
-                Err(ClientError::Protocol(message))
-                    if message == "STREAM_FORGET connector sender evidence is incomplete"
-            ),
-            "the final validator still refuses to reclaim"
-        );
-        actor
-            .handle_control(ControlMessage::StreamForget(forget))
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "incomplete, uncontradicted evidence must not end connect: {}",
-                    error.safe_message()
-                )
-            });
-        assert!(
-            actor
-                .pending_forgets
-                .get(&stream_id)
-                .is_some_and(|pending| pending.proof_pending && pending.proof_deadline.is_some())
-        );
-        actor
-            .retry_pending_forget_barriers()
-            .expect("within the window the proof stays retained");
-        assert!(actor.streams.contains_key(&stream_id));
-
-        actor
-            .pending_forgets
-            .get_mut(&stream_id)
-            .expect("proof remains retained")
-            .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
         let error = actor
-            .retry_pending_forget_barriers()
-            .expect_err("an expired proof still ends the session");
-        assert!(error.retryable(), "{error:?}");
-        assert!(is_expired_forget_proof(&error), "{error:?}");
+            .handle_control(ControlMessage::StreamForget(
+                tunnel_protocol::rotation_control::StreamForget {
+                    message_id: "forget-m6c121-no-terminal".to_owned(),
+                    reply_to: String::new(),
+                    session_id: "session".to_owned(),
+                    epoch: 1,
+                    stream_id,
+                    operation_id: "operation".to_owned(),
+                    direction: Direction::RelayToConnector,
+                    final_state,
+                },
+            ))
+            .await
+            .expect_err("a FORGET before the connector's terminal is refused");
+        assert_eq!(error.code(), "PROTOCOL_ERROR", "{error:?}");
+        assert!(!error.retryable(), "{error:?}");
+        assert!(actor.pending_forgets.is_empty());
         assert!(actor.streams.contains_key(&stream_id));
-        assert_eq!(actor.forgotten_stream_through, 0);
     }
 
     /// The other half of M6-C105: an expired proof that the connector's own
