@@ -749,6 +749,16 @@ pub enum PeerTransportError {
     /// A bounded operation exceeded its deadline.
     #[error("peer transport operation timed out")]
     Timeout,
+    /// This relay retired the local peer identity the connection was
+    /// established under (a completed key rotation, task row M8-C45), and
+    /// closed it.  Nothing further is sent on the stream; whether the peer
+    /// had already acted on an earlier request body is the caller's
+    /// ordinary unknown-outcome question.  The peer sees an application
+    /// close with reason [`LOCAL_IDENTITY_RETIRED_REASON`].
+    #[error(
+        "peer connection closed: this relay retired the local identity it was established under"
+    )]
+    LocalIdentityRetired,
     /// The caller cancelled a transport operation.
     #[error("peer transport operation cancelled")]
     Cancelled,
@@ -1746,8 +1756,20 @@ struct ClientConnection {
     /// can only make a connection look older than it is -- which retires it
     /// early -- and never newer.
     local_generation: u64,
+    /// Set when [`PeerClient::retire_local_generations_before`] closes this
+    /// connection, so its streams report the typed cause.
+    retired: AtomicBool,
     _connection_permit: OwnedSemaphorePermit,
 }
+
+/// The QUIC application close code a relay uses when it closes a connection
+/// established under a local peer identity it has retired.  Distinct from
+/// the transport's ordinary `0` so a peer's diagnostics can tell a rotation
+/// apart from a shutdown.
+pub const LOCAL_IDENTITY_RETIRED_CODE: u32 = 0x4b52;
+
+/// The close reason sent with [`LOCAL_IDENTITY_RETIRED_CODE`].
+pub const LOCAL_IDENTITY_RETIRED_REASON: &[u8] = b"local identity retired";
 
 impl ClientConnection {
     /// Record a stream-level outcome on its pooled connection.
@@ -1764,7 +1786,26 @@ impl ClientConnection {
         if matches!(result, Err(PeerTransportError::GoAway)) {
             self.planned_remote_closing.cancel();
         }
-        result
+        match result {
+            // The typed cause wins over whatever the torn-down stream reported.
+            Err(_) if self.retired.load(Ordering::Acquire) => {
+                Err(PeerTransportError::LocalIdentityRetired)
+            }
+            other => other,
+        }
+    }
+
+    /// Close this connection because its local identity was retired.
+    async fn retire_local_identity(&self, deadline: Instant) {
+        self.retired.store(true, Ordering::Release);
+        // Cancel before closing, as every local close does (M7-C105), so the
+        // driver classifies the close as the one this side asked for.
+        self.cancel.cancel();
+        self.connection.close(
+            quinn::VarInt::from_u32(LOCAL_IDENTITY_RETIRED_CODE),
+            LOCAL_IDENTITY_RETIRED_REASON,
+        );
+        let _ = self.shutdown_until(deadline).await;
     }
 
     async fn open(
@@ -2163,8 +2204,15 @@ struct DrainingConnection {
 }
 
 /// The most connections a client keeps draining under a superseded local
-/// peer identity at once (`docs/cluster.md`: "at most four additional
-/// key-rotation replacement connections per node").  When the bound is
+/// peer identity at once.
+///
+/// Each drained predecessor has exactly one replacement dialed under the
+/// current identity, so this bounds the **additional outbound** connections a
+/// rotation adds to four.  `docs/cluster.md` budgets "at most four additional
+/// key-rotation replacement connections per node across both directions";
+/// this constant enforces the outbound half.  The inbound half -- connections
+/// peers opened to this relay under its predecessor -- is not replaced by
+/// this relay at all (task row M8-C47), so it adds none.  When the bound is
 /// reached, a destination keeps using its predecessor connection -- whose key
 /// is still approved during the overlap -- instead of tearing it down.
 pub const MAX_ROTATION_DRAINING_CONNECTIONS: usize = 4;
@@ -2401,7 +2449,7 @@ impl PeerClient {
         let count = retired.len();
         let deadline = Instant::now() + Duration::from_secs(1);
         for connection in retired {
-            let _ = connection.shutdown_until(deadline).await;
+            connection.retire_local_identity(deadline).await;
         }
         count
     }
@@ -2747,6 +2795,7 @@ impl PeerClient {
                 driver: Mutex::new(Some(driver_task)),
                 pin_watcher: Mutex::new(Some(pin_watcher)),
                 local_generation,
+                retired: AtomicBool::new(false),
                 _connection_permit: connection_permit,
             });
             with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())

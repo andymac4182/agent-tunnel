@@ -46,6 +46,11 @@ pub enum PeerIdentityError {
     /// the match could not be established.
     #[error("peer identity private key does not match its certificate")]
     KeyMismatch,
+    /// The configured startup identity was refused by rustls; the text is
+    /// rustls' own typed error, kept in the wording relays printed before the
+    /// identity became replaceable.
+    #[error("rustls configuration error: {0}")]
+    StartupConfiguration(String),
     /// The leaf certificate does not carry a relay peer role URI SAN.
     #[error("peer identity certificate is not a relay peer certificate")]
     NotPeerRole,
@@ -217,8 +222,11 @@ impl RotatingPeerIdentity {
             .map_err(|error| PeerIdentityError::Unusable(error.to_string()))?;
         let key = parse_private_key(private_key_pem)
             .map_err(|error| PeerIdentityError::Unusable(error.to_string()))?;
+        // The startup diagnostic keeps the wording `with_single_cert` produced
+        // ("rustls configuration error: ...KeyMismatch..."), which operators
+        // and the M7 deployment failure gate already match on.
         let certified = CertifiedKey::from_der(chain.clone(), key, &ring_provider())
-            .map_err(|_| PeerIdentityError::KeyMismatch)?;
+            .map_err(|error| PeerIdentityError::StartupConfiguration(format!("{error:?}")))?;
         let leaf = chain
             .first()
             .ok_or_else(|| PeerIdentityError::Unusable("empty certificate chain".into()))?;

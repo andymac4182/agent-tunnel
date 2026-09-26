@@ -56,6 +56,11 @@ pub const DEFAULT_PEER_REKEY_OVERLAP: Duration = Duration::from_secs(600);
 /// How often the rotation state machine re-reads verified membership state.
 pub const DEFAULT_PEER_REKEY_TICK: Duration = Duration::from_secs(1);
 
+/// How many retired SPKIs a process remembers in order to refuse restaging
+/// them.  Bounded: a process that rotates more often than this forgets the
+/// oldest, which is still far beyond any planned cadence.
+pub const MAX_RETIRED_SPKIS: usize = 8;
+
 /// Rotation timing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerRekeyConfig {
@@ -101,6 +106,11 @@ pub enum PeerRekeyPhase {
     Stable,
     /// A successor is loaded locally and awaits approval and convergence.
     Staged,
+    /// A switch is in progress: the staged identity is being bound and
+    /// installed under the membership reconcile gate.  Staging is refused
+    /// here, so a trigger that arrives mid-switch is reported rather than
+    /// silently overwritten when the switch completes.
+    Switching,
     /// The successor serves; the predecessor is draining.
     Overlap,
 }
@@ -111,6 +121,7 @@ impl PeerRekeyPhase {
         match self {
             Self::Stable => "stable",
             Self::Staged => "staged",
+            Self::Switching => "switching",
             Self::Overlap => "overlap",
         }
     }
@@ -142,6 +153,11 @@ pub enum PeerRekeyError {
     InProgress(&'static str),
     /// The staged key is the one already served.
     SameKey,
+    /// The staged key was retired by an earlier rotation on this process.
+    /// Rolling back to a retired key is refused: a key is retired because
+    /// it is being replaced, possibly because it is suspect, so it takes a
+    /// fresh key (or a restart with the operator's explicit configuration).
+    Retired,
     /// The candidate identity was refused before staging.
     Identity(PeerIdentityError),
 }
@@ -154,6 +170,9 @@ impl fmt::Display for PeerRekeyError {
                 "a peer-key rotation is already in progress (phase {phase})"
             ),
             Self::SameKey => formatter.write_str("the staged peer key is the key already served"),
+            Self::Retired => formatter.write_str(
+                "the staged peer key was retired by an earlier rotation and cannot be restaged",
+            ),
             Self::Identity(error) => fmt::Display::fmt(error, formatter),
         }
     }
@@ -181,6 +200,7 @@ pub struct PeerRekeySnapshot {
     pub stages: u64,
     pub switches: u64,
     pub retirements: u64,
+    pub overlap_elapsed_while_approved: u64,
     pub last_retirement: Option<PeerRekeyRetirement>,
     pub last_refusal: Option<&'static str>,
     pub draining_connections: usize,
@@ -202,6 +222,7 @@ struct OverlapState {
 enum RekeyState {
     Stable,
     Staged(StagedState),
+    Switching,
     Overlap(OverlapState),
 }
 
@@ -210,6 +231,7 @@ impl RekeyState {
         match self {
             Self::Stable => PeerRekeyPhase::Stable,
             Self::Staged(_) => PeerRekeyPhase::Staged,
+            Self::Switching => PeerRekeyPhase::Switching,
             Self::Overlap(_) => PeerRekeyPhase::Overlap,
         }
     }
@@ -220,6 +242,11 @@ struct Counters {
     stages: u64,
     switches: u64,
     retirements: u64,
+    /// Retirements by overlap timeout while the record still approved the
+    /// predecessor: peers still trust it until the publisher withdraws it.
+    overlap_elapsed_while_approved: u64,
+    /// Most recently retired SPKIs, bounded by [`MAX_RETIRED_SPKIS`].
+    retired: std::collections::VecDeque<String>,
     last_retirement: Option<PeerRekeyRetirement>,
     last_refusal: Option<&'static str>,
 }
@@ -338,6 +365,16 @@ impl PeerRekey {
             self.refuse("staged_same_key");
             return Err(PeerRekeyError::SameKey);
         }
+        if self
+            .lock_counters()
+            .retired
+            .iter()
+            .any(|retired| retired == &spki)
+        {
+            drop(state);
+            self.refuse("staged_retired_key");
+            return Err(PeerRekeyError::Retired);
+        }
         *state = RekeyState::Staged(StagedState {
             identity: staged,
             spki: spki.clone(),
@@ -362,7 +399,7 @@ impl PeerRekey {
         let action = {
             let mut state = self.lock_state();
             match &mut *state {
-                RekeyState::Stable => Action::None,
+                RekeyState::Stable | RekeyState::Switching => Action::None,
                 RekeyState::Staged(staged) => {
                     let approval = self.membership.local_key_approval(&staged.spki);
                     staged.last_approval = approval;
@@ -401,11 +438,16 @@ impl PeerRekey {
                         }
                         // A transient unready state is not evidence the
                         // predecessor was withdrawn.
-                        LocalKeyApproval::NotReady | LocalKeyApproval::Approved { .. } => {
+                        approval @ (LocalKeyApproval::NotReady
+                        | LocalKeyApproval::Approved { .. }) => {
                             if now.saturating_duration_since(overlap.switched_at)
                                 >= self.config.overlap
                             {
-                                Action::Retire(PeerRekeyRetirement::OverlapElapsed)
+                                if approval.is_approved() {
+                                    Action::RetireStillApproved
+                                } else {
+                                    Action::Retire(PeerRekeyRetirement::OverlapElapsed)
+                                }
                             } else {
                                 Action::None
                             }
@@ -431,6 +473,16 @@ impl PeerRekey {
             }
             Action::Switch => self.switch().await,
             Action::Retire(cause) => self.retire(cause).await,
+            Action::RetireStillApproved => {
+                self.lock_counters().overlap_elapsed_while_approved += 1;
+                tracing::warn!(
+                    phase = "overlap",
+                    "the rotation overlap elapsed while the signed record still approves the \
+                     predecessor key; this relay stops using it, but peers keep trusting it \
+                     until the membership publisher withdraws it"
+                );
+                self.retire(PeerRekeyRetirement::OverlapElapsed).await;
+            }
         }
         self.snapshot()
     }
@@ -438,7 +490,7 @@ impl PeerRekey {
     async fn switch(&self) {
         let staged = {
             let mut state = self.lock_state();
-            match std::mem::replace(&mut *state, RekeyState::Stable) {
+            match std::mem::replace(&mut *state, RekeyState::Switching) {
                 RekeyState::Staged(staged) => staged,
                 other => {
                     *state = other;
@@ -489,14 +541,17 @@ impl PeerRekey {
                     error,
                     LocalServingSwitchError::NotApproved(LocalKeyApproval::NotReady)
                 );
-                if let Some(identity) = slot.take() {
-                    *self.lock_state() = RekeyState::Staged(StagedState {
+                *self.lock_state() = match slot.take() {
+                    Some(identity) => RekeyState::Staged(StagedState {
                         identity,
                         spki,
                         approved_since: keep_hold.then_some(approved_since).flatten(),
                         last_approval: LocalKeyApproval::NotReady,
-                    });
-                }
+                    }),
+                    // The transport consumed and refused the identity: nothing
+                    // is staged any more, and the operator must stage again.
+                    None => RekeyState::Stable,
+                };
                 self.refuse(label);
                 tracing::warn!(reason = label, "peer identity switch refused");
             }
@@ -522,6 +577,10 @@ impl PeerRekey {
             let mut counters = self.lock_counters();
             counters.retirements += 1;
             counters.last_retirement = Some(cause);
+            if counters.retired.len() >= MAX_RETIRED_SPKIS {
+                counters.retired.pop_front();
+            }
+            counters.retired.push_back(previous.clone());
         }
         tracing::info!(
             phase = "stable",
@@ -543,6 +602,7 @@ impl PeerRekey {
                 Some(staged.last_approval.label()),
                 None,
             ),
+            RekeyState::Switching => (None, None, None),
             RekeyState::Overlap(overlap) => (None, None, Some(overlap.previous_spki.clone())),
         };
         let phase = state.phase();
@@ -558,6 +618,7 @@ impl PeerRekey {
             stages: counters.stages,
             switches: counters.switches,
             retirements: counters.retirements,
+            overlap_elapsed_while_approved: counters.overlap_elapsed_while_approved,
             last_retirement: counters.last_retirement,
             last_refusal: counters.last_refusal,
             draining_connections: self
@@ -590,4 +651,5 @@ enum Action {
     Switch,
     AbandonRevoked,
     Retire(PeerRekeyRetirement),
+    RetireStillApproved,
 }

@@ -54,6 +54,11 @@ struct TestCheckpointAuthority {
     next_checkpoint_version: AtomicU64,
     mode: AtomicU8,
     include_local_membership: AtomicBool,
+    /// While set, a fetch parks until `release` is notified, so a test can
+    /// hold a reconciliation pass -- and with it the reconcile gate -- open.
+    hold: AtomicBool,
+    held: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl TestCheckpointAuthority {
@@ -63,6 +68,9 @@ impl TestCheckpointAuthority {
             next_checkpoint_version: AtomicU64::new(1),
             mode: AtomicU8::new(AuthorityMode::Ready as u8),
             include_local_membership: AtomicBool::new(include_local_membership),
+            hold: AtomicBool::new(false),
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
         }
     }
 
@@ -87,6 +95,10 @@ impl CheckpointAuthority for TestCheckpointAuthority {
         request: CheckpointRequest,
     ) -> MembershipFuture<'a, Result<CheckpointResponse, CheckpointAuthorityError>> {
         Box::pin(async move {
+            if self.hold.swap(false, Ordering::AcqRel) {
+                self.held.notify_one();
+                self.release.notified().await;
+            }
             if self.mode() == AuthorityMode::Failed {
                 return Err(CheckpointAuthorityError::Transport);
             }
@@ -978,7 +990,7 @@ mod rekey {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn m8c45_stage_waits_for_a_continuous_approval_then_switches_and_retires_on_withdrawal() {
         let pki = Pki::new();
         let current = pki.peer(NODE_ID);
@@ -1068,7 +1080,7 @@ mod rekey {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn m7c152_a_transient_unready_state_neither_restarts_the_hold_nor_switches() {
         // A failed catalog read or checkpoint fetch takes the runtime Unready
         // for one pass.  That is not an observation that approval was lost:
@@ -1111,7 +1123,7 @@ mod rekey {
         assert_eq!(switched.serving_spki, next.spki);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn m7c151_a_staged_key_the_record_revokes_is_discarded_and_never_served() {
         let pki = Pki::new();
         let current = pki.peer(NODE_ID);
@@ -1139,7 +1151,7 @@ mod rekey {
         assert_eq!(snapshot.switches, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn m7c153_staging_is_refused_while_a_rotation_is_in_progress_or_for_the_wrong_identity() {
         let pki = Pki::new();
         let current = pki.peer(NODE_ID);
@@ -1182,6 +1194,137 @@ mod rekey {
         assert_eq!(
             rekey.snapshot().staged_spki.as_deref(),
             Some(next.spki.as_str())
+        );
+    }
+
+    /// Stage, approve, and wait out the hold so the next tick switches.
+    async fn staged_and_approved(
+        fixture: &RuntimeFixture,
+        pki: &Pki,
+        current: &Leaf,
+        next: &Leaf,
+    ) -> Arc<PeerRekey> {
+        fixture
+            .source
+            .replace(vec![record(fixture, 1, &[&current.spki, &next.spki], &[])])
+            .await;
+        fixture.runtime.bootstrap().await.expect("overlap ready");
+        let rekey = machine(fixture, pki, current);
+        rekey
+            .stage_pem(next.chain.as_bytes(), next.key.as_bytes())
+            .expect("staged");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
+        tokio::time::sleep(HOLD * 2).await;
+        rekey
+    }
+
+    #[tokio::test]
+    async fn m7c153_a_trigger_during_a_switch_is_refused_rather_than_lost() {
+        // Deterministic: a reconciliation pass is held open inside the
+        // checkpoint fetch, so it owns the reconcile gate; the switch then
+        // waits on that gate in the `switching` phase, and a second staging
+        // attempt made there must be refused, not overwritten when the switch
+        // lands.  (Real time, not paused: a paused clock would fire the
+        // held fetch's own timeout at once.)
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let late = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+
+        fixture.authority.hold.store(true, Ordering::Release);
+        let runtime = Arc::clone(&fixture.runtime);
+        let reconcile = tokio::spawn(async move { runtime.reconcile_once().await });
+        fixture.authority.held.notified().await;
+
+        let switching = {
+            let rekey = Arc::clone(&rekey);
+            tokio::spawn(async move { rekey.tick().await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rekey.phase() != PeerRekeyPhase::Switching {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the switch never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        let refused = rekey.stage_pem(late.chain.as_bytes(), late.key.as_bytes());
+        assert!(
+            matches!(refused, Err(PeerRekeyError::InProgress("switching"))),
+            "a trigger during a switch must be refused, got {refused:?}"
+        );
+        assert_eq!(rekey.snapshot().last_refusal, Some("rotation_in_progress"));
+
+        fixture.authority.release.notify_one();
+        reconcile.await.expect("reconcile join").expect("reconcile");
+        let switched = switching.await.expect("switch join");
+        assert_eq!(switched.phase, PeerRekeyPhase::Overlap);
+        assert_eq!(switched.serving_spki, next.spki);
+        assert_eq!(switched.stages, 1, "the refused trigger staged nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn m7c153_a_retired_key_cannot_be_restaged() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Overlap);
+        fixture
+            .source
+            .replace(vec![record(&fixture, 2, &[&next.spki], &[])])
+            .await;
+        fixture
+            .runtime
+            .reconcile_once()
+            .await
+            .expect("successor only");
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Stable);
+        // Rolling back to the key this process just retired is refused.
+        let rollback = rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes());
+        assert!(
+            matches!(rollback, Err(PeerRekeyError::Retired)),
+            "{rollback:?}"
+        );
+        assert_eq!(rekey.snapshot().last_refusal, Some("staged_retired_key"));
+        // A fresh key is still accepted.
+        let fresh = pki.peer(NODE_ID);
+        rekey
+            .stage_pem(fresh.chain.as_bytes(), fresh.key.as_bytes())
+            .expect("a fresh key stages");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn m8c45_an_overlap_that_elapses_while_the_predecessor_is_approved_is_counted() {
+        let pki = Pki::new();
+        let current = pki.peer(NODE_ID);
+        let next = pki.peer(NODE_ID);
+        let fixture = RuntimeFixture::new_with_local_spki(true, &current.spki);
+        let rekey = staged_and_approved(&fixture, &pki, &current, &next).await;
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Overlap);
+        // Just short of the overlap: nothing happens.
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Overlap);
+        // The overlap elapses with the record still approving both keys: the
+        // relay retires the predecessor locally, and says so, because peers
+        // keep trusting it until the publisher withdraws it.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let retired = rekey.tick().await;
+        assert_eq!(retired.phase, PeerRekeyPhase::Stable);
+        assert_eq!(
+            retired.last_retirement,
+            Some(PeerRekeyRetirement::OverlapElapsed)
+        );
+        assert_eq!(retired.overlap_elapsed_while_approved, 1);
+        assert!(
+            fixture
+                .runtime
+                .local_key_approval(&current.spki)
+                .is_approved(),
+            "the record still approves the predecessor: only the publisher can withdraw it"
         );
     }
 }

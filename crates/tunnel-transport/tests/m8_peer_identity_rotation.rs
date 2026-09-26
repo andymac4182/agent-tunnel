@@ -335,9 +335,15 @@ async fn a_client_install_drains_the_superseded_connection_and_dials_with_the_su
         third.spki.to_hex()
     );
     assert!(pool.retire_local_generations_before(3).await >= 1);
+    let error = body_of(held)
+        .await
+        .expect_err("a stream on a retired generation must end with an error");
     assert!(
-        body_of(held).await.is_err(),
-        "a stream on a retired generation must end with an error"
+        matches!(
+            error.downcast_ref::<PeerTransportError>(),
+            Some(PeerTransportError::LocalIdentityRetired)
+        ),
+        "a caller on a retired generation must see the typed cause, got {error}"
     );
     assert_eq!(pool.draining_connection_count(), 0);
 

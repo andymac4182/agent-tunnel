@@ -1552,6 +1552,7 @@ fn write_client_config(
                 mcp: None,
                 acp: None,
                 fs: None,
+                cua: None,
             },
         )]),
         limits: LimitsConfig::default(),
