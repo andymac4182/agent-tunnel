@@ -488,36 +488,7 @@ pin set, and only a local or transient unready state retains it. Red-then-green
 in both directions at the fix revision: with the retention widened back the gate
 fails at this phase in 65 s, and with the split in place it passes in 68 s.
 
-The retention split has a second consequence that is **not** yet resolved, and
-is why that work is held back as M7-C86: `verify-m7-trust-expiry` regresses on
-the branch carrying it (interleaved on one machine with pre-built binaries,
-10 of 10 without the retention and 6 of 10 with it)
-with `expired target pooled stream was not observed with its exact owner
-session/cursor before reclamation`. The stream *is* closed by the expiry in
-every run - the owner records `PeerMembershipExpired` and one terminal event
-either way - and exactly one of the gate's seventeen joined conditions differs:
-the ingress's receive-side outcome, `TrustExpired` when it passes and `Closed`
-when it fails. **Why that differs is not established**: three hypotheses were
-tested and refuted, including that the ingress reclassifies only once its own
-dispatcher has recorded the reason - instrumenting `dispatch_invalidations` on
-both revisions produced identical traces in passing and failing runs. What
-remains is an unconfirmed ordering hypothesis, recorded on M7-C86.
-
-The retention work that fixes the isolation blackout is **not landed**; it is
-held on M7-C86 because it regresses this gate. At `85cdd24` on
-`m3c10-gate-only` this gate
-is unaffected: interleaved against `origin/main` with both binaries pre-built,
-8 of 8 on each arm.
-
-An attribution change keyed on `VerifiedPeerBinding::valid_until` was written
-and then reverted: instrumentation showed the trust/checkpoint window, already
-carried monotonically, is *earlier*, so that arm could only fire later than the
-one that exists. The dispatcher was then instrumented on both revisions and
-latches `TrustExpired` identically in every run, passing or failing, so this is
-not a missed latch either. Measured interleaved on one machine with both
-binaries pre-built, the gate is **10 of 10 at the branch base and 6 of 10 on
-the branch**. The remaining difference is an ordering race whose mechanism is
-recorded as an unconfirmed hypothesis on M7-C83. Every transition
+The retention split is **held** as M7-C86 because it regresses this gate. Measured interleaved through the gate limiter against `origin/main` `6830ba79`: base 20 of 20, split branch 10 of 20, every failure `ingress_last_receive=(IngressReceive, Closed)`. Only the re-sign re-binding (M7-C80) landed without it: the shared pin wiring (M7-C90) and the Ready republication (M7-C91) also regressed this gate on their own and are held with M7-C86. With only M7-C80's runtime change, the gate passed 10 of 10. Attributing a peer reset to trust expiry was not changed. Every transition
 asserts payload-free, credential-free process diagnostics, and cleanup joins
 both relay processes, the impostor, the checkpoint authority, both Redis
 forwarders and the catalog namespace. The deterministic statement of the same

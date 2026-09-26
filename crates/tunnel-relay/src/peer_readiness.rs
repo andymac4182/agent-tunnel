@@ -281,6 +281,9 @@ struct RequiredRoute {
     state: PeerProbeState,
     last_probe: Option<Instant>,
     available_capacity: Option<usize>,
+    /// The approved SPKI digest the last successful probe authenticated, when
+    /// the prober reported it.
+    proven_spki: Option<String>,
 }
 
 #[derive(Debug)]
@@ -392,18 +395,32 @@ impl PeerReadiness {
                 });
             }
             let key = target.key();
-            let previous = state
-                .routes
-                .get(&key)
-                .filter(|previous| previous.target.same_pins(&target));
+            // Keep a route's probe evidence when the new signed target still
+            // approves the key that evidence was proven with. A record that
+            // only adds a key -- a staged rotation overlap -- or retires a
+            // key the peer is not presenting does not make the proven route
+            // any less reachable, and resetting it to `Pending` withdrew
+            // public readiness until the next probe pass completed (M8-C30).
+            // With no recorded proof, any pin change still resets, as before.
+            let previous = state.routes.get(&key).filter(|previous| {
+                previous.target.same_pins(&target)
+                    || previous.proven_spki.as_ref().is_some_and(|proven| {
+                        target
+                            .approved_spki_sha256()
+                            .iter()
+                            .any(|pin| pin == proven)
+                    })
+            });
             let route_state = previous.map_or(PeerProbeState::Pending, |previous| previous.state);
             let last_probe = previous.and_then(|previous| previous.last_probe);
             let available_capacity = previous.and_then(|previous| previous.available_capacity);
+            let proven_spki = previous.and_then(|previous| previous.proven_spki.clone());
             next.entry(key).or_insert(RequiredRoute {
                 target,
                 state: route_state,
                 last_probe,
                 available_capacity,
+                proven_spki,
             });
         }
         let revision = state.revision.saturating_add(1);
@@ -434,6 +451,7 @@ impl PeerReadiness {
             route.state = PeerProbeState::Pending;
             route.last_probe = None;
             route.available_capacity = None;
+            route.proven_spki = None;
         }
     }
 
@@ -455,6 +473,19 @@ impl PeerReadiness {
         target: &PeerRouteTarget,
         probe: PeerProbeState,
     ) -> Result<bool, PeerReadinessError> {
+        self.record_probe_locked(revision, target, probe, None)
+    }
+
+    /// Publish one probe outcome and its proof, if any, in one locked
+    /// section, so no interleaved `mark_route_unreachable` or reset can leave
+    /// an `Unreachable` route carrying a proof.
+    fn record_probe_locked(
+        &self,
+        revision: PeerReadinessRevision,
+        target: &PeerRouteTarget,
+        probe: PeerProbeState,
+        proven_spki: Option<&str>,
+    ) -> Result<bool, PeerReadinessError> {
         let key = target.key();
         let mut state = self.state.lock().expect("peer readiness mutex poisoned");
         if state.revision != revision {
@@ -467,6 +498,9 @@ impl PeerReadiness {
             return Err(PeerReadinessError::UnknownRoute);
         }
         required.state = probe;
+        required.proven_spki = proven_spki
+            .filter(|_| probe == PeerProbeState::Reachable)
+            .map(str::to_owned);
         required.last_probe = (probe == PeerProbeState::Reachable).then(Instant::now);
         required.available_capacity = match probe {
             PeerProbeState::Reachable => Some(1),
@@ -474,6 +508,29 @@ impl PeerReadiness {
             PeerProbeState::Pending | PeerProbeState::Unreachable => None,
         };
         Ok(true)
+    }
+
+    /// Record a successful probe together with the approved SPKI digest it
+    /// authenticated. The digest must be one of the route's approved pins.
+    pub fn record_probe_proven_at(
+        &self,
+        revision: PeerReadinessRevision,
+        target: &PeerRouteTarget,
+        observed_spki: &str,
+    ) -> Result<bool, PeerReadinessError> {
+        if !target
+            .approved_spki_sha256()
+            .iter()
+            .any(|pin| pin == observed_spki)
+        {
+            return Err(PeerReadinessError::UnknownRoute);
+        }
+        self.record_probe_locked(
+            revision,
+            target,
+            PeerProbeState::Reachable,
+            Some(observed_spki),
+        )
     }
 
     /// Return the current route-set revision.
@@ -536,6 +593,7 @@ impl PeerReadiness {
         {
             required.state = PeerProbeState::Unreachable;
             required.available_capacity = None;
+            required.proven_spki = None;
         }
     }
 
@@ -632,6 +690,157 @@ impl PeerReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target_with_pins(name: &str, pins: &[&str]) -> PeerRouteTarget {
+        PeerRouteTarget {
+            node_id: name.to_owned(),
+            peer_endpoint: format!("10.0.0.{}:8443", name.len()),
+            server_name: format!("10.0.0.{}", name.len()),
+            approved_spki_sha256: pins.iter().map(|pin| (*pin).to_owned()).collect(),
+        }
+    }
+
+    fn ready_with_one_route(proven: bool) -> (PeerReadiness, PeerRouteTarget) {
+        let readiness = PeerReadiness::new(1).expect("capacity floor");
+        readiness.set_listener_state(PeerListenerState::Bound);
+        readiness.set_available_capacity(1);
+        let old = target_with_pins("relay-a", &["aa"]);
+        let revision = readiness
+            .replace_required_routes_with_revision([old.clone()])
+            .expect("route set");
+        if proven {
+            readiness
+                .record_probe_proven_at(revision, &old, "aa")
+                .expect("proven probe");
+        } else {
+            readiness
+                .record_probe_at(revision, &old, PeerProbeState::Reachable)
+                .expect("probe");
+        }
+        assert!(
+            readiness.is_ready(),
+            "control: ready after a successful probe"
+        );
+        (readiness, old)
+    }
+
+    /// **M8-C30.** A signed record that only *adds* a key to a peer -- a
+    /// staged rotation overlap -- must not withdraw the route's proven
+    /// reachability: the key the probe authenticated is still approved.
+    #[test]
+    fn a_pin_addition_keeps_a_route_proven_with_a_still_approved_key() {
+        let (readiness, _) = ready_with_one_route(true);
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(
+            readiness.is_ready(),
+            "M8-C30: staging an overlap key reset a proven route to Pending and \
+             withdrew public readiness until the next probe pass"
+        );
+        // Retiring a key the peer was not presenting keeps it too.
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa"])])
+            .expect("restored route set");
+        assert!(readiness.is_ready());
+    }
+
+    /// The fail-closed side: once the proven key is no longer approved, the
+    /// route's evidence is gone and it must be re-probed.
+    #[test]
+    fn retiring_the_proven_key_resets_the_route() {
+        let (readiness, _) = ready_with_one_route(true);
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["bb"])])
+            .expect("replacement route set");
+        assert!(!readiness.is_ready(), "the proven key was retired");
+    }
+
+    /// Whether any installed route still carries a probe proof. The proof is
+    /// internal state, deliberately absent from every public snapshot.
+    fn route_carries_proof(readiness: &PeerReadiness) -> bool {
+        readiness
+            .state
+            .lock()
+            .expect("peer readiness mutex poisoned")
+            .routes
+            .values()
+            .any(|route| route.proven_spki.is_some())
+    }
+
+    /// An unreachable mark withdraws the proof with the reachability: a
+    /// later overlap record must not resurrect the route.
+    #[test]
+    fn an_unreachable_route_is_not_revived_by_an_overlap_record() {
+        let (readiness, old) = ready_with_one_route(true);
+        readiness.mark_route_unreachable(&old);
+        assert!(!readiness.is_ready());
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(
+            !readiness.is_ready(),
+            "M8-C30: an overlap record revived a route marked unreachable"
+        );
+        assert!(
+            !route_carries_proof(&readiness),
+            "M8-C30: an unreachable route kept its probe proof"
+        );
+    }
+
+    /// A probe reset withdraws the proof too.
+    #[test]
+    fn a_reset_route_is_not_revived_by_an_overlap_record() {
+        let (readiness, _) = ready_with_one_route(true);
+        readiness.reset_route_probes();
+        readiness.set_available_capacity(1);
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(!readiness.is_ready(), "a reset route is not ready");
+        assert!(
+            !route_carries_proof(&readiness),
+            "M8-C30: a reset route kept its probe proof"
+        );
+    }
+
+    /// A proof binds to one route: a record that moves the peer's endpoint is
+    /// a different route and must be probed afresh.
+    #[test]
+    fn an_endpoint_change_resets_a_proven_route() {
+        let (readiness, _) = ready_with_one_route(true);
+        let mut moved = target_with_pins("relay-a", &["aa"]);
+        moved.peer_endpoint = "10.0.0.99:8443".to_owned();
+        readiness
+            .replace_required_routes([moved])
+            .expect("moved route set");
+        assert!(!readiness.is_ready(), "a moved endpoint kept the old proof");
+    }
+
+    /// Without a recorded proof the old rule stands: any pin change resets.
+    #[test]
+    fn a_route_without_a_recorded_proof_still_resets_on_any_pin_change() {
+        let (readiness, _) = ready_with_one_route(false);
+        readiness
+            .replace_required_routes([target_with_pins("relay-a", &["aa", "bb"])])
+            .expect("overlap route set");
+        assert!(!readiness.is_ready());
+    }
+
+    /// A proof must name one of the route's approved pins.
+    #[test]
+    fn a_proof_for_an_unapproved_key_is_refused() {
+        let readiness = PeerReadiness::new(1).expect("capacity floor");
+        let route = target_with_pins("relay-a", &["aa"]);
+        let revision = readiness
+            .replace_required_routes_with_revision([route.clone()])
+            .expect("route set");
+        assert!(
+            readiness
+                .record_probe_proven_at(revision, &route, "cc")
+                .is_err()
+        );
+    }
 
     fn target(name: &str, pin: &str) -> PeerRouteTarget {
         PeerRouteTarget {
