@@ -960,8 +960,11 @@ connection and started a child.
   sampled every 25 ms for the whole case, latching no `membership_revoked` of
   its own. That last pair is the discriminator M8-C24 named: it is exactly
   what the phantom-successor arm above cannot show. A whole ACP turn then
-  completes across the rotated route, and the owner is rotated back the same
-  way so later cases meet the cluster they expect.
+  completes across the rotated route. The owner is not rotated back: a
+  retired key cannot be restaged. Instead the fixture adopts the successor as
+  the owner's identity, and a full re-sign on it alone must leave the owner
+  Ready. That is the operator's step after a rotation, and it is what every
+  later case meets.
 
   **Not claimed**: that an in-flight stream survives the *withdrawal*. The
   owner does not GOAWAY-drain inbound connections under the predecessor, so the

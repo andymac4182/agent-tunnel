@@ -39,10 +39,15 @@ What it does, in order:
    and `peer_tls_next_private_key`, with `peer_rekey_convergence_seconds = 4`.
 2. Attaches a device to B and sends a public canary into A. A forwards it over
    the private HTTP/3 hop to B, and B forwards it to the device.
-3. Sends B `SIGHUP`. B logs
+3. Sends B `SIGHUP` while `peer_tls_next_private_key` holds a key that does
+   not match the successor certificate. B logs
+   `peer rekey refused: peer identity private key does not match its certificate`
+   and stages nothing. The gate then writes the right key and sends `SIGHUP`
+   again. B logs
    `peer identity staged: staged_spki_sha256=<successor>`. Fresh handshakes
    still present the original key, because no signed record approves the
-   successor yet.
+   successor yet. The gate checks this after both relays have reconciled at
+   least twice more. That is a condition wait, not a fixed sleep.
 4. Publishes B's record approving both keys. After the hold, B logs
    `peer identity switched`. Fresh handshakes now present the successor and no
    longer the original. The canary still works.
@@ -71,13 +76,17 @@ turn and a flooded forwarded stream are live on the non-owner ingress. Look
 for:
 
 ```
-ACP cluster genuine peer-key rotation: staged_not_served=true switched=true … acp_survived_switch=true forward_survived_switch=true successor_presented=true predecessor_not_presented=true interrupted=true no_stop_reason=true ingress_reasons=["membership_revoked"] owner_reasons=[…] owner_unready=false retired_by_withdrawal=true post_rotation_turn=true rotated_back=true
+ACP cluster genuine peer-key rotation: staged_not_served=true switched=true … acp_survived_switch=true forward_survived_switch=true successor_presented=true predecessor_not_presented=true interrupted=true no_stop_reason=true ingress_reasons=["membership_revoked"] owner_reasons=[…] owner_unready=false retired_by_withdrawal=true post_rotation_turn=true resigned_on_successor=true
 ```
 
 Both live streams keep serving across the switch. The held turn ends when the
 predecessor is **withdrawn**, and the ingress attributes that to the key. The
 relay does not yet GOAWAY-drain its inbound connections before retiring the
-old key (M8-C47).
+old key (M8-C47). The owner is not rotated back afterwards, because a retired
+key cannot be restaged. The fixture adopts the successor, and a full re-sign
+on it must leave the owner Ready.
+
+Both gates also run from `scripts/m8-harness-verify.sh`.
 
 ## Failure recovery
 
