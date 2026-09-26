@@ -312,6 +312,21 @@ claim is still unclaimed.
   and waits them out; the rest shorten the bound so the mechanism is cheap to
   measure. A connection whose GET never arrives is ended and its child is gone
   **from the process table**.
+- **The two subscription windows are bounded separately** (task row M8-C12).
+  `[deadlines] connection_subscribe_ms` bounds the connection GET after
+  `initialize`; `[deadlines] session_subscribe_ms` bounds a session GET after
+  `session/new`. Each defaults to the documented ten seconds and is validated
+  to `1..=600000`. They replace a single `subscribe_ms` that bounded both, so
+  a test shortening the session window shortened the connection window with it
+  and, on a loaded machine, the connection's window closed first for a reason
+  unrelated to what the test measured. `subscribe_ms` is now refused as an
+  unknown key rather than silently ignored.
+  `shortening_the_session_window_does_not_shorten_the_connection_window` sends
+  the connection GET deliberately after a 200 ms session window and requires
+  it served; the `m8c3` guard cases "the connection window has its own bound,
+  not the session's" and "a session window has its own bound, not the
+  connection's" restore the shared bound in each direction and redden exactly
+  their declared witnesses.
 - **An expiry is counted once, and that is now falsifiable.** `session_subscribe_expired`
   is a count of **sessions whose subscription window closed**, not of watchdog
   ticks since the first such closure, and `last_expiry_elapsed_us` /
@@ -611,12 +626,15 @@ loss branch is a latency path the connection watchdog already covers. Both are
 kept, both are commented, and neither is claimed as guarded.
 
 **A chunk-3 test was found reddening at random** across the suite: its 300 ms
-subscribe bound applies to the connection GET as well as the session GET, and on
+subscribe bound applied to the connection GET as well as the session GET, and on
 a loaded machine the connection's own window closed first, so the session's
 window never expired and the test failed for a reason unrelated to what it
-measures. The bound is now 5000 ms and the test asserts the connection's window
-did not close, so a recurrence fails by name. 1500 ms was tried first and
-was still too tight under a full five-suite guard run.
+measures. It was first worked around by raising the test's bound to 5000 ms
+(1500 ms was tried first and was still too tight under a full five-suite guard
+run). **M8-C12 has since fixed the cause:** the connection and session windows
+are bounded by separate keys, so the session tests run a 300 ms session window
+beside a connection window at the 600 s ceiling, and still assert that the
+connection's window did not close, so a recurrence fails by name.
 
 ### Not proven
 
@@ -1138,12 +1156,15 @@ loss branch is a latency path the connection watchdog already covers. Both are
 kept, both are commented, and neither is claimed as guarded.
 
 **A chunk-3 test was found reddening at random** across the suite: its 300 ms
-subscribe bound applies to the connection GET as well as the session GET, and on
+subscribe bound applied to the connection GET as well as the session GET, and on
 a loaded machine the connection's own window closed first, so the session's
 window never expired and the test failed for a reason unrelated to what it
-measures. The bound is now 5000 ms and the test asserts the connection's window
-did not close, so a recurrence fails by name. 1500 ms was tried first and
-was still too tight under a full five-suite guard run.
+measures. It was first worked around by raising the test's bound to 5000 ms
+(1500 ms was tried first and was still too tight under a full five-suite guard
+run). **M8-C12 has since fixed the cause:** the connection and session windows
+are bounded by separate keys, so the session tests run a 300 ms session window
+beside a connection window at the 600 s ceiling, and still assert that the
+connection's window did not close, so a recurrence fails by name.
 
 ### Not proven
 
