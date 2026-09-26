@@ -50,7 +50,8 @@ use tunnel_mcp::message::{McpRejection, codes, validate_delete, validate_get, va
 use tunnel_mcp::{McpLimits, McpProfile};
 
 use crate::body::{
-    BoxError, CollectError, ExportBody, StreamFailure, collect_limited, local_error, rejection,
+    BoxError, CollectError, ExportBody, StreamFailure, capacity_refusal, collect_limited,
+    local_error, rejection,
 };
 use crate::config::{HttpBackend, McpConfigError};
 use crate::{ExportCounters, ExportError};
@@ -396,11 +397,7 @@ impl HttpBackendExport {
                     // Counted like any other refusal, so diagnostics and the
                     // gate can see an export that is at its session limit.
                     self.counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    return Ok(local_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "the export is at its session limit",
-                        None,
-                    ));
+                    return Ok(capacity_refusal("the export is at its session limit", None));
                 }
                 _ => {}
             }
