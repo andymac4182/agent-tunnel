@@ -1527,8 +1527,12 @@ refused` lines come after authentication and are not limited:
   in one tenant can silence another tenant's lines. A tenant's budget is kept
   while any of its sessions is live, so reconnecting some devices does not
   reset it; it may be dropped once the tenant has no live session. The relay-wide
-  200 is only an I/O backstop; many tenants flooding at once can reach it,
-  and then lines are dropped for everyone. Within one tenant, a device's
+  200 is only an I/O backstop, reached only when 20 or more tenants are each
+  at their own limit in the same 10 s (the windows are fixed and not aligned,
+  so a tenant can straddle two of its windows and place up to 20 lines in one
+  backstop window; 10 such tenants at the least), and then lines are dropped
+  for everyone. A line refused by a later budget does not lose an earlier
+  budget's `..._suppressed` count; it is reported on the next written line. Within one tenant, a device's
   forged REJECTEDs spend the same budget as its genuine ones.
 
 The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay

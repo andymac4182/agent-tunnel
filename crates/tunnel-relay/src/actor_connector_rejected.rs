@@ -25,8 +25,15 @@
 //!    any of the tenant's sessions is live, so reconnecting some devices does
 //!    not reset it.
 //! 3. The process: [`GLOBAL_REJECTED_LOG_BURST`] lines per window, an I/O
-//!    backstop well above one tenant's burst.  It can only be reached by many
-//!    tenants flooding at once, and then drops lines for everyone.
+//!    backstop well above one tenant's burst.  It is reached only when 20 or
+//!    more tenants are each at their own limit in the same window (because
+//!    the windows are fixed and not aligned, one tenant can place up to twice
+//!    its burst inside one backstop window, so 10 such tenants at the least),
+//!    and then drops lines for everyone.
+//!
+//! A budget that admits a line takes its suppressed count; if a later budget
+//! refuses the line, the earlier ones are rolled back, so every count is
+//! reported on a later written line.
 //!
 //! Each window is [`REJECTED_LOG_WINDOW`] long.  Matched and forged
 //! (unmatched) REJECTEDs spend the same session and tenant budgets.
@@ -96,6 +103,15 @@ impl RejectedLogWindow {
         }
         self.admitted += 1;
         Some(std::mem::take(&mut self.suppressed))
+    }
+
+    /// Undo an [`admit_at`](Self::admit_at) that returned `Some(taken)` when
+    /// a later budget refused the line: the admission is returned and the
+    /// suppressed count it took is restored, so the next written line still
+    /// reports it.
+    pub(super) fn roll_back(&mut self, taken: u64) {
+        self.admitted = self.admitted.saturating_sub(1);
+        self.suppressed = self.suppressed.saturating_add(taken);
     }
 }
 
@@ -220,10 +236,17 @@ pub(super) fn log_connector_rejected_with(
     let Some(session_suppressed) = budgets.session.admit_at(now, SESSION_REJECTED_LOG_BURST) else {
         return false;
     };
+    // A budget that admits takes its suppressed count; if a later budget
+    // refuses, the earlier ones are rolled back so no count is lost.
     let Some(tenant_suppressed) = budgets.tenant.admit_at(now, TENANT_REJECTED_LOG_BURST) else {
+        budgets.session.roll_back(session_suppressed);
         return false;
     };
+    // The backstop is charged last, so its own count is taken only when the
+    // line is written.
     let Some(suppressed) = backstop.admit_at(GLOBAL_KEY, now) else {
+        budgets.tenant.roll_back(tenant_suppressed);
+        budgets.session.roll_back(session_suppressed);
         return false;
     };
     let code_label = code_label(code);
@@ -328,6 +351,104 @@ mod tests {
             noisy.admit_at(later, SESSION_REJECTED_LOG_BURST),
             Some(u64::from(SESSION_REJECTED_LOG_BURST))
         );
+    }
+
+    /// Re-review of PR #207 at `ce7c42af`: a session's suppressed count must
+    /// survive a line that the session admits but its tenant then refuses,
+    /// and be reported on the session's next written line.
+    #[test]
+    fn a_later_budget_refusing_keeps_the_earlier_budgets_suppressed_counts() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_env_filter("info")
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let backstop = RefusalLogLimiter::new(GLOBAL_REJECTED_LOG_BURST, REJECTED_LOG_WINDOW);
+        let tenant_id = Uuid::from_u128(7);
+        let mut tenant = RejectedLogWindow::default();
+        let t0 = Instant::now();
+        let second = std::time::Duration::from_secs(1);
+        let log = |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow, at: Instant| {
+            log_connector_rejected_with(
+                &backstop,
+                RejectedLogBudgets { session, tenant },
+                at,
+                &context(&tenant_id),
+                "GOAWAY",
+                "x",
+            )
+        };
+        let burst = SESSION_REJECTED_LOG_BURST;
+        // Session S fills its window, then has 3 lines suppressed.
+        let mut probe = RejectedLogWindow::default();
+        for _ in 0..burst {
+            assert!(log(&mut probe, &mut tenant, t0));
+        }
+        for _ in 0..3 {
+            assert!(!log(&mut probe, &mut tenant, t0));
+        }
+        // After S's window, other sessions exhaust the tenant's new window.
+        let t1 = t0 + REJECTED_LOG_WINDOW + second;
+        let mut others: Vec<RejectedLogWindow> = (0..TENANT_REJECTED_LOG_BURST / burst)
+            .map(|_| RejectedLogWindow::default())
+            .collect();
+        for other in &mut others {
+            for _ in 0..burst {
+                assert!(log(other, &mut tenant, t1));
+            }
+        }
+        // S's own budget admits, but the tenant refuses: nothing written.
+        let before = captured.text().lines().count();
+        assert!(!log(&mut probe, &mut tenant, t1 + second));
+        assert_eq!(captured.text().lines().count(), before);
+        // Once the tenant's window has passed, S's next line reports all 3.
+        assert!(log(
+            &mut probe,
+            &mut tenant,
+            t1 + REJECTED_LOG_WINDOW + second
+        ));
+        let text = captured.text();
+        let last = text.lines().last().expect("a written line");
+        assert!(
+            last.contains("session_suppressed=3"),
+            "the session's suppressed count was lost: {last}"
+        );
+        assert!(last.contains("tenant_suppressed=1"), "{last}");
+    }
+
+    #[test]
+    fn a_backstop_refusal_keeps_the_session_and_tenant_counts() {
+        let backstop = RefusalLogLimiter::new(1, REJECTED_LOG_WINDOW);
+        let tenant_id = Uuid::from_u128(8);
+        let now = Instant::now();
+        let mut session = RejectedLogWindow {
+            suppressed: 2,
+            ..RejectedLogWindow::default()
+        };
+        let mut tenant = RejectedLogWindow {
+            suppressed: 4,
+            ..RejectedLogWindow::default()
+        };
+        let mut log = |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow| {
+            log_connector_rejected_with(
+                &backstop,
+                RejectedLogBudgets { session, tenant },
+                now,
+                &context(&tenant_id),
+                "GOAWAY",
+                "x",
+            )
+        };
+        // Spend the backstop with other budgets, then refuse this line.
+        assert!(log(
+            &mut RejectedLogWindow::default(),
+            &mut RejectedLogWindow::default()
+        ));
+        assert!(!log(&mut session, &mut tenant));
+        assert_eq!((session.admitted, session.suppressed), (0, 2));
+        assert_eq!((tenant.admitted, tenant.suppressed), (0, 4));
     }
 
     #[test]
