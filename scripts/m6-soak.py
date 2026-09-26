@@ -840,25 +840,39 @@ class McpSessionPool:
         if self.sessions[slot] == session:
             self.sessions[slot] = None
 
-    async def close(self, worker: "Worker") -> None:
-        """DELETE every open session through `worker`'s connection."""
+    async def close(self, worker: "Worker", attempts: int = 3) -> None:
+        """DELETE every open session through `worker`'s connection.
+
+        A reset keep-alive connection or a retryable `503` (for example
+        `CONNECTION_LIMIT`) is retried on a fresh connection, so a session is
+        left to the export's idle expiry only after `attempts` failures.
+        """
         for slot, session in enumerate(self.sessions):
             if session is None:
                 continue
             self.sessions[slot] = None
             key = ""
-            try:
-                status = await worker.delete_mcp_session(session)
+            for attempt in range(attempts):
+                if attempt:
+                    await asyncio.sleep(1.0)
+                try:
+                    status = await worker.delete_mcp_session(session)
+                except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError,
+                        asyncio.IncompleteReadError, ssl.SSLError, ValueError,
+                        IndexError) as error:
+                    await worker.conn.close()
+                    key = f"CONN_{type(error).__name__}"
+                    continue
                 if status in (200, 202, 204):
                     self.deleted += 1
-                elif status == 404:
+                    key = ""
+                    break
+                if status == 404:
                     key = "HTTP_404"  # already gone (crash or idle expiry)
-                else:
-                    key = f"HTTP_{status}"
-            except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError,
-                    asyncio.IncompleteReadError, ssl.SSLError, ValueError, IndexError) as error:
-                await worker.conn.close()
-                key = f"CONN_{type(error).__name__}"
+                    break
+                key = f"HTTP_{status}"
+                if status != 503:
+                    break
             if key:
                 self.delete_failures[key] = self.delete_failures.get(key, 0) + 1
 
@@ -1232,6 +1246,11 @@ async def load(args: argparse.Namespace) -> None:
                 until = time.time() + args.step_seconds
                 await asyncio.gather(*(w.loop_closed(until) for w in workers))
                 if pool is not None:
+                    # Release the step's connections first, then DELETE on a
+                    # fresh one, so a listener connection limit or a reset
+                    # keep-alive does not strand a session (M6-C146).
+                    for w in workers:
+                        await w.conn.close()
                     await pool.close(workers[0])
                 for w in workers:
                     await w.shutdown()
