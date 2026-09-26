@@ -1324,6 +1324,7 @@ mod tests {
                 send_buffer_bytes: None,
                 diagnostics: Some(diagnostics.clone()),
                 listener: None,
+                capacity: ListenerCapacity::default(),
             },
         ));
 
