@@ -1102,17 +1102,12 @@ impl Gate<'_> {
                 // refusal the gate must report **as a refusal**, not hand back
                 // as a status for a caller to describe as a broken route.
                 return Err(HarnessError::Process(format!(
-                    "ACP POST refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
-                     (coincided with an observed freeze: {coincides}); {}; M7-C130 forensics: \
-                     refusal code={} retry_after_ms={}; {}",
+                    "ACP POST refused {} time(s) with not_dispatched (retry budget \
+                     {NOT_DISPATCHED_RETRIES}, coincided with an observed freeze: {coincides}); \
+                     {}; M7-C130 forensics: refusal code={} retry_after_ms={}; {}",
+                    retries + 1,
                     self.freeze.unexplained(),
-                    serde_json::from_str::<Value>(&body)
-                        .ok()
-                        .and_then(|value| value
-                            .pointer("/error/code")
-                            .or_else(|| value.get("code"))
-                            .cloned())
-                        .map_or("-".to_owned(), |code| code.to_string()),
+                    refusal_code(&body),
                     headers
                         .get("x-agent-tunnel-retry-after-ms")
                         .and_then(|value| value.to_str().ok())
@@ -1194,8 +1189,11 @@ impl Gate<'_> {
                         continue;
                     }
                     return Err(HarnessError::Process(format!(
-                        "ACP GET refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
-                         (coincided with an observed freeze: {coincides}); {}",
+                        "ACP GET refused {} time(s) with not_dispatched (code={}, retry \
+                         budget {NOT_DISPATCHED_RETRIES}, coincided with an observed freeze: \
+                         {coincides}); {}",
+                        retries + 1,
+                        refusal_code(&body),
                         self.freeze.unexplained()
                     )));
                 }
@@ -1845,6 +1843,21 @@ impl InvalidationLedger {
         labels.dedup();
         labels
     }
+}
+
+/// The typed `code` of a relay refusal body, for a gate failure message
+/// (task row M7-C161).  Only the code is taken: the body is the relay's own
+/// error envelope, and nothing else from it is printed.  `unparsed` when the
+/// body is not JSON, `absent` when it is JSON with no code.
+fn refusal_code(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return "unparsed".to_owned();
+    };
+    value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .map_or_else(|| "absent".to_owned(), str::to_owned)
 }
 
 /// A payload-free label for each reason.
@@ -4883,6 +4896,22 @@ pub async fn verify() -> Result<AcpClusterEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task row M7-C161: a not_dispatched refusal names its typed code, and
+    /// nothing else from the body.
+    #[test]
+    fn a_refusal_message_names_only_the_typed_code() {
+        assert_eq!(
+            refusal_code(r#"{"code":"CLUSTER_UNREADY","execution":"not_dispatched"}"#),
+            "CLUSTER_UNREADY"
+        );
+        assert_eq!(
+            refusal_code(r#"{"error":{"code":"PEER_UNAVAILABLE"},"execution":"not_dispatched"}"#),
+            "PEER_UNAVAILABLE"
+        );
+        assert_eq!(refusal_code("not json not_dispatched"), "unparsed");
+        assert_eq!(refusal_code(r#"{"execution":"not_dispatched"}"#), "absent");
+    }
 
     /// Evidence from a run where everything this gate asserts held.
     ///
