@@ -1494,6 +1494,8 @@ const FORGED_BINDING: &str = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
 /// How long an explicit interruption may take to reach the consumer before the
 /// gate reports that it did not arrive.
 const INTERRUPTION_BOUND: Duration = Duration::from_secs(45);
+/// How long the same-key control arm watches its stream (M7-C80).
+const CONTROL_ARM_OBSERVATION: Duration = Duration::from_secs(5);
 
 /// How long a live stream is watched after its ingress relay's peer pins are
 /// withdrawn, before the gate records that the withdrawal left it serving.
@@ -2497,7 +2499,17 @@ impl Gate<'_> {
         // the key arm drives it Unready and a readiness excursion that is over
         // by the time the arm returns would otherwise be invisible.
         let mut owner_unready = false;
-        let deadline = Instant::now() + INTERRUPTION_BOUND;
+        // The control arm withdraws nothing, and since M7-C80 a same-key
+        // re-sign re-binds the admission rather than tearing the stream down,
+        // so there is nothing to wait 45 s for: waiting that long only
+        // pushed the case past the gate's 15 s re-sign boundary. It observes
+        // for a short bound; the key arm keeps the full interruption bound.
+        let bound = if spkis.contains(&old_spki) {
+            CONTROL_ARM_OBSERVATION
+        } else {
+            INTERRUPTION_BOUND
+        };
+        let deadline = Instant::now() + bound;
         while Instant::now() < deadline {
             if !matches!(
                 self.cluster.relay(TARGET_NODE)?.membership.readiness(),
