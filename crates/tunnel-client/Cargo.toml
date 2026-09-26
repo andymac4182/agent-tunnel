@@ -61,6 +61,8 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "process
 
 [dev-dependencies]
 tempfile = "3.21"
+# Paused-time tests of the connect-status rate bound (M7-C167 review).
+tokio = { version = "1.47", features = ["test-util"] }
 # M6-C25: signs a genuine X.509 v1 certificate at test time; no v1 generator
 # in the tree can, and no key material is committed.
 ring = "0.17.14"

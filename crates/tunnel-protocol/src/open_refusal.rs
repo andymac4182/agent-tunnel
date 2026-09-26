@@ -130,6 +130,27 @@ pub const ALL: &[OpenRefusal] = &[
     ECHO_CANCELLED,
 ];
 
+/// Every distinct `code` in [`ALL`], in order of first appearance: the fixed
+/// label set of a connector's per-code count of the refusals it sent (task
+/// row M7-C167).  A test holds it equal to the codes of [`ALL`], so every
+/// refusal a connector sends has exactly one label here.
+pub const CODES: [&str; 8] = [
+    "GOAWAY",
+    "RESOURCE_EXHAUSTED",
+    "EXPORT_DENIED",
+    "OPERATION_DENIED",
+    "STREAM_EXISTS",
+    "STALE_REQUEST",
+    "AUTHORIZATION_EXPIRED",
+    "CANCELLED",
+];
+
+/// The position of `refusal`'s code in [`CODES`].
+#[must_use]
+pub fn code_index(refusal: OpenRefusal) -> Option<usize> {
+    CODES.iter().position(|code| *code == refusal.code)
+}
+
 /// The table's code for `code`, if a connector sends it.
 #[must_use]
 pub fn known_code(code: &str) -> Option<&'static str> {
@@ -148,7 +169,22 @@ pub fn reason_category(reason: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALL, known_code, reason_category};
+    use super::{ALL, CODES, code_index, known_code, reason_category};
+
+    #[test]
+    fn codes_are_exactly_the_distinct_codes_of_the_table_in_order() {
+        let mut distinct: Vec<&str> = Vec::new();
+        for refusal in ALL {
+            if !distinct.contains(&refusal.code) {
+                distinct.push(refusal.code);
+            }
+        }
+        assert_eq!(distinct, CODES.to_vec());
+        for refusal in ALL {
+            let index = code_index(*refusal).expect("every table code has a label");
+            assert_eq!(CODES[index], refusal.code);
+        }
+    }
 
     #[test]
     fn every_entry_round_trips_and_reasons_are_distinct() {
