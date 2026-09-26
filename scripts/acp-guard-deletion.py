@@ -1263,8 +1263,8 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 BRIDGE,
-                "        if !target.is_subscribed() && target.created.elapsed() > bound {",
-                "        if false && !target.is_subscribed() && target.created.elapsed() > bound {",
+                "        if !target.is_subscribed() && target.created.elapsed() > connection_bound {",
+                "        if false && !target.is_subscribed() && target.created.elapsed() > connection_bound {",
             )
         ],
         False,
@@ -1277,9 +1277,39 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
                 """                .filter(|target| {
                     !target.is_subscribed()
                         && !target.is_closed()
-                        && target.created.elapsed() > bound
+                        && target.created.elapsed() > session_bound
                 })""",
                 "                .filter(|_target| false)",
+            )
+        ],
+        False,
+    ),
+    # **M8-C12.** One configured `subscribe_ms` used to bound both the
+    # connection window and every session window, so a test that shortened
+    # one shortened the other and a loaded machine closed the wrong window
+    # first.  Each case below restores that shared bound in one direction.
+    # Their witnesses are the tests that set the two windows apart: the
+    # connection GET sent deliberately after a short session window would
+    # have closed, and the session windows measured beside a connection window
+    # at the ceiling.
+    (
+        "the connection window has its own bound, not the session's",
+        [
+            (
+                BRIDGE,
+                "    let connection_bound = connection.connection_subscribe_deadline;",
+                "    let connection_bound = connection.session_subscribe_deadline;",
+            )
+        ],
+        False,
+    ),
+    (
+        "a session window has its own bound, not the connection's",
+        [
+            (
+                BRIDGE,
+                "    let session_bound = connection.session_subscribe_deadline;",
+                "    let session_bound = connection.connection_subscribe_deadline;",
             )
         ],
         False,
@@ -2872,6 +2902,8 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c3', 'a session admits its prompt only once its subscriber arrived'): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport', 'a_prompt_before_its_session_subscriber_is_refused_and_nothing_is_dispatched', 'output_credit_stalls_are_bounded_and_the_event_is_never_skipped', 'the_acp_export_serves_a_whole_conversation_with_nothing_listening', 'the_export_classifies_its_terminals_through_the_terminal_rule', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback', 'the_pinned_clients_own_delete_ends_the_child', 'the_sse_stream_never_carries_a_batch_and_the_refusal_ends_the_transport'}),
     ('m8c3', 'a session subscription that never arrives expires'): frozenset({'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
     ('m8c3', "a session-scoped message goes to its own session's stream"): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport', 'output_credit_stalls_are_bounded_and_the_event_is_never_skipped', 'the_pinned_client_completes_a_v1_conversation_with_a_permission_callback'}),
+    ('m8c3', "the connection window has its own bound, not the session's"): frozenset({'shortening_the_session_window_does_not_shorten_the_connection_window', 'a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured_deadline'}),
+    ('m8c3', "a session window has its own bound, not the connection's"): frozenset({'a_session_whose_subscriber_never_arrives_closes_its_window', 'an_expired_session_window_is_counted_once_not_once_per_watchdog_tick'}),
     ('m8c3', 'a subscription that never arrives expires'): frozenset({'a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured_deadline', 'the_documented_ten_second_deadline_is_the_one_that_elapses'}),
     ('m8c3', 'an SSE event begins with `data: `'): frozenset({'sse::tests::one_message_is_one_data_line_and_a_blank_line'}),
     ('m8c3', 'an SSE event ends with a blank line, not one newline'): frozenset({'sse::tests::one_message_is_one_data_line_and_a_blank_line'}),

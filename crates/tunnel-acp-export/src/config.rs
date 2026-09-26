@@ -40,6 +40,8 @@ pub const MAX_ENV: usize = 64;
 
 /// `docs/acp.md`: "Require the connection GET within 10 seconds of
 /// initialization and a session GET within 10 seconds of its creation."
+/// The default of each window; `connection_subscribe_ms` and
+/// `session_subscribe_ms` override them separately (M8-C12).
 pub const DEFAULT_SUBSCRIBE_DEADLINE_MS: u64 = 10_000;
 /// The ceiling on that deadline.  There is no unlimited value.
 pub const MAX_SUBSCRIBE_DEADLINE_MS: u64 = 600_000;
@@ -119,9 +121,18 @@ pub struct AcpLimitsConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpDeadlinesConfig {
-    /// How long a connection GET has after `initialize`, and a session GET
-    /// after `session/new`.
-    pub subscribe_ms: Option<u64>,
+    /// How long a connection GET has after `initialize`.
+    ///
+    /// **Its own bound, not shared with the session window (task row
+    /// M8-C12).**  One `subscribe_ms` used to bound both, so a test that
+    /// shortened the session window shortened the connection window with it,
+    /// and on a loaded machine the connection's window closed first for a
+    /// reason unrelated to what the test measured.  The two windows are
+    /// different rules with the same documented default, and each is set on
+    /// its own.
+    pub connection_subscribe_ms: Option<u64>,
+    /// How long a session GET has after `session/new`.
+    pub session_subscribe_ms: Option<u64>,
     /// How long a `session/request_permission` may stay outstanding.
     pub permission_ms: Option<u64>,
     /// How long one message may wait for room on a stream's queue before the
@@ -148,7 +159,10 @@ pub struct ValidatedAcp {
     pub limits: AcpLimits,
     pub child: crate::child::ChildConfig,
     pub workspace: PathBuf,
-    pub subscribe_deadline: Duration,
+    /// The connection GET's window after `initialize` (M8-C12).
+    pub connection_subscribe_deadline: Duration,
+    /// A session GET's window after `session/new` (M8-C12).
+    pub session_subscribe_deadline: Duration,
     pub permission_timeout: Duration,
     pub output_stall_deadline: Duration,
     pub session_limit: usize,
@@ -209,13 +223,22 @@ impl AcpExportConfig {
             return Err(AcpConfigError("an acp.agent environment entry is invalid"));
         }
 
-        let subscribe_ms = self
+        let connection_subscribe_ms = self
             .deadlines
-            .subscribe_ms
+            .connection_subscribe_ms
             .unwrap_or(DEFAULT_SUBSCRIBE_DEADLINE_MS);
-        if subscribe_ms == 0 || subscribe_ms > MAX_SUBSCRIBE_DEADLINE_MS {
+        if connection_subscribe_ms == 0 || connection_subscribe_ms > MAX_SUBSCRIBE_DEADLINE_MS {
             return Err(AcpConfigError(
-                "acp.deadlines.subscribe_ms must be 1..=600000",
+                "acp.deadlines.connection_subscribe_ms must be 1..=600000",
+            ));
+        }
+        let session_subscribe_ms = self
+            .deadlines
+            .session_subscribe_ms
+            .unwrap_or(DEFAULT_SUBSCRIBE_DEADLINE_MS);
+        if session_subscribe_ms == 0 || session_subscribe_ms > MAX_SUBSCRIBE_DEADLINE_MS {
+            return Err(AcpConfigError(
+                "acp.deadlines.session_subscribe_ms must be 1..=600000",
             ));
         }
         let permission_ms = self
@@ -251,7 +274,8 @@ impl AcpExportConfig {
                 stderr_cap: DEFAULT_STDERR_CAP,
             },
             workspace: agent.workspace.clone(),
-            subscribe_deadline: Duration::from_millis(subscribe_ms),
+            connection_subscribe_deadline: Duration::from_millis(connection_subscribe_ms),
+            session_subscribe_deadline: Duration::from_millis(session_subscribe_ms),
             permission_timeout: Duration::from_millis(permission_ms),
             output_stall_deadline: Duration::from_millis(output_stall_ms),
             session_limit: DEFAULT_SESSION_LIMIT,
@@ -291,7 +315,14 @@ mod tests {
         assert_eq!(validated.profile, AcpProfile::HttpV1);
         // The documented bound, read back from the validated value rather than
         // asserted against the constant it came from.
-        assert_eq!(validated.subscribe_deadline, Duration::from_secs(10));
+        assert_eq!(
+            validated.connection_subscribe_deadline,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            validated.session_subscribe_deadline,
+            Duration::from_secs(10)
+        );
         assert_eq!(validated.permission_timeout, Duration::from_secs(60));
         assert_eq!(validated.session_limit, 8);
     }
@@ -303,9 +334,15 @@ mod tests {
             valid().replace(COMMAND, "agent"),
             valid().replace(WORKSPACE, "workspace"),
             valid().replace(COMMAND, PARENT_ESCAPE),
-            format!("{}[deadlines]\nsubscribe_ms = 0\n", valid()),
+            format!("{}[deadlines]\nconnection_subscribe_ms = 0\n", valid()),
+            format!("{}[deadlines]\nsession_subscribe_ms = 0\n", valid()),
+            // The retired shared key is refused by name rather than ignored:
+            // a configuration written for it would otherwise silently get the
+            // defaults (M8-C12).
+            format!("{}[deadlines]\nsubscribe_ms = 5000\n", valid()),
             format!("{}[deadlines]\npermission_ms = 0\n", valid()),
-            format!("{}[deadlines]\nsubscribe_ms = 600001\n", valid()),
+            format!("{}[deadlines]\nconnection_subscribe_ms = 600001\n", valid()),
+            format!("{}[deadlines]\nsession_subscribe_ms = 600001\n", valid()),
             format!("{}[limits]\nrequest_body_bytes = 0\n", valid()),
         ] {
             let parsed: Result<AcpExportConfig, _> = toml::from_str(&broken);
@@ -318,6 +355,37 @@ mod tests {
                 "accepted a configuration it must refuse:\n{broken}"
             );
         }
+    }
+
+    /// **M8-C12.** Each subscription window is set on its own: shortening
+    /// one leaves the other at its documented default.
+    #[test]
+    fn the_connection_and_session_subscription_windows_are_bounded_separately() {
+        let text = format!("{}[deadlines]\nsession_subscribe_ms = 300\n", valid());
+        let config: AcpExportConfig = toml::from_str(&text).expect("parses");
+        let validated = config.validate().expect("valid");
+        assert_eq!(
+            validated.session_subscribe_deadline,
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            validated.connection_subscribe_deadline,
+            Duration::from_secs(10),
+            "shortening the session window must not shorten the connection window"
+        );
+
+        let text = format!("{}[deadlines]\nconnection_subscribe_ms = 300\n", valid());
+        let config: AcpExportConfig = toml::from_str(&text).expect("parses");
+        let validated = config.validate().expect("valid");
+        assert_eq!(
+            validated.connection_subscribe_deadline,
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            validated.session_subscribe_deadline,
+            Duration::from_secs(10),
+            "shortening the connection window must not shorten the session window"
+        );
     }
 
     #[test]
