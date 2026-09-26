@@ -5847,6 +5847,8 @@ async fn start_relay(
         http_forward: None,
         redis_restart_continuity_seconds: None,
         metrics_bind: None,
+        listener_max_connections: tunnel_transport::DEFAULT_MAX_CONCURRENT_HANDSHAKES,
+        listener_refusal_margin: tunnel_transport::DEFAULT_REFUSAL_MARGIN,
     };
     let mut options = RelayOptions::new(harness.production_oidc_verifier()?);
     options.node_id = node.node_id.clone();
