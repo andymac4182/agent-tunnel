@@ -1845,6 +1845,21 @@ impl InvalidationLedger {
     }
 }
 
+/// The typed `code` of a relay refusal body, for a gate failure message
+/// (task row M7-C161).  Only the code is taken: the body is the relay's own
+/// error envelope, and nothing else from it is printed.  `unparsed` when the
+/// body is not JSON, `absent` when it is JSON with no code.
+fn refusal_code(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return "unparsed".to_owned();
+    };
+    value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .map_or_else(|| "absent".to_owned(), str::to_owned)
+}
+
 /// A payload-free label for each reason.
 ///
 /// The mapping lives here rather than in the product because the product has
@@ -1852,22 +1867,6 @@ impl InvalidationLedger {
 /// stringified. Naming every variant rather than the two under test is
 /// deliberate — a third reason arriving must show up as itself, not fall into
 /// an "other" bucket that a rule would then read as one of the two.
-/// The typed `code` of a relay refusal body, for a gate failure message
-/// (task row M7-C161).  Only the code is taken: the body is the relay's own
-/// error envelope, and nothing else from it is printed.
-fn refusal_code(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/code")
-                .or_else(|| value.get("code"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unparsed".to_owned())
-}
-
 const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
     match reason {
         PeerInvalidationReason::TrustExpired => "trust_expired",
@@ -4911,10 +4910,7 @@ mod tests {
             "PEER_UNAVAILABLE"
         );
         assert_eq!(refusal_code("not json not_dispatched"), "unparsed");
-        assert_eq!(
-            refusal_code(r#"{"execution":"not_dispatched"}"#),
-            "unparsed"
-        );
+        assert_eq!(refusal_code(r#"{"execution":"not_dispatched"}"#), "absent");
     }
 
     /// Evidence from a run where everything this gate asserts held.
