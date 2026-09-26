@@ -849,9 +849,15 @@ impl Combo {
             self.marker(&tunnel_mcp_fixture::release_marker(name)),
             b"release",
         )
-        .map_err(HarnessError::Io)
+        .map_err(wire::io_during(
+            "write a release marker in the combination's marker directory",
+        ))
     }
 }
+
+/// M3-43: how long a stopped device's export children may take to be
+/// reaped before one counts as having outlived its session.
+const CHILD_REAP_BOUND: Duration = Duration::from_secs(10);
 
 type Client = RunningService<RoleClient, GateClient>;
 
@@ -1294,16 +1300,37 @@ impl Gate<'_> {
             polls += 1;
             let recorded_now = snapshot.http_forward.rotations_recorded;
             let recorded_at_start = *recorded_at_start.get_or_insert(recorded_now);
-            let observations = snapshot
+            // M3-22: the relay-wide ring can evict a live stream's
+            // observation within the rotation that recorded it, when that
+            // rotation observed more than 64 streams; the stream's own
+            // retained observations cannot be evicted by other streams.
+            let own = self
+                .session(&snapshot)
+                .ok()
+                .and_then(|session| {
+                    session
+                        .streams
+                        .iter()
+                        .find(|stream| {
+                            stream.stream_id == stream_id && stream.operation_id == operation_id
+                        })
+                        .and_then(|stream| stream.http.as_ref())
+                })
+                .map(|http| http.rotation_observations.clone())
+                .unwrap_or_default();
+            let mut observations = snapshot
                 .http_forward
                 .rotations
                 .iter()
+                .chain(own.iter())
                 .filter(|observation| {
                     observation.stream_id == stream_id
                         && observation.operation_id == operation_id
                         && observation.rotation > after
                 })
                 .collect::<Vec<_>>();
+            observations.sort_by_key(|observation| observation.rotation);
+            observations.dedup_by_key(|observation| observation.rotation);
             if let Some(observation) = observations
                 .iter()
                 .find(|observation| position(observation))
@@ -2039,6 +2066,7 @@ pub async fn verify() -> Result<McpCloudClientEvidence> {
         request_body_bytes: None,
         response_body_bytes: None,
         deadline_seconds: None,
+        public_url: None,
     };
     let exports = match serve.exports() {
         Ok(exports) => exports,
@@ -2327,7 +2355,19 @@ async fn run(
             combo_evidence.highest_call_stream_id = highest_stream;
             evidence.rotations_completed += rotations;
             gate.stop_device().await?;
-            last_combo(&mut evidence)?.children_running_after_stop = gate.children_running();
+            // M3-43: the export kills its children when the connector stops,
+            // but each supervisor decrements `children_running` only after it
+            // has reaped its child, asynchronously.  Read at once, a child
+            // being reaped counted as one that outlived the session.  Wait,
+            // bounded, for the count to settle; a child that really
+            // survives still fails the check.
+            let settle = Instant::now() + CHILD_REAP_BOUND;
+            let mut running = gate.children_running();
+            while running > 0 && Instant::now() < settle {
+                sleep(POLL).await;
+                running = gate.children_running();
+            }
+            last_combo(&mut evidence)?.children_running_after_stop = running;
         }
         evidence.device_session_stable =
             !evidence.combos.is_empty() && evidence.combos.iter().all(|combo| combo.session_stable);

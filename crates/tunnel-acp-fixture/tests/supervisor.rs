@@ -13,7 +13,6 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -71,16 +70,40 @@ fn config(workspace: &Path) -> SupervisorConfig {
 /// the same shape `tunnel-mcp-fixture`'s process-group tests use.
 fn wrapper_script(dir: &Path) -> PathBuf {
     let script = dir.join("wrapper.sh");
-    std::fs::write(
+    write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n/bin/sleep 300 &\necho $! > grandchild.pid\nexec \"{}\" \"$@\"\n",
             fixture_binary().display()
         ),
-    )
-    .expect("script");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     script
+}
+
+/// Write an executable script that no descriptor of **this** process has
+/// ever held open for writing (task row M3-35).
+///
+/// Tests in one binary run on parallel threads, and each spawn briefly
+/// shares this process's descriptor table with a child that has not yet
+/// `exec`ed.  A script written here with `std::fs::write` can therefore still
+/// be open for writing in such a child when another thread `exec`s it, and
+/// Linux refuses that `exec` with `ETXTBSY` -- seen once on hosted
+/// `ubuntu-latest` as `spawn: SpawnError`.  So the text is written to a
+/// side file and `/bin/cp` creates the script: the only writer of the
+/// script's inode is the `cp` process, which exits before this returns.
+fn write_executable(script: &Path, text: &str) {
+    let source = script.with_extension("src");
+    std::fs::write(&source, text).expect("script source");
+    for (program, args) in [
+        ("/bin/cp", vec![source.as_os_str(), script.as_os_str()]),
+        ("/bin/chmod", vec!["755".as_ref(), script.as_os_str()]),
+    ] {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .expect("run a script writer");
+        assert!(status.success(), "{program} failed");
+    }
 }
 
 /// Read the process table, not a handle. `kill -0` asks the kernel whether a

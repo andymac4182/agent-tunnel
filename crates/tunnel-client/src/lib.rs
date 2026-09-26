@@ -138,6 +138,22 @@ pub(crate) mod test_hooks {
         pub(crate) block_once: AtomicBool,
         pub(crate) entered: Notify,
         pub(crate) release: Notify,
+        /// An optional one-shot hook the M2 session loop runs inside its
+        /// deadline tick, immediately before it retries pending
+        /// `STREAM_FORGET` barriers (task row M7-C84).  It lets a test force
+        /// a stop to land inside that tick body on the real loop.
+        pub(crate) forget_tick: std::sync::Mutex<Option<ForgetTickHook>>,
+    }
+
+    /// Seeds actor state; the argument is the M2 actor as `dyn Any`.
+    pub(crate) type ForgetTickSeed = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
+
+    /// Runs its seed, then signals `entered` and waits for `release` before
+    /// the tick continues.
+    pub(crate) struct ForgetTickHook {
+        pub(crate) seed: ForgetTickSeed,
+        pub(crate) entered: std::sync::Arc<Notify>,
+        pub(crate) release: std::sync::Arc<Notify>,
     }
 }
 
@@ -1534,7 +1550,10 @@ impl SessionActor {
             | ControlMessage::Rejected(_)
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
-            | ControlMessage::AuthorizationChallenge(_) => Ok(()),
+            | ControlMessage::AuthorizationChallenge(_)
+            // M3-16: the M1 profile serves no MCP export, so there is no
+            // session to end; the message is advisory and ignored.
+            | ControlMessage::PrincipalSessionsEnd(_) => Ok(()),
             ControlMessage::ResultStatus(_)
             | ControlMessage::RotateRequest(_)
             | ControlMessage::RotatePrepare(_)
@@ -2518,7 +2537,12 @@ impl ClientError {
 
     #[must_use]
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::HandshakeTimeout)
+        // An exhausted OPEN retention ends only the session that holds it; a
+        // fresh session starts with an empty journal (task row M7-C95).
+        matches!(
+            self,
+            Self::Transport { .. } | Self::HandshakeTimeout | Self::OpenRetentionFull
+        )
     }
 
     fn safe_message(&self) -> String {

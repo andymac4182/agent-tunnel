@@ -4562,6 +4562,7 @@ async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
         "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total",
         "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"}",
         "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"hold_full\"}",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"revocation\"}",
         "tunnel_relay_rotation_freeze_hold_cancelled_total",
         "tunnel_relay_rotation_freeze_hold_max_wait_ms",
     ];

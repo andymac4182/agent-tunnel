@@ -15,6 +15,7 @@ pub mod cluster_transport;
 /// The gate-4 owner-relay fixture hold (harness only, gate 5).
 pub mod http_relay_hold;
 pub mod m2_acceptance;
+pub mod mcp_demo_client;
 pub mod peer;
 pub mod peer_fragmentation;
 pub mod peer_frames;

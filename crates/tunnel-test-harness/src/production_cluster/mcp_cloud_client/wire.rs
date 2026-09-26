@@ -346,6 +346,15 @@ pub(super) fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Task row M3-36: an I/O error that names the operation that failed and
+/// the class of path it touched, never the path itself.  A bare
+/// `HarnessError::Io` ended one suite run with only `No such file or
+/// directory (os error 2)`, and the `crash` case has two sites that can
+/// raise it.
+pub(super) fn io_during(operation: &'static str) -> impl FnOnce(std::io::Error) -> HarnessError {
+    move |error| HarnessError::Process(format!("I/O error during {operation}: {error}"))
+}
+
 /// A bounded SSE reconnection policy: three attempts 250 ms apart.
 #[derive(Debug)]
 pub(super) struct BoundedRetry;
@@ -1184,7 +1193,9 @@ impl HttpBackend {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(HarnessError::Io)?;
+            .map_err(io_during(
+                "spawn the synthetic MCP HTTP backend (tunnel-mcp-fixture binary)",
+            ))?;
         if let Some(pid) = child.id() {
             self.pids.push(pid);
         }
@@ -1232,6 +1243,47 @@ impl HttpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M3-36: each I/O site of the `crash` case names itself.
+    #[tokio::test]
+    async fn crash_case_io_errors_name_their_operation() {
+        let missing = tempfile::tempdir().expect("tempdir");
+        let marker = missing.path().join("gone").join("release-x");
+        let error = std::fs::write(&marker, b"release")
+            .map_err(io_during(
+                "write a release marker in the combination's marker directory",
+            ))
+            .expect_err("the marker directory does not exist");
+        let text = error.to_string();
+        assert!(
+            text.contains("write a release marker") && text.contains("os error 2"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(missing.path().to_str().expect("utf-8")),
+            "no path: {text}"
+        );
+
+        let mut backend = HttpBackend {
+            binary: missing.path().join("no-such-fixture"),
+            marker_dir: missing.path().to_owned(),
+            legacy: true,
+            address: "127.0.0.1:0".parse().expect("address"),
+            child: None,
+            starts: 0,
+            pids: Vec::new(),
+        };
+        let error = backend
+            .spawn(0)
+            .await
+            .expect_err("the binary does not exist");
+        assert!(
+            error
+                .to_string()
+                .contains("spawn the synthetic MCP HTTP backend"),
+            "{error}"
+        );
+    }
 
     fn event(data: &str) -> std::result::Result<Sse, SseError> {
         Ok(Sse {

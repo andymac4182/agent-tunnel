@@ -283,11 +283,12 @@ fn render_rotation_freeze_hold(out: &mut Writer, hold: &crate::RotationFreezeHol
     out.family(
         "tunnel_relay_rotation_freeze_hold_refused_total",
         "counter",
-        "OPENs refused ROTATION_FREEZE by the hold: held past its bound, or never held because the hold was full.",
+        "OPENs the hold refused, not_dispatched: ROTATION_FREEZE when held past its bound or never held because the hold was full; revocation when the consumer's grant was revoked while held.",
     );
     for (reason, count) in [
         ("after_bound", hold.refused_after_bound),
         ("hold_full", hold.refused_hold_full),
+        ("revocation", hold.refused_on_revocation),
     ] {
         out.sample(
             "tunnel_relay_rotation_freeze_hold_refused_total",

@@ -150,7 +150,7 @@ require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-
   "m6c31-catalog ok nonce=" "serve_restarts=0 grant_pickup_ms=" \
   "grant_pickup_attempts=1" "revoke_grant_attempts=1" \
   "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true" \
-  "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1 freeze_hold_series=12"
+  "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1 freeze_hold_series=13"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi

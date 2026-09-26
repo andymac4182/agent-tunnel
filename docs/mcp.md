@@ -377,12 +377,11 @@ session that never existed.
   but the colliding JSON-RPC IDs and progress tokens of the `correlation` case
   still run on the stdio exports only, where each session has its own child.
   So shared-process *correlation* remains unproven here (M3-13).
-- **Ending a device-side session on revocation.** Revocation makes the session
-  unreachable but does not end it, so its child holds a `max_children` slot
-  for as long as the device session lives, or until `session_idle_seconds`
-  (M3-16 in [tasks.md](tasks.md)). It no longer outlives the device session:
-  the export ends every session it holds when the connector's handler registry
-  goes away.
+- ~~**Ending a device-side session on revocation.**~~ Closed by M3-16 on
+  branch `feat-mcp-demo` (applied by default pending owner confirmation,
+  2026-09-25): see [Revocation ends the session (M3-16)](#revocation-ends-the-session-m3-16).
+  The gate's `revocation` case now also requires the revoked principal's
+  device-side session to end within 5 s.
 
 ## Off-the-shelf clients (M3-17)
 
@@ -441,3 +440,124 @@ Also observed, but not recorded as rows:
 - Rotation, crash and isolation with these SDKs. Those stay proven with rmcp by the M3 gates.
 - Sampling, elicitation and other server-to-client requests through an SDK client. The conformance suite drives the reference server's `tools-call-sampling` and `tools-call-elicitation` through the relay, and both pass. No SDK client case does.
 - Hosted CI beyond one run. The script runs in the `m3-acceptance` job; hosted run 36197864485 passed it (76 SDK cases, conformance 30/31 through the relay) at `2242b33`.
+
+## The demo path, discovery and revocation (branch `feat-mcp-demo`)
+
+Recorded 2026-09-26. [docs/demo/mcp.md](demo/mcp.md) is the runnable recipe.
+
+### Demo (M3-39)
+
+`scripts/demo-mcp.sh` brings up one relay and one device from the shipped
+binaries and examples. It uses a throwaway PKI and identity issuer and its
+own TLS Redis. It exports `tunnel-mcp-fixture` over stdio, and drives it
+through the relay's public route with the pinned rmcp 3.4.0 client
+(`tunnel-test-harness mcp-demo-client`). The client covers discovery,
+lifecycle, tools (text and image), resources (text and blob), prompts, a
+subscription and its update, and progress and log notifications. Both
+profiles pass. The client is the harness binary, not a shipped one, and no
+hosted agent has been connected (M3-40).
+
+### Fixture additions (part of M3-13)
+
+`tunnel-mcp-fixture` now advertises `resources` (with `subscribe`) and
+`prompts`:
+
+- two resources: `fixture://synthetic/readme.txt` (text) and
+  `fixture://synthetic/pixel.png` (blob);
+- one prompt: `greet`, with a required `name`;
+- a `touch` tool, which sends `notifications/resources/updated` to a
+  2025-11-25 subscriber;
+- a 2026-07-28 `subscriptions/listen` handler, which reports each accepted
+  URI once and then ends the subscription cleanly.
+
+Only the stdio export, driven by the demo client, exercises these. Sampling,
+elicitation and MRTR input requests are still unexercised, and so is the
+Streamable HTTP export (M3-13 stays open).
+
+### Protected-resource discovery (M3-11)
+
+The consumer listener serves RFC 9728 metadata at
+`GET /.well-known/oauth-protected-resource/v1/devices/{device}/services/{service}/http/{path}`.
+The metadata holds:
+
+- `resource`: the endpoint URL;
+- `authorization_servers`: the relay's `oidc_issuer`;
+- `scopes_supported`: `http:invoke`, plus any scope every token must carry;
+- `bearer_methods_supported`: `["header"]`.
+
+**Set `public_url` in production.** Without it, the resource origin comes from the request's own `Host` or `:authority`. That is correct only when clients reach the relay directly at the name they use. Behind a proxy or load balancer that rewrites the authority, the metadata would name the wrong resource, and clients would refuse it.
+
+The route is unauthenticated. It serves the same document for any
+well-formed device and service, so it does not reveal whether a device,
+service or grant exists. The host in `resource` comes from
+`[http_forward] public_url` (`https://host[:port]`) when that is set.
+Otherwise it comes from the request's own authority.
+
+Every credential refusal on an `http-forward` route carries a
+`WWW-Authenticate: Bearer` challenge with `resource_metadata` and `scope`.
+The `scope` is the same set as `scopes_supported`, space-separated:
+
+- A request with no token gets no `error` parameter.
+- A token refused for its signature, claims, key or identity gets
+  `error="invalid_token"`.
+- A token without the route's scope gets `403` with
+  `error="insufficient_scope"`.
+
+A `503` for the relay's own fault, and a refusal for a missing grant, carry
+no challenge.
+
+Token validation itself is unchanged: issuer, audience, signature, expiry,
+scope, catalog identity and grant, on the ingress and again on the owner.
+Audiences are still the configured `oidc_audience` list. An issuer that puts
+the RFC 8707 `resource` value into `aud` therefore needs that URL listed
+there (M3-42). Browser `Origin` is still refused on both profiles.
+
+Evidence:
+
+- `http::mcp_authorization_tests`, over the real consumer router;
+- `http::forward::authorization::tests`;
+- the demo, whose client performs the discovery before any MCP traffic.
+
+### Revocation ends the session (M3-16)
+
+This is option (c) from the row, applied by default pending owner
+confirmation (2026-09-25).
+
+The owner relay watches each consumer it admits to a session-keyed export
+(it sends the message only to connectors that advertised
+`principal-sessions-end-v1`; see [protocol.md](protocol.md#control-messages)
+for that gate, the read cap and jitter, and the refusal of held requests):
+the `mcp-2025-11-25` profile, the only one that carries the principal
+binding. It keeps at most 64 per device session and re-reads each one's grant
+about once a second. When the grant is revoked or expired, or no longer
+allows `http:invoke`, the owner sends the device `PRINCIPAL_SESSIONS_END`
+(see [protocol.md](protocol.md#control-messages)), naming the service and the
+opaque binding.
+
+The connector then ends that binding's sessions on that export:
+
+- a stdio session is removed and its child's process group killed, as a
+  `DELETE` would;
+- a Streamable HTTP export forgets the backend sessions it bound to that
+  binding.
+
+Other principals' sessions are untouched, and the device still learns no
+identity. The export counts these in `sessions_revoked`.
+
+Evidence:
+
+- `principal_binding` tests in `tunnel-mcp-fixture`, for both export kinds;
+- the protocol codec tests;
+- `verify-m3-mcp-isolation`'s `revocation` case, which requires the device
+  session to end within 5 s.
+
+Residuals are in M3-41:
+
+- the message is not journaled, so one lost with its control socket leaves
+  the sessions to idle expiry;
+- a request already in flight at revocation is withdrawn by the relay with
+  `502 HTTP_STREAM_INTERRUPTED`, `execution: unknown`. That outcome is
+  truthful but not revocation-specific (M3-44);
+- no upstream `DELETE` is sent to a Streamable HTTP backend;
+- M5-C05 does not use the message yet.
+

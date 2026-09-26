@@ -49,7 +49,8 @@ m6c24-metrics ok nonce=8f82edaecd114c739a05c9bc1fa76ac2 series=27 bytes=5273 ses
 The nonce differs per run; `series` and `bytes` change only when the metrics
 set does.
 
-`freeze_hold_series=12` is the number of rotation-freeze hold series the
+The line above predates the `revocation` reason (M3-16); a run now prints
+`freeze_hold_series=13`, which is the number of rotation-freeze hold series the
 scrape was required to contain (every one present; all zero here because no
 data rotation froze during this short session). The test also fails if the
 scrape contains the echo payload, the refused subject, either token, the
@@ -80,13 +81,14 @@ The series, all prefixed `tunnel_relay_`
 | `rotation_freeze_hold_admitted_total` | Held OPENs admitted once the hold ended |
 | `rotation_freeze_hold_released_total{outcome}` | Held OPENs released, by `commit`, `abort`, `recovery` or `session_loss` |
 | `rotation_freeze_hold_released_with_deferred_writes_total` | Releases that found deferred writes still queued |
-| `rotation_freeze_hold_refused_total{reason}` | Refused `ROTATION_FREEZE`: `after_bound` (held past the bound) or `hold_full` |
+| `rotation_freeze_hold_refused_total{reason}` | Refused `ROTATION_FREEZE`: `after_bound` (held past the bound) or `hold_full`; or `revocation`: the consumer's grant was revoked while held (M3-16) |
 | `rotation_freeze_hold_cancelled_total` | Held OPENs whose consumer went away |
 | `rotation_freeze_hold_max_wait_ms` (gauge) | Longest time any OPEN spent in the hold |
 | `consumer_refusals_total{route,stage="rotation_freeze"}` | Requests this relay, as owner, answered `ROTATION_FREEZE`, by route (`echo`, `stream`, `http-forward`, `fs`) |
 
 Check: `held_total` equals `current` plus every `released_total`,
-`refused_total{reason="after_bound"}` and `cancelled_total`. A scrape where
+`refused_total{reason="after_bound"}`, `refused_total{reason="revocation"}`
+and `cancelled_total`. A scrape where
 it does not is a relay defect.
 
 ## 4. Failure recovery

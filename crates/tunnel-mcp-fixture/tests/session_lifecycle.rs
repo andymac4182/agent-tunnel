@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -276,16 +275,40 @@ async fn a_duplicate_in_flight_progress_token_is_rejected() {
 
 fn wrapper_script(dir: &Path) -> PathBuf {
     let script = dir.join("wrapper.sh");
-    std::fs::write(
+    write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n/bin/sleep 300 &\necho $! > grandchild.pid\nexec \"{}\" \"$@\"\n",
             fixture_binary().display()
         ),
-    )
-    .expect("script");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     script
+}
+
+/// Write an executable script that no descriptor of **this** process has
+/// ever held open for writing (task row M3-35).
+///
+/// Tests in one binary run on parallel threads, and each spawn briefly
+/// shares this process's descriptor table with a child that has not yet
+/// `exec`ed.  A script written here with `std::fs::write` can therefore still
+/// be open for writing in such a child when another thread `exec`s it, and
+/// Linux refuses that `exec` with `ETXTBSY` -- seen once on hosted
+/// `ubuntu-latest` as `spawn: SpawnError`.  So the text is written to a
+/// side file and `/bin/cp` creates the script: the only writer of the
+/// script's inode is the `cp` process, which exits before this returns.
+fn write_executable(script: &Path, text: &str) {
+    let source = script.with_extension("src");
+    std::fs::write(&source, text).expect("script source");
+    for (program, args) in [
+        ("/bin/cp", vec![source.as_os_str(), script.as_os_str()]),
+        ("/bin/chmod", vec!["755".as_ref(), script.as_os_str()]),
+    ] {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .expect("run a script writer");
+        assert!(status.success(), "{program} failed");
+    }
 }
 
 fn alive(pid: &str) -> bool {
@@ -346,7 +369,29 @@ async fn wrapper_descendants_die_with_a_completed_request() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = body_bytes(response).await;
     grandchild_is_reaped(workspace.path()).await;
-    assert!(export.diagnostics().child_group_kills >= 1);
+    // M3-35: the grandchild dies from the supervisor's *pre-reap* group
+    // signal, which is not counted; `child_group_kills` counts only the
+    // post-reap one, sent after `child.wait()` returns.  Reading the counter
+    // the moment the grandchild is gone raced that second signal (the
+    // M5-C18 window), so wait for the supervisor itself, bounded.
+    assert!(
+        group_kill_counted(&export).await,
+        "the supervisor never counted its post-reap group kill"
+    );
+}
+
+/// Wait, bounded, until the export's supervisor has counted a post-reap
+/// group kill.  The count is the supervisor's last step before its child is
+/// reported gone, so a slow supervisor is waited for and a missing kill is
+/// still red.
+async fn group_kill_counted(export: &tunnel_mcp_export::McpExport) -> bool {
+    for _ in 0..1_000 {
+        if export.diagnostics().child_group_kills >= 1 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
