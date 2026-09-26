@@ -1059,6 +1059,31 @@ impl ServeConfig {
         Ok(())
     }
 
+    /// File descriptors the two public listeners alone can hold at once
+    /// (task row M6-C155): each serves `listener_max_connections` and
+    /// refuses up to `listener_refusal_margin` more.  Redis, peer, metrics
+    /// and file descriptors come on top, so this is a floor, not a budget.
+    pub fn listener_descriptor_demand(&self) -> u64 {
+        2 * (self.listener_max_connections as u64 + self.listener_refusal_margin as u64)
+    }
+
+    /// The startup warning for a soft `RLIMIT_NOFILE` (`None`: unlimited)
+    /// below [`Self::listener_descriptor_demand`], or `None` when it fits.
+    /// Payload-free: numbers and fixed words only.
+    pub fn descriptor_limit_warning(&self, soft_limit: Option<u64>) -> Option<String> {
+        let demand = self.listener_descriptor_demand();
+        let soft = soft_limit?;
+        (soft < demand).then(|| {
+            format!(
+                "tunnel-relay warning: open-file soft limit {soft} is below the {demand} descriptors \
+                 the public listeners can hold (2 x (listener_max_connections {} + \
+                 listener_refusal_margin {})); accept will fail with EMFILE under load. \
+                 Raise it (ulimit -n, LimitNOFILE=) or lower listener_max_connections.",
+                self.listener_max_connections, self.listener_refusal_margin
+            )
+        })
+    }
+
     /// The public listeners' connection limit and over-capacity refusal
     /// (task row M6-C153), applied to the consumer and device listeners
     /// separately.
@@ -1633,6 +1658,32 @@ consumer_tls_private_key = "consumer-key.pem"
             "{}\nnode_id = \"relay-a\"\n\n[cluster]\ndeployment_id = \"deployment-a\"\npeer_bind = \"127.0.0.1:8443\"\npeer_tls_cert_chain = \"peer-cert.pem\"\npeer_tls_private_key = \"peer-key.pem\"\npeer_tls_client_ca = \"peer-ca.pem\"\nmembership_signer_public_key_path = \"membership-signer.pub\"\nmembership_signer_trust_path = \"membership-trust.pem\"\ncheckpoint_authority_endpoint = \"https://checkpoint.example.test/v1/checkpoint\"\ncheckpoint_authority_trust_path = \"checkpoint-ca.pem\"\nmembership_version_state_path = \"state/membership-version-state.json\"\n\n[cluster.endpoint_policy]\nallowed_ports = [8443]\nrequire_private_ip = true\n",
             valid_toml()
         )
+    }
+
+    /// M6-C155: the startup check warns when the soft descriptor limit is
+    /// below what the two listeners can hold, and never when it fits or is
+    /// unlimited.
+    #[test]
+    fn descriptor_limit_warning_follows_listener_capacity() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid");
+        assert_eq!(config.listener_descriptor_demand(), 160);
+        assert!(config.descriptor_limit_warning(None).is_none());
+        assert!(config.descriptor_limit_warning(Some(160)).is_none());
+        assert!(config.descriptor_limit_warning(Some(1_048_576)).is_none());
+        let warning = config
+            .descriptor_limit_warning(Some(159))
+            .expect("a limit below demand warns");
+        assert!(
+            warning.contains("159") && warning.contains("160"),
+            "{warning}"
+        );
+        let large = ServeConfig::parse(&format!(
+            "listener_max_connections = 4096\n{}",
+            valid_toml()
+        ))
+        .expect("large");
+        assert_eq!(large.listener_descriptor_demand(), 8_224);
+        assert!(large.descriptor_limit_warning(Some(256)).is_some());
     }
 
     /// M6-C153: the listener limit and refusal margin are configurable,
