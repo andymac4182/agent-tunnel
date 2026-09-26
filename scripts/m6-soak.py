@@ -59,7 +59,8 @@ ISSUER = "https://issuer.m6-03-soak.invalid/"
 AUDIENCE = "agent-tunnel"
 CANARY = b"m1-device-a-synthetic"
 MCP_PROFILE = "mcp-2025-11-25"
-REDIS_IMAGE = "redis:8.4.0-alpine"
+REDIS_IMAGE = ("redis:8.4.0-alpine@sha256:"
+               "6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798")
 
 
 # ---------------------------------------------------------------- utilities
@@ -147,6 +148,50 @@ def percentile(values: list[float], pct: float) -> float | None:
     return ordered[index]
 
 
+# ------------------------------------------------------ child processes
+
+def _child_setup() -> None:
+    """Runs in each child before exec: on Linux, ask for SIGTERM when the
+    harness dies (the parent-death signal survives exec).  Children are also
+    started in their own session (process group), which `stop_group` kills."""
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        except OSError:
+            pass
+
+
+def spawn(args: list[str], **kwargs) -> subprocess.Popen:
+    """Start a harness child in its own process group.  Call only from the
+    main thread: the Linux parent-death signal follows the spawning thread."""
+    assert threading.current_thread() is threading.main_thread(), "spawn from the main thread"
+    return subprocess.Popen(args, start_new_session=True, preexec_fn=_child_setup, **kwargs)
+
+
+def stop_group(proc: subprocess.Popen | None, timeout: float = 15) -> None:
+    """SIGTERM the child's whole process group, then SIGKILL it if it lingers."""
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGCONT)
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 # ------------------------------------------------------- the TLS forwarder
 
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -217,6 +262,7 @@ class Stack:
         self.rotation = rotation
         self.relay_extra = relay_extra
         self.relay: subprocess.Popen | None = None
+        self.relay_procs: list[subprocess.Popen] = []
         self.forwarder: subprocess.Popen | None = None
         self.devices: dict[str, dict] = {}
         self.users: dict[str, dict] = {}
@@ -282,7 +328,7 @@ class Stack:
         log = (self.run_dir / "forwarder.log").open("w")
         log.write(f"nonce={self.nonce} head={head_sha()} forwarder\n")
         log.flush()
-        self.forwarder = subprocess.Popen(
+        self.forwarder = spawn(
             [sys.executable, __file__, "forwarder", "--cert", str(self.work / "server-cert.pem"),
              "--key", str(self.work / "server-key.pem"), "--port", str(self.forwarder_port),
              "--upstream", f"{self.redis[0]}:{self.redis[1]}"],
@@ -338,10 +384,11 @@ class Stack:
         log.write(f"nonce={self.nonce} head={head_sha()} relay start={self.relay_starts}\n")
         log.flush()
         started = time.time()
-        self.relay = subprocess.Popen(
+        self.relay = spawn(
             ["nice", "-n", "10", str(self.bins / "tunnel-relay"), "serve", "--config",
              str(self.relay_config)], stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, env={**os.environ, "RUST_LOG": "warn"})
+        self.relay_procs.append(self.relay)
         if wait:
             deadline = time.time() + 30
             path = self.run_dir / f"relay-{self.relay_starts}.log"
@@ -513,15 +560,21 @@ class Stack:
     # -- devices
     def start_device(self, name: str) -> None:
         dev = self.devices[name]
+        previous = dev.get("proc")
+        if previous is not None and previous.poll() is None:
+            # Never orphan a live device by overwriting its handle.
+            self.event("device-still-running", device=name, pid=previous.pid)
+            stop_group(previous, timeout=10)
         dev["starts"] += 1
         out = (self.run_dir / f"device-{name}-{dev['starts']}.jsonl").open("w")
         err = (self.run_dir / f"device-{name}-{dev['starts']}.stderr.log").open("w")
         err.write(f"nonce={self.nonce} head={head_sha()} device={name} start={dev['starts']}\n")
         err.flush()
-        dev["proc"] = subprocess.Popen(
+        dev["proc"] = spawn(
             ["nice", "-n", "10", str(self.bins / "tunnel-client"), "connect", "--config",
              str(dev["config"]), "--json"], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
             env={**os.environ, "RUST_LOG": "warn"})
+        dev.setdefault("all_procs", []).append(dev["proc"])
         self.event("device-start", device=name, start=dev["starts"], pid=dev["proc"].pid)
 
     def device_sessions(self, name: str) -> tuple[list[str], int, list[dict]]:
@@ -544,25 +597,14 @@ class Stack:
 
     # -- teardown
     def close(self) -> None:
+        # Whole process groups, so a device's MCP children and anything a
+        # killed relay left behind go too; each group is signalled even when
+        # its leader already exited.
         for dev in self.devices.values():
-            proc = dev.get("proc")
-            if proc and proc.poll() is None:
-                try:
-                    proc.send_signal(signal.SIGCONT)
-                except OSError:
-                    pass
-                proc.terminate()
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        for proc in (self.relay, self.forwarder):
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            for proc in dev.get("all_procs", []):
+                stop_group(proc)
+        for proc in self.relay_procs + [self.forwarder]:
+            stop_group(proc)
         try:
             removed = delete_namespace(self.redis[0], self.redis[1], self.namespace)
             self.event("namespace-deleted", namespace=self.namespace, keys=removed)
@@ -1223,17 +1265,21 @@ class DedicatedRedis:
         run(timeout=600, args=["docker", "run", "-d", "--rm", "--name", self.name, "--label",
              f"m6-03-soak={nonce}", "-p", "127.0.0.1::6379", REDIS_IMAGE,
              "redis-server", "--appendonly", "yes", "--appendfsync", "always"])
-        port = run(["docker", "port", self.name, "6379/tcp"]).stdout.decode().strip().splitlines()[0]
-        self.port = int(port.rsplit(":", 1)[1])
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                if b"PONG" in resp("127.0.0.1", self.port, ["PING"]):
-                    return
-            except OSError:
-                pass
-            time.sleep(0.2)
-        raise SystemExit("dedicated Redis did not answer PING")
+        try:  # a container that never answers is removed, not left behind
+            port = run(["docker", "port", self.name, "6379/tcp"]).stdout.decode().strip().splitlines()[0]
+            self.port = int(port.rsplit(":", 1)[1])
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                try:
+                    if b"PONG" in resp("127.0.0.1", self.port, ["PING"]):
+                        return
+                except OSError:
+                    pass
+                time.sleep(0.2)
+            raise SystemExit("dedicated Redis did not answer PING")
+        except BaseException:
+            self.remove()
+            raise
 
     def pause(self) -> None:
         run(["docker", "pause", self.name], timeout=300)
@@ -1251,12 +1297,14 @@ async def chaos(args: argparse.Namespace) -> None:
     # --dedicated-redis (the default since Docker Desktop was unavailable on
     # 2026-09-26), every other fault runs against the shared Redis under a
     # unique namespace, and the pause is recorded as not run.
-    redis = DedicatedRedis(nonce) if args.dedicated_redis else None
+    redis = None
     stack = None
     rec = Recorder(run_dir / "requests.csv", nonce)
     faults = []
     sampler = None
     try:
+        if args.dedicated_redis:
+            redis = DedicatedRedis(nonce)
         if redis:
             stack = base_stack(args, run_dir, nonce, "m6-03-chaos",
                                redis=("127.0.0.1", redis.port),
@@ -1309,7 +1357,8 @@ async def chaos(args: argparse.Namespace) -> None:
             try:
                 code = await asyncio.to_thread(dev["proc"].wait, 30)
             except subprocess.TimeoutExpired:
-                code = "no-exit-within-30s"
+                code = "no-exit-within-30s; SIGKILLed"
+                stop_group(dev["proc"], timeout=0)
             exited = time.time()
             await asyncio.sleep(restart_after)
             restarted = time.time()
@@ -1364,7 +1413,7 @@ async def chaos(args: argparse.Namespace) -> None:
             stack.event("fault", fault=label)
             stack.relay.send_signal(signal.SIGKILL)
             await asyncio.to_thread(stack.relay.wait, 30)
-            restart_s = await asyncio.to_thread(stack.start_relay, True)
+            restart_s = stack.start_relay(True)  # main thread: see spawn()
             listening = time.time()
             rec_s = await measure_recovery(label, listening)
             faults.append({"fault": label, "relay_restart_to_listening_s": round(restart_s, 3),

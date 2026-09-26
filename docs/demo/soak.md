@@ -38,8 +38,11 @@ Actions -> `m6-soak` -> Run workflow.
   device session.
 * `chaos`: a `faults` list with recovery times. `integrity_mismatches: 0`, and
   `mcp_backend_tool_invocations` equal to `mcp_tool_calls_ok_seen_by_consumer + 1`.
-* `flood`: on the current build, `device_session_ends` is non-empty
-  (`RESOURCE_EXHAUSTED`). That is the open defect M6-C120, not a harness fault.
+* `flood`: on `6830ba79`, the build these measurements used, `device_session_ends` is non-empty
+  (`RESOURCE_EXHAUSTED`). That is defect M6-C120, not a harness fault. With the
+  fix tracked in M6-C140/C141 (PR #182), expect an empty list and capacity
+  refusals (`ADMISSION_LIMIT`/`STREAM_LIMIT`) instead. Compare
+  `device_session_ends` with `device_exit_code: null`.
 
 ## Recovery
 
@@ -47,7 +50,17 @@ Actions -> `m6-soak` -> Run workflow.
   tail. A `stage=connection_establishment` failure means Redis or the
   forwarder is not reachable.
 * Interrupted runs: SIGTERM or SIGHUP to the driver stops its children and
-  deletes its namespace. After a SIGKILL, remove stray `tunnel-relay serve` or
-  `tunnel-client connect` processes whose `--config` path is under the run
-  directory, and delete the namespace's keys
-  (`tunnel-catalog:<namespace>:*`) by hand.
+  deletes its namespace. Each child runs in its own process group, which is
+  killed as a group. On Linux, the children also get SIGTERM when the driver dies.
+  After a SIGKILL of the driver on macOS, remove the strays by hand. These are
+  three kinds of process, all with a path under the run directory on their
+  command line:
+  * `tunnel-relay serve --config <run>/work/relay.toml`
+  * `tunnel-client connect --config <run>/work/device-*/client.toml`, and its
+    `tunnel-mcp-fixture` children
+  * the Redis TLS forwarders: `m6-soak.py forwarder --cert <run>/work/server-cert.pem ...`
+
+  For example, `pkill -f '<run>/work/'`. Then delete the namespace's keys
+  (`tunnel-catalog:<namespace>:*`) by hand, and for `chaos --dedicated-redis`
+  the container labelled `m6-03-soak=<nonce>`
+  (`docker rm -f $(docker ps -aq --filter label=m6-03-soak=<nonce>)`).
