@@ -108,10 +108,9 @@ fn derive_pins(membership: &MembershipRuntime) -> Result<PinDecision, PinDerivat
             return Ok(PinDecision::Withdraw);
         }
         MembershipReadiness::Starting | MembershipReadiness::Unready(_) => {
-            let approved = approved_digests(membership.currently_approved_peer_route_targets())?;
-            // As below: latch expiry for any key this narrowing drops.
-            let _ = membership.readiness();
-            return Ok(PinDecision::Retain(approved));
+            return Ok(PinDecision::Retain(approved_digests(
+                membership.currently_approved_peer_route_targets(),
+            )?));
         }
     }
     // Derive the pin set from current, verifier-filtered route targets rather
@@ -120,12 +119,6 @@ fn derive_pins(membership: &MembershipRuntime) -> Result<PinDecision, PinDerivat
     // expired/revoked SPKI in the transport trust set until the next full
     // candidate swap.
     let digests = approved_digests(membership.verified_peer_route_targets())?;
-    // Read readiness once more before the set is applied. The targets above
-    // filtered key windows at their own `now`; this later read expires every
-    // admission whose signed boundary has passed by then, so any admission
-    // bound to a key just dropped from the set latches `TrustExpired` before
-    // the transport pin watcher can close its connection (M7-C86).
-    let _ = membership.readiness();
     Ok(PinDecision::Install(digests))
 }
 

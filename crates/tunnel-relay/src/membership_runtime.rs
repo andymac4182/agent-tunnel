@@ -2103,17 +2103,7 @@ impl RuntimeState {
         let expired = self
             .active_peers
             .iter()
-            // Monotonic deadline, or the signed wall-clock boundary itself.
-            // The pin set is derived from route targets filtered by wall
-            // clock, so without the second arm a publication could drop an
-            // expired peer key -- and close its pooled connection -- a few
-            // milliseconds before this admission's monotonic conversion of
-            // the same boundary, leaving the stream closed with no
-            // `TrustExpired` latched (M7-C86).
-            .filter(|(_, peer)| {
-                peer.admission.deadline.expires_at <= monotonic_now
-                    || peer.admission.deadline.trust_expires_at <= now
-            })
+            .filter(|(_, peer)| peer.admission.deadline.expires_at <= monotonic_now)
             .map(|(identity, _)| identity.clone())
             .collect::<Vec<_>>();
         expired
