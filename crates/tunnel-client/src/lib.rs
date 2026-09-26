@@ -316,9 +316,13 @@ pub struct ConnectionStatus {
 /// can only be recorded as an `OpenRefusal` from that table, so no reason
 /// text, identifier or peer-supplied string is representable. Each count is
 /// monotonic for the session, saturates rather than wraps, and starts at zero
-/// for every new session (a reconnect is a new session). A refusal is counted
-/// once, when it is first queued; a retried OPEN answered from the journal
-/// with the same stored refusal is not counted again.
+/// for every new session (a reconnect is a new session). It counts refusal
+/// frames queued, not distinct requests or frames delivered: a journaled
+/// refusal is counted when queued and not again when a retried OPEN is
+/// answered from the journal, but the three unjournaled refusals
+/// (`STREAM_FORGOTTEN`, `OPEN_IDEMPOTENCY_FULL`, `OPEN_FORGOTTEN`) are counted
+/// on every retry, and a refusal queued to the critical spill is counted even
+/// if the session ends before it is written.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OpenRefusalCounts {
     counts: [u64; open_refusal::CODES.len()],

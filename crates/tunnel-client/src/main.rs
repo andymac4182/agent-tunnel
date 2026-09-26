@@ -1765,7 +1765,7 @@ async fn run_session(
     }
 
     let mut status = handle.status();
-    let mut last_status = status.borrow().clone();
+    let last_status = status.borrow().clone();
     publisher.update(|published| {
         published.session = Some((&last_status).into());
     });
@@ -1775,39 +1775,218 @@ async fn run_session(
         // `changed()` would otherwise omit the first bounded identity event.
         print_connect_status(&last_status);
     }
-    loop {
-        tokio::select! {
-            signal = stop.recv() => {
-                // The same orderly path for SIGINT and SIGTERM, and for every
-                // phase a live session can be in, rotation included: this
-                // loop runs for the whole life of the session.
-                return signal;
+    let mut emitter = ConnectStatusEmitter::new(&last_status);
+    // The same orderly path for SIGINT and SIGTERM, and for every phase a
+    // live session can be in, rotation included: this watch runs for the
+    // whole life of the session.
+    let end = watch_session(
+        stop.recv(),
+        &mut readiness,
+        &mut status,
+        &mut emitter,
+        |current| {
+            publisher.update(|published| {
+                published.session = Some(current.into());
+            });
+        },
+        |current| {
+            if json {
+                print_connect_status(current);
             }
+        },
+    )
+    .await;
+    match end {
+        SessionWatchEnd::Stop(signal) => signal,
+        SessionWatchEnd::Closed(reason) => Err(closed_session_error(
+            reason,
+            join_after_close(handle, stop, bound).await?,
+        )),
+        SessionWatchEnd::ReadinessStopped => Err(stopped_connector_error(
+            &mut readiness,
+            handle,
+            stop,
+            bound,
+            "connector supervisor stopped",
+        )
+        .await?),
+        // The status publisher stopping must not outrank the typed terminal
+        // cause the readiness channel still holds.
+        SessionWatchEnd::StatusStopped => Err(stopped_connector_error(
+            &mut readiness,
+            handle,
+            stop,
+            bound,
+            "connector status publisher stopped",
+        )
+        .await?),
+    }
+}
+
+/// How a live session's watch ended.
+#[derive(Debug)]
+enum SessionWatchEnd {
+    Stop(Result<StopSignal, CliError>),
+    Closed(String),
+    ReadinessStopped,
+    StatusStopped,
+}
+
+/// Watch a live session until a stop request, a terminal readiness state or a
+/// stopped channel, forwarding every status snapshot to `on_status` and the
+/// ones worth a `connect-status` event to `emit` (through `emitter`).
+///
+/// **The final snapshot is never lost** (M7-C167 review): on every exit the
+/// latest status is read once more, and emitted if it holds anything not yet
+/// printed, including refusal counts still held back by the rate bound. A
+/// dropped status sender keeps its last value, so this also covers the
+/// publisher stopping.
+async fn watch_session<F>(
+    stop: F,
+    readiness: &mut tokio::sync::watch::Receiver<tunnel_client::Readiness>,
+    status: &mut tokio::sync::watch::Receiver<tunnel_client::ConnectionStatus>,
+    emitter: &mut ConnectStatusEmitter,
+    mut on_status: impl FnMut(&tunnel_client::ConnectionStatus),
+    mut emit: impl FnMut(&tunnel_client::ConnectionStatus),
+) -> SessionWatchEnd
+where
+    F: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    tokio::pin!(stop);
+    let end = loop {
+        let trailing = emitter.trailing_deadline();
+        tokio::select! {
+            signal = &mut stop => break SessionWatchEnd::Stop(signal),
             changed = readiness.changed() => {
                 if changed.is_err() {
-                    return Err(stopped_connector_error(&mut readiness, handle, stop, bound, "connector supervisor stopped").await?);
+                    break SessionWatchEnd::ReadinessStopped;
                 }
                 let state = readiness.borrow_and_update().clone();
                 if let tunnel_client::Readiness::Closed { reason } = state {
-                    return Err(closed_session_error(reason, join_after_close(handle, stop, bound).await?));
+                    break SessionWatchEnd::Closed(reason);
                 }
             }
             changed = status.changed() => {
                 if changed.is_err() {
-                    // The status publisher stopping must not outrank the
-                    // typed terminal cause the readiness channel still holds.
-                    return Err(stopped_connector_error(&mut readiness, handle, stop, bound, "connector status publisher stopped").await?);
+                    break SessionWatchEnd::StatusStopped;
                 }
                 let current = status.borrow_and_update().clone();
-                publisher.update(|published| {
-                    published.session = Some((&current).into());
-                });
-                if json && should_emit_connect_status(&last_status, &current) {
-                    print_connect_status(&current);
+                on_status(&current);
+                if emitter.observe(&current, tokio::time::Instant::now()) {
+                    emit(&current);
                 }
-                last_status = current;
+            }
+            () = tokio::time::sleep_until(trailing.unwrap_or_else(tokio::time::Instant::now)),
+                if trailing.is_some() =>
+            {
+                if let Some(pending) = emitter.fire(tokio::time::Instant::now()) {
+                    emit(&pending);
+                }
             }
         }
+    };
+    let current = status.borrow_and_update().clone();
+    on_status(&current);
+    if emitter.finish(&current) {
+        emit(&current);
+    }
+    end
+}
+
+/// The minimum spacing of `connect-status` events caused **only** by a new
+/// refusal count (M7-C167 review).  A refusal storm would otherwise print one
+/// event per refused OPEN; with this bound it prints at most one per second,
+/// plus a trailing event carrying the final counts.
+const REFUSAL_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Decides which status snapshots become `connect-status` events.
+///
+/// A change to any field `should_emit_connect_status` compares is emitted at
+/// once, with the current refusal counts.  A change to `open_refusals_sent`
+/// alone is emitted at most once per [`REFUSAL_STATUS_INTERVAL`]; a change
+/// held back is emitted when the interval ends (the trailing event), or at
+/// the end of the session by `finish`, whichever comes first.
+struct ConnectStatusEmitter {
+    last_observed: tunnel_client::ConnectionStatus,
+    printed_refusals: tunnel_client::OpenRefusalCounts,
+    last_refusal_event: Option<tokio::time::Instant>,
+    pending: bool,
+}
+
+impl ConnectStatusEmitter {
+    /// Start from the snapshot already printed at ready.
+    fn new(printed: &tunnel_client::ConnectionStatus) -> Self {
+        Self {
+            last_observed: printed.clone(),
+            printed_refusals: printed.open_refusals_sent,
+            last_refusal_event: None,
+            pending: false,
+        }
+    }
+
+    fn reportable(status: &tunnel_client::ConnectionStatus) -> bool {
+        status.session_id.is_some() && status.control_local_addr.is_some()
+    }
+
+    fn mark_printed(&mut self, now: tokio::time::Instant, refusals_changed: bool) {
+        if refusals_changed {
+            self.last_refusal_event = Some(now);
+        }
+        self.printed_refusals = self.last_observed.open_refusals_sent;
+        self.pending = false;
+    }
+
+    /// Record `current`; `true` means print it now.
+    fn observe(
+        &mut self,
+        current: &tunnel_client::ConnectionStatus,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let other = should_emit_connect_status(&self.last_observed, current);
+        let refusals =
+            Self::reportable(current) && current.open_refusals_sent != self.printed_refusals;
+        self.last_observed = current.clone();
+        let window_open = self
+            .last_refusal_event
+            .is_none_or(|last| now >= last + REFUSAL_STATUS_INTERVAL);
+        if other || (refusals && window_open) {
+            self.mark_printed(now, refusals);
+            return true;
+        }
+        self.pending = refusals;
+        false
+    }
+
+    /// When the held-back refusal counts are due, if any are held back.
+    fn trailing_deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.pending {
+            return None;
+        }
+        self.last_refusal_event
+            .map(|last| last + REFUSAL_STATUS_INTERVAL)
+    }
+
+    /// The trailing event: the latest snapshot, if counts are held back.
+    fn fire(&mut self, now: tokio::time::Instant) -> Option<tunnel_client::ConnectionStatus> {
+        if !self.pending {
+            return None;
+        }
+        self.mark_printed(now, true);
+        Some(self.last_observed.clone())
+    }
+
+    /// The session is ending: `true` means print `current`, whatever the rate
+    /// bound, because it holds something not yet printed.
+    fn finish(&mut self, current: &tunnel_client::ConnectionStatus) -> bool {
+        let other = should_emit_connect_status(&self.last_observed, current);
+        let refusals =
+            Self::reportable(current) && current.open_refusals_sent != self.printed_refusals;
+        self.last_observed = current.clone();
+        if other || refusals {
+            self.mark_printed(tokio::time::Instant::now(), refusals);
+            return true;
+        }
+        false
     }
 }
 
@@ -1840,8 +2019,7 @@ fn should_emit_connect_status(
             || previous.active_local_addr != current.active_local_addr
             || previous.candidate_local_addr != current.candidate_local_addr
             || previous.drain_fences != current.drain_fences
-            || previous.drain_acks != current.drain_acks
-            || previous.open_refusals_sent != current.open_refusals_sent)
+            || previous.drain_acks != current.drain_acks)
 }
 
 fn print_connect_status(status: &tunnel_client::ConnectionStatus) {
@@ -2199,6 +2377,167 @@ backoff, or exits at once with --no-reconnect."
 mod tests {
     use super::*;
 
+    fn m7c167_ready_status() -> tunnel_client::ConnectionStatus {
+        tunnel_client::ConnectionStatus {
+            phase: "active".to_owned(),
+            session_id: Some("session".to_owned()),
+            control_local_addr: Some("127.0.0.1:1".parse().expect("address")),
+            ..tunnel_client::ConnectionStatus::default()
+        }
+    }
+
+    fn m7c167_ready() -> tunnel_client::Readiness {
+        tunnel_client::Readiness::Ready(tunnel_client::SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        })
+    }
+
+    fn goaway_count(status: &tunnel_client::ConnectionStatus) -> Option<u64> {
+        status.open_refusals_sent.get("GOAWAY")
+    }
+
+    /// M7-C167 review: a refusal storm does not flood `--json`.  1,000
+    /// refusals inside one second print at most two `connect-status` events,
+    /// and the last carries the final count before the session ends.
+    #[tokio::test(start_paused = true)]
+    async fn m7c167_a_refusal_storm_prints_at_most_two_status_events_per_second() {
+        use tunnel_protocol::open_refusal;
+
+        let initial = m7c167_ready_status();
+        let (status_tx, mut status_rx) = tokio::sync::watch::channel(initial.clone());
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(m7c167_ready());
+        status_rx.borrow_and_update();
+        ready_rx.borrow_and_update();
+        let mut emitter = ConnectStatusEmitter::new(&initial);
+        let mut events: Vec<(tokio::time::Instant, tunnel_client::ConnectionStatus)> = Vec::new();
+        let started = tokio::time::Instant::now();
+        let closed_at = std::cell::Cell::new(None);
+
+        let producer = async {
+            let mut refusals = tunnel_client::OpenRefusalCounts::default();
+            for _ in 0..1_000 {
+                refusals.record(open_refusal::CONNECTOR_DRAINING);
+                status_tx.send_modify(|status| status.open_refusals_sent = refusals);
+                tokio::time::advance(std::time::Duration::from_micros(900)).await;
+            }
+            // Well past the trailing event, in small steps so the time an
+            // event is printed is measured, then the session ends.
+            for _ in 0..200 {
+                tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            }
+            closed_at.set(Some(tokio::time::Instant::now()));
+            ready_tx
+                .send(tunnel_client::Readiness::Closed {
+                    reason: "synthetic close".to_owned(),
+                })
+                .expect("watch receiver alive");
+        };
+        let watch = watch_session(
+            std::future::pending(),
+            &mut ready_rx,
+            &mut status_rx,
+            &mut emitter,
+            |_| {},
+            |status| events.push((tokio::time::Instant::now(), status.clone())),
+        );
+        let (end, ()) = tokio::join!(watch, producer);
+        assert!(matches!(end, SessionWatchEnd::Closed(_)), "{end:?}");
+
+        assert!(
+            (1..=2).contains(&events.len()),
+            "a storm of 1,000 refusals printed {} events",
+            events.len()
+        );
+        let (last_at, last) = events.last().expect("an event");
+        assert_eq!(
+            goaway_count(last),
+            Some(1_000),
+            "the last event has the final count"
+        );
+        // The producer advances in 10 ms steps, and the event is printed at
+        // the step after the deadline passes; allow a few steps.
+        assert!(
+            *last_at <= started + REFUSAL_STATUS_INTERVAL + std::time::Duration::from_millis(50),
+            "the final count is printed by the trailing event, not only at the end: {:?} after start",
+            *last_at - started
+        );
+        assert!(Some(*last_at) < closed_at.get());
+    }
+
+    /// M7-C167 review: counts published together with the end of the session
+    /// (a readiness close or a stop request) are printed before the watch
+    /// returns, even while the rate bound is holding them back.
+    #[tokio::test(start_paused = true)]
+    async fn m7c167_the_final_refusal_count_is_printed_when_the_session_ends() {
+        use tunnel_protocol::open_refusal;
+
+        for ending in ["closed", "stop"] {
+            let initial = m7c167_ready_status();
+            let (status_tx, mut status_rx) = tokio::sync::watch::channel(initial.clone());
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(m7c167_ready());
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            status_rx.borrow_and_update();
+            ready_rx.borrow_and_update();
+            let mut emitter = ConnectStatusEmitter::new(&initial);
+            let mut events: Vec<tunnel_client::ConnectionStatus> = Vec::new();
+
+            let producer = async {
+                let mut refusals = tunnel_client::OpenRefusalCounts::default();
+                refusals.record(open_refusal::CONNECTOR_DRAINING);
+                status_tx.send_modify(|status| status.open_refusals_sent = refusals);
+                for _ in 0..10 {
+                    tokio::time::advance(std::time::Duration::from_millis(10)).await;
+                }
+                // Inside the rate bound: this count is held back, and the
+                // session ends in the same instant.
+                refusals.record(open_refusal::CONNECTOR_DRAINING);
+                status_tx.send_modify(|status| status.open_refusals_sent = refusals);
+                if ending == "closed" {
+                    ready_tx
+                        .send(tunnel_client::Readiness::Closed {
+                            reason: "relay GOAWAY".to_owned(),
+                        })
+                        .expect("watch receiver alive");
+                } else {
+                    stop_tx.send(()).expect("stop receiver alive");
+                }
+            };
+            let stop = async move {
+                if stop_rx.await.is_err() {
+                    // No stop request in this case.
+                    std::future::pending::<()>().await;
+                }
+                Ok(StopSignal::Terminate)
+            };
+            let watch = watch_session(
+                stop,
+                &mut ready_rx,
+                &mut status_rx,
+                &mut emitter,
+                |_| {},
+                |status| events.push(status.clone()),
+            );
+            let (end, ()) = tokio::join!(watch, producer);
+            match ending {
+                "closed" => assert!(matches!(end, SessionWatchEnd::Closed(_)), "{end:?}"),
+                _ => assert!(matches!(end, SessionWatchEnd::Stop(Ok(_))), "{end:?}"),
+            }
+            assert_eq!(
+                events.first().and_then(goaway_count),
+                Some(1),
+                "{ending}: the first count opens the rate window"
+            );
+            assert_eq!(
+                events.last().and_then(goaway_count),
+                Some(2),
+                "{ending}: the final count was not printed ({} events)",
+                events.len()
+            );
+        }
+    }
+
     /// M7-C167: `connect-status` reports the OPEN refusals the session sent,
     /// one counter per fixed code, every code always present, and nothing
     /// else changes shape.  A new count also emits a status event.
@@ -2216,8 +2555,8 @@ mod tests {
             .open_refusals_sent
             .record(open_refusal::CONNECTOR_DRAINING);
         assert!(
-            should_emit_connect_status(&before, &status),
-            "a new refusal count emits a connect-status event"
+            ConnectStatusEmitter::new(&before).observe(&status, tokio::time::Instant::now()),
+            "a first new refusal count emits a connect-status event"
         );
 
         let value = serde_json::to_value(connect_status_result(&status)).expect("serialize");

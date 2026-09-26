@@ -4212,9 +4212,8 @@ impl M2Actor {
             }
         }
         self.send_critical_message(response.clone(), None)?;
-        self.complete_open_journal(&open.message_id, vec![response], vec![None])?;
         self.record_open_refusal_sent(refusal);
-        Ok(())
+        self.complete_open_journal(&open.message_id, vec![response], vec![None])
     }
 
     /// Count a refusal once it is queued, and publish it (M7-C167).  Only
