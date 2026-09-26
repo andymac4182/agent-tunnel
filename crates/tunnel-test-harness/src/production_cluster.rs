@@ -344,6 +344,10 @@ use liveness::{
 };
 pub use liveness::{ProductionLivenessEvidence, validate_production_liveness_evidence};
 
+mod resign_stream;
+pub use resign_stream::{
+    ResignStreamEvidence, validate_resign_stream_evidence, verify as verify_resign_stream,
+};
 mod trust_expiry;
 pub use trust_expiry::{
     TrustExpiryEvidence, validate_trust_expiry_evidence, verify as verify_trust_expiry,
@@ -5066,13 +5070,26 @@ impl ProductionCluster {
     /// boundaries instead of on a background timer.  It cannot be combined
     /// with [`Self::start_membership_resigning`].
     async fn resign_membership_now(&mut self) -> Result<u64> {
+        self.resign_membership_burst(1).await
+    }
+
+    /// Publish `count` consecutive re-signed record versions for every node
+    /// with no wait between them, then settle once on the last: the
+    /// back-to-back re-sign shape of M7-C81 and M7-C83.
+    async fn resign_membership_burst(&mut self, count: u64) -> Result<u64> {
+        if count == 0 {
+            return Err(HarnessError::InvalidInput(
+                "a membership re-sign burst needs at least one version".into(),
+            ));
+        }
         if self.membership_resign.is_some() {
             return Err(HarnessError::InvalidInput(
                 "membership re-signing is already running in the background".into(),
             ));
         }
         let inputs = &self.membership_resign_inputs;
-        let version = inputs.next_record_version;
+        let first_version = inputs.next_record_version;
+        let version = first_version.saturating_add(count - 1);
         let publisher =
             RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
                 .await
@@ -5088,37 +5105,39 @@ impl ProductionCluster {
             .iter()
             .map(|relay| relay.running.is_some() && !relay.pins.snapshot().is_empty())
             .collect();
-        let now = Utc::now();
-        for (identity, peer_endpoint) in &inputs.nodes {
-            let signed = self
-                .checkpoint_authority
-                .issuer
-                .sign_membership_identity(
-                    &inputs.deployment_id,
-                    &inputs.deployment_incarnation,
-                    identity,
-                    MembershipLifetimeOptions {
-                        record_version: version,
-                        peer_endpoint: *peer_endpoint,
-                        now,
-                        lifetime: M7_MEMBERSHIP_LIFETIME,
-                    },
-                )
-                .map_err(|error| {
-                    HarnessError::Pki(format!(
-                        "re-signing membership for {}: {error}",
-                        identity.node_id
-                    ))
-                })?;
-            publisher
-                .publish_signed_membership_for_node(&identity.node_id, &signed.catalog_record())
-                .await
-                .map_err(|error| {
-                    HarnessError::Redis(format!(
-                        "publishing membership for {}: {error}",
-                        identity.node_id
-                    ))
-                })?;
+        for record_version in first_version..=version {
+            let now = Utc::now();
+            for (identity, peer_endpoint) in &inputs.nodes {
+                let signed = self
+                    .checkpoint_authority
+                    .issuer
+                    .sign_membership_identity(
+                        &inputs.deployment_id,
+                        &inputs.deployment_incarnation,
+                        identity,
+                        MembershipLifetimeOptions {
+                            record_version,
+                            peer_endpoint: *peer_endpoint,
+                            now,
+                            lifetime: M7_MEMBERSHIP_LIFETIME,
+                        },
+                    )
+                    .map_err(|error| {
+                        HarnessError::Pki(format!(
+                            "re-signing membership for {}: {error}",
+                            identity.node_id
+                        ))
+                    })?;
+                publisher
+                    .publish_signed_membership_for_node(&identity.node_id, &signed.catalog_record())
+                    .await
+                    .map_err(|error| {
+                        HarnessError::Redis(format!(
+                            "publishing membership for {}: {error}",
+                            identity.node_id
+                        ))
+                    })?;
+            }
         }
         self.membership_resign_inputs.next_record_version = version.saturating_add(1);
         let nodes = self.membership_resign_inputs.nodes.len();
@@ -6283,6 +6302,31 @@ async fn wait_for_pins_over<R: PinWaitRelay>(
             )));
         }
         sleep(poll).await;
+    }
+}
+
+/// The fixture's pin-publishing invalidation callback, as `start_relay`
+/// installs it. A gate that replaces the callback to record reasons restores
+/// the relay with this, so the fixture's behaviour is the same afterwards.
+fn fixture_pin_callback(
+    membership: &Arc<MembershipRuntime>,
+    pins: &SharedPeerPins,
+    pending: &Arc<std::sync::atomic::AtomicBool>,
+) -> impl Fn() + Send + Sync + 'static {
+    let membership = Arc::clone(membership);
+    let pins = pins.clone();
+    let pending = Arc::clone(pending);
+    move || {
+        if let Err(error) = publish_verified_pins(&membership, &pins) {
+            tracing::warn!(
+                ?error,
+                "production membership pin publication failed closed"
+            );
+            let _ = pins.replace(std::iter::empty::<SpkiSha256>());
+            pending.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 

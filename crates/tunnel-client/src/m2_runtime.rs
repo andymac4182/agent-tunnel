@@ -9365,11 +9365,38 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
         .await,
         Ok(Ok(()))
     );
+    // The writer can exit on the session's cancellation while this Close is
+    // being queued.  tokio's receiver drains its queue when it is dropped,
+    // but a send that reserved its slot before the drop and stores its value
+    // after the drain leaves the Close stranded until the last sender (held
+    // here) is dropped, so its reply never comes.  A finished writer answers
+    // no command, so its completion ends the wait as well (task row
+    // M6-C158); without this, shutdown waited the whole close timeout.
+    let mut writer_finished = false;
     let _writer_closed = if sent_close {
-        tokio::time::timeout(M2_CLOSE_TIMEOUT, wait).await.is_ok()
+        match carrier.writer.as_mut() {
+            Some(writer) => tokio::time::timeout(M2_CLOSE_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    reply = wait => reply.is_ok(),
+                    _ = writer => {
+                        writer_finished = true;
+                        false
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false),
+            None => tokio::time::timeout(M2_CLOSE_TIMEOUT, wait).await.is_ok(),
+        }
     } else {
         false
     };
+    // A writer whose completion was observed above has been joined; its
+    // handle must not be polled again.
+    if writer_finished {
+        carrier.writer = None;
+    }
     let writer_joined = if let Some(writer) = carrier.writer.take() {
         join_carrier_task(writer).await
     } else {
@@ -16714,6 +16741,52 @@ mod tests {
         fn drop(&mut self) {
             self.0.release.notify_waiters();
         }
+    }
+
+    /// Task row M6-C158.  A carrier writer that exits on the session's
+    /// cancellation can leave the Close that `close_carrier` queued stranded
+    /// behind its dropped receiver (a send that reserved its slot before the
+    /// drop and stored its value after the drain), so the Close is never
+    /// answered.  This forces the same state deterministically: the writer
+    /// task parks its receiver elsewhere, unread, and finishes.  The close
+    /// must end once the writer has finished instead of waiting out the
+    /// whole close timeout, and must still report the carrier locally
+    /// closed.  Before the fix it waited `M2_CLOSE_TIMEOUT` (5 s), which is
+    /// how `m6c120_read_gate_stops_control_reads_under_back_pressure` came
+    /// to be aborted by its 2 s cleanup bound on hosted Linux.
+    #[tokio::test]
+    async fn closing_a_carrier_whose_writer_already_exited_does_not_wait_for_a_reply() {
+        let (tx, receiver) = mpsc::channel::<CarrierCommand>(M2_CARRIER_QUEUE_FRAMES);
+        let (park, parked) = std::sync::mpsc::channel();
+        let exited = Arc::new(Notify::new());
+        let writer_exited = exited.clone();
+        let writer = tokio::spawn(async move {
+            // Keep the receiver alive but unread, as the stranded Close is.
+            let _ = park.send(receiver);
+            writer_exited.notify_one();
+        });
+        exited.notified().await;
+        let carrier = Carrier {
+            key: CarrierKey::new(1, "connection"),
+            local_addr: None,
+            tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: Some(writer),
+        };
+        let started = Instant::now();
+        let closed = timeout(M2_CLOSE_TIMEOUT * 2, close_carrier(carrier))
+            .await
+            .expect("close_carrier is bounded");
+        let elapsed = started.elapsed();
+        drop(parked);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "closing a carrier whose writer had exited waited {elapsed:?} for a reply \
+             no writer could send"
+        );
+        assert!(closed.local_closed, "the finished writer counts as joined");
     }
 
     /// M6-C120, review: the read gate on the real session loop.  With the

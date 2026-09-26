@@ -1099,16 +1099,21 @@ impl PeerRuntime {
             .map_err(peer_readiness_error)?;
 
         let mut probes = stream::iter(targets.into_iter().map(|target| async move {
-            let result = self.probe_route(&target).await;
+            let result = self
+                .probe_route_with_deadline(&target, PEER_PROBE_TIMEOUT)
+                .await;
             (target, result)
         }))
         .buffer_unordered(MAX_CONCURRENT_PEER_PROBES);
         let mut first_error = None;
         while let Some((target, result)) = probes.next().await {
             match result {
-                Ok(()) => {
+                Ok(observed_spki) => {
+                    // Record which approved key proved the route, so a later
+                    // record that only changes *other* keys of this peer
+                    // keeps the proof instead of dropping readiness (M8-C30).
                     let _published = readiness
-                        .record_probe_at(revision, &target, PeerProbeState::Reachable)
+                        .record_probe_proven_at(revision, &target, &observed_spki)
                         .map_err(peer_readiness_error)?;
                     // A successful health stream proves one slot for this
                     // route only; stale results are deliberately ignored.
@@ -1138,16 +1143,13 @@ impl PeerRuntime {
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn probe_route(&self, target: &PeerRouteTarget) -> Result<(), PeerRuntimeError> {
-        self.probe_route_with_deadline(target, PEER_PROBE_TIMEOUT)
-            .await
-    }
-
+    /// Probe one route within `deadline`, returning the approved SPKI digest
+    /// the peer proved.
     async fn probe_route_with_deadline(
         &self,
         target: &PeerRouteTarget,
         deadline: Duration,
-    ) -> Result<(), PeerRuntimeError> {
+    ) -> Result<String, PeerRuntimeError> {
         let expires_at = TokioInstant::now() + deadline;
         // A failed health stream is reachability evidence, not authority to
         // cancel unrelated admitted requests on its pooled connection.
@@ -1156,11 +1158,12 @@ impl PeerRuntime {
         self.probe_route_until(target, expires_at).await
     }
 
+    /// Probe one route and return the approved SPKI digest the peer proved.
     async fn probe_route_until(
         &self,
         target: &PeerRouteTarget,
         expires_at: TokioInstant,
-    ) -> Result<(), PeerRuntimeError> {
+    ) -> Result<String, PeerRuntimeError> {
         let address = target
             .peer_endpoint()
             .parse::<SocketAddr>()
@@ -1204,7 +1207,7 @@ impl PeerRuntime {
             .await
             .map_err(|_| PeerRuntimeError::Transport(PeerTransportError::Timeout))??
         {
-            None => Ok(()),
+            None => Ok(observed_spki),
             Some(_) => {
                 // A readiness probe has no application body.  Stop at the
                 // first unexpected chunk rather than draining an unbounded or

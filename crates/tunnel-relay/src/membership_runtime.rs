@@ -504,8 +504,51 @@ pub enum MembershipUnreadyReason {
     CatalogUnavailable,
     MembershipRejected,
     MissingLocalMembership,
+    MissingLocalKey,
     PersistenceUnavailable,
     Cancelled,
+}
+
+impl MembershipUnreadyReason {
+    /// Whether becoming unready for this reason must also withdraw this
+    /// relay's approved peer SPKI pins (M7-C86).
+    ///
+    /// **Recorded owner decision (2026-09-16).** Withdrawing the pin set is
+    /// the fail-closed answer when the *trust evidence itself* was rejected:
+    /// an authority this relay cannot verify, a signed record that failed
+    /// verification, or an expired checkpoint or key window. In those states
+    /// the relay can no longer say which peer keys are approved, so it must
+    /// approve none -- that is what makes a rogue-signed record fail closed
+    /// in both directions (`m7_deployment_spki_replacement` phase 6).
+    ///
+    /// The remaining reasons are *local or transient*: this relay's own
+    /// prerequisites are unmet, or an infrastructure read failed, while the
+    /// signed peer keys it already verified are untouched. Withdrawing trust
+    /// there turned one relay's transient local failure into a cluster-wide
+    /// trust blackout (M7-C81, M7-C83). The decision is that those should
+    /// retain the verified set and withdraw *readiness* instead.
+    ///
+    /// **Held: today every reason returns `true`.** Retaining regresses
+    /// `verify-m7-trust-expiry` (M7-C86, M7-C131), so nothing is retained
+    /// until that is understood. The reasons are split out now so that the
+    /// labels are accurate and the retention is a one-line change here.
+    #[must_use]
+    pub const fn withdraws_peer_trust(self) -> bool {
+        match self {
+            // M7-C86 (the retention split) is held: until its trust-expiry
+            // regression is understood, every unready reason withdraws the
+            // pin set, exactly as before the split. The classification stays
+            // named per reason so the split is a one-line decision to revisit.
+            Self::UnknownAuthority
+            | Self::MembershipRejected
+            | Self::CheckpointExpired
+            | Self::MissingLocalMembership
+            | Self::MissingLocalKey
+            | Self::CatalogUnavailable
+            | Self::PersistenceUnavailable
+            | Self::Cancelled => true,
+        }
+    }
 }
 
 impl fmt::Display for MembershipUnreadyReason {
@@ -516,6 +559,7 @@ impl fmt::Display for MembershipUnreadyReason {
             Self::CatalogUnavailable => "membership catalog unavailable",
             Self::MembershipRejected => "membership record rejected",
             Self::MissingLocalMembership => "local relay membership is unavailable",
+            Self::MissingLocalKey => "local relay key is not approved",
             Self::PersistenceUnavailable => "membership version state persistence unavailable",
             Self::Cancelled => "membership runtime cancelled",
         })
@@ -677,7 +721,42 @@ impl PeerInvalidationReason {
 pub struct PeerAdmissionCancellation {
     token: CancellationToken,
     reason: Arc<AtomicU8>,
-    expires_at: Option<Instant>,
+    expires_at: Option<SharedAdmissionExpiry>,
+}
+
+/// The monotonic trust deadline of one admission, shared between the
+/// runtime's active-admission table and every stream riding the admission.
+///
+/// It only ever moves when a successful reconcile re-binds an unchanged
+/// admission to freshly verified signed evidence (M7-C80); it is never moved
+/// earlier than a boundary already observed and never extended by a cache hit,
+/// a late response or a clock correction.
+#[derive(Clone, Debug)]
+struct SharedAdmissionExpiry(Arc<Mutex<(Instant, Option<DateTime<Utc>>)>>);
+
+impl SharedAdmissionExpiry {
+    fn new(expires_at: Instant, trust_expires_at: Option<DateTime<Utc>>) -> Self {
+        Self(Arc::new(Mutex::new((expires_at, trust_expires_at))))
+    }
+
+    fn load(&self) -> (Instant, Option<DateTime<Utc>>) {
+        match self.0.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn get(&self) -> Instant {
+        self.load().0
+    }
+
+    fn set(&self, expires_at: Instant, trust_expires_at: DateTime<Utc>) {
+        let value = (expires_at, Some(trust_expires_at));
+        match self.0.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => *poisoned.into_inner() = value,
+        }
+    }
 }
 
 impl PeerAdmissionCancellation {
@@ -703,7 +782,7 @@ impl PeerAdmissionCancellation {
         Self {
             token,
             reason: Arc::new(AtomicU8::new(0)),
-            expires_at: Some(expires_at),
+            expires_at: Some(SharedAdmissionExpiry::new(expires_at, None)),
         }
     }
 
@@ -727,10 +806,13 @@ impl PeerAdmissionCancellation {
     }
 
     /// Return the admission's monotonic trust deadline when the provider
-    /// exposed one.  It is never extended after construction.
+    /// exposed one.  It is shared with the runtime's active-admission table,
+    /// so it reads the current value: a successful reconcile that re-binds an
+    /// unchanged admission to fresh signed evidence moves it later (M7-C80),
+    /// and nothing else ever moves it.
     #[must_use]
     pub fn expires_at(&self) -> Option<Instant> {
-        self.expires_at
+        self.expires_at.as_ref().map(SharedAdmissionExpiry::get)
     }
 
     /// Return whether signed trust for this admission has ended.
@@ -749,7 +831,7 @@ impl PeerAdmissionCancellation {
             Some(PeerInvalidationReason::TrustExpired) => true,
             Some(_) => false,
             None => self
-                .expires_at
+                .expires_at()
                 .is_some_and(|deadline| Instant::now() >= deadline),
         }
     }
@@ -760,7 +842,9 @@ impl PeerAdmissionCancellation {
 pub type PeerInvalidationCallback = Arc<dyn Fn(PeerIdentity, PeerInvalidationReason) + Send + Sync>;
 
 /// A monotonic deadline attached to one admission.  It is never extended by a
-/// Redis cache hit, a late HTTP response or a wall-clock correction.
+/// Redis cache hit, a late HTTP response or a wall-clock correction; only a
+/// successful reconcile re-binding the admission to freshly verified signed
+/// evidence for the same key moves it, and never earlier (M7-C80).
 #[derive(Clone, Copy, Debug)]
 pub struct AdmissionDeadline {
     started_at: Instant,
@@ -805,6 +889,7 @@ pub struct PeerAdmission {
     deadline: AdmissionDeadline,
     invalidation: CancellationToken,
     invalidation_reason: Arc<AtomicU8>,
+    expiry: SharedAdmissionExpiry,
 }
 
 impl fmt::Debug for PeerAdmission {
@@ -830,9 +915,17 @@ impl PeerAdmission {
         &self.binding
     }
 
+    /// The admission's current deadline, read through the same shared cell
+    /// its streams read, so a clone never reports a boundary the runtime has
+    /// since re-bound (M7-C80).
     #[must_use]
     pub fn deadline(&self) -> AdmissionDeadline {
-        self.deadline
+        let (expires_at, trust_expires_at) = self.expiry.load();
+        AdmissionDeadline {
+            started_at: self.deadline.started_at,
+            expires_at,
+            trust_expires_at: trust_expires_at.unwrap_or(self.deadline.trust_expires_at),
+        }
     }
 
     #[must_use]
@@ -847,7 +940,7 @@ impl PeerAdmission {
         PeerAdmissionCancellation {
             token: self.invalidation.clone(),
             reason: self.invalidation_reason.clone(),
-            expires_at: Some(self.deadline.expires_at),
+            expires_at: Some(self.expiry.clone()),
         }
     }
 
@@ -1324,6 +1417,10 @@ impl MembershipRuntime {
         if !matches!(state.readiness, MembershipReadiness::Ready) {
             return Vec::new();
         }
+        Self::route_targets_at(&state, now)
+    }
+
+    fn route_targets_at(state: &RuntimeState, now: DateTime<Utc>) -> Vec<PeerRouteTarget> {
         let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
             return Vec::new();
         };
@@ -1466,6 +1563,10 @@ impl MembershipRuntime {
                     deadline,
                     invalidation: CancellationToken::new(),
                     invalidation_reason: Arc::new(AtomicU8::new(0)),
+                    expiry: SharedAdmissionExpiry::new(
+                        deadline.expires_at,
+                        Some(deadline.trust_expires_at),
+                    ),
                 };
                 if let Some(previous) = state.active_peers.insert(
                     identity.clone(),
@@ -1658,12 +1759,20 @@ impl MembershipRuntime {
                         && membership.record().record_version >= local_minimum_version
                 });
         let Some(local_membership) = local_membership else {
+            // Every record in the candidate verified; what is missing is a
+            // usable record for *this* node at or above the checkpoint's
+            // minimum version. That is `MissingLocalMembership`, the same
+            // condition as a checkpoint that does not name this node, and
+            // deliberately not `MembershipRejected`, which means a record
+            // failed verification. (M7-C86 would retain peer pins for this
+            // local condition; that retention is held, so it withdraws them
+            // like every other unready reason today.)
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
                 .await?;
             self.install_unready_candidate(
                 candidate_verifier,
-                MembershipUnreadyReason::MembershipRejected,
+                MembershipUnreadyReason::MissingLocalMembership,
                 checkpoint.checkpoint().checkpoint_version,
                 checkpoint_expiry,
                 checkpoint_received_wall,
@@ -1707,8 +1816,15 @@ impl MembershipRuntime {
                     PeerInvalidationReason::TrustExpired,
                 )
             } else {
+                // This relay's own certificate is not an approved key of its
+                // own record: a statement about this relay's right to serve,
+                // not about the peer keys it verified. Readiness, ownership
+                // and admission still fail closed. (M7-C86 would retain the
+                // peer pin set here; that retention is held, so the set is
+                // withdrawn today.) The *expired* local pin above stays
+                // `CheckpointExpired`.
                 (
-                    MembershipUnreadyReason::MembershipRejected,
+                    MembershipUnreadyReason::MissingLocalKey,
                     MembershipRuntimeError::PeerRejected,
                     PeerInvalidationReason::MembershipRevoked,
                 )
@@ -1773,6 +1889,7 @@ impl MembershipRuntime {
         state.last_verified_at = Some(checkpoint_received_wall);
         let invalidations = state.revalidate_active(
             checkpoint_received_wall,
+            checkpoint_received_mono,
             PeerInvalidationReason::MembershipChanged,
         );
         let snapshot = state.snapshot();
@@ -2100,14 +2217,31 @@ impl RuntimeState {
             .collect()
     }
 
+    /// Re-check every active admission against a freshly installed verified
+    /// directory.
+    ///
+    /// **M7-C80.** A re-signed record for an unchanged node, boot, key,
+    /// endpoint and server name, at a higher record version and with a trust
+    /// boundary that did not shrink, is the publisher renewing the authority
+    /// the admission already rests on. Invalidating it there killed every
+    /// in-flight peer stream at every routine re-sign. Such an admission is
+    /// now *re-bound*: it keeps its cancellation token, so the streams riding
+    /// it survive, and takes the new record version, the new binding and the
+    /// new deadline -- exactly what a fresh admission would get from the same
+    /// evidence, but never earlier than the deadline it already had.
+    ///
+    /// Anything else still invalidates: a binding that no longer verifies
+    /// (revoked or removed key), a changed key, endpoint or server name, a
+    /// shrunk signed boundary, or a passed deadline.
     fn revalidate_active(
         &mut self,
         now: DateTime<Utc>,
+        now_mono: Instant,
         default_reason: PeerInvalidationReason,
     ) -> Vec<Invalidation> {
         let mut invalidations = Vec::new();
         let peers = std::mem::take(&mut self.active_peers);
-        for (identity, peer) in peers {
+        for (identity, mut peer) in peers {
             let current = self.verifier.bind_peer(
                 &identity.node_id,
                 &identity.boot_id,
@@ -2121,7 +2255,7 @@ impl RuntimeState {
                 .find(|membership| membership.node_id() == identity.node_id.as_str())
                 .map(|membership| membership.record().record_version);
             let binding_changed = match current.as_ref() {
-                Ok(binding) => binding != peer.admission.binding(),
+                Ok(binding) => !same_peer_binding(binding, peer.admission.binding()),
                 Err(_) => true,
             };
             // Compare the signed wall-clock trust boundary. Recomputing a
@@ -2134,30 +2268,118 @@ impl RuntimeState {
                     expires_at.min(binding.valid_until())
                         < peer.admission.deadline.trust_expires_at()
                 });
-            if current.is_err()
-                || current_version.is_none()
-                || current_version != Some(peer.record_version)
-                || binding_changed
-                || trust_deadline_shrank
-                || peer.admission.deadline.is_expired()
-            {
-                invalidations.push(Invalidation {
-                    identity,
-                    token: peer.admission.invalidation,
-                    reason_cell: peer.admission.invalidation_reason,
-                    callback: self.callback.clone(),
-                    reason: if current.is_err() {
-                        PeerInvalidationReason::MembershipRevoked
-                    } else {
-                        default_reason
-                    },
-                });
-            } else {
-                self.active_peers.insert(identity, peer);
+            let permitted = rebind_permitted(RebindCheck {
+                previous_version: peer.record_version,
+                current_version,
+                binding_changed,
+                trust_deadline_shrank,
+                deadline_expired: peer.admission.deadline.is_expired(),
+            });
+            match current {
+                Ok(binding) if permitted => {
+                    let signed_boundary = self
+                        .trust_expires_at
+                        .map_or(binding.valid_until(), |expires_at| {
+                            expires_at.min(binding.valid_until())
+                        });
+                    // Re-convert only when the signed boundary actually
+                    // moved later. An unchanged boundary keeps the monotonic
+                    // deadline it was first converted to: re-converting the
+                    // same wall-clock instant from each reconcile's receipt
+                    // and keeping the latest would ratchet it later by
+                    // clock-conversion drift, past the peer's own conversion
+                    // of the same boundary (the M7-C86 trust-expiry race).
+                    let renewed = renewed_deadline(
+                        peer.admission.deadline.expires_at,
+                        signed_boundary > peer.admission.deadline.trust_expires_at(),
+                        self.trust_deadline,
+                        monotonic_deadline(now, now_mono, binding.valid_until()),
+                    );
+                    peer.admission.deadline = AdmissionDeadline {
+                        started_at: peer.admission.deadline.started_at,
+                        expires_at: renewed,
+                        trust_expires_at: signed_boundary,
+                    };
+                    peer.admission.expiry.set(renewed, signed_boundary);
+                    peer.admission.binding = binding;
+                    if let Some(version) = current_version {
+                        peer.record_version = version;
+                    }
+                    self.active_peers.insert(identity, peer);
+                }
+                current => {
+                    invalidations.push(Invalidation {
+                        identity,
+                        token: peer.admission.invalidation,
+                        reason_cell: peer.admission.invalidation_reason,
+                        callback: self.callback.clone(),
+                        reason: if current.is_err() {
+                            PeerInvalidationReason::MembershipRevoked
+                        } else {
+                            default_reason
+                        },
+                    });
+                }
             }
         }
         invalidations
     }
+}
+
+/// The facts one re-bind decision rests on (M7-C80).
+#[derive(Clone, Copy, Debug)]
+struct RebindCheck {
+    previous_version: u64,
+    current_version: Option<u64>,
+    binding_changed: bool,
+    trust_deadline_shrank: bool,
+    deadline_expired: bool,
+}
+
+/// Whether an active admission may be re-bound to freshly verified evidence
+/// instead of invalidated. Every clause fails closed: a missing or lower
+/// record version, a changed binding identity, a shrunk signed boundary or
+/// an already-passed deadline each forbid the re-bind. The verifier already
+/// refuses a lower or equal-version record, so the version clause is defence
+/// in depth and is witnessed by a unit test rather than through a record.
+const fn rebind_permitted(check: RebindCheck) -> bool {
+    let version_ok = match check.current_version {
+        Some(version) => version >= check.previous_version,
+        None => false,
+    };
+    let deadline_ok = !check.deadline_expired;
+    version_ok && !check.binding_changed && !check.trust_deadline_shrank && deadline_ok
+}
+
+/// The monotonic deadline of a re-bound admission. It is re-converted only
+/// when the signed boundary moved later -- re-converting an unchanged
+/// boundary on every reconcile would ratchet it later by clock-conversion
+/// drift -- and it is never moved earlier than the deadline it already had.
+fn renewed_deadline(
+    previous: Instant,
+    boundary_moved_later: bool,
+    local_trust_deadline: Option<Instant>,
+    peer_deadline: Instant,
+) -> Instant {
+    if !boundary_moved_later {
+        return previous;
+    }
+    let bounded =
+        local_trust_deadline.map_or(peer_deadline, |deadline| deadline.min(peer_deadline));
+    bounded.max(previous)
+}
+
+/// Whether two verified bindings name the same peer authority: node, boot,
+/// key, SPKI, endpoint and server name. The signed validity window is
+/// deliberately excluded; a re-sign renewing it is compared separately as a
+/// trust boundary that must not shrink (M7-C80).
+fn same_peer_binding(left: &VerifiedPeerBinding, right: &VerifiedPeerBinding) -> bool {
+    left.node_id() == right.node_id()
+        && left.boot_id() == right.boot_id()
+        && left.key_id() == right.key_id()
+        && left.spki_sha256() == right.spki_sha256()
+        && left.peer_endpoint() == right.peer_endpoint()
+        && left.server_name() == right.server_name()
 }
 
 fn monotonic_deadline(
@@ -2471,6 +2693,68 @@ fn parse_root_certificates(pem: &[u8]) -> Result<RootCertStore, CheckpointAuthor
 mod tests {
     use super::*;
 
+    fn rebind_check() -> RebindCheck {
+        RebindCheck {
+            previous_version: 3,
+            current_version: Some(4),
+            binding_changed: false,
+            trust_deadline_shrank: false,
+            deadline_expired: false,
+        }
+    }
+
+    /// M7-C80: every clause of the re-bind guard fails closed on its own.
+    #[test]
+    fn every_rebind_clause_fails_closed_on_its_own() {
+        assert!(
+            rebind_permitted(rebind_check()),
+            "control: a clean re-sign re-binds"
+        );
+        let mut equal = rebind_check();
+        equal.current_version = Some(3);
+        assert!(rebind_permitted(equal), "the same version still re-binds");
+        type Mutation = fn(&mut RebindCheck);
+        let cases: [(&str, Mutation); 5] = [
+            ("a lower version", |c| c.current_version = Some(2)),
+            ("a missing record", |c| c.current_version = None),
+            ("a changed binding", |c| c.binding_changed = true),
+            ("a shrunk boundary", |c| c.trust_deadline_shrank = true),
+            ("a passed deadline", |c| c.deadline_expired = true),
+        ];
+        for (name, mutate) in cases {
+            let mut check = rebind_check();
+            mutate(&mut check);
+            assert!(!rebind_permitted(check), "M7-C80: {name} was re-bound");
+        }
+    }
+
+    /// M7-C80: a renewal never moves a deadline earlier, and an unchanged
+    /// signed boundary keeps the deadline it was first converted to.
+    #[test]
+    fn a_renewed_deadline_is_never_earlier_and_unchanged_boundaries_keep_theirs() {
+        let base = Instant::now();
+        let previous = base + Duration::from_secs(10);
+        let earlier = base + Duration::from_secs(9);
+        let later = base + Duration::from_secs(20);
+        assert_eq!(
+            renewed_deadline(previous, true, Some(earlier), later),
+            previous,
+            "M7-C80: a renewal moved the deadline earlier than it already was"
+        );
+        assert_eq!(renewed_deadline(previous, true, None, earlier), previous);
+        assert_eq!(renewed_deadline(previous, true, Some(later), later), later);
+        assert_eq!(
+            renewed_deadline(previous, true, Some(later + Duration::from_secs(1)), later),
+            later,
+            "the peer boundary still bounds the renewal"
+        );
+        assert_eq!(
+            renewed_deadline(previous, false, Some(later), later),
+            previous,
+            "an unchanged boundary keeps its first conversion"
+        );
+    }
+
     #[test]
     fn request_rejects_invalid_nonce() {
         let request = CheckpointRequest {
@@ -2687,7 +2971,10 @@ mod tests {
             reason: Arc::new(AtomicU8::new(
                 PeerInvalidationReason::MembershipRevoked.code(),
             )),
-            expires_at: Some(Instant::now() - Duration::from_millis(1)),
+            expires_at: Some(SharedAdmissionExpiry::new(
+                Instant::now() - Duration::from_millis(1),
+                None,
+            )),
         };
         revoked_after_deadline.token().cancel();
         assert!(!revoked_after_deadline.trust_expired());
