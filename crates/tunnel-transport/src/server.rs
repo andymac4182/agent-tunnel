@@ -1362,6 +1362,80 @@ mod tests {
         assert!(result.is_ok(), "cancellation returned an error: {result:?}");
     }
 
+    /// M6-C124 with M6-C153: a connection accepted into the over-capacity
+    /// refusal margin (answered `503 CONNECTION_LIMIT`, not served) gets
+    /// `TCP_NODELAY` too.  With a limit of one, the second connection is
+    /// refused; both must be counted as set.
+    #[tokio::test]
+    async fn a_connection_refused_for_capacity_has_nodelay_set() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind refused-nodelay test listener");
+        let address = listener.local_addr().expect("listener address");
+        let cancel = CancellationToken::new();
+        let diagnostics = AcceptedSocketDiagnostics::new();
+        let server = tokio::spawn(serve_with_socket_options(
+            listener,
+            Router::new(),
+            test_server_config(),
+            cancel.clone(),
+            AcceptedSocketOptions {
+                send_buffer_bytes: None,
+                diagnostics: Some(diagnostics.clone()),
+                listener: None,
+                capacity: ListenerCapacity {
+                    max_connections: 1,
+                    refusal_margin: 1,
+                    ..ListenerCapacity::default()
+                },
+            },
+        ));
+
+        let served = TcpStream::connect(address)
+            .await
+            .expect("connect the served client");
+        // The served connection holds the only permit before the next arrives.
+        timeout(Duration::from_secs(5), async {
+            while diagnostics.nodelay_counts().0 + diagnostics.nodelay_counts().1 < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the served connection was not accepted before the deadline");
+        let refused = TcpStream::connect(address)
+            .await
+            .expect("connect the over-capacity client");
+        let counts = timeout(Duration::from_secs(5), async {
+            loop {
+                let (set, unset) = diagnostics.nodelay_counts();
+                if diagnostics.capacity_refusals() >= 1 && set + unset >= 2 {
+                    break (set, unset);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the over-capacity connection was not accepted before the deadline");
+        assert_eq!(
+            diagnostics.capacity_refusals(),
+            1,
+            "the second connection is refused"
+        );
+        assert_eq!(
+            counts,
+            (2, 0),
+            "the served and the refused socket must both have TCP_NODELAY set (set, unset)"
+        );
+
+        cancel.cancel();
+        drop((served, refused));
+        let result = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("transport supervisor did not join after cancellation")
+            .expect("transport supervisor task panicked");
+        assert!(result.is_ok(), "cancellation returned an error: {result:?}");
+    }
+
     #[tokio::test]
     async fn invalid_accepted_socket_option_returns_and_releases_listener() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
