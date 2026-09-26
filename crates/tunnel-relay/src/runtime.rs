@@ -522,6 +522,9 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "STREAM_CLOSED",
         "CANCEL_UNDELIVERABLE",
         "FLOW_CONTROL_UNDELIVERABLE",
+        // A session asked to owe more relay ACKs than its bound (review of
+        // #199, task row M6-C160).
+        "FLOW_CONTROL_OWED_LIMIT",
         // An abandoned unary echo outlived its bound (task row M7-C94).
         "UNARY_ABANDON_TIMEOUT",
     ];

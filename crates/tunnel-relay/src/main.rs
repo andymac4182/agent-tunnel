@@ -837,6 +837,11 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
     let options = RelayOptions::new(oidc);
     let consumer_listener = TcpListener::bind(config.consumer_bind).await?;
     let device_listener = TcpListener::bind(config.device_bind).await?;
+    // M6-C155: an open-file limit below what the listeners can hold turns a
+    // connection flood into EMFILE at accept; say so before serving.
+    if let Some(warning) = config.descriptor_limit_warning(soft_descriptor_limit()) {
+        eprintln!("{warning}");
+    }
     // M6-C24: the private metrics listener, bound with the others so a busy
     // or refused address stops startup before anything serves.
     let metrics_listener = match config.metrics_bind {
@@ -1940,4 +1945,16 @@ mod tests {
             "cluster membership bootstrap did not reach ready: readiness=unready reason=catalog_unavailable category=catalog; cleanup=membership_shutdown_failed reason=join"
         );
     }
+}
+
+/// The soft `RLIMIT_NOFILE`, `None` when unlimited or not applicable.
+#[cfg(unix)]
+fn soft_descriptor_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
+/// Windows has no `RLIMIT_NOFILE`; the check is Unix-only.
+#[cfg(not(unix))]
+fn soft_descriptor_limit() -> Option<u64> {
+    None
 }
