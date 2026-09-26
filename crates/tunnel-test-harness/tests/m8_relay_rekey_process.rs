@@ -62,9 +62,9 @@ use uuid::Uuid;
 #[path = "common/m7_deployment.rs"]
 mod common;
 use common::{
-    CheckpointServer, FixtureFiles, ProcessConfigFixture, free_tcp_addr,
-    health_request, hex_encode, jwks_json, parse_plaintext_upstream, process_diagnostic,
-    relay_binary_path, send_sigint, wait_for_exit, wait_for_ports_released, wait_for_ready,
+    CheckpointServer, FixtureFiles, ProcessConfigFixture, free_tcp_addr, health_request,
+    hex_encode, jwks_json, parse_plaintext_upstream, process_diagnostic, relay_binary_path,
+    send_sigint, wait_for_exit, wait_for_ports_released, wait_for_ready,
 };
 
 macro_rules! bail {
@@ -552,15 +552,19 @@ async fn create_fixture_inner(
     let peer_a_key_path = files.write("relay-a-peer-key.pem", a_credential.key_pem.as_bytes())?;
     let old_credential = credential("relay-b-old", &node_b.peer_certificate, &pki);
     let new_credential = credential("relay-b-next", &successor, &pki);
-    let peer_b_chain_path =
-        files.write("relay-b-peer-chain.pem", old_credential.chain_pem.as_bytes())?;
+    let peer_b_chain_path = files.write(
+        "relay-b-peer-chain.pem",
+        old_credential.chain_pem.as_bytes(),
+    )?;
     let peer_b_key_path = files.write("relay-b-peer-key.pem", old_credential.key_pem.as_bytes())?;
     let peer_b_next_chain_path = files.write(
         "relay-b-next-peer-chain.pem",
         new_credential.chain_pem.as_bytes(),
     )?;
-    let peer_b_next_key_path =
-        files.write("relay-b-next-peer-key.pem", new_credential.key_pem.as_bytes())?;
+    let peer_b_next_key_path = files.write(
+        "relay-b-next-peer-key.pem",
+        new_credential.key_pem.as_bytes(),
+    )?;
     let state_a = files.state_path()?;
     let state_b = state_a.with_file_name("relay-b-membership-state.json");
     let a_consumer_bind = free_tcp_addr();
@@ -1010,7 +1014,8 @@ impl RekeyFixture {
         // ---- phase 2: the publisher approves both; B switches -------------
         self.refresh_a().await?;
         self.publish_b(2, &[&self.old_key, &self.new_key]).await?;
-        self.wait_b_presents(self.new_spki, "switch", deadline).await?;
+        self.wait_b_presents(self.new_spki, "switch", deadline)
+            .await?;
         let new_presented_after_switch = self.b_presents(self.new_spki).await?;
         let old_presented_after_switch = self.b_presents(self.old_spki).await?;
         self.wait_b_logged(&["peer identity switched"], "switch log", deadline)
@@ -1038,10 +1043,9 @@ impl RekeyFixture {
         let (b_readiness_samples, b_unready_samples) = b_sampler.stop().await?;
         let (a_readiness_samples, a_unready_samples) = a_sampler.stop().await?;
         let b_pid_final = self.b_pid()?;
-        let diagnostics_payload_free = self
-            .processes
-            .iter()
-            .all(|slot| ensure_safe_diagnostic(&process_diagnostic(&slot.process), slot.label).is_ok());
+        let diagnostics_payload_free = self.processes.iter().all(|slot| {
+            ensure_safe_diagnostic(&process_diagnostic(&slot.process), slot.label).is_ok()
+        });
         Ok(RekeyEvidence {
             b_pid_initial,
             b_pid_final,
@@ -1135,7 +1139,9 @@ fn send_sighup(pid: u32) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(HarnessError::Process(format!("sending SIGHUP returned {status}")))
+        Err(HarnessError::Process(format!(
+            "sending SIGHUP returned {status}"
+        )))
     }
 }
 
@@ -1850,7 +1856,8 @@ impl LongLivedRedisTlsProxy {
     }
 
     async fn shutdown_allow_unused(mut self) -> Result<()> {
-        self.handshakes.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.cancellation.cancel();
         if let Some(task) = self.task.take() {
             let _ = timeout(Duration::from_secs(5), task).await;

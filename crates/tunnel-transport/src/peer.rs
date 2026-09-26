@@ -2345,7 +2345,8 @@ impl PeerClient {
         drop(draining);
         let weak = Arc::downgrade(connection);
         let permits = connection.stream_permits.clone();
-        let permit_count = u32::try_from(self.limits.max_streams_per_connection).unwrap_or(u32::MAX);
+        let permit_count =
+            u32::try_from(self.limits.max_streams_per_connection).unwrap_or(u32::MAX);
         let budget = self.limits.drain_timeout;
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
@@ -2457,15 +2458,16 @@ impl PeerClient {
 
         let result: Result<PeerConnectionHandle, PeerTransportError> = async {
             let local_generation = self.local_generation();
-            let usable = with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
-                .await?
-                .get(&destination)
-                .filter(|connection| {
-                    connection.connection.close_reason().is_none()
-                        && !connection.cancel.is_cancelled()
-                        && current_pins.verify(&connection.identity).is_ok()
-                })
-                .cloned();
+            let usable =
+                with_checkout_deadline(&self.cancel, deadline, self.state.connections.lock())
+                    .await?
+                    .get(&destination)
+                    .filter(|connection| {
+                        connection.connection.close_reason().is_none()
+                            && !connection.cancel.is_cancelled()
+                            && current_pins.verify(&connection.identity).is_ok()
+                    })
+                    .cloned();
             if let Some(connection) = usable {
                 // Same local identity: reuse.  A superseded local identity:
                 // drain the predecessor and dial with the current one -- unless

@@ -5735,14 +5735,10 @@ async fn start_relay(
     .map_err(|error| HarnessError::Pki(format!("peer identity {}: {error}", node.node_id)))?;
     let mut peer_server = peer_identity
         .quinn_server_config(node.peer_ca_pem().as_bytes())
-        .map_err(|error| {
-            HarnessError::Pki(format!("peer server TLS {}: {error}", node.node_id))
-        })?;
+        .map_err(|error| HarnessError::Pki(format!("peer server TLS {}: {error}", node.node_id)))?;
     let mut peer_client = peer_identity
         .quinn_client_config(node.peer_ca_pem().as_bytes())
-        .map_err(|error| {
-            HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id))
-        })?;
+        .map_err(|error| HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id)))?;
     let peer_limits = PeerTransportLimits::default()
         .with_timeouts(PRODUCTION_PEER_IDLE_TIMEOUT, Duration::from_secs(5))
         .map_err(|error| HarnessError::Process(format!("peer limits: {error}")))?;

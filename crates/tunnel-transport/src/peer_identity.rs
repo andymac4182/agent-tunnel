@@ -328,7 +328,10 @@ struct ServerResolver(Arc<RotatingPeerIdentity>);
 
 impl fmt::Debug for ServerResolver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ServerResolver").field(&self.0).finish()
+        formatter
+            .debug_tuple("ServerResolver")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -342,7 +345,10 @@ struct ClientResolver(Arc<RotatingPeerIdentity>);
 
 impl fmt::Debug for ClientResolver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ClientResolver").field(&self.0).finish()
+        formatter
+            .debug_tuple("ClientResolver")
+            .field(&self.0)
+            .finish()
     }
 }
 

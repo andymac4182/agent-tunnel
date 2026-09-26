@@ -516,7 +516,10 @@ impl ClusterConfig {
                 "cluster.membership_refresh_seconds must not exceed the record lifetime",
             ));
         }
-        match (&self.peer_tls_next_cert_chain, &self.peer_tls_next_private_key) {
+        match (
+            &self.peer_tls_next_cert_chain,
+            &self.peer_tls_next_private_key,
+        ) {
             (None, None) => {}
             (Some(chain), Some(key)) => {
                 validate_config_path(chain, "cluster.peer_tls_next_cert_chain")?;

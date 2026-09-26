@@ -813,10 +813,7 @@ async fn m8c45_without_the_switch_withdrawing_the_served_key_still_fails_closed(
 #[tokio::test]
 async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_installed() {
     let fixture = RuntimeFixture::new(true);
-    fixture
-        .source
-        .replace(vec![fixture.valid_record(1)])
-        .await;
+    fixture.source.replace(vec![fixture.valid_record(1)]).await;
     fixture.runtime.bootstrap().await.expect("single-key ready");
     assert_eq!(
         fixture.runtime.local_key_approval(NEXT_SPKI_SHA256),
@@ -832,7 +829,9 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
         .await;
     assert!(matches!(
         refused,
-        Err(LocalServingSwitchError::NotApproved(LocalKeyApproval::Absent))
+        Err(LocalServingSwitchError::NotApproved(
+            LocalKeyApproval::Absent
+        ))
     ));
     assert!(!installed, "nothing may be installed for an unapproved key");
     assert_eq!(
@@ -845,7 +844,11 @@ async fn m8c45_a_switch_to_an_unapproved_key_is_refused_before_anything_is_insta
         .source
         .replace(vec![fixture.overlap_record(2)])
         .await;
-    fixture.runtime.reconcile_once().await.expect("overlap ready");
+    fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect("overlap ready");
     let failed = fixture
         .runtime
         .switch_local_serving_spki(NEXT_SPKI_SHA256, || Err::<(), _>("transport refused"))
@@ -1017,7 +1020,11 @@ mod rekey {
             .source
             .replace(vec![record(&fixture, 4, &[&current.spki, &next.spki], &[])])
             .await;
-        fixture.runtime.reconcile_once().await.expect("overlap again");
+        fixture
+            .runtime
+            .reconcile_once()
+            .await
+            .expect("overlap again");
         assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Staged);
         tokio::time::sleep(HOLD / 2).await;
         assert_eq!(
@@ -1029,7 +1036,10 @@ mod rekey {
         let switched = rekey.tick().await;
         assert_eq!(switched.phase, PeerRekeyPhase::Overlap);
         assert_eq!(switched.serving_spki, next.spki);
-        assert_eq!(switched.previous_spki.as_deref(), Some(current.spki.as_str()));
+        assert_eq!(
+            switched.previous_spki.as_deref(),
+            Some(current.spki.as_str())
+        );
         assert_eq!(
             fixture.runtime.local_serving_spki().as_deref(),
             Some(next.spki.as_str())
@@ -1040,12 +1050,22 @@ mod rekey {
             .source
             .replace(vec![record(&fixture, 5, &[&next.spki], &[])])
             .await;
-        fixture.runtime.reconcile_once().await.expect("successor only");
+        fixture
+            .runtime
+            .reconcile_once()
+            .await
+            .expect("successor only");
         assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
         let retired = rekey.tick().await;
         assert_eq!(retired.phase, PeerRekeyPhase::Stable);
-        assert_eq!(retired.last_retirement, Some(PeerRekeyRetirement::Withdrawn));
-        assert_eq!((retired.stages, retired.switches, retired.retirements), (1, 1, 1));
+        assert_eq!(
+            retired.last_retirement,
+            Some(PeerRekeyRetirement::Withdrawn)
+        );
+        assert_eq!(
+            (retired.stages, retired.switches, retired.retirements),
+            (1, 1, 1)
+        );
     }
 
     #[tokio::test]
@@ -1076,7 +1096,11 @@ mod rekey {
         ));
         tokio::time::sleep(HOLD / 2).await;
         let unready = rekey.tick().await;
-        assert_eq!(unready.phase, PeerRekeyPhase::Staged, "never switch while Unready");
+        assert_eq!(
+            unready.phase,
+            PeerRekeyPhase::Staged,
+            "never switch while Unready"
+        );
         assert_eq!(unready.staged_approval, Some("not_ready"));
         fixture.authority.set_mode(AuthorityMode::Ready);
         fixture.runtime.reconcile_once().await.expect("ready again");
@@ -1155,6 +1179,9 @@ mod rekey {
             pki.ca_pem.as_bytes(),
         )
         .expect("valid candidate");
-        assert_eq!(rekey.snapshot().staged_spki.as_deref(), Some(next.spki.as_str()));
+        assert_eq!(
+            rekey.snapshot().staged_spki.as_deref(),
+            Some(next.spki.as_str())
+        );
     }
 }

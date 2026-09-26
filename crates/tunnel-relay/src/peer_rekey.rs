@@ -274,7 +274,9 @@ impl PeerRekey {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, RekeyState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn lock_counters(&self) -> std::sync::MutexGuard<'_, Counters> {
@@ -308,8 +310,9 @@ impl PeerRekey {
         certificate_pem: &[u8],
         private_key_pem: &[u8],
     ) -> Result<String, PeerRekeyError> {
-        let staged = StagedPeerIdentity::from_pem(certificate_pem, private_key_pem, &self.peer_ca_pem)
-            .inspect_err(|_| self.refuse("staged_identity_invalid"))?;
+        let staged =
+            StagedPeerIdentity::from_pem(certificate_pem, private_key_pem, &self.peer_ca_pem)
+                .inspect_err(|_| self.refuse("staged_identity_invalid"))?;
         self.stage(staged)
     }
 
@@ -366,7 +369,8 @@ impl PeerRekey {
                     match approval {
                         LocalKeyApproval::Approved { .. } => {
                             let since = *staged.approved_since.get_or_insert(now);
-                            if now.saturating_duration_since(since) >= self.config.convergence_hold {
+                            if now.saturating_duration_since(since) >= self.config.convergence_hold
+                            {
                                 Action::Switch
                             } else {
                                 Action::None

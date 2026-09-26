@@ -321,7 +321,9 @@ impl Gate<'_> {
             .nodes
             .iter()
             .find(|node| node.node_id == INGRESS_NODE)
-            .ok_or_else(|| HarnessError::InvalidInput("the ingress node fixture is missing".into()))?;
+            .ok_or_else(|| {
+                HarnessError::InvalidInput("the ingress node fixture is missing".into())
+            })?;
         let config = load_peer_client_config_from_pem(
             ingress.peer_certificate_chain_pem().as_bytes(),
             ingress.peer_certificate.private_key_pem.as_bytes(),
@@ -346,8 +348,7 @@ impl Gate<'_> {
             .ok_or_else(|| HarnessError::InvalidInput("the owner peer proxy is missing".into()))?
             .address();
         let destination = PeerDestination::new(address, "localhost");
-        let presented = match timeout(Duration::from_secs(10), client.connect(destination)).await
-        {
+        let presented = match timeout(Duration::from_secs(10), client.connect(destination)).await {
             Ok(Ok(handle)) => handle.peer_identity().spki_sha256() == pin,
             Ok(Err(_)) | Err(_) => false,
         };
@@ -370,12 +371,16 @@ impl Gate<'_> {
             .nodes
             .iter()
             .find(|node| node.node_id == TARGET_NODE)
-            .ok_or_else(|| HarnessError::InvalidInput("the owner node fixture is missing".into()))?;
+            .ok_or_else(|| {
+                HarnessError::InvalidInput("the owner node fixture is missing".into())
+            })?;
         let chain = original.peer_certificate_chain_pem();
         let key = original.peer_certificate.private_key_pem.clone();
         rekey
             .stage_pem(chain.as_bytes(), key.as_bytes())
-            .map_err(|error| HarnessError::Process(format!("staging the original back: {error}")))?;
+            .map_err(|error| {
+                HarnessError::Process(format!("staging the original back: {error}"))
+            })?;
         let now = Utc::now();
         let overlap = self.next_record_version();
         self.publish_owner_keys(overlap, &[original_spki, current_spki], now)
@@ -394,7 +399,8 @@ impl Gate<'_> {
             sleep(Duration::from_millis(50)).await;
         }
         let withdraw = self.next_record_version();
-        self.publish_owner_keys(withdraw, &[original_spki], now).await?;
+        self.publish_owner_keys(withdraw, &[original_spki], now)
+            .await?;
         if !self.converge_owner_keys(withdraw, &[original_spki]).await? {
             return Ok(false);
         }
@@ -415,7 +421,9 @@ impl Gate<'_> {
 fn spki_from_hex(hex: &str) -> Result<tunnel_transport::SpkiSha256> {
     let mut bytes = [0_u8; 32];
     if hex.len() != 64 {
-        return Err(HarnessError::InvalidInput("an SPKI digest is 64 hex digits".into()));
+        return Err(HarnessError::InvalidInput(
+            "an SPKI digest is 64 hex digits".into(),
+        ));
     }
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)

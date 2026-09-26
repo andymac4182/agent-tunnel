@@ -1144,25 +1144,37 @@ impl MembershipRuntime {
         let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
             return LocalKeyApproval::NotReady;
         };
-        let Some(minimum) = checkpoint.checkpoint().minimum_versions.get(node_id).copied() else {
+        let Some(minimum) = checkpoint
+            .checkpoint()
+            .minimum_versions
+            .get(node_id)
+            .copied()
+        else {
             return LocalKeyApproval::Absent;
         };
-        let Some(membership) = state
-            .verifier
-            .retained_memberships()
-            .into_iter()
-            .find(|membership| {
-                membership.node_id() == node_id && membership.record().record_version >= minimum
-            })
+        let Some(membership) =
+            state
+                .verifier
+                .retained_memberships()
+                .into_iter()
+                .find(|membership| {
+                    membership.node_id() == node_id && membership.record().record_version >= minimum
+                })
         else {
             return LocalKeyApproval::Absent;
         };
         let mut listed = LocalKeyApproval::Absent;
-        for key in membership.keys().iter().filter(|key| key.spki_sha256 == spki) {
+        for key in membership
+            .keys()
+            .iter()
+            .filter(|key| key.spki_sha256 == spki)
+        {
             if key.revoked {
                 return LocalKeyApproval::Revoked;
             }
-            if key.not_before <= now && key.expires_at >= now && membership.record().expires_at >= now
+            if key.not_before <= now
+                && key.expires_at >= now
+                && membership.record().expires_at >= now
             {
                 return LocalKeyApproval::Approved {
                     record_version: membership.record().record_version,

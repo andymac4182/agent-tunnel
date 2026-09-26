@@ -21,9 +21,8 @@ use tokio::{sync::watch, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tunnel_transport::{
     ApprovedPeerPins, MAX_ROTATION_DRAINING_CONNECTIONS, PeerClient, PeerDestination,
-    PeerIdentityError, PeerServer,
-    PeerTransportError, PeerTransportLimits, RotatingPeerIdentity, SharedPeerPins, SpkiSha256,
-    StagedPeerIdentity, TlsIdentity, spki_sha256_from_der,
+    PeerIdentityError, PeerServer, PeerTransportError, PeerTransportLimits, RotatingPeerIdentity,
+    SharedPeerPins, SpkiSha256, StagedPeerIdentity, TlsIdentity, spki_sha256_from_der,
 };
 
 const SERVER_NAME: &str = "localhost";
@@ -50,7 +49,9 @@ impl Pki {
         params.distinguished_name.push(DnType::CommonName, name);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let ca = params.self_signed(&ca_key).expect("rotation CA certificate");
+        let ca = params
+            .self_signed(&ca_key)
+            .expect("rotation CA certificate");
         Self {
             ca_pem: ca.pem(),
             ca,
@@ -60,8 +61,12 @@ impl Pki {
 
     fn issue(&self, role_uri: &str, dns: &[&str]) -> Leaf {
         let key = KeyPair::generate().expect("rotation leaf key");
-        let mut params = CertificateParams::new(dns.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>())
-            .expect("rotation leaf params");
+        let mut params = CertificateParams::new(
+            dns.iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("rotation leaf params");
         params
             .distinguished_name
             .push(DnType::CommonName, role_uri.to_owned());
@@ -136,7 +141,9 @@ impl Server {
             ApprovedPeerPins::new(client_pins.iter().copied()).expect("client pins"),
         )
         .expect("client pin provider");
-        let handler = move |identity: TlsIdentity, request: Request<()>, mut stream: tunnel_transport::PeerServerStream| {
+        let handler = move |identity: TlsIdentity,
+                            request: Request<()>,
+                            mut stream: tunnel_transport::PeerServerStream| {
             let mut release = release.clone();
             async move {
                 if request.uri().path() == "/hold" {
@@ -248,8 +255,7 @@ fn get(path: &str) -> Request<()> {
 }
 
 #[tokio::test]
-async fn a_server_install_changes_new_handshakes_and_keeps_established_connections() -> TestResult
-{
+async fn a_server_install_changes_new_handshakes_and_keeps_established_connections() -> TestResult {
     let pki = Pki::new("rotation server CA");
     let first = pki.peer("relay-a");
     let second = pki.peer("relay-a");
@@ -371,7 +377,11 @@ async fn the_drain_set_is_bounded_and_a_full_set_keeps_the_predecessor_serving()
             .open(server.destination.clone(), get("/who"))
             .await
             .map_err(|error| format!("who open: {error}"))?;
-        bodies.push(body_of(stream).await.map_err(|error| format!("who body: {error}"))?);
+        bodies.push(
+            body_of(stream)
+                .await
+                .map_err(|error| format!("who body: {error}"))?,
+        );
     }
     release_tx.send(true)?;
     let successors = bodies
