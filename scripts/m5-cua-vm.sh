@@ -19,6 +19,7 @@
 #   scripts/m5-cua-vm.sh destroy NAME         stop and delete (refuses cua-golden)
 #   scripts/m5-cua-vm.sh destroy-golden       delete cua-golden and its cached base image
 #   scripts/m5-cua-vm.sh cycle [NAME]         create, run, probe, stop, destroy; proves disposability
+#   scripts/m5-cua-vm.sh build-client OUTDIR  build the guest tunnel-client (--features cua) in a clone
 #
 # Environment: TART (default: tart on PATH), TART_HOME (Tart's storage, default
 # ~/.tart; the disk floor is checked on the filesystem holding it),
@@ -85,7 +86,11 @@ disk_check() {
   [ $((free - need)) -ge "${MIN_FREE_GIB}" ] || die "aborting: free space would drop below ${MIN_FREE_GIB} GiB"
 }
 
-vm_exists() { "${TART}" list --quiet 2>/dev/null | grep -qx "$1"; }
+# Not `grep -q`: under `pipefail` an early-exiting grep leaves `tart list`
+# writing into a closed pipe, and the SIGPIPE makes an existing VM read as
+# absent -- measured on 2026-09-26, when `destroy` of a demo clone printed
+# "does not exist" and left it running (task row M5-C25).
+vm_exists() { "${TART}" list --quiet 2>/dev/null | grep -x "$1" >/dev/null; }
 vm_running() { "${TART}" list --format json | python3 -c 'import json,sys; n=sys.argv[1]; sys.exit(0 if any(v["Name"]==n and v["Running"] for v in json.load(sys.stdin)) else 1)' "$1"; }
 gexec() { local vm="$1"; shift; "${TART}" exec "${vm}" "$@"; }
 # gexec_in VM CMD...: as gexec, with the host's stdin attached (`tart exec -i`
@@ -349,8 +354,40 @@ cmd_cycle() {
   cmd_probe "${vm}"
   cmd_stop "${vm}"
   cmd_destroy "${vm}"
-  "${TART}" list --quiet | grep -qx "${vm}" && die "${vm} survived the cycle"
+  vm_exists "${vm}" && die "${vm} survived the cycle"
   log "cycle complete: ${vm} created, probed and deleted; remaining: $("${TART}" list --quiet | tr '\n' ' ')"
+}
+
+# build-client OUTDIR: build tunnel-client (--features cua) and tunnel-deadman
+# for aarch64-unknown-linux-gnu INSIDE a disposable clone, copy them to
+# OUTDIR, and delete the clone. The clone's Ubuntu matches the guest's glibc.
+# It downloads rustup and the pinned toolchain from the official Rust
+# distribution inside the guest; crates come from the host's cargo registry
+# (run `cargo fetch --locked` first), so the build itself is --offline.
+cmd_build_client() {
+  local out="${1:?output directory}" vm q
+  mkdir -p "${out}"
+  vm="cua-build-$(openssl rand -hex 3)"
+  cmd_create "${vm}"
+  q="$(printf %q "${vm}")"
+  CLEANUP+=("cmd_stop ${q}; cmd_destroy ${q}")
+  boot "${vm}"
+  disk_check 3
+  gexec "${vm}" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.95.0 >/tmp/rustup.log 2>&1' \
+    || die "rustup install failed in ${vm}"
+  COPYFILE_DISABLE=1 tar -C "${HOME}/.cargo/registry" -cf - cache index \
+    | gexec_in "${vm}" bash -c 'mkdir -p ~/.cargo/registry && tar -x -C ~/.cargo/registry 2>/dev/null'
+  git -C "${ROOT}" archive --format=tar HEAD | gexec_in "${vm}" bash -c 'mkdir -p ~/src && tar -x -C ~/src'
+  log "building in ${vm} (release, 3 jobs, nice 10; about 20 minutes)"
+  gexec "${vm}" bash -c 'cd ~/src && CARGO_BUILD_JOBS=3 CARGO_INCREMENTAL=0 nice -n 10 ~/.cargo/bin/cargo build --offline --locked --release -p tunnel-client --features cua -p tunnel-deadman --bins' >"${STATE}/logs/${vm}.build.log" 2>&1 \
+    || die "build failed; see ${STATE}/logs/${vm}.build.log"
+  local b
+  for b in tunnel-client tunnel-deadman; do
+    gexec "${vm}" cat "/home/admin/src/target/release/${b}" >"${out}/${b}.tmp"
+    chmod 0755 "${out}/${b}.tmp"
+    mv "${out}/${b}.tmp" "${out}/${b}"
+  done
+  log "built from $(git -C "${ROOT}" rev-parse --short HEAD): $(cd "${out}" && shasum -a 256 tunnel-client tunnel-deadman | tr '\n' ' ')"
 }
 
 sub="${1:-}"; shift || true
@@ -364,5 +401,6 @@ case "${sub}" in
   destroy) cmd_destroy "$@" ;;
   destroy-golden) cmd_destroy_golden ;;
   cycle) cmd_cycle "$@" ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  build-client) cmd_build_client "$@" ;;
+  *) sed -n '2,26p' "$0"; exit 2 ;;
 esac

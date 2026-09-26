@@ -261,3 +261,123 @@ fn an_undeclared_scale_is_refused_at_resolution_and_never_defaulted() {
         Err(GeometryError)
     );
 }
+
+// ---- M5-C19 option (b): a declared point space, a ratio per capture -------
+
+/// The Linux identity case measured in the guest (1280x800 capture of a
+/// 1280x800 screen) and the fixture's 2x case both derive the ratio that
+/// places the pixel on the point it was picked from.
+#[test]
+fn a_point_space_derives_the_scale_of_each_capture() {
+    let space = PointSpace::new(1280, 800).unwrap();
+    assert_eq!(
+        space.scale_percent_for(1280, 800),
+        Ok(IDENTITY_SCALE_PERCENT)
+    );
+    assert_eq!(space.scale_percent_for(2560, 1600), Ok(200));
+
+    let fixture = PointSpace::new(128, 96).unwrap();
+    let percent = fixture.scale_percent_for(256, 192).unwrap();
+    let mut captures = Captures::new();
+    let identity = captures.record(&target(), 0, 256, 192, percent).unwrap();
+    assert_eq!(
+        identity.to_backend_point(Point::new(100, 80)),
+        Some((50, 40))
+    );
+}
+
+/// **The reason for option (b): the macOS resize.** A 1512x982-point Retina
+/// screen captured at 3024x1964 is resized by the pinned handler to
+/// 1920x1247 before encoding. A declared factor of 2 would click at 1.57x
+/// the intended position there; the point space derives 127% from the image
+/// itself, and the last pixel still lands inside the display.
+#[test]
+fn a_resized_capture_still_maps_inside_the_declared_space() {
+    let space = PointSpace::new(1512, 982).unwrap();
+    assert_eq!(space.scale_percent_for(3024, 1964), Ok(200));
+    let resized = space.scale_percent_for(1920, 1247).unwrap();
+    assert_eq!(resized, 127);
+    let mut captures = Captures::new();
+    let identity = captures.record(&target(), 0, 1920, 1247, resized).unwrap();
+    let (x, y) = identity.to_backend_point(Point::new(1919, 1246)).unwrap();
+    assert!(x < 1512 && y < 982, "({x}, {y}) is outside the display");
+}
+
+/// A declaration that contradicts the image refuses; it never picks one axis.
+#[test]
+fn a_point_space_that_contradicts_the_capture_is_refused() {
+    let space = PointSpace::new(1280, 800).unwrap();
+    // Rotated display, or the wrong screen declared.
+    assert_eq!(
+        space.scale_percent_for(800, 1280),
+        Err(ScaleDerivationError::AspectMismatch)
+    );
+    // A 4:3 capture against a 16:10 declaration.
+    assert_eq!(
+        space.scale_percent_for(1024, 768),
+        Err(ScaleDerivationError::AspectMismatch)
+    );
+    // Above the ceiling.
+    assert_eq!(
+        PointSpace::new(10, 10).unwrap().scale_percent_for(900, 900),
+        Err(ScaleDerivationError::OutOfRange)
+    );
+    assert_eq!(
+        space.scale_percent_for(0, 800),
+        Err(ScaleDerivationError::Geometry)
+    );
+    assert!(PointSpace::new(0, 800).is_err());
+    assert!(PointSpace::new(1280, MAX_CAPTURE_DIMENSION + 1).is_err());
+}
+
+/// Rounding must never place the far corner outside the display. Ratios are
+/// rounded **up**, so the last pixel of every axis converts to a point inside
+/// it; each case below is one where rounding to nearest would round down and
+/// push the last pixels past the edge.
+#[test]
+fn every_pixel_of_a_capture_maps_inside_the_declared_space() {
+    for (pixels, points) in [
+        (1004, 1000),
+        (101, 100),
+        (1005, 1000),
+        (50, 99),
+        (1247, 982),
+        (3, 2),
+    ] {
+        let space = PointSpace::new(points, points).unwrap();
+        let percent = space.scale_percent_for(pixels, pixels).unwrap();
+        let mut captures = Captures::new();
+        let identity = captures
+            .record(&target(), 0, pixels, pixels, percent)
+            .unwrap();
+        let (x, y) = identity
+            .to_backend_point(Point::new(pixels - 1, pixels - 1))
+            .unwrap();
+        assert!(
+            x < points && y < points,
+            "{pixels} px over {points} pt at {percent}%: last pixel maps to ({x}, {y})"
+        );
+    }
+    assert_eq!(
+        PointSpace::new(1000, 1000)
+            .unwrap()
+            .scale_percent_for(1004, 1004),
+        Ok(101)
+    );
+}
+
+/// The backend cross-check: equal on Linux, a whole multiple where the
+/// handler reports pixels.
+#[test]
+fn a_screen_size_reading_must_agree_with_the_declaration() {
+    let space = PointSpace::new(1280, 800).unwrap();
+    assert!(space.agrees_with_screen_size(1280, 800, &[1]));
+    // A declaration of half the real size passes a pixel-multiple platform
+    // and is refused on Linux, where there is no scale.
+    let half = PointSpace::new(640, 400).unwrap();
+    assert!(!half.agrees_with_screen_size(1280, 800, &[1]));
+    assert!(half.agrees_with_screen_size(1280, 800, &[1, 2, 3]));
+    // Both axes must use the same factor.
+    assert!(!half.agrees_with_screen_size(1280, 1200, &[1, 2, 3]));
+    assert!(!space.agrees_with_screen_size(1281, 800, &[1, 2, 3]));
+}

@@ -1,0 +1,6 @@
+{"baseline": {"button1_down": false, "shift_l_key_down": false, "shift_mask": false},
+ "mouse_down": {"success": true},
+ "key_down": {"success": true},
+ "after_client_disconnect": {"button1_down": true, "shift_l_key_down": true, "shift_mask": true},
+ "after_server_sigkill": {"button1_down": true, "shift_l_key_down": true, "shift_mask": true},
+ "after_guest_cleanup": {"button1_down": false, "shift_l_key_down": false, "shift_mask": false}}

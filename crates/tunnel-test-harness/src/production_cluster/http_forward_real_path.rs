@@ -910,6 +910,7 @@ async fn run(
             device_canary: None,
             mcp: None,
             acp: None,
+            cua: None,
             fs: None,
         },
     );

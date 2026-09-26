@@ -1,0 +1,1 @@
+{"button": {"height": 40, "width": 160, "x": 100, "y": 160}, "centre_colour": "#ffff00", "clicks": 0, "corner_colours": ["#ff0000", "#00ff00", "#0000ff", "#ff00ff"], "entry": {"height": 32, "width": 400, "x": 100, "y": 100}, "marker_size": 40, "screen": {"height": 800, "width": 1280}, "text": "", "title": "agentuplink-cua-fixture"}

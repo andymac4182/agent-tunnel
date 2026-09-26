@@ -1,0 +1,11 @@
+{
+  "clicks_after": 1,
+  "clicks_before": 0,
+  "consumer_exit": 0,
+  "markers_match_fixture": true,
+  "ok": true,
+  "stale_click": "capture_superseded",
+  "text_before_chars": 0,
+  "text_matches": true,
+  "unleased_click": "lease_not_held"
+}

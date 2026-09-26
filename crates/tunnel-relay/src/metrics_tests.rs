@@ -54,6 +54,21 @@ fn canary_snapshot() -> RelaySnapshot {
         ..RelaySnapshot::default()
     };
     snapshot.consumer_write_diagnostics.timeout_count = 2;
+    // Distinct values so a field rendered under the wrong series is caught.
+    snapshot.rotation_freeze_hold = crate::RotationFreezeHoldSnapshot {
+        held: 29,
+        currently_held: 2,
+        admitted_after_hold: 17,
+        released_on_commit: 13,
+        released_on_abort: 3,
+        released_on_recovery: 1,
+        released_with_deferred_writes: 4,
+        refused_after_bound: 5,
+        refused_hold_full: 7,
+        cancelled: 3,
+        released_on_session_loss: 2,
+        max_hold_wait_ms: 1_234,
+    };
     snapshot
         .consumer_write_diagnostics
         .recent_timeouts
@@ -96,7 +111,11 @@ fn rendered() -> String {
             failures: BTreeMap::from([("run_changed", 2), ("timeout", 1)]),
         }),
         snapshot: &snapshot,
-        consumer_refusals: BTreeMap::from([(("echo", "identity"), 6), (("echo", "grant"), 1)]),
+        consumer_refusals: BTreeMap::from([
+            (("echo", "identity"), 6),
+            (("echo", "grant"), 1),
+            (("stream", "rotation_freeze"), 8),
+        ]),
     })
 }
 
@@ -137,6 +156,19 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_consumer_write_timeouts_total 2",
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"identity\"} 6",
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"grant\"} 1",
+        "tunnel_relay_consumer_refusals_total{route=\"stream\",stage=\"rotation_freeze\"} 8",
+        "tunnel_relay_rotation_freeze_hold_held_total 29",
+        "tunnel_relay_rotation_freeze_hold_current 2",
+        "tunnel_relay_rotation_freeze_hold_admitted_total 17",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"commit\"} 13",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"abort\"} 3",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"recovery\"} 1",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"session_loss\"} 2",
+        "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total 4",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"} 5",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"hold_full\"} 7",
+        "tunnel_relay_rotation_freeze_hold_cancelled_total 3",
+        "tunnel_relay_rotation_freeze_hold_max_wait_ms 1234",
         "tunnel_relay_peer_faults_total{stage=\"head\"} 4",
         "tunnel_relay_peer_fault_causes_total{cause=\"transport_timeout\"} 4",
     ] {
@@ -145,6 +177,36 @@ fn m6c24_a_scrape_reports_the_aggregates() {
             "missing `{line}`:\n{text}"
         );
     }
+}
+
+/// The hold's partition (every held OPEN leaves exactly once) can be checked
+/// from the scrape alone: `held_total == current + released_total (all
+/// outcomes) + refused_total{after_bound} + cancelled_total`.
+#[test]
+fn m3_15_the_freeze_hold_partition_is_checkable_from_a_scrape() {
+    let text = rendered();
+    let value = |series: &str| -> u64 {
+        text.lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .unwrap_or_else(|| panic!("missing {series}:\n{text}"))
+            .parse()
+            .expect("u64 sample")
+    };
+    let released: u64 = ["commit", "abort", "recovery", "session_loss"]
+        .into_iter()
+        .map(|outcome| {
+            value(&format!(
+                "tunnel_relay_rotation_freeze_hold_released_total{{outcome=\"{outcome}\"}}"
+            ))
+        })
+        .sum();
+    assert_eq!(
+        value("tunnel_relay_rotation_freeze_hold_held_total"),
+        value("tunnel_relay_rotation_freeze_hold_current")
+            + released
+            + value("tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"}")
+            + value("tunnel_relay_rotation_freeze_hold_cancelled_total"),
+    );
 }
 
 #[test]
