@@ -77,3 +77,20 @@ relay also logs `refusing connection over the listener connection limit`
   `listener_refusal_margin` (`0..=256`) at the top level of the relay
   config. A margin of `0` does no TLS work over the limit. Excess connections
   then wait in the backlog with no answer.
+
+## Descriptor exhaustion (M6-C155, M6-C156)
+
+```sh
+cargo test --locked -p tunnel-transport --test m6_accept_errors
+cargo test --locked -p tunnel-transport --lib accept_error_tests
+```
+
+The first test lowers its own process's open-file limit to 256, fills it,
+and connects so that the listener's `accept` fails with `EMFILE`. It then
+checks that the listener is still serving. Before M6-C155 the listener
+returned `Accept(Too many open files)`, and the relay exited.
+
+To see the startup check, run `ulimit -n 100` in a shell, then start
+`tunnel-relay serve` from it. Before it prints `tunnel-relay listening`, it
+prints `tunnel-relay warning: open-file soft limit 100 is below the 160
+descriptors ...`.

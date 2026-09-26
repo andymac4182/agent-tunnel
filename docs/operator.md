@@ -1061,6 +1061,23 @@ health checks headroom by raising the limit. Before M6-C153 such a connection
 was dropped before TLS and the client saw a connection reset. Design and
 rationale: [runtime.md](runtime.md#connections-over-the-limit-m6-c153).
 
+**Open-file limit (M6-C155).** Every connection is a file descriptor. The two
+public listeners alone can hold `2 x (listener_max_connections +
+listener_refusal_margin)` at once (160 with the defaults); Redis, peer and
+metrics connections come on top. At startup the relay prints `tunnel-relay
+warning: open-file soft limit N is below the M descriptors ...` when the soft
+`RLIMIT_NOFILE` is lower. Raise it before raising `listener_max_connections`:
+`ulimit -n 4096` in the shell that starts the relay, or `LimitNOFILE=` in the
+systemd unit. If descriptors still run out, `accept` fails with `EMFILE` or
+`ENFILE`. The relay no longer exits when that happens (before M6-C155 it
+did). It logs `accept failed; backing off and continuing to serve` at `warn`
+with `phase=accept_error` and a fixed `class` (rate limited per class), waits
+100 ms and keeps serving. `ENOBUFS` and `ENOMEM` are handled the same way. A
+client that aborts or resets before the relay accepts it (`ECONNABORTED`) is
+not an exhaustion signal: the relay retries at once, without a pause, and
+logs only at `debug`. On macOS the kernel closes the connection whose
+accept failed; on Linux it stays queued.
+
 ### 3.3 A cluster
 
 **A cluster cannot be brought up with what this alpha ships** (M6-C22). Each

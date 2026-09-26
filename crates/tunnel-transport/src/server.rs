@@ -510,10 +510,34 @@ pub async fn serve_with_listener_options(
             }
             result = listener.accept() => match result {
                 Ok(accepted) => accepted,
-                Err(error) => {
-                    first_error = Some(TransportError::Accept(error));
-                    break;
-                }
+                Err(error) => match transient_accept_error(&error) {
+                    // M6-C155: descriptor or buffer exhaustion, or a peer that
+                    // aborted before accept, is not the listener's failure.
+                    // Release the slot, back off so a pending connection
+                    // cannot spin the loop, and keep serving.
+                    Some(class) => {
+                        drop(slot);
+                        let backoff = accept_error_backoff(class);
+                        if backoff.is_zero() {
+                            // Peer-caused: retry at once, as axum does, so a
+                            // client that connects and resets cannot throttle
+                            // the listener.
+                            tracing::debug!(listener = listener_name, class, "accept failed; peer went away");
+                            continue;
+                        }
+                        log_accept_error(&ACCEPT_ERROR_LOG, listener_name, class);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        continue;
+                    }
+                    None => {
+                        first_error = Some(TransportError::Accept(error));
+                        break;
+                    }
+                },
             },
         };
         // A permit may have been released while this slot waited in accept.
@@ -574,6 +598,8 @@ pub async fn serve_with_listener_options(
                         connection_cancel,
                         capacity.refusal_timeout,
                         timeouts,
+                        listener_name,
+                        &TLS_REFUSAL_LOG,
                     )
                     .await;
                     Ok::<(), TransportError>(())
@@ -685,10 +711,18 @@ async fn refuse_connection(
     cancel: CancellationToken,
     refusal_timeout: Duration,
     timeouts: ListenerTimeouts,
+    listener: &'static str,
+    tls_refusal_log: &crate::log_limit::RefusalLogLimiter,
 ) {
     let refusal = async {
-        let Ok(tls_stream) = acceptor.accept(stream).await else {
-            return;
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(tls_stream) => tls_stream,
+            Err(error) => {
+                // M6-C156: the same level, label and rate limit as a TLS
+                // refusal on a served connection.
+                log_handshake_failure(tls_refusal_log, listener, &error);
+                return;
+            }
         };
         let first_request = CancellationToken::new();
         let service = ObserveFirstRequest {
@@ -853,12 +887,7 @@ async fn serve_connection(
             // TCP close) stays at debug.
             // Any peer that can reach the listener can trigger it, so the
             // line is rate limited per label (review of M6-C52).
-            match tls_refusal_label(&error) {
-                Some(refusal) => {
-                    log_tls_refusal(&TLS_REFUSAL_LOG, listener, refusal);
-                }
-                None => tracing::debug!(?error, "TLS handshake rejected"),
-            }
+            log_handshake_failure(&TLS_REFUSAL_LOG, listener, &error);
             return Ok(());
         }
         Err(_) => {
@@ -922,6 +951,114 @@ async fn serve_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Log a failed TLS handshake: a certificate refusal at `info` with its fixed
+/// label, rate limited per label; anything else at `debug`.  Served and
+/// over-capacity connections share it (M6-C156).  Returns the refusal label,
+/// if the failure had one.
+fn log_handshake_failure(
+    limiter: &crate::log_limit::RefusalLogLimiter,
+    listener: &'static str,
+    error: &std::io::Error,
+) -> Option<&'static str> {
+    match tls_refusal_label(error) {
+        Some(refusal) => {
+            log_tls_refusal(limiter, listener, refusal);
+            Some(refusal)
+        }
+        None => {
+            tracing::debug!(?error, "TLS handshake rejected");
+            None
+        }
+    }
+}
+
+/// Pause after a resource-exhaustion `accept` error before accepting again
+/// (M6-C155); see [`accept_error_backoff`].
+///
+/// A connection that cannot be accepted stays pending, so without a pause the
+/// accept loop would spin on the same error at full speed.
+pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The pause before accepting again after a transient `accept` error of
+/// `class` (review of M6-C155).
+///
+/// Only resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) waits
+/// [`ACCEPT_ERROR_BACKOFF`]: retrying at once would spin on the same error.
+/// An aborted or reset connection is peer-caused and retried immediately with
+/// no pause, so a client that connects and resets repeatedly cannot throttle
+/// the listener to one accept per backoff.
+pub fn accept_error_backoff(class: &str) -> Duration {
+    match class {
+        "connection_aborted" | "connection_reset" => Duration::ZERO,
+        _ => ACCEPT_ERROR_BACKOFF,
+    }
+}
+
+/// The process-wide limit on `accept failed` lines, keyed by error class.
+static ACCEPT_ERROR_LOG: std::sync::LazyLock<crate::log_limit::RefusalLogLimiter> =
+    std::sync::LazyLock::new(crate::log_limit::RefusalLogLimiter::with_defaults);
+
+/// A fixed label for an `accept` error the listener survives (M6-C155), or
+/// `None` for one that ends it.
+///
+/// Recoverable: the process or system is out of file descriptors (`EMFILE`,
+/// `ENFILE`), buffer space or memory (`ENOBUFS`, `ENOMEM`), or the peer went
+/// away between the handshake and `accept` (`ECONNABORTED`; on Windows also
+/// `WSAECONNRESET`).  These describe the moment, not the listener.  Anything
+/// else (a closed or invalid listening socket) still ends the listener with
+/// [`TransportError::Accept`].
+pub fn transient_accept_error(error: &std::io::Error) -> Option<&'static str> {
+    #[cfg(unix)]
+    if let Some(errno) = rustix::io::Errno::from_io_error(error) {
+        use rustix::io::Errno;
+        return match errno {
+            Errno::MFILE => Some("process_file_descriptors_exhausted"),
+            Errno::NFILE => Some("system_file_descriptors_exhausted"),
+            Errno::NOBUFS => Some("no_buffer_space"),
+            Errno::NOMEM => Some("out_of_memory"),
+            Errno::CONNABORTED => Some("connection_aborted"),
+            _ => None,
+        };
+    }
+    #[cfg(windows)]
+    match error.raw_os_error() {
+        // WSAEMFILE, WSAENOBUFS, WSAECONNABORTED, WSAECONNRESET.
+        Some(10024) => return Some("process_file_descriptors_exhausted"),
+        Some(10055) => return Some("no_buffer_space"),
+        Some(10053) => return Some("connection_aborted"),
+        Some(10054) => return Some("connection_reset"),
+        Some(_) => return None,
+        None => {}
+    }
+    match error.kind() {
+        std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+        std::io::ErrorKind::OutOfMemory => Some("out_of_memory"),
+        _ => None,
+    }
+}
+
+/// Write one `accept failed` line for `class` unless `limiter` suppresses it.
+fn log_accept_error(
+    limiter: &crate::log_limit::RefusalLogLimiter,
+    listener: &'static str,
+    class: &'static str,
+) -> bool {
+    match limiter.admit(class) {
+        Some(suppressed) => {
+            tracing::warn!(
+                phase = "accept_error",
+                listener,
+                class,
+                suppressed,
+                backoff_ms = ACCEPT_ERROR_BACKOFF.as_millis() as u64,
+                "accept failed; backing off and continuing to serve"
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -1475,6 +1612,144 @@ mod tests {
         assert!(
             connection.is_err(),
             "listener remained reachable after configuration failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::*;
+
+    /// M6-C155: descriptor, buffer and memory exhaustion and an aborted peer
+    /// are survivable; a broken listening socket is not.
+    #[cfg(unix)]
+    #[test]
+    fn transient_accept_errors_are_classified_and_others_are_fatal() {
+        use rustix::io::Errno;
+        let io = |errno: Errno| std::io::Error::from_raw_os_error(errno.raw_os_error());
+        for (errno, class) in [
+            (Errno::MFILE, "process_file_descriptors_exhausted"),
+            (Errno::NFILE, "system_file_descriptors_exhausted"),
+            (Errno::NOBUFS, "no_buffer_space"),
+            (Errno::NOMEM, "out_of_memory"),
+            (Errno::CONNABORTED, "connection_aborted"),
+        ] {
+            assert_eq!(transient_accept_error(&io(errno)), Some(class), "{class}");
+        }
+        for fatal in [Errno::BADF, Errno::INVAL, Errno::NOTSOCK, Errno::OPNOTSUPP] {
+            assert_eq!(transient_accept_error(&io(fatal)), None, "{fatal:?}");
+        }
+        assert_eq!(
+            transient_accept_error(&std::io::Error::other("not an OS error")),
+            None
+        );
+    }
+
+    /// Review of M6-C155: an aborted or reset accept is peer-caused and must
+    /// not pause the listener; only descriptor, buffer and memory exhaustion
+    /// back off.  Red before the fix, which slept 100 ms for every class.
+    #[test]
+    fn aborted_accepts_do_not_pause_and_exhaustion_backs_off() {
+        for class in ["connection_aborted", "connection_reset"] {
+            assert_eq!(accept_error_backoff(class), Duration::ZERO, "{class}");
+        }
+        for class in [
+            "process_file_descriptors_exhausted",
+            "system_file_descriptors_exhausted",
+            "no_buffer_space",
+            "out_of_memory",
+        ] {
+            assert_eq!(accept_error_backoff(class), ACCEPT_ERROR_BACKOFF, "{class}");
+        }
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let class = transient_accept_error(&aborted).expect("aborted is transient");
+        assert!(accept_error_backoff(class).is_zero());
+        #[cfg(unix)]
+        {
+            let aborted =
+                std::io::Error::from_raw_os_error(rustix::io::Errno::CONNABORTED.raw_os_error());
+            let class = transient_accept_error(&aborted).expect("ECONNABORTED is transient");
+            assert!(accept_error_backoff(class).is_zero());
+        }
+    }
+
+    /// The accept-error line is rate limited per class like the TLS lines.
+    #[test]
+    fn accept_error_lines_are_rate_limited() {
+        let limiter = crate::log_limit::RefusalLogLimiter::new(3, Duration::from_secs(60));
+        let written = (0..100)
+            .filter(|_| {
+                log_accept_error(&limiter, "consumer", "process_file_descriptors_exhausted")
+            })
+            .count();
+        assert_eq!(written, 3);
+    }
+
+    /// M6-C156: a certificate refusal on an over-capacity connection is logged
+    /// through the same labelled, rate-limited path as on a served one.  The
+    /// limiter admits one line, so the refusal consuming it is observable: a
+    /// further admit for the same label is suppressed.  Red before the fix,
+    /// which returned without logging.
+    #[tokio::test]
+    async fn refused_connection_tls_failure_uses_the_tls_refusal_log() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+
+        let server_key = KeyPair::generate().expect("server key");
+        let mut server_params = CertificateParams::default();
+        server_params
+            .subject_alt_names
+            .push(SanType::DnsName("localhost".try_into().expect("name")));
+        let server_cert = server_params.self_signed(&server_key).expect("server cert");
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("client ca");
+        let server_config = crate::load_server_config_from_pem(
+            server_cert.pem().as_bytes(),
+            server_key.serialize_pem().as_bytes(),
+            Some(ca_cert.pem().as_bytes()),
+        )
+        .expect("mTLS server config");
+        let roots = crate::require_root_certificates(server_cert.pem().as_bytes()).expect("roots");
+        let client_config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let client = tokio::spawn(async move {
+            let tcp = TcpStream::connect(address).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect("localhost".try_into().expect("name"), tcp)
+                .await?;
+            // TLS 1.3 completes on the client first; reading surfaces the
+            // server's refusal of the missing certificate.
+            let _ = tokio::io::AsyncReadExt::read(&mut tls, &mut [0_u8; 1]).await;
+            Ok::<(), std::io::Error>(())
+        });
+        let (stream, _) = listener.accept().await.expect("accept");
+
+        let limiter = crate::log_limit::RefusalLogLimiter::new(1, Duration::from_secs(60));
+        refuse_connection(
+            stream,
+            TlsAcceptor::from(server_config),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+            ListenerTimeouts::default(),
+            "device",
+            &limiter,
+        )
+        .await;
+        let _ = client.await;
+
+        assert_eq!(
+            limiter.admit("client_certificate_missing"),
+            None,
+            "the over-capacity certificate refusal did not reach the TLS refusal log"
         );
     }
 }
