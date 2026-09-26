@@ -1282,7 +1282,26 @@ mod rekey {
             .reconcile_once()
             .await
             .expect("successor only");
-        assert_eq!(rekey.tick().await.phase, PeerRekeyPhase::Stable);
+        // Hold the retirement open where it closes the predecessor's
+        // connections (up to the drain budget in production), and try to
+        // restage the retiring key inside that window.
+        let hold = Arc::new(tunnel_relay::peer_rekey::RetireHold::default());
+        rekey.hold_next_retirement(Arc::clone(&hold));
+        let retiring = {
+            let rekey = Arc::clone(&rekey);
+            tokio::spawn(async move { rekey.tick().await })
+        };
+        hold.entered.notified().await;
+        let mid_retirement = rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes());
+        assert!(
+            mid_retirement.is_err(),
+            "the retiring key was restaged while its retirement was still closing connections"
+        );
+        hold.release.notify_one();
+        assert_eq!(
+            retiring.await.expect("retire join").phase,
+            PeerRekeyPhase::Stable
+        );
         // Rolling back to the key this process just retired is refused.
         let rollback = rekey.stage_pem(current.chain.as_bytes(), current.key.as_bytes());
         assert!(

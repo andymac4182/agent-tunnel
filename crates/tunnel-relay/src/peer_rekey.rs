@@ -113,6 +113,9 @@ pub enum PeerRekeyPhase {
     Switching,
     /// The successor serves; the predecessor is draining.
     Overlap,
+    /// The predecessor is being retired: its remaining connections are being
+    /// closed, which can take the peer drain budget.  Staging is refused.
+    Retiring,
 }
 
 impl PeerRekeyPhase {
@@ -123,6 +126,7 @@ impl PeerRekeyPhase {
             Self::Staged => "staged",
             Self::Switching => "switching",
             Self::Overlap => "overlap",
+            Self::Retiring => "retiring",
         }
     }
 }
@@ -224,6 +228,7 @@ enum RekeyState {
     Staged(StagedState),
     Switching,
     Overlap(OverlapState),
+    Retiring,
 }
 
 impl RekeyState {
@@ -233,6 +238,7 @@ impl RekeyState {
             Self::Staged(_) => PeerRekeyPhase::Staged,
             Self::Switching => PeerRekeyPhase::Switching,
             Self::Overlap(_) => PeerRekeyPhase::Overlap,
+            Self::Retiring => PeerRekeyPhase::Retiring,
         }
     }
 }
@@ -262,6 +268,17 @@ pub struct PeerRekey {
     counters: Mutex<Counters>,
     // Serializes `tick` so a switch/retire pass is never interleaved.
     tick_gate: tokio::sync::Mutex<()>,
+    retire_hold: Mutex<Option<Arc<RetireHold>>>,
+}
+
+/// A test seam that parks a retirement where it closes the predecessor's
+/// connections, which can take the peer drain budget in production.  Never
+/// installed by the relay itself.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct RetireHold {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl fmt::Debug for PeerRekey {
@@ -297,6 +314,7 @@ impl PeerRekey {
             state: Mutex::new(RekeyState::Stable),
             counters: Mutex::new(Counters::default()),
             tick_gate: tokio::sync::Mutex::new(()),
+            retire_hold: Mutex::new(None),
         })
     }
 
@@ -314,6 +332,15 @@ impl PeerRekey {
 
     fn refuse(&self, label: &'static str) {
         self.lock_counters().last_refusal = Some(label);
+    }
+
+    /// Park the next retirement at its connection close until released.
+    #[doc(hidden)]
+    pub fn hold_next_retirement(&self, hold: Arc<RetireHold>) {
+        *self
+            .retire_hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hold);
     }
 
     /// The current phase.
@@ -399,7 +426,7 @@ impl PeerRekey {
         let action = {
             let mut state = self.lock_state();
             match &mut *state {
-                RekeyState::Stable | RekeyState::Switching => Action::None,
+                RekeyState::Stable | RekeyState::Switching | RekeyState::Retiring => Action::None,
                 RekeyState::Staged(staged) => {
                     let approval = self.membership.local_key_approval(&staged.spki);
                     staged.last_approval = approval;
@@ -561,7 +588,7 @@ impl PeerRekey {
     async fn retire(&self, cause: PeerRekeyRetirement) {
         let (previous, generation) = {
             let mut state = self.lock_state();
-            match std::mem::replace(&mut *state, RekeyState::Stable) {
+            match std::mem::replace(&mut *state, RekeyState::Retiring) {
                 RekeyState::Overlap(overlap) => (overlap.previous_spki, overlap.serving_generation),
                 other => {
                     *state = other;
@@ -569,6 +596,25 @@ impl PeerRekey {
                 }
             }
         };
+        // Record the key as retired before any await, so no trigger can
+        // restage it while its connections are still being closed; the
+        // `Retiring` phase additionally refuses any staging until then.
+        {
+            let mut counters = self.lock_counters();
+            if counters.retired.len() >= MAX_RETIRED_SPKIS {
+                counters.retired.pop_front();
+            }
+            counters.retired.push_back(previous.clone());
+        }
+        let hold = self
+            .retire_hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hold) = hold {
+            hold.entered.notify_one();
+            hold.release.notified().await;
+        }
         let closed = match &self.peer_client {
             Some(client) => client.retire_local_generations_before(generation).await,
             None => 0,
@@ -577,11 +623,8 @@ impl PeerRekey {
             let mut counters = self.lock_counters();
             counters.retirements += 1;
             counters.last_retirement = Some(cause);
-            if counters.retired.len() >= MAX_RETIRED_SPKIS {
-                counters.retired.pop_front();
-            }
-            counters.retired.push_back(previous.clone());
         }
+        *self.lock_state() = RekeyState::Stable;
         tracing::info!(
             phase = "stable",
             retired_spki_sha256 = %previous,
@@ -602,7 +645,7 @@ impl PeerRekey {
                 Some(staged.last_approval.label()),
                 None,
             ),
-            RekeyState::Switching => (None, None, None),
+            RekeyState::Switching | RekeyState::Retiring => (None, None, None),
             RekeyState::Overlap(overlap) => (None, None, Some(overlap.previous_spki.clone())),
         };
         let phase = state.phase();
