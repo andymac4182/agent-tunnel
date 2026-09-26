@@ -387,7 +387,9 @@ class Stack:
         self.relay = spawn(
             ["nice", "-n", "10", str(self.bins / "tunnel-relay"), "serve", "--config",
              str(self.relay_config)], stdout=log, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, env={**os.environ, "RUST_LOG": "warn"})
+            stdin=subprocess.DEVNULL,
+            # M6-C190: payload-free failed-exchange lines, off by default.
+            env={**os.environ, "RUST_LOG": "warn", "AGENT_TUNNEL_HTTP_EXCHANGE_LOG": "1"})
         self.relay_procs.append(self.relay)
         if wait:
             deadline = time.time() + 30
@@ -645,7 +647,12 @@ class Stack:
                 stop_group(proc)
         for proc in self.relay_procs + [self.forwarder]:
             stop_group(proc)
-        self.extract_http_failures()
+        # Never let the diagnostics extraction keep the namespace from being
+        # deleted (M6-C190 review).
+        try:
+            self.extract_http_failures()
+        except Exception as error:  # noqa: BLE001
+            self.event("http-failures-extract-failed", error=type(error).__name__)
         try:
             removed = delete_namespace(self.redis[0], self.redis[1], self.namespace)
             self.event("namespace-deleted", namespace=self.namespace, keys=removed)
@@ -678,7 +685,7 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_streams", "tunnel_relay_sessions_rotating",
                  "tunnel_relay_queue_bytes", "tunnel_relay_replay_bytes",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
-                 "tunnel_relay_http_writer_parks_total",
+                 "tunnel_relay_http_writer_parks_total", "tunnel_relay_http_writer_reparks_total",
                  "tunnel_relay_ready")
 
 
@@ -1206,7 +1213,8 @@ def summarize_samples(path: Path) -> dict:
                     entry[f"{series_name}_last"] = vals[-1]
             for counter in ("tunnel_relay_consumer_refusals_total",
                             "tunnel_relay_consumer_write_timeouts_total",
-                            "tunnel_relay_http_writer_parks_total"):
+                            "tunnel_relay_http_writer_parks_total",
+                            "tunnel_relay_http_writer_reparks_total"):
                 vals = [float(r[counter]) for r in items if r.get(counter)]
                 if vals:
                     entry[f"{counter}_last"] = vals[-1]

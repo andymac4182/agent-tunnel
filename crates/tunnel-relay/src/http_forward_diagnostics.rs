@@ -14,6 +14,21 @@ use std::sync::{Arc, Mutex, Weak};
 use serde::Serialize;
 use tunnel_http_forward::{RecordPosition, TrackerSnapshot};
 
+/// M6-C190 review: set to `1` to log each failed `http-forward/1` exchange
+/// and each owner HTTP stream released without both FINs as a payload-free
+/// `warn` line (`scripts/m6-soak.py` sets it).  Off by default: a routine
+/// consumer cancel releases a stream without both FINs, so the lines would
+/// otherwise scale with ordinary traffic.  The same variable enables the
+/// connector's `http-exchange-failed` line.
+pub const HTTP_EXCHANGE_LOG_ENV: &str = "AGENT_TUNNEL_HTTP_EXCHANGE_LOG";
+
+/// Whether [`HTTP_EXCHANGE_LOG_ENV`] is `1`, read once per process.
+#[must_use]
+pub fn exchange_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(HTTP_EXCHANGE_LOG_ENV).is_ok_and(|value| value == "1"))
+}
+
 /// The most recent records retained per kind.
 pub const MAX_HTTP_FORWARD_RECORDS: usize = 64;
 

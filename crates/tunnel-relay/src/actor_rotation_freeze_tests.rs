@@ -2774,10 +2774,21 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     // without spinning.
     fixture.actor.retry_writer_held_http();
     assert_eq!(fixture.stream().pending_records.len(), 2);
+    let snapshot = fixture.actor.snapshot();
     assert_eq!(
-        fixture.actor.snapshot().http_writer_parks,
-        2,
-        "the first write and its retry each parked the head chunk"
+        snapshot.http_writer_parks, 1,
+        "one chunk parked; the queued-behind chunk and the retry are not parks"
+    );
+    assert_eq!(
+        snapshot.http_writer_reparks, 0,
+        "the retry checks the writer's room before popping, so it re-parks nothing"
+    );
+    assert!(
+        fixture
+            .actor
+            .http_maintenance
+            .is_writer_held(&key, STREAM_ID),
+        "the stream is still tracked for the next retry"
     );
     assert!(matches!(
         head.try_recv(),
@@ -2806,6 +2817,73 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     );
     assert!(fixture.stream().pending_records.is_empty());
     assert!(fixture.stream().pending_terminal.is_none());
+    assert!(
+        fixture.actor.http_maintenance.writer_held.is_empty(),
+        "a sequenced stream is no longer tracked"
+    );
+    assert_eq!(fixture.actor.snapshot().http_writer_reparks, 0);
+    assert!(fixture.session_alive());
+}
+
+/// M6-C190 review: a parked chunk must not take the slot an owed ACK needs.
+/// On a writer that drains one slot at a time, the owed ACK goes first, so
+/// the session's owed-ACK fence (`OWNER_FORGET_FAILURE_TIMEOUT`, 5 s) is
+/// disarmed although the writer never has room for both at once.
+#[tokio::test]
+async fn m6c190_an_owed_ack_is_sent_before_a_parked_chunk_on_a_slow_writer() {
+    let mut fixture = FreezeFixture::new("http-parked-owed-ack", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let generation = fixture.attempt.old_generation;
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    let (head_tx, mut head) = oneshot::channel();
+    fixture.actor.write_echo_stream(
+        key.clone(),
+        STREAM_ID,
+        OPERATION_ID.to_owned(),
+        b"synthetic-head".to_vec(),
+        head_tx,
+    );
+    {
+        let session = fixture
+            .actor
+            .sessions
+            .get_mut(&key.scope())
+            .expect("fixture session");
+        session.owed_acks.insert(
+            STREAM_ID,
+            super::OwedAck {
+                tx: data_tx.clone(),
+                generation,
+                sequence: 1,
+            },
+        );
+        session.flow_control_owed_deadline =
+            Some(Instant::now() + super::OWNER_FORGET_FAILURE_TIMEOUT);
+    }
+
+    // One slot frees: the owed ACK takes it and the fence is disarmed.
+    let _ = fixture.old_rx.try_recv().expect("one queued item");
+    fixture.actor.retry_writer_held_http();
+    assert!(
+        fixture.session().owed_acks.is_empty(),
+        "the owed ACK is sent first"
+    );
+    assert!(fixture.session().flow_control_owed_deadline.is_none());
+    assert!(
+        matches!(head.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the parked chunk waits for the next free slot"
+    );
+
+    // The next slot is the chunk's.
+    let _ = fixture.old_rx.try_recv().expect("one queued item");
+    fixture.actor.retry_writer_held_http();
+    assert!(matches!(head.try_recv(), Ok(Ok(_))));
     assert!(fixture.session_alive());
 }
 

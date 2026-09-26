@@ -267,6 +267,12 @@ pub(crate) struct ActorWriter {
     key: SessionKey,
     stream_id: u64,
     operation_id: String,
+    /// M6-C190: reset the stream when the actor refuses a write.  Only an
+    /// `http-forward/1` exchange does: a filesystem session's close code is
+    /// decided by the device's own RESET reason (`AUTHORIZATION_EXPIRED` is
+    /// 1008) or the grant timer, and a relay RESET would end its reader with
+    /// no code first.
+    reset_on_refusal: bool,
 }
 
 impl CarrierWriter for ActorWriter {
@@ -275,6 +281,7 @@ impl CarrierWriter for ActorWriter {
         let key = self.key.clone();
         let stream_id = self.stream_id;
         let operation_id = self.operation_id.clone();
+        let reset_on_refusal = self.reset_on_refusal;
         async move {
             match handle
                 .write_http_stream(key.clone(), stream_id, operation_id.clone(), data.to_vec())
@@ -288,12 +295,17 @@ impl CarrierWriter for ActorWriter {
                         crate::actor::EchoOutcome::Failure { code, .. } => code,
                         crate::actor::EchoOutcome::Success(_) => "UNEXPECTED_SUCCESS",
                     };
-                    tracing::warn!(
-                        target: "tunnel_relay::http_forward_exchange",
-                        stream_id,
-                        code,
-                        phase = "http_forward_actor_write_refused",
-                    );
+                    if crate::http_forward_diagnostics::exchange_log_enabled() {
+                        tracing::warn!(
+                            target: "tunnel_relay::http_forward_exchange",
+                            stream_id,
+                            code,
+                            phase = "http_forward_actor_write_refused",
+                        );
+                    }
+                    if !reset_on_refusal {
+                        return Err(CarrierClosed);
+                    }
                     // M6-C190: a refused chunk leaves the device holding a
                     // truncated request it would otherwise wait out for its
                     // 10 s record budget or 30 s operation deadline.  Reset
@@ -499,6 +511,24 @@ pub(crate) fn actor_carriers(
     handle: &RelayHandle,
     registration: HttpStreamRegistration,
 ) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
+    carriers(handle, registration, true)
+}
+
+/// [`actor_carriers`] for a filesystem session: a refused write ends the
+/// consumer direction without a relay RESET, so the session's close code is
+/// still the device's (M6-C190 review).
+pub(crate) fn actor_carriers_without_refusal_reset(
+    handle: &RelayHandle,
+    registration: HttpStreamRegistration,
+) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
+    carriers(handle, registration, false)
+}
+
+fn carriers(
+    handle: &RelayHandle,
+    registration: HttpStreamRegistration,
+    reset_on_refusal: bool,
+) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
     let HttpStreamRegistration {
         base,
         peer_reset,
@@ -528,6 +558,7 @@ pub(crate) fn actor_carriers(
             key: base.key.clone(),
             stream_id: base.stream_id,
             operation_id: base.operation_id.clone(),
+            reset_on_refusal,
         },
         ActorReader {
             handle: handle.clone(),
@@ -1952,7 +1983,8 @@ pub(crate) async fn http_forward_route(
                 let _permits = (permit, scope_permit);
                 let (report, outbound_end, inbound_end) =
                     tokio::join!(exchange.report(), outbound, inbound);
-                if report.error.is_some() {
+                if report.error.is_some() && crate::http_forward_diagnostics::exchange_log_enabled()
+                {
                     // M6-C190: how each carrier pump ended, beside the
                     // exchange record logged by `record_exchange`.
                     tracing::warn!(
@@ -2063,7 +2095,7 @@ fn record_exchange(
     };
     // M6-C190: a failed exchange is logged once, payload-free, so a stalled
     // phase can be attributed from the relay log.
-    if record.error_code.is_some() {
+    if record.error_code.is_some() && crate::http_forward_diagnostics::exchange_log_enabled() {
         tracing::warn!(
             target: "tunnel_relay::http_forward_exchange",
             phase = "http_forward_exchange_failed",
@@ -2440,6 +2472,7 @@ mod tests {
             },
             stream_id: 7,
             operation_id: "m6c190-operation".to_owned(),
+            reset_on_refusal: true,
         };
         let (to_writer, from_bridge, _) = channel(HANDOFF_CAPACITY);
         let pump = tokio::spawn(pump_outbound(from_bridge, writer));
@@ -2471,6 +2504,59 @@ mod tests {
             .policies(tunnel_mcp::McpLimits::default())
             .unwrap();
         HttpForwardExport::new(Arc::new(profile), BridgeConfig::default())
+    }
+
+    /// M6-C190 review: the refusal reset is `http-forward/1` only.  A
+    /// filesystem session's writer ends without a relay RESET when the actor
+    /// refuses a write (here `AUTHORIZATION_EXPIRED`), so its reader still
+    /// ends on the device's own RESET reason or the grant timer and the
+    /// consumer still gets 1008 for an expired authorization, not a close
+    /// with no code.
+    #[tokio::test]
+    async fn m6c190_a_filesystem_writer_does_not_reset_on_a_refused_write() {
+        use crate::actor::ScriptedHttpOp;
+        let (handle, mut ops) = RelayHandle::refusing_http_writes_for_test("AUTHORIZATION_EXPIRED");
+        let registration_writer = ActorWriter {
+            handle,
+            key: SessionKey {
+                tenant_id: Uuid::from_u128(1),
+                device_id: Uuid::from_u128(2),
+                session_id: "m6c190-fs-session".to_owned(),
+                epoch: 1,
+            },
+            stream_id: 9,
+            operation_id: "m6c190-fs-operation".to_owned(),
+            reset_on_refusal: false,
+        };
+        let mut writer = registration_writer;
+        assert!(
+            writer
+                .data(Bytes::from_static(b"synthetic-9p"))
+                .await
+                .is_err(),
+            "the refused write still ends the consumer direction"
+        );
+        assert_eq!(ops.recv().await, Some(ScriptedHttpOp::Write));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(300), ops.recv())
+                .await
+                .ok()
+                .flatten(),
+            None,
+            "no relay RESET follows a refused filesystem write"
+        );
+        // The mapping the filesystem reader applies to the device's RESET is
+        // unchanged: an expired authorization is 1008, anything else 1011.
+        assert_eq!(
+            crate::http::fs::session_close_code_for_reset(Some(
+                reset_reason::AUTHORIZATION_EXPIRED
+            )),
+            Some(1008)
+        );
+        assert_eq!(
+            crate::http::fs::session_close_code_for_reset(Some(reset_reason::CANCELLED)),
+            Some(1011)
+        );
     }
 
     /// M3-04.  The binding an ingress derives is a stable, opaque function of

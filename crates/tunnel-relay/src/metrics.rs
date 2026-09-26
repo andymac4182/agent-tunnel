@@ -442,8 +442,14 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
     counter(
         &mut out,
         "tunnel_relay_http_writer_parks_total",
-        "HTTP-forward and filesystem stream chunks parked because the device writer queue was momentarily full.",
+        "HTTP-forward and filesystem stream chunks parked because the device writer queue was momentarily full (each chunk once).",
         snapshot.http_writer_parks,
+    );
+    counter(
+        &mut out,
+        "tunnel_relay_http_writer_reparks_total",
+        "Retries that popped a parked chunk, found the device writer queue still full and parked it again.",
+        snapshot.http_writer_reparks,
     );
 
     render_rotation_freeze_hold(&mut out, &snapshot.rotation_freeze_hold);

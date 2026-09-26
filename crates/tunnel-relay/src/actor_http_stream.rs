@@ -189,8 +189,11 @@ pub(crate) struct HttpStreamTrace {
     pub(crate) confirmations_sent: u32,
     /// Milliseconds from creation to the first confirmation.
     pub(crate) first_confirmation_ms: Option<u64>,
-    /// Times a full writer queue parked one of this stream's chunks.
+    /// Chunks of this stream a full writer queue parked (each counted once).
     pub(crate) writer_parks: u32,
+    /// The stream's head record is parked for writer room and has already
+    /// been counted, so a re-park is not counted as a new chunk.
+    pub(crate) head_writer_parked: bool,
 }
 
 impl HttpStreamTrace {
@@ -202,6 +205,7 @@ impl HttpStreamTrace {
             confirmations_sent: 0,
             first_confirmation_ms: None,
             writer_parks: 0,
+            head_writer_parked: false,
         }
     }
 
@@ -258,29 +262,51 @@ pub(crate) struct HttpMaintenance {
     /// How many sessions had their HTTP streams visited to re-publish a
     /// freeze transition (a local counter for regression tests).
     pub(crate) freeze_stream_scans: u64,
-    /// M6-C190: HTTP streams whose head record a momentarily full writer
-    /// queue parked, retried after every command and on the tick.  At most
-    /// one entry per stream, so it is bounded by the stream tables.
-    pub(crate) writer_held: Vec<(SessionKey, u64)>,
-    /// M6-C190: every such park, for the relay snapshot and metrics.
+    /// M6-C190: per session, the HTTP streams whose head record waits for
+    /// room in that session's full writer queue, retried in stream order
+    /// after every command and on the tick.  At most one entry per stream,
+    /// so it is bounded by the stream tables; lookups are O(1) per session
+    /// and O(log n) per stream.
+    pub(crate) writer_held: HashMap<SessionKey, std::collections::BTreeSet<u64>>,
+    /// M6-C190: chunks a full writer queue parked (each chunk counted once,
+    /// however many retries it took), for the relay snapshot and metrics.
     pub(crate) writer_parks_total: u64,
+    /// M6-C190 review: retries that popped a parked chunk and found the
+    /// writer still full, so re-parked it.  The retry checks the writer's
+    /// room before popping, so this stays near zero; it is kept to show that.
+    pub(crate) writer_reparks_total: u64,
 }
 
 impl HttpMaintenance {
     pub(crate) fn note_writer_held(&mut self, key: &SessionKey, stream_id: u64) {
-        if !self.is_writer_held(key, stream_id) {
-            self.writer_held.push((key.clone(), stream_id));
+        if let Some(streams) = self.writer_held.get_mut(key) {
+            streams.insert(stream_id);
+        } else {
+            self.writer_held
+                .insert(key.clone(), std::collections::BTreeSet::from([stream_id]));
         }
     }
 
     pub(crate) fn is_writer_held(&self, key: &SessionKey, stream_id: u64) -> bool {
         self.writer_held
-            .iter()
-            .any(|(held, id)| *id == stream_id && held == key)
+            .get(key)
+            .is_some_and(|streams| streams.contains(&stream_id))
     }
 
     pub(crate) fn is_writer_held_session(&self, key: &SessionKey) -> bool {
-        self.writer_held.iter().any(|(held, _)| held == key)
+        self.writer_held.contains_key(key)
+    }
+
+    /// Stop tracking one stream; returns whether it was tracked.
+    pub(crate) fn clear_writer_held(&mut self, key: &SessionKey, stream_id: u64) -> bool {
+        let Some(streams) = self.writer_held.get_mut(key) else {
+            return false;
+        };
+        let removed = streams.remove(&stream_id);
+        if streams.is_empty() {
+            self.writer_held.remove(key);
+        }
+        removed
     }
 }
 
@@ -1287,7 +1313,7 @@ impl RelayActor {
             reset_deferred_by_freeze: http.reset_deferred_by_freeze,
             cancel_sent: http.cancel_sent,
         };
-        if record.release != "fin" {
+        if record.release != "fin" && crate::http_forward_diagnostics::exchange_log_enabled() {
             log_unfinished_owner_stream(&record, &live, http);
         }
         diagnostics.record_owner_stream(record);
