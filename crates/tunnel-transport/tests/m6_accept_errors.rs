@@ -31,7 +31,7 @@ struct RestoreLimit(Rlimit);
 
 impl Drop for RestoreLimit {
     fn drop(&mut self) {
-        let _ = setrlimit(Resource::Nofile, self.0.clone());
+        let _ = setrlimit(Resource::Nofile, self.0);
     }
 }
 
@@ -69,7 +69,7 @@ async fn descriptor_exhaustion_at_accept_does_not_end_the_listener() -> TestResu
     ));
 
     let original = getrlimit(Resource::Nofile);
-    let restore = RestoreLimit(original.clone());
+    let restore = RestoreLimit(original);
     setrlimit(
         Resource::Nofile,
         Rlimit {
