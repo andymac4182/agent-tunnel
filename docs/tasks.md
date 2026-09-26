@@ -1,6 +1,6 @@
 # Milestone task tracker
 
-Last updated: 2026-09-26T10:32:55+10:00
+Last updated: 2026-09-26T11:02:14+10:00
 
 This tracker follows the roadmap. It records implementation work, discovered defects, owners, exact acceptance scope, and the evidence needed to close each gate.
 
@@ -1194,3 +1194,4 @@ evidence for verified events; a baseline is an observed count, not a completion.
 | 2026-09-26T10:06:26+10:00 | M7-C120 | diagnostic added; stays open | The body-budget case prints the connection charge on failure. Review of PR #171 fixes (`fac7b3a0`, `20513bf8`); local chain at `20513bf8` in `/private/tmp/claude-501/m7-connector-logs/campaign-e/`; full M7 harness not run locally (Docker unavailable); hosted M7 green at `6dbde3bd` (run 36168781241). |
 | 2026-09-26T10:06:26+10:00 | M7-C96, M7-C108, M7-C111, M7-C121 | next steps recorded; stay open | Review of PR #171 fixes (`fac7b3a0`, `20513bf8`); local chain at `20513bf8` in `/private/tmp/claude-501/m7-connector-logs/campaign-e/`; full M7 harness not run locally (Docker unavailable); hosted M7 green at `6dbde3bd` (run 36168781241). |
 | 2026-09-26T10:32:55+10:00 | M7-C82, M7-C84, M7-C85, M7-C92, M7-C93, M7-C94, M7-C98, M7-C100, M7-C109, M7-C110 | re-verified on the merge with origin/main | `f1a001de` (merge of `origin/main` after #168): fmt 0, clippy 0, workspace tests 155 `test result:` lines, 2395 passed, 0 failed, 91 ignored; through the limiter `verify-m7-ec023-owner-death`, M1, M2, M3 and M6 harnesses each 0, and 5 of 5 each of real-path, saturated-peer-frames, transport, concurrent-load, production, `m7c92` and `m7c93`. Full M7 harness left to hosted CI (Docker unavailable locally). Logs `/private/tmp/claude-501/m7-connector-logs/campaign-f/`. |
+| 2026-09-26T11:02:14+10:00 | M7-C82, M7-C84, M7-C85, M7-C92, M7-C93, M7-C94, M7-C98, M7-C100, M7-C109, M7-C110 | re-verified on the second merge with origin/main | `39778b09` (merge of `origin/main` `d1f8c892`): fmt 0, clippy 0, workspace tests 157 `test result:` lines, 2420 passed, 0 failed, 91 ignored; through the limiter `verify-m7-ec023-owner-death`, M1, M2, M3 and M6 harnesses each 0, and 5 of 5 each of real-path, saturated-peer-frames, transport, concurrent-load, production, `m7c92` and `m7c93`. Full M7 harness left to hosted CI (Docker unavailable locally). Logs `/private/tmp/claude-501/m7-connector-logs/campaign-g/`. |
