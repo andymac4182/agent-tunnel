@@ -46,6 +46,8 @@ pub(super) const SESSION_REJECTED_LOG_BURST: u32 = 5;
 pub(super) const TENANT_REJECTED_LOG_BURST: u32 = 10;
 /// Lines the whole process may write per window: an I/O backstop.
 pub(super) const GLOBAL_REJECTED_LOG_BURST: u32 = 200;
+// The backstop must sit well above one tenant's burst.
+const _: () = assert!(GLOBAL_REJECTED_LOG_BURST >= TENANT_REJECTED_LOG_BURST * 10);
 /// The window for all three budgets.
 pub(super) const REJECTED_LOG_WINDOW: Duration = Duration::from_secs(10);
 
@@ -287,7 +289,7 @@ mod tests {
         let tenant_b = Uuid::from_u128(2);
         let mut tenant_a_budget = RejectedLogWindow::default();
         let mut tenant_b_budget = RejectedLogWindow::default();
-        let mut log =
+        let log =
             |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow, tenant_id: &Uuid| {
                 log_connector_rejected_with(
                     &backstop,
@@ -326,7 +328,6 @@ mod tests {
             noisy.admit_at(later, SESSION_REJECTED_LOG_BURST),
             Some(u64::from(SESSION_REJECTED_LOG_BURST))
         );
-        assert!(GLOBAL_REJECTED_LOG_BURST >= TENANT_REJECTED_LOG_BURST * 10);
     }
 
     #[test]
