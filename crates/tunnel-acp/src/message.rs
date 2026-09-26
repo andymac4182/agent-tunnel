@@ -276,6 +276,15 @@ const EVENT_STREAM: &str = "text/event-stream";
 /// The session-scoped methods that require `Acp-Session-Id`.
 ///
 /// Taken from the pinned schema's names, not spelled out here.
+///
+/// **This is where the profile selects its session routing, and it
+/// deliberately does not reuse the pinned HTTP crate's table** (task row
+/// M8-C03).  `agent-client-protocol-http` 2.1.0's
+/// `protocol::method_requires_session_header` is maintained by hand and names
+/// `session/set_model`, a method `agent-client-protocol-schema` 1.7.0 does not
+/// define, so it is not a normative source for which methods are
+/// session-scoped.  A later change that routes by the SDK's table instead of
+/// the schema's names must first reconcile that entry.
 fn requires_session_header(method: &str) -> bool {
     let agent = agent_client_protocol::schema::v1::AGENT_METHOD_NAMES;
     method == agent.session_prompt || method == agent.session_cancel

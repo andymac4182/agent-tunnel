@@ -144,7 +144,22 @@ The native Files SDK `createFilesClient` speaks a separate HTTP gateway protocol
 
 Implement [acp.md](acp.md) and [http-forwarding.md](http-forwarding.md). Pin and prove the official Rust ACP HTTP/core SDK transport profile; HTTP binding is draft and version-sensitive. The desktop CLI supervises a fixed local ACP stdio agent behind an in-process HTTP handler. Host GET/POST/DELETE traverse the server and existing data WebSocket; there is no new device listener or host-selected executable.
 
-**Status 2026-09-17: the pin exists, and that is all.** M8-01 is implemented awaiting verification: `crates/tunnel-acp` exact-pins `agent-client-protocol` and `agent-client-protocol-http` 2.1.0 with their `Cargo.lock` checksums and upstream commits, reconciles the transport RFD revision `acp.md` had wrong (2026-07-02, not 2026-05-04), and defines the `acp-http-v1` `http-forward/1` profile and its message validation. **No ACP client, server or agent has been run against anything in this repository**, and the gate below is untouched. **Five** defect rows came out of the pin: M8-C01 (the stale revision, corrected), M8-C02 (the pinned SDK accepts batches the RFD answers with 501), M8-C03 (the SDK's session-scoping table names a method the schema does not define) and M8-C04 (the SDK's `serde_json/preserve_order` requirement now applies to the whole workspace). **M8-C05** is the fifth and came from review rather than from the pinning work: this crate stated as fact that the pinned server sends no `Acp-Session-Id` on responses, when `http_server.rs` sends one on every session-scoped stream, so the profile diverges from the artifact it pins and the divergence is now disclosed, named in a test and assigned to the chunk that first holds a live stream.
+**Status 2026-09-26 (rewritten for task row M8-C26; [tasks.md](tasks.md) holds the current rows).** M8 is **not complete**. Landed so far:
+
+- **The pin** (M8-01): `crates/tunnel-acp` pins the official `agent-client-protocol` and `agent-client-protocol-http` crates at `=2.1.0` and defines the `acp-http-v1` profile.
+- **The supervisor and the in-process HTTP/SSE bridge** (chunks 2 and 3): `crates/tunnel-acp-export` and `crates/tunnel-acp-fixture`.
+- **The three-relay real path and the cluster gates** (chunks 4, 5 and 7): `verify-m8-acp-real-path` and `verify-m8-acp-cluster` in `scripts/m8-harness-verify.sh`.
+- **A one-relay demo** (`docs/demo/acp.md`, `scripts/demo-acp.sh`): the official pinned ACP client runs initialize, a session, streaming updates, a permission callback and a cancellation through shipped `tunnel-relay` and `tunnel-client` processes.
+
+The official ACP **client** has been run, first in-process in chunk 3, then through a real relay. **No ACP server has been run.** **The only agent ever exercised is this repository's own synthetic fixture.** No real coding agent has been run. The limits the gate below depends on are all still open:
+
+- **macOS is the only host.**
+- **No sandbox is claimed.** An ACP export is trusted-agent execution until a tested OS sandbox profile exists.
+- Process-tree cleanup has been validated on macOS only, and a descendant that escapes its process group is not contained (M8-C07).
+
+Implementation rows: M8-01 and M8-04 are verified local. M8-02 and M8-03 are tracked in [tasks.md](tasks.md). M8-05 (peer-key rotation and both forwarding segments saturated) is blocked on M8-C24 and M8-C22.
+
+**Superseded status, kept for its history (2026-09-17).** At that date the pin was the only landed work, and this paragraph said no ACP client, server or agent had been run. The client and agent halves of that sentence are no longer true; the server half still is.
 
 Gate: an official HTTP client initializes, subscribes, creates sessions, prompts, receives streaming updates and permission callbacks, responds, cancels and deletes against a deterministic child agent. Test two users reusing IDs, subscriber loss, child crashes, output backpressure and missed HTTP acknowledgements across three relays and three rotations. Permission timeout cannot approve an action; ambiguous prompts are never resubmitted. Validate process-tree cleanup on each supported desktop OS. Restrict real-agent tests to dedicated workspaces/VMs and publish the sandbox guarantees actually proven.
 

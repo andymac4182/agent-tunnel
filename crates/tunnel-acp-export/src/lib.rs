@@ -65,7 +65,7 @@ pub use config::{
     AcpAgentConfig, AcpConfigError, AcpDeadlinesConfig, AcpExportConfig, AcpLimitsConfig,
     DEFAULT_OUTPUT_STALL_MS, DEFAULT_PERMISSION_TIMEOUT_MS, DEFAULT_SUBSCRIBE_DEADLINE_MS,
 };
-pub use sse::{ExportBody, sse_event};
+pub use sse::{ExportBody, STREAM_QUEUE, sse_event};
 pub use supervisor::{
     AgentEvent, ConnectionScope, Diagnostics, OutboundMessage, PromptTicket, Supervisor,
     SupervisorConfig, SupervisorError,
