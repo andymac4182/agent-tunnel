@@ -368,7 +368,9 @@ EXPECTED_GUARD_ANCHORS = {
     # m0 raised 13 -> **44** after merging #140, re-measured rather than
     # carried: `--check-anchors` reports 44 across 3 suites, and 45 fails
     # naming m0. The floor had gone slack by 31 without anyone noticing.
-    "m0-guard-exit-codes.py": 44,
+    # **54** after merging #178 (M6-06 ops gate) into the integration branch:
+    # `--check-anchors` reports 54 across 4 suites, and 55 fails naming m0.
+    "m0-guard-exit-codes.py": 54,
     "m6-guard-client-bundle-sentinel.py": 2,
 }
 
