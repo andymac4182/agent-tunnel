@@ -44,6 +44,9 @@ const MAX_ECHO_CANARY_BYTES: usize = 256;
 /// existing owner-not-ready and stream-limit hints: admission capacity is
 /// released by an in-flight operation completing, not by a lease or a clock.
 const ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 250;
+/// Retry hint for a unary echo refused by the owner's per-device capacity
+/// before dispatch (task row M6-C120).
+const ECHO_CAPACITY_RETRY_AFTER_MS: u64 = 250;
 const MAX_ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
 // A ConsumerChunk body may use the full protocol-defined 64 KiB bound. The
 // transport fragments its encoded record (including the eight-byte prefix)
@@ -4574,7 +4577,37 @@ fn echo_failure_response(code: &'static str, execution: &'static str) -> Respons
     if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
         return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
     }
+    // A capacity refusal before dispatch is retryable, and says when (task
+    // row M6-C120): the device's session is untouched, only this request was
+    // refused, so a consumer should back off and retry rather than treat the
+    // device as gone.
+    if code == "RESOURCE_EXHAUSTED" && execution == "not_dispatched" {
+        return echo_capacity_response();
+    }
     failure_outcome(code, execution)
+}
+
+/// The unary echo's answer when the owner's per-device capacity refused the
+/// request before dispatch (task row M6-C120): `503 RESOURCE_EXHAUSTED`,
+/// `not_dispatched`, retryable, with a bounded `Retry-After`.
+fn echo_capacity_response() -> Response {
+    let retry_after_ms = ECHO_CAPACITY_RETRY_AFTER_MS;
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "not_dispatched",
+            message: "reverse channel operation did not complete",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn failure_outcome(code: &'static str, execution: &'static str) -> Response {
@@ -4938,6 +4971,33 @@ fn error_response(
 
 #[cfg(test)]
 mod tests {
+    /// M6-C120: an echo refused by the owner's per-device capacity before
+    /// dispatch is answered as retryable with a bounded `Retry-After`, so a
+    /// flooding consumer backs off instead of seeing the device as gone.
+    #[tokio::test]
+    async fn m6c120_echo_capacity_refusal_is_retryable_with_retry_after() {
+        let response = echo_failure_response("RESOURCE_EXHAUSTED", "not_dispatched");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body reads");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retry_after_ms"], super::ECHO_CAPACITY_RETRY_AFTER_MS);
+        // An outcome that may have executed is never given a retry hint.
+        let unknown = echo_failure_response("RESOURCE_EXHAUSTED", "unknown");
+        assert!(unknown.headers().get(header::RETRY_AFTER).is_none());
+    }
+
     // M6-C68: the device control idle deadline.  Only an inbound frame moves
     // it, it never moves backwards, and a live device's Pong -- due every
     // Ping interval -- keeps it ahead of the next Ping with room for two

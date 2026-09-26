@@ -10808,8 +10808,16 @@ impl RelayActor {
                         );
                         unary_rejected = true;
                     }
+                    // The connector's own capacity refusal is a per-request,
+                    // retryable capacity answer, not a device fault (task row
+                    // M6-C120); every other refusal stays DEVICE_REJECTED.
+                    let code = if rejected.code == "RESOURCE_EXHAUSTED" {
+                        "RESOURCE_EXHAUSTED"
+                    } else {
+                        "DEVICE_REJECTED"
+                    };
                     let _ = pending.response.send(EchoOutcome::Failure {
-                        code: "DEVICE_REJECTED",
+                        code,
                         execution: "not_dispatched",
                     });
                 }
