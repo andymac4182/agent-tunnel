@@ -773,7 +773,9 @@ class HttpConn:
             name, _, value = line.decode("latin-1").partition(":")
             response_headers[name.strip().lower()] = value.strip()
         data = b""
-        if response_headers.get("transfer-encoding", "").lower() == "chunked":
+        if status in (204, 304) or 100 <= status < 200:
+            pass  # no body by definition (a DELETE answers 204 without Content-Length)
+        elif response_headers.get("transfer-encoding", "").lower() == "chunked":
             while True:
                 size = int((await self.reader.readline()).split(b";")[0].strip(), 16)
                 if size == 0:
@@ -813,17 +815,74 @@ def client_ctx(stack: Stack) -> ssl.SSLContext:
     return ctx
 
 
+class McpSessionPool:
+    """2025-11-25 MCP sessions shared by one or more workers (M6-C146).
+
+    A stdio export holds one child, and one of its `max_children` slots
+    (default 8), per session until `DELETE`, a child crash or the 600 s
+    `session_idle_seconds`.  Workers therefore share a bounded number of
+    sessions (concurrent POSTs on one session are routed by JSON-RPC ID) and
+    whoever owns the pool DELETEs every session it opened when it is done, so
+    a load step measures concurrent MCP calls instead of the leaked-session
+    bound.  A session is dropped from the pool only on 404 (the export no
+    longer knows it); a timeout or connection error resets the worker's
+    connection, never the session, so it is not orphaned.
+    """
+
+    def __init__(self, size: int):
+        self.sessions: list[str | None] = [None] * max(1, size)
+        self.locks = [asyncio.Lock() for _ in self.sessions]
+        self.opened = 0
+        self.deleted = 0
+        self.delete_failures: dict[str, int] = {}
+
+    def forget(self, slot: int, session: str) -> None:
+        if self.sessions[slot] == session:
+            self.sessions[slot] = None
+
+    async def close(self, worker: "Worker") -> None:
+        """DELETE every open session through `worker`'s connection."""
+        for slot, session in enumerate(self.sessions):
+            if session is None:
+                continue
+            self.sessions[slot] = None
+            key = ""
+            try:
+                status = await worker.delete_mcp_session(session)
+                if status in (200, 202, 204):
+                    self.deleted += 1
+                elif status == 404:
+                    key = "HTTP_404"  # already gone (crash or idle expiry)
+                else:
+                    key = f"HTTP_{status}"
+            except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError,
+                    asyncio.IncompleteReadError, ssl.SSLError, ValueError, IndexError) as error:
+                await worker.conn.close()
+                key = f"CONN_{type(error).__name__}"
+            if key:
+                self.delete_failures[key] = self.delete_failures.get(key, 0) + 1
+
+    def stats(self) -> dict:
+        return {"size": len(self.sessions), "opened": self.opened, "deleted": self.deleted,
+                "delete_failures": dict(self.delete_failures)}
+
+
 class Worker:
     """One consumer: one keep-alive connection, echo or MCP tools/call."""
 
     def __init__(self, stack: Stack, rec: Recorder, kind: str, user: str, device: str,
-                 worker_id: str, payload_size: int = 1024):
+                 worker_id: str, payload_size: int = 1024,
+                 mcp_pool: McpSessionPool | None = None, mcp_slot: int = 0):
         self.stack, self.rec, self.kind, self.user, self.device = stack, rec, kind, user, device
         self.worker_id = worker_id
         self.payload_size = payload_size
         self.conn = HttpConn(stack.consumer_port, client_ctx(stack))
         self.seq = 0
-        self.mcp_session: str | None = None
+        # A worker without a shared pool owns a private one-session pool and
+        # DELETEs that session at shutdown.
+        self.owns_pool = mcp_pool is None
+        self.mcp_pool = mcp_pool if mcp_pool is not None else McpSessionPool(1)
+        self.mcp_slot = mcp_slot % len(self.mcp_pool.sessions)
         self.mcp_calls_ok = 0
 
     def path(self) -> str:
@@ -858,12 +917,10 @@ class Worker:
                 status, body, code, execution, ok = await self.mcp_call(token)
         except (asyncio.TimeoutError, TimeoutError):
             await self.conn.close()
-            self.mcp_session = None
             status, code, execution, ok = 0, "CLIENT_TIMEOUT", "unknown", False
         except (OSError, ConnectionError, asyncio.IncompleteReadError, ssl.SSLError, ValueError,
                 IndexError) as error:
             await self.conn.close()
-            self.mcp_session = None
             status, code, execution, ok = 0, f"CONN_{type(error).__name__}", "", False
         latency = (time.perf_counter() - start) * 1000
         # An unclassified refusal keeps a short printable prefix of its body
@@ -873,28 +930,58 @@ class Worker:
             detail = re.sub(r"[^ -~]", "?", body[:80].decode("latin-1"))
         self.rec.add(t0, self.kind, self.worker_id, latency, status, code, execution, ok, detail)
 
-    async def mcp_call(self, token: str):
-        base = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+    def mcp_headers(self, token: str) -> dict:
+        return {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream"}
-        if self.mcp_session is None:
-            init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {},
-                "clientInfo": {"name": "m6-03-soak", "version": "1"}}}).encode()
-            status, headers, body = await self.call("POST", base, init)
-            if status != 200 or "mcp-session-id" not in headers:
-                code, execution = classify(status, body)
-                return status, body, code or "MCP_INIT_NO_SESSION", execution, False
-            session = headers["mcp-session-id"]
-            hdrs = {**base, "mcp-protocol-version": "2025-11-25", "mcp-session-id": session}
-            status, _, body = await self.call(
-                "POST", hdrs, b'{"jsonrpc":"2.0","method":"notifications/initialized"}')
-            if status != 202:
-                code, execution = classify(status, body)
-                return status, body, code, execution, False
-            self.mcp_session = session
-        hdrs = {**base, "mcp-protocol-version": "2025-11-25", "mcp-session-id": self.mcp_session}
+
+    async def mcp_initialize(self, base: dict):
+        """Open one session; returns (session, None) or (None, failure tuple)."""
+        init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "m6-03-soak", "version": "1"}}}).encode()
+        status, headers, body = await self.call("POST", base, init)
+        if status != 200 or "mcp-session-id" not in headers:
+            code, execution = classify(status, body)
+            return None, (status, body, code or "MCP_INIT_NO_SESSION", execution, False)
+        session = headers["mcp-session-id"]
+        self.mcp_pool.opened += 1
+        hdrs = {**base, "mcp-protocol-version": "2025-11-25", "mcp-session-id": session}
+        status, _, body = await self.call(
+            "POST", hdrs, b'{"jsonrpc":"2.0","method":"notifications/initialized"}')
+        if status != 202:
+            # Not usable: DELETE it rather than leave it holding a child slot.
+            try:
+                await self.delete_mcp_session(session)
+            except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError,
+                    asyncio.IncompleteReadError, ssl.SSLError, ValueError, IndexError):
+                await self.conn.close()
+            code, execution = classify(status, body)
+            return None, (status, body, code, execution, False)
+        return session, None
+
+    async def delete_mcp_session(self, session: str) -> int:
+        token = await asyncio.to_thread(self.stack.token, self.stack.users[self.user]["subject"],
+                                        "http:invoke")
+        hdrs = {"Authorization": f"Bearer {token}", "mcp-protocol-version": "2025-11-25",
+                "mcp-session-id": session}
+        status, _, _ = await self.call("DELETE", hdrs, b"", timeout=15.0)
+        return status
+
+    async def mcp_call(self, token: str):
+        base = self.mcp_headers(token)
+        pool, slot = self.mcp_pool, self.mcp_slot
+        session = pool.sessions[slot]
+        if session is None:
+            async with pool.locks[slot]:
+                session = pool.sessions[slot]
+                if session is None:
+                    session, failure = await self.mcp_initialize(base)
+                    if failure is not None:
+                        return failure
+                    pool.sessions[slot] = session
+        hdrs = {**base, "mcp-protocol-version": "2025-11-25", "mcp-session-id": session}
         marker = f"{self.worker_id}-{self.seq}"
-        call = json.dumps({"jsonrpc": "2.0", "id": self.seq + 10, "method": "tools/call",
+        call = json.dumps({"jsonrpc": "2.0", "id": marker, "method": "tools/call",
                            "params": {"name": "echo", "arguments": {"marker": marker}}}).encode()
         status, _, body = await self.call("POST", hdrs, call)
         code, execution = classify(status, body)
@@ -909,7 +996,7 @@ class Worker:
             else:
                 self.mcp_calls_ok += 1
         elif status == 404:
-            self.mcp_session = None
+            pool.forget(slot, session)
         return status, body, code, execution, ok
 
     async def loop_rate(self, rate: float, until: float) -> None:
@@ -929,6 +1016,8 @@ class Worker:
             await self.once()
 
     async def shutdown(self) -> None:
+        if self.owns_pool:
+            await self.mcp_pool.close(self)
         await self.conn.close()
 
 
@@ -1134,14 +1223,22 @@ async def load(args: argparse.Namespace) -> None:
             for concurrency in steps:
                 rec.phase = f"{kind}-c{concurrency}"
                 stack.event("load-step", kind=kind, concurrency=concurrency, seconds=args.step_seconds)
+                # MCP workers share at most --mcp-sessions sessions (M6-C146).
+                pool = (McpSessionPool(min(concurrency, args.mcp_sessions))
+                        if kind == "mcp" else None)
                 workers = [Worker(stack, rec, kind, "a", "a", f"{kind}{concurrency}-{i}",
-                                  payload_size=args.payload) for i in range(concurrency)]
+                                  payload_size=args.payload, mcp_pool=pool, mcp_slot=i)
+                           for i in range(concurrency)]
                 until = time.time() + args.step_seconds
                 await asyncio.gather(*(w.loop_closed(until) for w in workers))
+                if pool is not None:
+                    await pool.close(workers[0])
                 for w in workers:
                     await w.shutdown()
                 s = summarize_rows(rec.rows, kind, rec.phase)
                 s.update({"kind": kind, "concurrency": concurrency})
+                if pool is not None:
+                    s["mcp_sessions"] = pool.stats()
                 results.append(s)
                 stack.event("load-step-done", kind=kind, concurrency=concurrency,
                             ok_per_s=s["throughput_ok_per_s"], p99=s["latency_ms_ok"]["p99"],
@@ -1496,6 +1593,10 @@ def main() -> None:
             p.add_argument("--step-seconds", type=float, default=30)
             p.add_argument("--kinds", default="echo,mcp")
             p.add_argument("--payload", type=int, default=1024)
+            p.add_argument("--mcp-sessions", type=int, default=8,
+                           help="MCP sessions shared by a step's workers (the stdio export's "
+                                "default max_children is 8); every session is DELETEd after "
+                                "the step")
         if name == "flood":
             p.add_argument("--workers", type=int, default=128)
             p.add_argument("--seconds", type=float, default=60)
