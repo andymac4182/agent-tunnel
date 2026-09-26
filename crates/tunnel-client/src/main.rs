@@ -331,6 +331,19 @@ struct ConnectStatusResult {
     candidate_local_addr: Option<String>,
     drain_fences: usize,
     drain_acks: usize,
+    /// OPEN refusals this session sent, one entry per fixed code in
+    /// `tunnel_protocol::open_refusal::CODES`, zeros included (M7-C167).
+    open_refusals_sent: OpenRefusalCountsJson,
+}
+
+/// Serializes `OpenRefusalCounts` as `{"GOAWAY": n, ...}` with every fixed
+/// code present, so the object's keys never depend on what happened.
+struct OpenRefusalCountsJson(tunnel_client::OpenRefusalCounts);
+
+impl Serialize for OpenRefusalCountsJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter())
+    }
 }
 
 /// How long `main` waits, after the command has returned, for work still
@@ -1827,37 +1840,40 @@ fn should_emit_connect_status(
             || previous.active_local_addr != current.active_local_addr
             || previous.candidate_local_addr != current.candidate_local_addr
             || previous.drain_fences != current.drain_fences
-            || previous.drain_acks != current.drain_acks)
+            || previous.drain_acks != current.drain_acks
+            || previous.open_refusals_sent != current.open_refusals_sent)
 }
 
 fn print_connect_status(status: &tunnel_client::ConnectionStatus) {
-    print_ok_json(
-        "connect-status",
-        ConnectStatusResult {
-            state: "status",
-            phase: status.phase.clone(),
-            session_id: status.session_id.clone(),
-            epoch: status.epoch,
-            generation: status.active_generation,
-            active_connection_id: status.active_connection_id.clone(),
-            rotations_completed: status.rotations_completed,
-            recovery_attempt: status.recovery_attempt,
-            recovery_attempt_started_at_ms: status.recovery_attempt_started_at_ms,
-            recovery_attempt_deadline_ms: status.recovery_attempt_deadline_ms,
-            recovery_episode_deadline_ms: status.recovery_episode_deadline_ms,
-            recovery_closed_connection_ids: status.recovery_closed_connection_ids.clone(),
-            recovery_reset_reason: status.recovery_reset_reason,
-            recovery_old_generation: status.recovery_old_generation,
-            recovery_old_connection_id: status.recovery_old_connection_id.clone(),
-            recovery_successor_generation: status.recovery_successor_generation,
-            recovery_successor_connection_id: status.recovery_successor_connection_id.clone(),
-            control_local_addr: status.control_local_addr.map(|value| value.to_string()),
-            active_local_addr: status.active_local_addr.map(|value| value.to_string()),
-            candidate_local_addr: status.candidate_local_addr.map(|value| value.to_string()),
-            drain_fences: status.drain_fences,
-            drain_acks: status.drain_acks,
-        },
-    );
+    print_ok_json("connect-status", connect_status_result(status));
+}
+
+fn connect_status_result(status: &tunnel_client::ConnectionStatus) -> ConnectStatusResult {
+    ConnectStatusResult {
+        state: "status",
+        phase: status.phase.clone(),
+        session_id: status.session_id.clone(),
+        epoch: status.epoch,
+        generation: status.active_generation,
+        active_connection_id: status.active_connection_id.clone(),
+        rotations_completed: status.rotations_completed,
+        recovery_attempt: status.recovery_attempt,
+        recovery_attempt_started_at_ms: status.recovery_attempt_started_at_ms,
+        recovery_attempt_deadline_ms: status.recovery_attempt_deadline_ms,
+        recovery_episode_deadline_ms: status.recovery_episode_deadline_ms,
+        recovery_closed_connection_ids: status.recovery_closed_connection_ids.clone(),
+        recovery_reset_reason: status.recovery_reset_reason,
+        recovery_old_generation: status.recovery_old_generation,
+        recovery_old_connection_id: status.recovery_old_connection_id.clone(),
+        recovery_successor_generation: status.recovery_successor_generation,
+        recovery_successor_connection_id: status.recovery_successor_connection_id.clone(),
+        control_local_addr: status.control_local_addr.map(|value| value.to_string()),
+        active_local_addr: status.active_local_addr.map(|value| value.to_string()),
+        candidate_local_addr: status.candidate_local_addr.map(|value| value.to_string()),
+        drain_fences: status.drain_fences,
+        drain_acks: status.drain_acks,
+        open_refusals_sent: OpenRefusalCountsJson(status.open_refusals_sent),
+    }
 }
 
 /// Recover the connector's typed terminal cause after one of its channels
@@ -2182,6 +2198,84 @@ backoff, or exits at once with --no-reconnect."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M7-C167: `connect-status` reports the OPEN refusals the session sent,
+    /// one counter per fixed code, every code always present, and nothing
+    /// else changes shape.  A new count also emits a status event.
+    #[test]
+    fn m7c167_connect_status_reports_open_refusals_by_fixed_code_with_a_stable_schema() {
+        use tunnel_protocol::open_refusal;
+
+        let mut status = tunnel_client::ConnectionStatus {
+            session_id: Some("session".to_owned()),
+            control_local_addr: Some("127.0.0.1:1".parse().expect("address")),
+            ..tunnel_client::ConnectionStatus::default()
+        };
+        let before = status.clone();
+        status
+            .open_refusals_sent
+            .record(open_refusal::CONNECTOR_DRAINING);
+        assert!(
+            should_emit_connect_status(&before, &status),
+            "a new refusal count emits a connect-status event"
+        );
+
+        let value = serde_json::to_value(connect_status_result(&status)).expect("serialize");
+        let object = value.as_object().expect("result object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "state",
+            "phase",
+            "session_id",
+            "epoch",
+            "generation",
+            "active_connection_id",
+            "rotations_completed",
+            "recovery_attempt",
+            "recovery_attempt_started_at_ms",
+            "recovery_attempt_deadline_ms",
+            "recovery_episode_deadline_ms",
+            "recovery_closed_connection_ids",
+            "recovery_reset_reason",
+            "recovery_old_generation",
+            "recovery_old_connection_id",
+            "recovery_successor_generation",
+            "recovery_successor_connection_id",
+            "control_local_addr",
+            "active_local_addr",
+            "candidate_local_addr",
+            "drain_fences",
+            "drain_acks",
+            "open_refusals_sent",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "connect-status result schema changed");
+
+        let refusals = object
+            .get("open_refusals_sent")
+            .and_then(serde_json::Value::as_object)
+            .expect("open_refusals_sent is an object");
+        let mut codes: Vec<&str> = refusals.keys().map(String::as_str).collect();
+        codes.sort_unstable();
+        let mut fixed = open_refusal::CODES.to_vec();
+        fixed.sort_unstable();
+        assert_eq!(
+            codes, fixed,
+            "exactly the fixed code labels, zeros included"
+        );
+        for (code, count) in refusals {
+            let expected = u64::from(code == "GOAWAY");
+            assert_eq!(count.as_u64(), Some(expected), "{code}");
+        }
+        let text = value.to_string();
+        for refusal in open_refusal::ALL {
+            assert!(
+                !text.contains(refusal.reason()) && !text.contains(refusal.category()),
+                "connect-status carries no refusal reason: {text}"
+            );
+        }
+    }
 
     // ---------------------------------------------- bounded stop-path waits
     //

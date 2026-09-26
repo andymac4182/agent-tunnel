@@ -302,6 +302,52 @@ pub struct ConnectionStatus {
     /// Per-stream operation authorization, summed over live streams.
     /// Counters only, like `fs`.
     pub stream_auth: StreamAuthCounters,
+    /// The OPEN refusals this session has sent, by code (task row M7-C167).
+    /// Counters only, keyed by the fixed labels of
+    /// `tunnel_protocol::open_refusal::CODES`.
+    pub open_refusals_sent: OpenRefusalCounts,
+}
+
+/// How many `REJECTED` refusals of an OPEN this session has sent, per code
+/// (task row M7-C167).
+///
+/// **Bounded and payload-free by construction:** one counter for each of the
+/// eight fixed codes in `tunnel_protocol::open_refusal::CODES`, and a refusal
+/// can only be recorded as an `OpenRefusal` from that table, so no reason
+/// text, identifier or peer-supplied string is representable. Each count is
+/// monotonic for the session, saturates rather than wraps, and starts at zero
+/// for every new session (a reconnect is a new session). A refusal is counted
+/// once, when it is first queued; a retried OPEN answered from the journal
+/// with the same stored refusal is not counted again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OpenRefusalCounts {
+    counts: [u64; open_refusal::CODES.len()],
+}
+
+impl OpenRefusalCounts {
+    /// Count one sent refusal under its code.
+    pub fn record(&mut self, refusal: OpenRefusal) {
+        if let Some(index) = open_refusal::code_index(refusal) {
+            self.counts[index] = self.counts[index].saturating_add(1);
+        }
+    }
+
+    /// The count for `code`, or `None` if it is not one of the fixed labels.
+    #[must_use]
+    pub fn get(&self, code: &str) -> Option<u64> {
+        open_refusal::CODES
+            .iter()
+            .position(|known| *known == code)
+            .map(|index| self.counts[index])
+    }
+
+    /// Every fixed label with its count, in `CODES` order, zeros included.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        open_refusal::CODES
+            .iter()
+            .copied()
+            .zip(self.counts.iter().copied())
+    }
 }
 
 /// The connector's view of stream operation authorization.
@@ -405,6 +451,7 @@ impl Default for ConnectionStatus {
             candidate_local_addr: None,
             fs: FsCounters::default(),
             stream_auth: StreamAuthCounters::default(),
+            open_refusals_sent: OpenRefusalCounts::default(),
         }
     }
 }

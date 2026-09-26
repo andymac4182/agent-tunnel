@@ -1703,6 +1703,8 @@ struct M2Actor {
     writes_frozen: bool,
     /// Streams ended because their operation authorization lapsed.
     auth_expired_streams: u64,
+    /// OPEN refusals this session has sent, by fixed code (M7-C167).
+    open_refusals_sent: crate::OpenRefusalCounts,
     /// Every `expire_stream` call, for the M6-C88 regression test.
     #[cfg(test)]
     expire_stream_calls: u64,
@@ -1896,6 +1898,7 @@ async fn run_m2_session(
         accepting: true,
         writes_frozen: false,
         auth_expired_streams: 0,
+        open_refusals_sent: crate::OpenRefusalCounts::default(),
         #[cfg(test)]
         expire_stream_calls: 0,
         #[cfg(test)]
@@ -2608,6 +2611,7 @@ impl M2Actor {
             queue_bytes: self.aggregate_retained_bytes(),
             rotations_completed: self.rotations_completed,
             fs: self.fs_counters,
+            open_refusals_sent: self.open_refusals_sent,
             recovery_attempt,
             recovery_attempt_started_at_ms,
             recovery_attempt_deadline_ms,
@@ -4208,7 +4212,16 @@ impl M2Actor {
             }
         }
         self.send_critical_message(response.clone(), None)?;
-        self.complete_open_journal(&open.message_id, vec![response], vec![None])
+        self.complete_open_journal(&open.message_id, vec![response], vec![None])?;
+        self.record_open_refusal_sent(refusal);
+        Ok(())
+    }
+
+    /// Count a refusal once it is queued, and publish it (M7-C167).  Only
+    /// the fixed code is kept; see `OpenRefusalCounts`.
+    fn record_open_refusal_sent(&mut self, refusal: OpenRefusal) {
+        self.open_refusals_sent.record(refusal);
+        self.publish_status();
     }
 
     /// Whether this OPEN names a stream ID whose state the session has
@@ -4747,7 +4760,9 @@ impl M2Actor {
                 refusal.reason(),
             )),
             None,
-        )
+        )?;
+        self.record_open_refusal_sent(refusal);
+        Ok(())
     }
 
     fn handle_rotate_drained(&mut self, drained: RotateDrained) -> Result<(), ClientError> {
@@ -9640,6 +9655,7 @@ mod tests {
             accepting: true,
             writes_frozen: false,
             auth_expired_streams: 0,
+            open_refusals_sent: crate::OpenRefusalCounts::default(),
             #[cfg(test)]
             expire_stream_calls: 0,
             #[cfg(test)]
@@ -9669,6 +9685,100 @@ mod tests {
             control_local_addr: None,
         };
         (actor, active_key, receiver, control_receiver)
+    }
+
+    fn last_published_status(actor: &M2Actor) -> ConnectionStatus {
+        actor
+            .published_statuses
+            .lock()
+            .expect("test status history lock")
+            .last()
+            .cloned()
+            .expect("a status was published")
+    }
+
+    /// M7-C167: every OPEN refusal the connector sends is counted under its
+    /// fixed code in the published status, once per refusal, and the status
+    /// carries no reason text.
+    #[tokio::test]
+    async fn m7c167_sent_open_refusals_are_counted_by_code_in_the_status() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        assert_eq!(
+            actor.open_refusals_sent,
+            crate::OpenRefusalCounts::default()
+        );
+
+        // A draining connector refuses GOAWAY "connector is draining"
+        // (journaled path).
+        actor.accepting = false;
+        for stream_id in [9, 11] {
+            actor
+                .handle_control(ControlMessage::Open(test_open(stream_id)))
+                .await
+                .expect("a draining connector refuses the OPEN");
+        }
+        let refused: Vec<_> = drain_control_messages(&mut control_receiver)
+            .into_iter()
+            .filter_map(|message| match message {
+                ControlMessage::Rejected(rejected) => Some(rejected.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["GOAWAY", "GOAWAY"]);
+        let status = last_published_status(&actor);
+        assert_eq!(status.open_refusals_sent.get("GOAWAY"), Some(2));
+
+        // A retried OPEN answered from the journal is not a new refusal.
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("a retried OPEN is answered from the journal");
+        let replayed = drain_control_messages(&mut control_receiver);
+        assert!(
+            replayed
+                .iter()
+                .any(|message| matches!(message, ControlMessage::Rejected(rejected) if rejected.stream_id == 9)),
+            "the retry is answered with the stored refusal"
+        );
+        assert_eq!(
+            last_published_status(&actor)
+                .open_refusals_sent
+                .get("GOAWAY"),
+            Some(2)
+        );
+
+        // A stream past the retry horizon is refused STREAM_EXISTS without
+        // journaling (the other send path).
+        actor.forgotten_stream_through = 5;
+        actor
+            .handle_control(ControlMessage::Open(test_open(3)))
+            .await
+            .expect("a forgotten stream is refused");
+        let status = last_published_status(&actor);
+        let counts: Vec<_> = status.open_refusals_sent.iter().collect();
+        assert_eq!(
+            counts,
+            [
+                ("GOAWAY", 2),
+                ("RESOURCE_EXHAUSTED", 0),
+                ("EXPORT_DENIED", 0),
+                ("OPERATION_DENIED", 0),
+                ("STREAM_EXISTS", 1),
+                ("STALE_REQUEST", 0),
+                ("AUTHORIZATION_EXPIRED", 0),
+                ("CANCELLED", 0),
+            ]
+        );
+        assert_eq!(status.open_refusals_sent.get("goaway"), None);
+        assert_eq!(status.open_refusals_sent.get("connector is draining"), None);
+        let rendered = format!("{:?}", status.open_refusals_sent);
+        for refusal in tunnel_protocol::open_refusal::ALL {
+            assert!(
+                !rendered.contains(refusal.reason()) && !rendered.contains(refusal.category()),
+                "the counter carries no reason text or category: {rendered}"
+            );
+        }
     }
 
     async fn fill_control_queue_before_open(actor: &mut M2Actor) -> Result<(), ClientError> {
