@@ -391,6 +391,9 @@ fn m2_hello(config: &RuntimeConfig) -> ControlMessage {
         .collect::<Vec<_>>();
     features.push(M2_FEATURE.to_owned());
     features.push(OWNER_FENCING_FEATURE.to_owned());
+    // M3-16: this connector handles `PRINCIPAL_SESSIONS_END`; a relay sends
+    // it only to connectors that say so.
+    features.push("principal-sessions-end-v1".to_owned());
     let hello = Hello {
         message_id: message_id(),
         connector_id: config.device_id.clone(),
@@ -3703,6 +3706,18 @@ impl M2Actor {
             | ControlMessage::Pong(_)
             | ControlMessage::AuthorizationChallenge(_) => Ok(()),
             ControlMessage::StreamForget(forget) => self.handle_stream_forget(forget),
+            ControlMessage::PrincipalSessionsEnd(end) => {
+                // M3-16: advisory and idempotent.  A message for another
+                // session or epoch is stale and ignored; authorization itself
+                // is enforced by the relay on every request, not here.
+                if end.session_id == self.session.session_id && end.epoch == self.session.epoch {
+                    // The count lands in the export's `sessions_revoked`.
+                    let _ = self
+                        .http_handlers
+                        .end_principal_sessions(&end.service_id, &end.principal_binding);
+                }
+                Ok(())
+            }
             ControlMessage::RecoveryBegin(begin) => self.handle_recovery_begin(begin).await,
             ControlMessage::RecoveryClosed(closed) => self.handle_recovery_closed(closed),
             ControlMessage::OwnerFence(_) | ControlMessage::OwnerFenced(_) => {

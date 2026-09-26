@@ -1622,6 +1622,224 @@ M7_CONNECTOR_CLIENT_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-11: a refused credential names the protected-resource metadata.**
+#: Without the header a standard MCP client that has no token cannot
+#: discover the authorization server, and nothing else in the relay would go
+#: red: the refusal's status, code and message are unchanged.
+RELAY_FORWARD = RELAY / "src" / "http" / "forward.rs"
+AUTHORIZATION_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "http::mcp_authorization_tests::",
+]
+AUTHORIZATION_CASES: list[Case] = [
+    Case(
+        "a refused http-forward credential carries the bearer challenge",
+        [
+            (
+                RELAY_FORWARD,
+                "                response\n"
+                "                    .headers_mut()\n"
+                "                    .insert(header::WWW_AUTHENTICATE, challenge);\n",
+                "                let _ = challenge;\n",
+            )
+        ],
+        frozenset(
+            {
+                "http::mcp_authorization_tests::"
+                "refused_credentials_carry_a_bearer_challenge_naming_the_resource_metadata"
+            }
+        ),
+    ),
+    Case(
+        # Review of #173: the challenge names the same scope set the
+        # metadata publishes, including scopes every token must carry.
+        "the challenge scope is the published scope set",
+        [
+            (
+                RELAY / "src" / "http" / "forward" / "authorization.rs",
+                '    parameters.push(format!("scope=\\"{}\\"", scopes.join(" ")));\n',
+                '    let _ = scopes;\n'
+                '    parameters.push(format!("scope=\\"{}\\"", crate::HTTP_FORWARD_OPERATION));\n',
+            )
+        ],
+        frozenset(
+            {
+                "http::mcp_authorization_tests::"
+                "the_challenge_scope_and_scopes_supported_are_the_same_set"
+            }
+        ),
+    ),
+]
+
+#: **M3-16: a revoked principal's sessions end on the device, and only its
+#: own.**  Witnessed by the export tests driven through the in-process bridge.
+EXPORT_STDIO = EXPORT / "src" / "stdio.rs"
+EXPORT_HTTP_BACKEND = EXPORT / "src" / "http_backend.rs"
+REVOKED_SESSIONS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-mcp-fixture",
+    "--test",
+    "principal_binding",
+    "--locked",
+    "--no-fail-fast",
+]
+REVOKED_SESSIONS_CASES: list[Case] = [
+    Case(
+        "a revoked principal's stdio sessions are ended",
+        [
+            (
+                EXPORT_STDIO,
+                "            .filter(|(_, session)| session.binding.as_deref() == Some(binding))\n",
+                "            .filter(|_| false)\n",
+            )
+        ],
+        frozenset({"a_revoked_principal_loses_its_stdio_sessions_and_only_its_own"}),
+    ),
+    Case(
+        "a revoked principal's Streamable HTTP sessions are forgotten",
+        [
+            (
+                EXPORT_HTTP_BACKEND,
+                "            .retain(|_, entry| entry.binding.as_deref() != Some(binding));\n",
+                "            .retain(|_, _| true);\n",
+            )
+        ],
+        frozenset(
+            {"a_revoked_principal_loses_its_streamable_http_sessions_and_only_its_own"}
+        ),
+    ),
+]
+
+#: **M3-16, owner side (review of #173).**  The watch must actually send
+#: `PRINCIPAL_SESSIONS_END`, only to a connector that advertised it, and a
+#: request held across a freeze must be refused when its grant is revoked.
+OWNER_WATCH_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "revoke",
+]
+OWNER_WATCH_CASES: list[Case] = [
+    Case(
+        "a revoked watch sends PRINCIPAL_SESSIONS_END",
+        [
+            (
+                ACTOR,
+                "        let sent = self\n"
+                "            .send_control(\n"
+                "                key,\n"
+                "                wire::principal_sessions_end(\n"
+                "                    &key.session_id,\n"
+                "                    key.epoch,\n"
+                "                    &service_id.to_string(),\n"
+                "                    &binding,\n"
+                "                    PRINCIPAL_SESSIONS_END_REASON,\n"
+                "                ),\n"
+                "            )\n"
+                "            .is_ok();\n",
+                "        let _ = (&binding, PRINCIPAL_SESSIONS_END_REASON);\n"
+                "        let sent = true;\n",
+            )
+        ],
+        frozenset(
+            {
+                "actor::stream_identity_tests::"
+                "a_revoked_watch_sends_principal_sessions_end_once_and_only_when_supported"
+            }
+        ),
+    ),
+    Case(
+        "a connector that did not advertise the feature is never sent it",
+        [
+            (
+                ACTOR,
+                "        if !self\n"
+                "            .session_for(key)\n"
+                "            .is_some_and(|session| session.principal_sessions_end)\n",
+                "        if false\n"
+                "            && !self\n"
+                "            .session_for(key)\n"
+                "            .is_some_and(|session| session.principal_sessions_end)\n",
+            )
+        ],
+        frozenset(
+            {
+                "actor::stream_identity_tests::"
+                "a_revoked_watch_sends_principal_sessions_end_once_and_only_when_supported"
+            }
+        ),
+    ),
+    Case(
+        "a request held across a freeze is refused when its grant is revoked",
+        [
+            (
+                ACTOR,
+                "        let _ = self.freeze_hold.refuse_revoked(\n"
+                "            key,\n"
+                "            service_id,\n"
+                "            principal_id,\n"
+                "            tokio::time::Instant::now(),\n"
+                "        );\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "actor::rotation_freeze_tests::freeze_hold_tests::"
+                "a_request_held_across_a_freeze_is_refused_when_its_grant_is_revoked"
+            }
+        ),
+    ),
+]
+
+#: **M3-22: a live stream keeps its own rotation observations.**  The
+#: relay-wide ring can evict them within one rotation over more than 64
+#: streams.
+ACTOR_HTTP_STREAM = RELAY / "src" / "actor_http_stream.rs"
+STREAM_OBSERVATIONS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::http_stream::tests::a_rotation_over_many_streams",
+]
+STREAM_OBSERVATIONS_CASES: list[Case] = [
+    Case(
+        "a stream's rotation observation is kept with the stream",
+        [
+            (
+                ACTOR_HTTP_STREAM,
+                "    http.remember_observation(observation.clone());\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "actor::http_stream::tests::"
+                "a_rotation_over_many_streams_cannot_lose_a_live_streams_observation"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -1651,6 +1869,20 @@ SUITES: list[Suite] = [
         [CLIENT],
         RETIRING_ADMISSION_TEST,
         M7_CONNECTOR_CLIENT_CASES,
+    ),
+    Suite("m3c11-authorization", [RELAY], AUTHORIZATION_TEST, AUTHORIZATION_CASES),
+    Suite(
+        "m3c16-revoked-sessions",
+        [EXPORT, FIXTURE],
+        REVOKED_SESSIONS_TEST,
+        REVOKED_SESSIONS_CASES,
+    ),
+    Suite("m3c16-owner-watch", [RELAY], OWNER_WATCH_TEST, OWNER_WATCH_CASES),
+    Suite(
+        "m3c22-stream-observations",
+        [RELAY],
+        STREAM_OBSERVATIONS_TEST,
+        STREAM_OBSERVATIONS_CASES,
     ),
 ]
 

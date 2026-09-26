@@ -1022,6 +1022,30 @@ impl AuthorizationInvalidated {
     }
 }
 
+/// PRINCIPAL_SESSIONS_END (task row M3-16): the relay tells the device that
+/// one consumer's authorization for one service has ended, so every
+/// application session that consumer holds on that export must end too.
+///
+/// The consumer is named only by its opaque principal binding (the value the
+/// relay already hands the export with each of that consumer's requests,
+/// M3-04), never by an identity.  The message is advisory for authorization,
+/// which the relay already enforces on every request, and idempotent: a
+/// device that holds no session for the binding does nothing.  It is not
+/// journaled or replayed; one lost with its control socket leaves those
+/// sessions to the export's idle expiry.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalSessionsEnd {
+    pub message_id: String,
+    pub session_id: String,
+    #[serde(with = "decimal_u64")]
+    pub epoch: u64,
+    pub service_id: String,
+    /// 32 lowercase hexadecimal characters.
+    pub principal_binding: String,
+    pub reason: String,
+}
+
 /// The initial M1 control-message registry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1059,6 +1083,7 @@ pub enum ControlMessage {
     Resumed(Resumed),
     RecoveryBegin(RecoveryBegin),
     RecoveryClosed(RecoveryClosed),
+    PrincipalSessionsEnd(PrincipalSessionsEnd),
 }
 
 /// Short aliases for callers that use `Control`/`Message` vocabulary.
@@ -1099,6 +1124,7 @@ impl ControlMessage {
             Self::RotateAbort(message) => &message.message_id,
             Self::RotateAborted(message) => &message.message_id,
             Self::StreamForget(message) => &message.message_id,
+            Self::PrincipalSessionsEnd(message) => &message.message_id,
             Self::Resume(message) => &message.message_id,
             Self::Resumed(message) => &message.message_id,
             Self::RecoveryBegin(message) => &message.message_id,
@@ -1151,6 +1177,7 @@ impl ControlMessage {
             | Self::GoAway(_)
             | Self::AuthorizationChallenge(_)
             | Self::AuthorizationInvalidated(_)
+            | Self::PrincipalSessionsEnd(_)
             | Self::OwnerFence(_) => return None,
         };
         (!value.is_empty()).then_some(value)
@@ -1193,6 +1220,7 @@ impl ControlMessage {
             Self::Resumed(_) => "RESUMED",
             Self::RecoveryBegin(_) => "RECOVERY_BEGIN",
             Self::RecoveryClosed(_) => "RECOVERY_CLOSED",
+            Self::PrincipalSessionsEnd(_) => "PRINCIPAL_SESSIONS_END",
         }
     }
 
@@ -1352,6 +1380,23 @@ impl ControlMessage {
             Self::Resumed(message) => validate_resumed(message)?,
             Self::RecoveryBegin(message) => validate_recovery_begin(message)?,
             Self::RecoveryClosed(message) => validate_recovery_closed(message)?,
+            Self::PrincipalSessionsEnd(message) => {
+                validate_id("session_id", &message.session_id)?;
+                validate_id("service_id", &message.service_id)?;
+                if message.principal_binding.len() != 32
+                    || !message
+                        .principal_binding
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(ControlError::InvalidIdentifier {
+                        field: "principal_binding",
+                        length: message.principal_binding.len(),
+                        maximum: 32,
+                    });
+                }
+                validate_reason("reason", &message.reason)?;
+            }
         }
         Ok(())
     }
@@ -2195,5 +2240,52 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod principal_sessions_end_tests {
+    use super::*;
+
+    fn message(binding: &str) -> ControlMessage {
+        ControlMessage::PrincipalSessionsEnd(PrincipalSessionsEnd {
+            message_id: "m-1".to_owned(),
+            session_id: "s-1".to_owned(),
+            epoch: 3,
+            service_id: "55555555-5555-4555-8555-555555555555".to_owned(),
+            principal_binding: binding.to_owned(),
+            reason: "AUTHORIZATION_REVOKED".to_owned(),
+        })
+    }
+
+    #[test]
+    fn principal_sessions_end_round_trips_with_a_decimal_epoch() {
+        let original = message("0123456789abcdef0123456789abcdef");
+        let encoded = encode_control(&original).expect("encode");
+        let text = String::from_utf8(encoded.clone()).expect("UTF-8");
+        assert!(
+            text.contains(r#""type":"PRINCIPAL_SESSIONS_END""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""epoch":"3""#), "{text}");
+        assert_eq!(decode_control(&encoded).expect("decode"), original);
+        assert_eq!(original.kind_name(), "PRINCIPAL_SESSIONS_END");
+        assert_eq!(original.reply_to(), None);
+    }
+
+    #[test]
+    fn principal_sessions_end_carries_only_an_opaque_binding() {
+        for refused in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "trial-user@example.test-00000000",
+        ] {
+            assert!(
+                encode_control(&message(refused)).is_err(),
+                "{refused:?} is not a principal binding"
+            );
+        }
     }
 }

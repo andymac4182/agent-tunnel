@@ -146,6 +146,14 @@ impl SessionBindings {
         );
     }
 
+    /// Forget every session issued to `binding`; returns how many.
+    fn forget_binding(&mut self, binding: &str) -> u64 {
+        let before = self.bindings.len();
+        self.bindings
+            .retain(|_, entry| entry.binding.as_deref() != Some(binding));
+        (before - self.bindings.len()) as u64
+    }
+
     fn forget(&mut self, session: &str) {
         self.bindings.remove(session);
     }
@@ -238,6 +246,14 @@ impl Body for BackendBody {
 }
 
 impl HttpBackendExport {
+    /// Forget the backend sessions bound to `binding` (M3-16).
+    pub(crate) fn forget_binding_sessions(&self, binding: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_binding(binding)
+    }
+
     pub(crate) fn new(
         profile: McpProfile,
         limits: McpLimits,

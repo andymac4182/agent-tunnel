@@ -732,6 +732,13 @@ pub struct HttpForwardServeConfig {
     /// Absolute exchange deadline in seconds (default 300, at most 86400).
     #[serde(default)]
     pub deadline_seconds: Option<u64>,
+    /// Task row M3-11: the consumer listener's public origin,
+    /// `https://host[:port]`, from which protected-resource identifiers and
+    /// the `WWW-Authenticate` metadata URL are built.  Absent, each request's
+    /// own authority is used; set it when the relay sits behind a proxy or
+    /// load balancer that rewrites the authority.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl HttpForwardServeConfig {
@@ -767,6 +774,9 @@ impl HttpForwardServeConfig {
                 })?;
         }
         let mut exports = crate::HttpForwardExports::new();
+        if let Some(url) = &self.public_url {
+            exports = exports.with_public_url(url).map_err(ConfigError::Invalid)?;
+        }
         for id in &self.profiles {
             // Two pinned application profiles live in this repository and each
             // owns its own tables: MCP's in `tunnel-mcp`, ACP's in
@@ -1576,6 +1586,8 @@ consumer_tls_private_key = "consumer-key.pem"
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nresponse_body_bytes = 2000000000\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\ndeadline_seconds = 0\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nfixture_hold = true\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\npublic_url = \"http://relay.test\"\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\npublic_url = \"https://relay.test/v1\"\n",
         ] {
             let input = format!("{}\n{broken}", valid_toml());
             assert!(ServeConfig::parse(&input).is_err(), "{broken}");

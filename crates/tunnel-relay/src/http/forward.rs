@@ -63,6 +63,7 @@ use crate::http_forward_diagnostics::{
 };
 
 mod aggregate;
+pub(crate) mod authorization;
 mod hold;
 mod owner_relay;
 
@@ -150,6 +151,9 @@ pub const MAX_PROFILE_ID_LEN: usize = 64;
 pub struct HttpForwardExports {
     exports: std::collections::BTreeMap<String, HttpForwardExport>,
     interposer: Option<Arc<dyn HttpRelayInterposer>>,
+    /// M3-11: the public origin protected-resource identifiers are built
+    /// from.  Absent, a request's own authority is used.
+    public_url: Option<String>,
 }
 
 impl core::fmt::Debug for HttpForwardExports {
@@ -158,6 +162,7 @@ impl core::fmt::Debug for HttpForwardExports {
             .debug_struct("HttpForwardExports")
             .field("profiles", &self.exports.keys().collect::<Vec<_>>())
             .field("interposer", &self.interposer.is_some())
+            .field("public_url", &self.public_url)
             .finish()
     }
 }
@@ -166,6 +171,22 @@ impl HttpForwardExports {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build protected-resource identifiers (task row M3-11) from `url`, an
+    /// `https://host[:port]` origin, instead of each request's authority.
+    ///
+    /// # Errors
+    /// Anything but a bare HTTPS origin.
+    pub fn with_public_url(mut self, url: &str) -> Result<Self, &'static str> {
+        self.public_url = Some(authorization::validate_public_url(url)?);
+        Ok(self)
+    }
+
+    /// The configured public origin, if any.
+    #[must_use]
+    pub fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
     }
 
     /// Serve `export` for services whose capability names `id`.
@@ -1418,6 +1439,18 @@ pub(crate) fn principal_binding_header() -> http::HeaderName {
     http::HeaderName::from_static(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
 }
 
+/// Task row M3-16: whether the owner watches a consumer's authorization on
+/// this export so the device can end its protocol sessions on revocation.
+/// Exactly the profiles that carry a principal binding hold sessions keyed
+/// by one.
+fn watches_principal_sessions(export: &HttpForwardExport) -> bool {
+    export
+        .profile
+        .request
+        .headers
+        .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+}
+
 /// The refusal for a consumer request that presents the relay-only principal
 /// binding itself, or `None` when it presents none.
 ///
@@ -1537,7 +1570,24 @@ pub(crate) async fn http_forward_route(
         .await
     {
         Ok(value) => value,
-        Err(error) => return consumer_authentication_response(&error, "http-forward"),
+        Err(error) => {
+            // M3-11: a refused credential names the protected-resource
+            // metadata, so a standard MCP client can discover how to
+            // authenticate.  The refusal itself is unchanged.
+            let mut response = consumer_authentication_response(&error, "http-forward");
+            let origin = authorization::resource_origin(&exports, headers, request.uri());
+            if let Some(challenge) = authorization::bearer_challenge(
+                origin.as_deref(),
+                request.uri().path(),
+                &error,
+                &authorization::scopes_supported(oidc),
+            ) {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge);
+            }
+            return response;
+        }
     };
     let bearer_token = forwarded_bearer_token(headers).to_owned();
     let Ok(device_id) = parse_uuid(&device) else {
@@ -1802,6 +1852,8 @@ pub(crate) async fn http_forward_route(
             response.map(axum::body::Body::new)
         }
         _ => {
+            let watch = watches_principal_sessions(&export)
+                .then(|| (validated.consumer.clone(), grant.tenant_id));
             let registration = match timeout(
                 state.limits.operation_timeout,
                 state.handle.open_http_stream(
@@ -1827,6 +1879,14 @@ pub(crate) async fn http_forward_route(
                     );
                 }
             };
+            if let Some((consumer, tenant_id)) = watch {
+                state.handle.watch_principal_sessions(
+                    registration.base.key.clone(),
+                    consumer,
+                    service_id,
+                    tenant_id,
+                );
+            }
             let key = registration.base.key.clone();
             let stream_id = registration.base.stream_id;
             let operation_id = registration.base.operation_id.clone();
@@ -2087,6 +2147,7 @@ pub(crate) async fn handle_peer_http_stream(
     let request_id = request.envelope().request_id.clone();
     let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
+    let watch = watches_principal_sessions(&export).then(|| (consumer.clone(), grant.tenant_id));
     let registration = match handle
         .open_http_stream(
             consumer,
@@ -2126,6 +2187,9 @@ pub(crate) async fn handle_peer_http_stream(
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     let key = registration.base.key.clone();
+    if let Some((consumer, tenant_id)) = watch {
+        handle.watch_principal_sessions(key.clone(), consumer, service_id, tenant_id);
+    }
     let stream_id = registration.base.stream_id;
     let operation_id = registration.base.operation_id.clone();
     let mut cleanup = handle.echo_cleanup_guard(

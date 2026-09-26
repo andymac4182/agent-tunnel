@@ -161,7 +161,19 @@ pub(crate) struct HttpStreamState {
     reset_deferred_by_freeze: bool,
     cancel_sent: bool,
     freeze_capture: Option<HttpFreezeCapture>,
+    /// M3-22: this stream's own most recent rotation observations, newest
+    /// last, at most [`STREAM_ROTATION_OBSERVATIONS`].  The relay-wide ring
+    /// holds only the last 64 observations of every stream on the relay, and
+    /// one rotation records one observation per HTTP stream the session still
+    /// holds, so a rotation over more than 64 streams could evict a live
+    /// stream's observation before any reader saw it.  Kept with the stream,
+    /// it lives exactly as long as the stream and is bounded by the stream
+    /// table.
+    recent_observations: VecDeque<HttpRotationObservation>,
 }
+
+/// M3-22: rotation observations retained per HTTP stream.
+pub(crate) const STREAM_ROTATION_OBSERVATIONS: usize = 4;
 
 /// The watchers an HTTP ingress task receives with its registration.
 pub(crate) struct HttpStreamWatchers {
@@ -237,6 +249,7 @@ impl HttpStreamState {
                 reset_deferred_by_freeze: false,
                 cancel_sent: false,
                 freeze_capture: None,
+                recent_observations: VecDeque::new(),
             },
             HttpStreamWatchers {
                 peer_reset: reset_rx,
@@ -502,8 +515,28 @@ impl HttpStreamState {
             reset_generation: self.reset_sequence.map(|(_, generation)| generation),
             reset_deferred_by_freeze: self.reset_deferred_by_freeze,
             frozen,
+            rotation_observations: self.recent_observations.iter().cloned().collect(),
         }
     }
+
+    /// Keep `observation` with the stream (M3-22).
+    pub(crate) fn remember_observation(&mut self, observation: HttpRotationObservation) {
+        if self.recent_observations.len() >= STREAM_ROTATION_OBSERVATIONS {
+            self.recent_observations.pop_front();
+        }
+        self.recent_observations.push_back(observation);
+    }
+}
+
+/// Record one stream's rotation observation with the stream itself and on
+/// the relay-wide ring (M3-22).
+fn record_observation(
+    http: &mut HttpStreamState,
+    observation: HttpRotationObservation,
+    diagnostics: &HttpForwardDiagnostics,
+) {
+    http.remember_observation(observation.clone());
+    diagnostics.record_rotation(observation);
 }
 
 const fn terminal_label(terminal: Option<Terminal>) -> Option<&'static str> {
@@ -1048,7 +1081,7 @@ impl RelayActor {
             else {
                 continue;
             };
-            diagnostics.record_rotation(HttpRotationObservation {
+            let observation = HttpRotationObservation {
                 stream_id: *stream_id,
                 operation_id: stream.operation_id.clone(),
                 request_id: stream.request_id.clone(),
@@ -1083,7 +1116,10 @@ impl RelayActor {
                     completed.map(|snapshot| &snapshot.connector_ack_sequences),
                     *stream_id,
                 ),
-            });
+            };
+            if let Some(http) = stream.http.as_mut() {
+                record_observation(http, observation, diagnostics);
+            }
         }
     }
 
@@ -1165,6 +1201,58 @@ mod tests {
 
     fn state() -> (HttpStreamState, HttpStreamWatchers) {
         HttpStreamState::new(false)
+    }
+
+    /// M3-22: one rotation records one observation per HTTP stream the
+    /// session holds.  Over more than 64 streams the relay-wide ring drops a
+    /// live stream's observation within that same rotation, which is the
+    /// `observations=[]` signature; the stream's own copy survives it.
+    #[test]
+    fn a_rotation_over_many_streams_cannot_lose_a_live_streams_observation() {
+        let diagnostics = HttpForwardDiagnostics::default();
+        let streams = crate::http_forward_diagnostics::MAX_HTTP_FORWARD_RECORDS + 6;
+        let mut states: Vec<HttpStreamState> = (0..streams).map(|_| state().0).collect();
+        for (index, http) in states.iter_mut().enumerate() {
+            record_observation(
+                http,
+                HttpRotationObservation {
+                    stream_id: index as u64 + 1,
+                    operation_id: format!("op-{index}"),
+                    rotation: 7,
+                    ..HttpRotationObservation::default()
+                },
+                &diagnostics,
+            );
+        }
+        let ring = diagnostics.snapshot().rotations;
+        assert!(
+            !ring.iter().any(|observation| observation.stream_id == 1),
+            "the ring evicted the first stream's observation in the same rotation"
+        );
+        let own = states[0].live_snapshot(0, None, 0, 0, false);
+        assert_eq!(own.rotation_observations.len(), 1);
+        assert_eq!(own.rotation_observations[0].stream_id, 1);
+        assert_eq!(own.rotation_observations[0].rotation, 7);
+        // Bounded per stream, newest last.
+        for rotation in 8..=12 {
+            record_observation(
+                &mut states[0],
+                HttpRotationObservation {
+                    stream_id: 1,
+                    rotation,
+                    ..HttpRotationObservation::default()
+                },
+                &diagnostics,
+            );
+        }
+        let own = states[0].live_snapshot(0, None, 0, 0, false);
+        assert_eq!(
+            own.rotation_observations
+                .iter()
+                .map(|observation| observation.rotation)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11, 12]
+        );
     }
 
     #[test]

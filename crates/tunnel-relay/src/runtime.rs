@@ -639,6 +639,10 @@ pub struct RotationFreezeHoldSnapshot {
     /// relay shutdown). Each was refused with the owner-not-ready fault
     /// refusal, `not_dispatched`.
     pub released_on_session_loss: u64,
+    /// Held OPENs refused because the owner learned, while they were held,
+    /// that their consumer's grant for that service was revoked (M3-16,
+    /// review of #173). Refused `not_dispatched`; no OPEN reached the device.
+    pub refused_on_revocation: u64,
     /// The longest time any OPEN spent in the hold, in milliseconds.
     pub max_hold_wait_ms: u64,
 }
