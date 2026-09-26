@@ -3851,6 +3851,7 @@ dependencies = [
  "hyper-util",
  "quinn",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
