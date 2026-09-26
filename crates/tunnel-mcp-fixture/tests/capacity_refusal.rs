@@ -196,3 +196,48 @@ async fn a_2026_request_past_the_child_limit_is_the_same_retryable_refusal() {
     sleeper.abort();
     let _ = sleeper.await;
 }
+
+/// Review of #187: the Streamable HTTP export's session table
+/// (`http_backend.rs`) refuses a new `initialize` once one principal holds
+/// `MAX_SESSIONS_PER_BINDING` sessions, before the backend is dialled.  That
+/// refusal is the same documented `-32050`; the request's ID is not parsed
+/// there, so the body carries `"id": null` as JSON-RPC requires of an error
+/// whose request ID is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_http_session_table_is_the_same_retryable_refusal_with_a_null_id() {
+    let markers = tempfile::tempdir().expect("markers");
+    let (url, shutdown) = common::rmcp_http_backend(true, markers.path()).await;
+    let export = common::http_export(LEGACY, &url, None);
+    let share = tunnel_mcp_export::http_backend::MAX_SESSIONS_PER_BINDING;
+    for index in 0..share {
+        let (status, session, body) = initialize(&export).await;
+        assert_eq!(status, StatusCode::OK, "session {index}: {body}");
+        assert!(session.is_some(), "session {index}");
+    }
+    let dispatched = export.diagnostics().dispatched;
+    let response = within(exchange(
+        &export,
+        request("POST", &legacy_headers(None), INIT),
+    ))
+    .await;
+    let status = response.status();
+    let body = parse(&body_bytes(response).await.expect("body"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let error = &body["error"];
+    assert_ne!(error["code"], -32603, "never an internal error: {body}");
+    assert_eq!(error["code"], -32050, "{body}");
+    assert_eq!(error["data"]["retryable"], true, "{body}");
+    assert_eq!(error["data"]["execution"], "not_dispatched", "{body}");
+    assert!(
+        body.as_object()
+            .is_some_and(|object| object.contains_key("id"))
+            && body["id"].is_null(),
+        "an unknown request ID is sent as null, not omitted: {body}"
+    );
+    assert_eq!(
+        export.diagnostics().dispatched,
+        dispatched,
+        "refused before the backend is dialled"
+    );
+    shutdown.cancel();
+}

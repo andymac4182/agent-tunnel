@@ -397,7 +397,12 @@ impl HttpBackendExport {
                     // Counted like any other refusal, so diagnostics and the
                     // gate can see an export that is at its session limit.
                     self.counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    return Ok(capacity_refusal("the export is at its session limit", None));
+                    return Ok(capacity_refusal(
+                        "the export is at its session limit",
+                        // The request ID is not parsed here; JSON-RPC sends
+                        // an unknown ID as `null` (review of #187).
+                        Some(serde_json::Value::Null),
+                    ));
                 }
                 _ => {}
             }
