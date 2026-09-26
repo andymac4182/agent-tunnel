@@ -42,11 +42,10 @@
 //! key material, a ticket, a token, a canary or payload bytes, and its error
 //! field is a closed diagnostic code rather than a message.
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
+// Used only by the Unix transport below; Windows has no supervisor IPC.
+#[cfg(unix)]
+use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +265,7 @@ pub struct IpcResponse {
     pub error: Option<String>,
 }
 
+#[cfg(unix)]
 fn check_path_length(path: &Path) -> Result<(), IpcError> {
     if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
         return Err(IpcError::PathTooLong);
@@ -406,7 +406,9 @@ mod unix {
                     "the supervisor lock is owned by another user",
                 ));
             }
-            if u32::from(stat.st_mode) & 0o077 != 0 {
+            // `st_mode` is `u16` on macOS and `u32` on Linux; masking in its own
+            // type is portable where a widening conversion is a no-op on Linux.
+            if stat.st_mode & 0o077 != 0 {
                 return Err(IpcError::Unauthorized(
                     "the supervisor lock is accessible to other users",
                 ));
