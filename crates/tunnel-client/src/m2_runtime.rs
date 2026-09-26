@@ -4245,13 +4245,24 @@ impl M2Actor {
     /// with the typed, retryable `OpenRetentionFull` lets `connect` replace
     /// it with a fresh session whose journal is empty.
     fn check_open_retention_exhaustion(&mut self) -> Result<(), ClientError> {
+        self.check_open_retention_exhaustion_at(Instant::now())
+    }
+
+    /// [`Self::check_open_retention_exhaustion`] at `now`.  A test passes an
+    /// instant *after* the exhaustion began rather than back-dating the start:
+    /// `Instant::now() - grace` panics on a platform whose monotonic clock
+    /// began recently (Windows counts from boot; hosted run of PR #186).
+    fn check_open_retention_exhaustion_at(&mut self, now: Instant) -> Result<(), ClientError> {
         // A session at its live limit is busy, not wedged: its retention is
         // concurrent work, so the give-up clock restarts.
         if self.active_stream_count() >= self.config.limits.max_streams {
             self.open_retention_exhausted_since = None;
         }
         match self.open_retention_exhausted_since {
-            Some(since) if since.elapsed() >= self.open_retention_exhaustion_grace() => {
+            Some(since)
+                if now.saturating_duration_since(since)
+                    >= self.open_retention_exhaustion_grace() =>
+            {
                 Err(ClientError::OpenRetentionFull)
             }
             _ => Ok(()),
@@ -17084,17 +17095,21 @@ mod tests {
         for stream_id in 1..=max as u64 {
             actor.streams.insert(stream_id, test_stream());
         }
-        let long_ago = Instant::now() - Duration::from_secs(3_600);
-        actor.open_retention_exhausted_since = Some(long_ago);
+        // Time moves forward from the exhaustion's start rather than the start
+        // being back-dated: `Instant::now() - 3_600 s` panicked on hosted
+        // Windows, whose monotonic clock counts from boot (PR #186).
+        let since = Instant::now();
+        let past_grace = since + actor.open_retention_exhaustion_grace() + Duration::from_secs(1);
+        actor.open_retention_exhausted_since = Some(since);
         assert!(
-            actor.check_open_retention_exhaustion().is_ok(),
+            actor.check_open_retention_exhaustion_at(past_grace).is_ok(),
             "a session at its live limit is busy"
         );
         assert!(actor.open_retention_exhausted_since.is_none());
         actor.streams.remove(&1);
-        actor.open_retention_exhausted_since = Some(long_ago);
+        actor.open_retention_exhausted_since = Some(since);
         assert!(matches!(
-            actor.check_open_retention_exhaustion(),
+            actor.check_open_retention_exhaustion_at(past_grace),
             Err(ClientError::OpenRetentionFull)
         ));
     }

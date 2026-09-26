@@ -3692,7 +3692,12 @@ async fn a_unary_echo_past_its_operation_timeout_is_still_forgotten() {
         .get_mut(&fixture.key.scope())
         .and_then(|session| session.pending.get_mut(&stream_id))
     {
-        pending.created_at = Instant::now() - timeout - StdDuration::from_secs(1);
+        // `checked_sub`: a bare `Instant - Duration` panics where the
+        // monotonic clock began less than that long ago (Windows counts from
+        // boot).
+        pending.created_at = Instant::now()
+            .checked_sub(timeout + StdDuration::from_secs(1))
+            .expect("the monotonic clock has run longer than the operation timeout");
     }
     let key = fixture.key.clone();
     fixture.actor.expire_pending_echoes(&key);
@@ -3734,7 +3739,11 @@ async fn an_abandoned_unary_echo_that_never_ends_closes_the_session_after_its_bo
             .get_mut(&key.scope())
             .and_then(|session| session.pending.get_mut(&stream_id))
         {
-            pending.abandon.abandoned_at = Some(Instant::now() - ago);
+            pending.abandon.abandoned_at = Some(
+                Instant::now()
+                    .checked_sub(ago)
+                    .expect("the monotonic clock has run longer than the back-dated interval"),
+            );
         }
     };
     set_abandoned_ago(&mut fixture, StdDuration::from_secs(90));
