@@ -533,12 +533,40 @@ pub(crate) enum HttpActorRequest {
 /// A sink for actor requests (the actor's bounded event channel).
 pub(crate) trait ActorSink: Clone + Send + Sync + 'static {
     fn send(&self, request: HttpActorRequest) -> impl Future<Output = bool> + Send;
+
+    /// Resolves once the actor's receiving end is gone: no request sent from
+    /// now on, or still queued, will be answered.
+    fn closed(&self) -> impl Future<Output = ()> + Send;
 }
 
 impl ActorSink for mpsc::Sender<HttpActorRequest> {
     fn send(&self, request: HttpActorRequest) -> impl Future<Output = bool> + Send {
         let sender = self.clone();
         async move { sender.send(request).await.is_ok() }
+    }
+
+    fn closed(&self) -> impl Future<Output = ()> + Send {
+        let sender = self.clone();
+        async move { sender.closed().await }
+    }
+}
+
+/// Wait for the actor's reply to one request, or for the actor's receiver to
+/// be gone, whichever comes first (task row M6-C162).
+///
+/// Dropping a tokio mpsc receiver drains its queue, but a `send` that
+/// reserved its slot before the drop and stores its value after the drain
+/// leaves the request -- and the reply sender inside it -- in the channel
+/// until the last sender is dropped. The exchange task's own sink is such a
+/// sender, so an unbounded wait could only end by aborting the task. A reply
+/// sent before the receiver went away is still returned; `None` means none.
+/// The closed signal is polled first so such a reply is taken by the
+/// `try_recv` arm deterministically.
+async fn actor_reply<S: ActorSink, T>(sink: &S, receiver: &mut oneshot::Receiver<T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = sink.closed() => receiver.try_recv().ok(),
+        reply = &mut *receiver => reply.ok(),
     }
 }
 
@@ -553,7 +581,7 @@ impl<S: ActorSink> CarrierWriter for DeviceWriter<S> {
         let sink = self.sink.clone();
         let stream_id = self.stream_id;
         async move {
-            let (reply, receiver) = oneshot::channel();
+            let (reply, mut receiver) = oneshot::channel();
             if !sink
                 .send(HttpActorRequest::Write {
                     stream_id,
@@ -564,8 +592,8 @@ impl<S: ActorSink> CarrierWriter for DeviceWriter<S> {
             {
                 return Err(CarrierClosed);
             }
-            match receiver.await {
-                Ok(true) => Ok(()),
+            match actor_reply(&sink, &mut receiver).await {
+                Some(true) => Ok(()),
                 _ => Err(CarrierClosed),
             }
         }
@@ -575,15 +603,15 @@ impl<S: ActorSink> CarrierWriter for DeviceWriter<S> {
         let sink = self.sink.clone();
         let stream_id = self.stream_id;
         async move {
-            let (reply, receiver) = oneshot::channel();
+            let (reply, mut receiver) = oneshot::channel();
             if !sink
                 .send(HttpActorRequest::Finish { stream_id, reply })
                 .await
             {
                 return Err(CarrierClosed);
             }
-            match receiver.await {
-                Ok(true) => Ok(()),
+            match actor_reply(&sink, &mut receiver).await {
+                Some(true) => Ok(()),
                 _ => Err(CarrierClosed),
             }
         }
@@ -593,7 +621,7 @@ impl<S: ActorSink> CarrierWriter for DeviceWriter<S> {
         let sink = self.sink.clone();
         let stream_id = self.stream_id;
         async move {
-            let (reply, receiver) = oneshot::channel();
+            let (reply, mut receiver) = oneshot::channel();
             if sink
                 .send(HttpActorRequest::Reset {
                     stream_id,
@@ -605,7 +633,7 @@ impl<S: ActorSink> CarrierWriter for DeviceWriter<S> {
                 })
                 .await
             {
-                let _ = receiver.await;
+                let _ = actor_reply(&sink, &mut receiver).await;
             }
         }
     }
@@ -642,7 +670,9 @@ impl<S: ActorSink> CarrierReader for DeviceReader<S> {
                 let Some(receiver) = self.pending.as_mut() else {
                     return CarrierEvent::Closed;
                 };
-                let read = receiver.await.unwrap_or(DeviceRead::Closed);
+                let read = actor_reply(&self.sink, receiver)
+                    .await
+                    .unwrap_or(DeviceRead::Closed);
                 self.pending = None;
                 match read {
                     DeviceRead::Data(data) if data.is_empty() => {}
@@ -659,5 +689,137 @@ impl<S: ActorSink> CarrierReader for DeviceReader<S> {
 
     fn reset_signal(&self) -> ResetSignal {
         self.signal.clone()
+    }
+}
+
+#[cfg(test)]
+mod stranded_reply_tests {
+    //! Task row M6-C162: a request stranded behind an actor whose receiver
+    //! is gone must end with the typed closed outcome, not wait forever.
+
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+    use tunnel_http_bridge::{
+        CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, reset_signal_pair,
+    };
+
+    use super::{ActorSink, DeviceReader, DeviceWriter, HttpActorRequest};
+
+    /// A real bounded channel whose owner ends inside the send: the send
+    /// reserves its slot, the owner drops its receiver (draining an empty
+    /// queue), and only then is the request stored. This is the exact
+    /// interleaving measured in M6-C158, made deterministic. The request, and
+    /// the reply sender inside it, stays in the channel while this sink lives.
+    #[derive(Clone)]
+    struct StrandingSink {
+        tx: mpsc::Sender<HttpActorRequest>,
+        owner: Arc<Mutex<Option<mpsc::Receiver<HttpActorRequest>>>>,
+    }
+
+    impl StrandingSink {
+        fn new() -> Self {
+            let (tx, rx) = mpsc::channel(4);
+            Self {
+                tx,
+                owner: Arc::new(Mutex::new(Some(rx))),
+            }
+        }
+    }
+
+    impl ActorSink for StrandingSink {
+        fn send(&self, request: HttpActorRequest) -> impl Future<Output = bool> + Send {
+            let tx = self.tx.clone();
+            let owner = Arc::clone(&self.owner);
+            async move {
+                let Ok(permit) = tx.reserve().await else {
+                    return false;
+                };
+                drop(owner.lock().expect("owner slot").take());
+                permit.send(request);
+                true
+            }
+        }
+
+        fn closed(&self) -> impl Future<Output = ()> + Send {
+            <mpsc::Sender<HttpActorRequest> as ActorSink>::closed(&self.tx)
+        }
+    }
+
+    const BOUND: Duration = Duration::from_secs(2);
+
+    /// A reply the actor sent before its receiver went away is still
+    /// returned: the reply is sent, then the receiver dropped, then waited on.
+    #[tokio::test]
+    async fn a_reply_sent_before_the_actor_receiver_closed_is_still_returned() {
+        let (sink, actor_rx) = mpsc::channel::<HttpActorRequest>(1);
+        let (reply, mut receiver) = tokio::sync::oneshot::channel();
+        reply.send(true).expect("receiver alive");
+        drop(actor_rx);
+        let outcome = tokio::time::timeout(BOUND, super::actor_reply(&sink, &mut receiver))
+            .await
+            .expect("the reply wait returns once the actor's receiver is gone");
+        assert_eq!(outcome, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_write_behind_an_exited_actor_reports_carrier_closed() {
+        let mut writer = DeviceWriter {
+            sink: StrandingSink::new(),
+            stream_id: 1,
+        };
+        let outcome = tokio::time::timeout(BOUND, writer.data(bytes::Bytes::from_static(b"x")))
+            .await
+            .expect(
+                "a write stranded behind an exited actor waited for a reply it could never get",
+            );
+        assert_eq!(outcome, Err(CarrierClosed));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_finish_behind_an_exited_actor_reports_carrier_closed() {
+        let mut writer = DeviceWriter {
+            sink: StrandingSink::new(),
+            stream_id: 1,
+        };
+        let outcome = tokio::time::timeout(BOUND, writer.finish()).await.expect(
+            "a finish stranded behind an exited actor waited for a reply it could never get",
+        );
+        assert_eq!(outcome, Err(CarrierClosed));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_reset_behind_an_exited_actor_returns() {
+        let mut writer = DeviceWriter {
+            sink: StrandingSink::new(),
+            stream_id: 1,
+        };
+        let detail =
+            tunnel_http_bridge::detail_from_reason(tunnel_protocol::reset_reason::CANCELLED);
+        tokio::time::timeout(BOUND, writer.reset(detail))
+            .await
+            .expect(
+                "a reset stranded behind an exited actor waited for a reply it could never get",
+            );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_read_behind_an_exited_actor_reports_closed() {
+        let (_notifier, signal) = reset_signal_pair();
+        let mut reader = DeviceReader {
+            sink: StrandingSink::new(),
+            stream_id: 1,
+            signal,
+            pending: None,
+        };
+        let event = tokio::time::timeout(BOUND, reader.next())
+            .await
+            .expect("a read stranded behind an exited actor waited for a reply it could never get");
+        assert!(
+            matches!(event, CarrierEvent::Closed),
+            "a stranded read must report the carrier closed"
+        );
     }
 }
