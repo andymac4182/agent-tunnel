@@ -1003,7 +1003,9 @@ async fn a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured
     let workspace = workspace();
     let export = acp_export_with(
         workspace.path(),
-        "[deadlines]\nconnection_subscribe_ms = 200\npermission_ms = 60000\n",
+        // The session window at the ceiling, so only the connection window is
+        // in play here.
+        "[deadlines]\nconnection_subscribe_ms = 200\nsession_subscribe_ms = 600000\npermission_ms = 60000\n",
     );
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let started = Instant::now();

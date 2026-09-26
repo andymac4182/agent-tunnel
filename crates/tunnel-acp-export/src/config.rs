@@ -133,6 +133,11 @@ pub struct AcpDeadlinesConfig {
     pub connection_subscribe_ms: Option<u64>,
     /// How long a session GET has after `session/new`.
     pub session_subscribe_ms: Option<u64>,
+    /// **Deprecated alias (M8-C12)**, kept because configurations written for
+    /// v0.1.0 may carry it: sets both windows to one value.  Setting it
+    /// together with either key above is refused as ambiguous.  Scheduled for
+    /// removal in v0.3.0; see [`AcpExportConfig::uses_deprecated_subscribe_ms`].
+    pub subscribe_ms: Option<u64>,
     /// How long a `session/request_permission` may stay outstanding.
     pub permission_ms: Option<u64>,
     /// How long one message may wait for room on a stream's queue before the
@@ -173,6 +178,14 @@ fn absolute(path: &Path) -> bool {
 }
 
 impl AcpExportConfig {
+    /// Whether this configuration uses the deprecated `subscribe_ms` alias
+    /// (M8-C12).  The host warns once when it does; the crate itself does not
+    /// log.
+    #[must_use]
+    pub fn uses_deprecated_subscribe_ms(&self) -> bool {
+        self.deadlines.subscribe_ms.is_some()
+    }
+
     /// Validate every rule this export has.
     ///
     /// # Errors
@@ -223,18 +236,37 @@ impl AcpExportConfig {
             return Err(AcpConfigError("an acp.agent environment entry is invalid"));
         }
 
-        let connection_subscribe_ms = self
-            .deadlines
+        let deadlines = &self.deadlines;
+        if deadlines.subscribe_ms.is_some()
+            && (deadlines.connection_subscribe_ms.is_some()
+                || deadlines.session_subscribe_ms.is_some())
+        {
+            return Err(AcpConfigError(
+                "acp.deadlines.subscribe_ms is a deprecated alias for both subscription windows \
+                 and cannot be combined with connection_subscribe_ms or session_subscribe_ms",
+            ));
+        }
+        if deadlines.subscribe_ms == Some(0)
+            || deadlines
+                .subscribe_ms
+                .is_some_and(|ms| ms > MAX_SUBSCRIBE_DEADLINE_MS)
+        {
+            return Err(AcpConfigError(
+                "acp.deadlines.subscribe_ms must be 1..=600000",
+            ));
+        }
+        let connection_subscribe_ms = deadlines
             .connection_subscribe_ms
+            .or(deadlines.subscribe_ms)
             .unwrap_or(DEFAULT_SUBSCRIBE_DEADLINE_MS);
         if connection_subscribe_ms == 0 || connection_subscribe_ms > MAX_SUBSCRIBE_DEADLINE_MS {
             return Err(AcpConfigError(
                 "acp.deadlines.connection_subscribe_ms must be 1..=600000",
             ));
         }
-        let session_subscribe_ms = self
-            .deadlines
+        let session_subscribe_ms = deadlines
             .session_subscribe_ms
+            .or(deadlines.subscribe_ms)
             .unwrap_or(DEFAULT_SUBSCRIBE_DEADLINE_MS);
         if session_subscribe_ms == 0 || session_subscribe_ms > MAX_SUBSCRIBE_DEADLINE_MS {
             return Err(AcpConfigError(
@@ -336,10 +368,17 @@ mod tests {
             valid().replace(COMMAND, PARENT_ESCAPE),
             format!("{}[deadlines]\nconnection_subscribe_ms = 0\n", valid()),
             format!("{}[deadlines]\nsession_subscribe_ms = 0\n", valid()),
-            // The retired shared key is refused by name rather than ignored:
-            // a configuration written for it would otherwise silently get the
-            // defaults (M8-C12).
-            format!("{}[deadlines]\nsubscribe_ms = 5000\n", valid()),
+            format!("{}[deadlines]\nsubscribe_ms = 0\n", valid()),
+            format!("{}[deadlines]\nsubscribe_ms = 600001\n", valid()),
+            // The deprecated alias beside either new key is ambiguous (M8-C12).
+            format!(
+                "{}[deadlines]\nsubscribe_ms = 5000\nsession_subscribe_ms = 300\n",
+                valid()
+            ),
+            format!(
+                "{}[deadlines]\nsubscribe_ms = 5000\nconnection_subscribe_ms = 300\n",
+                valid()
+            ),
             format!("{}[deadlines]\npermission_ms = 0\n", valid()),
             format!("{}[deadlines]\nconnection_subscribe_ms = 600001\n", valid()),
             format!("{}[deadlines]\nsession_subscribe_ms = 600001\n", valid()),
@@ -386,6 +425,28 @@ mod tests {
             Duration::from_secs(10),
             "shortening the connection window must not shorten the session window"
         );
+    }
+
+    /// **M8-C12.** `subscribe_ms` is kept as a deprecated alias for
+    /// configurations written for v0.1.0: alone, it sets both windows, and the
+    /// configuration reports that it uses it so the host can warn.
+    #[test]
+    fn the_deprecated_subscribe_ms_alias_sets_both_windows() {
+        let text = format!("{}[deadlines]\nsubscribe_ms = 5000\n", valid());
+        let config: AcpExportConfig = toml::from_str(&text).expect("parses");
+        assert!(config.uses_deprecated_subscribe_ms());
+        let validated = config.validate().expect("the alias alone is accepted");
+        assert_eq!(
+            validated.connection_subscribe_deadline,
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            validated.session_subscribe_deadline,
+            Duration::from_millis(5000)
+        );
+
+        let config: AcpExportConfig = toml::from_str(&valid()).expect("parses");
+        assert!(!config.uses_deprecated_subscribe_ms());
     }
 
     #[test]

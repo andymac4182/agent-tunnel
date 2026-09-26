@@ -231,3 +231,130 @@ async fn a_stranded_claim_never_releases_an_owner_that_has_since_changed() {
         "a stranded claim's release is fenced on its exact token and must never delete a successor"
     );
 }
+
+/// Queue a `RegisterResolved` for the relay's own handoff registry, then drop
+/// the queue and the cleanup worker in the order a panicking or aborted
+/// `RelayActor` drops its fields: `rx` first (the drain drops the queued
+/// command), then `cleanup` (its join handle aborts the worker).  Found by the
+/// review of PR #208: the first version of this fix dropped the guard with
+/// the command, onto a worker about to be aborted, and the claim was lost.
+async fn drop_queued_register_resolved_in_actor_field_order(
+    handle: &RelayHandle,
+    catalog: &MemoryCatalog,
+    token: tunnel_catalog::OwnerToken,
+) {
+    let worker = CleanupWorker::spawn(Arc::new(catalog.clone()) as SharedCatalog);
+    let mut guard = OwnerClaimCleanup::new(worker.dispatcher());
+    guard.arm_token(token);
+    let (queue_tx, queue_rx) = mpsc::channel(1);
+    let (response, _reply) = oneshot::channel();
+    queue_tx
+        .send(Command::RegisterResolved {
+            device_id: DEVICE,
+            tenant_id: Some(TENANT),
+            spki: "queued-claim-spki".into(),
+            hello: tunnel_protocol::Hello::new(
+                "queued-claim",
+                DEVICE.to_string(),
+                u16::from(crate::PROTOCOL_MAJOR),
+                0,
+            ),
+            data_connection_id: "queued-claim-data".into(),
+            response,
+            owner_cleanup: handle.claim_handoffs.deposit(Some(guard)),
+            result: Box::new(Err(RegisterControlFailure::OwnerBusy)),
+        })
+        .await
+        .expect("queue the command");
+    drop(queue_rx);
+    drop(worker);
+    // Let the aborted worker actually end before anything else runs.
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
+async fn a_register_resolved_queued_when_the_actor_is_aborted_releases_its_claim() {
+    let catalog = seeded_catalog().await;
+    let claim = catalog
+        .claim_owner(&claim_request("queued-owner"))
+        .await
+        .expect("claim owner");
+    let handle = relay(&catalog);
+    drop_queued_register_resolved_in_actor_field_order(&handle, &catalog, claim.token).await;
+    assert_eq!(
+        handle.claim_handoffs.parked(),
+        1,
+        "a dropped command leaves its guard parked rather than dropping it onto a dying worker"
+    );
+
+    // An abort, as for a panic: the actor's `close_all` never runs, so only the
+    // supervisor's release can reach the parked guard.
+    handle.abort_actor_task().await;
+    let mut released = false;
+    for _ in 0..200 {
+        if current_session(&catalog).await.is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "a claim whose command was queued when the actor ended must be released, not left fenced"
+    );
+}
+
+#[tokio::test]
+async fn a_register_resolved_queued_at_shutdown_releases_its_claim() {
+    let catalog = seeded_catalog().await;
+    let claim = catalog
+        .claim_owner(&claim_request("queued-owner"))
+        .await
+        .expect("claim owner");
+    let handle = relay(&catalog);
+    drop_queued_register_resolved_in_actor_field_order(&handle, &catalog, claim.token).await;
+    let _ = handle.shutdown().await;
+    assert_eq!(
+        current_session(&catalog).await,
+        None,
+        "queued claim left fenced"
+    );
+}
+
+/// **The supervisor's release has one overall deadline.**  Against an
+/// authority that never answers, N parked claims used to cost N times the
+/// per-operation timeout.  The release here never completes; the call must
+/// still return at the deadline, count every claim it did not release, and
+/// leave nothing parked.
+#[tokio::test]
+async fn the_stranded_release_ends_at_its_deadline_and_counts_what_it_left() {
+    let catalog = seeded_catalog().await;
+    let handoffs = super::ClaimHandoffs::default();
+    let worker = CleanupWorker::spawn(Arc::new(catalog.clone()) as SharedCatalog);
+    let dispatcher = worker.dispatcher();
+    let mut parked = Vec::new();
+    for index in 0..3 {
+        let mut guard = OwnerClaimCleanup::new(dispatcher.clone());
+        guard.arm_request(claim_request(&format!("deadline-{index}")));
+        parked.push(handoffs.deposit(Some(guard)));
+    }
+    assert_eq!(handoffs.parked(), 3);
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::release_parked_until(&handoffs, started + Duration::from_millis(100), |_item| {
+            std::future::pending::<()>()
+        }),
+    )
+    .await
+    .expect("the stranded release must end at its own deadline, not wait on the authority");
+    assert_eq!(
+        outcome,
+        (0, 3),
+        "nothing was released and all three claims are counted as left to lease expiry"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(handoffs.parked(), 0);
+    drop(parked);
+    worker.shutdown().await;
+}

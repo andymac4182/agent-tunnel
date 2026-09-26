@@ -319,8 +319,12 @@ claim is still unclaimed.
   to `1..=600000`. They replace a single `subscribe_ms` that bounded both, so
   a test shortening the session window shortened the connection window with it
   and, on a loaded machine, the connection's window closed first for a reason
-  unrelated to what the test measured. `subscribe_ms` is now refused as an
-  unknown key rather than silently ignored.
+  unrelated to what the test measured. **`subscribe_ms` is kept as a
+  deprecated alias** for configurations written for v0.1.0: alone it sets both
+  windows to its value, `tunnel-client` warns once per process that it is
+  deprecated, and setting it together with either new key is refused as
+  ambiguous. **It will be removed in v0.3.0**, after which it is refused as an
+  unknown key.
   `shortening_the_session_window_does_not_shorten_the_connection_window` sends
   the connection GET deliberately after a 200 ms session window and requires
   it served; the `m8c3` guard cases "the connection window has its own bound,
