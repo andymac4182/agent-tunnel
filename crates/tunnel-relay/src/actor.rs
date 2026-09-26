@@ -344,6 +344,15 @@ impl ActorCompletion {
         }
     }
 
+    /// Record an abort that is not a failure (the maintenance ticker), unless
+    /// an outcome was already recorded.  `failed` is never written, so it is
+    /// never observed `true` for a clean abort and a recorded panic is kept.
+    fn mark_stopped(&self) {
+        if !self.done.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
     async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
@@ -387,11 +396,36 @@ impl ActorCompletion {
 /// is dropped before it records an outcome itself, so every abort route --
 /// including one that never reaches `abort_actor_task`, or a task aborted
 /// before its first poll -- leaves the completion set (task row M6-C162).
-struct CompletionOnDrop(ActorCompletion);
+/// An aborted actor is a failure; an aborted maintenance ticker is not, and
+/// its completion never shows `failed` (task row M6-C175).
+struct CompletionOnDrop {
+    completion: ActorCompletion,
+    abort_is_failure: bool,
+}
+
+impl CompletionOnDrop {
+    fn actor(completion: ActorCompletion) -> Self {
+        Self {
+            completion,
+            abort_is_failure: true,
+        }
+    }
+
+    fn maintenance(completion: ActorCompletion) -> Self {
+        Self {
+            completion,
+            abort_is_failure: false,
+        }
+    }
+}
 
 impl Drop for CompletionOnDrop {
     fn drop(&mut self) {
-        self.0.mark_aborted();
+        if self.abort_is_failure {
+            self.completion.mark_aborted();
+        } else {
+            self.completion.mark_stopped();
+        }
     }
 }
 
@@ -2429,7 +2463,7 @@ impl RelayHandle {
         // Keep the actor failure boundary attached to the relay-wide
         // cancellation token.  A panic in the actor must not leave listener
         // tasks serving with no owner for their state.
-        let actor_completion = CompletionOnDrop(actor_completion);
+        let actor_completion = CompletionOnDrop::actor(actor_completion);
         let actor_task = tokio::spawn(async move {
             let completion = actor_completion;
             let failed = AssertUnwindSafe(actor.run()).catch_unwind().await.is_err();
@@ -2437,14 +2471,15 @@ impl RelayHandle {
             // owner, including a normal explicit shutdown or a terminal
             // cleanup overflow.  Propagate it to every relay task.
             actor_cancel.cancel();
-            completion.0.mark_done(failed);
+            completion.completion.mark_done(failed);
         });
         *actor_task_slot
             .lock()
             .expect("actor task slot mutex poisoned") = Some(actor_task);
         let ticker = handle.clone();
         let maintenance_shared_cancel = maintenance_cancel.clone();
-        let maintenance_completion_for_task = CompletionOnDrop(maintenance_completion.clone());
+        let maintenance_completion_for_task =
+            CompletionOnDrop::maintenance(maintenance_completion.clone());
         let maintenance_task = tokio::spawn(async move {
             let completion = maintenance_completion_for_task;
             let failed = AssertUnwindSafe(async move {
@@ -2471,7 +2506,7 @@ impl RelayHandle {
             if failed && !maintenance_shared_cancel.is_cancelled() {
                 maintenance_shared_cancel.cancel();
             }
-            completion.0.mark_done(failed);
+            completion.completion.mark_done(failed);
         });
         *maintenance_task_slot
             .lock()
@@ -3134,7 +3169,7 @@ impl RelayHandle {
             let task = AbortOnDropJoinHandle::new(task);
             task.abort();
             let _ = task.join().await;
-            self.maintenance_completion.mark_done(false);
+            self.maintenance_completion.mark_stopped();
         }
     }
 

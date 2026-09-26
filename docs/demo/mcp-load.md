@@ -29,31 +29,41 @@ a retry after one `DELETE` to be admitted.
 
 ## 2. The capacity refusal through a real relay (shared Redis, about 3 minutes)
 
-This uses PR #180's soak harness (`scripts/m6-soak.py`, branch `m6-03-soak`)
-and release binaries from this branch. It uses its own Redis namespace on
-127.0.0.1:63790 and deletes it on exit.
+This uses the soak harness (`scripts/m6-soak.py`) and binaries built from this
+checkout. It uses its own Redis namespace on 127.0.0.1:63790 and deletes it on
+exit.
+
+Since M6-C146, the harness shares at most `--mcp-sessions` (default 8, the
+stdio export's default `max_children`) MCP sessions among a step's workers.
+It `DELETE`s every session it opened when the step or the warm-up ends. So the
+default run fits the export. To see the refusal, ask for one session more than
+the export allows:
 
 ```sh
-cargo build --release --locked -p tunnel-relay -p tunnel-client -p tunnel-mcp-fixture
-mkdir -p /private/tmp/$USER-bins && cp $CARGO_TARGET_DIR/release/{tunnel-relay,tunnel-client,tunnel-mcp-fixture} /private/tmp/$USER-bins/
-git worktree add --detach /private/tmp/$USER-soak origin/m6-03-soak
-cd /private/tmp/$USER-soak
+cargo build --release --locked -p tunnel-relay -p tunnel-client -p tunnel-deadman -p tunnel-mcp-fixture
+mkdir -p /private/tmp/$USER-bins && cp $CARGO_TARGET_DIR/release/{tunnel-relay,tunnel-client,tunnel-deadman,tunnel-mcp-fixture} /private/tmp/$USER-bins/
 python3 scripts/m6-soak.py load --bin-dir /private/tmp/$USER-bins \
-  --logs /private/tmp/$USER-soak-logs --kinds mcp --steps 8 --step-seconds 30
+  --logs /private/tmp/$USER-soak-logs --kinds mcp --steps 16 --mcp-sessions 9 --step-seconds 15
 ```
 
-Expected (measured 2026-09-26 at `3bb61ec7`): one line like
+Expected (measured 2026-09-26 on branch `fix-soak-mcp` with **debug**
+binaries, nonce `663FBF12-B807-4D5C-9CEB-85ADEBD8BA2B`, not with the release
+build above): one line like the one below. Only the outcome codes and the
+session counts carry over to a release build; the rates and counts of calls
+will differ.
 
 ```
-load-step-done {"kind": "mcp", "concurrency": 8, "ok_per_s": 268.97, ..., "errors": {"-32050": 1215}}
+load-step-done {"kind": "mcp", "concurrency": 16, "ok_per_s": 386.8, ..., "errors": {"-32050": 451}}
 ```
 
-The harness's warm-up session plus 8 workers need 9 slots, and there are 8. So
-seven workers succeed, and one is refused on every attempt with `-32050`,
-never `-32603`. With `--steps 1,2,4,8,16`, steps 8 and 16 are refused on
-every call. The harness never deletes its sessions (M6-C146), so steps 1, 2
-and 4 leave 8 sessions holding every slot for 600 s. Origin/main at
-`598baf98` gives the same shape with `-32603`.
+Eight sessions fill the eight slots. The ninth `initialize` is refused with
+`-32050` on every attempt, never `-32603`, so the one worker bound to it is
+refused and the other fifteen succeed. The step's `mcp_sessions` summary shows
+`opened: 8, deleted: 8`. Without `--mcp-sessions 9`, `--steps 8,16` has no
+errors (nonce `3277A374-D6C4-4D96-9A7B-95B4F61D2DED`). The harness before
+M6-C146 leaked its sessions: on the same binaries its step 8 had 571 and its
+step 16 had 6,756 `-32050` refusals, and step 16 had no successes at all
+(nonce `412EE926-B8C8-4485-ADFD-297418513F93`).
 
 ## 3. The offline answer through a real relay
 
