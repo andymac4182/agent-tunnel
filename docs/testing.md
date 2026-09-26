@@ -2597,7 +2597,7 @@ Findings:
 
 ## Soak, chaos, and load experiments
 
-The following are proposed experiment sizes and acceptance targets for the first working transport. They have not been measured and are not product guarantees. **First measurements at smaller sizes (2026-09-26, task row M6-03):** [soak-2026-09-26.md](soak-2026-09-26.md) records a 2-hour one-device soak, stepped load, device/relay/Redis chaos and two-user fairness, driven by `scripts/m6-soak.py`, with raw CSV/JSON and explicit limits; the sizes in this table remain unmeasured. Record hardware, OS, commit, configuration, TLS settings, network conditions, and raw measurements; revise the targets through a documented decision after obtaining a baseline.
+The following are proposed experiment sizes and acceptance targets for the first working transport. They have not been measured and are not product guarantees. **First measurements at smaller sizes (2026-09-26, task row M6-03):** [soak-2026-09-26.md](soak-2026-09-26.md) records a 2-hour one-device soak, stepped load, device/relay/Redis chaos and two-user fairness, driven by `scripts/m6-soak.py`, with raw CSV/JSON and explicit limits; [soak-2026-09-27.md](soak-2026-09-27.md) re-runs all four on a `TCP_NODELAY` build with the device kept online under load (task rows M6-C150, M6-C176). The sizes in this table remain unmeasured. Record hardware, OS, commit, configuration, TLS settings, network conditions, and raw measurements; revise the targets through a documented decision after obtaining a baseline.
 
 | Experiment | Proposed workload | Initial acceptance target |
 | --- | --- | --- |
