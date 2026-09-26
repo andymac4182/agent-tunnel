@@ -2612,7 +2612,7 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
     assert!(fixture.session().terminal_fin_failure_deadline.is_none());
 }
 
-/// M6-C157: a FIN that a momentarily full writer queue refuses is kept for
+/// M6-C151: a FIN that a momentarily full writer queue refuses is kept for
 /// the ordered retry, like a refused RESET, so the burst that filled the
 /// queue is survived instead of ending the device session.
 ///
@@ -2622,7 +2622,7 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
 /// and 5 s later the session closed `TERMINAL_FIN_TIMEOUT` with the queue
 /// empty -- every consumer of the device then saw `DEVICE_OFFLINE`.
 #[tokio::test]
-async fn m6c157_refused_http_fin_is_retried_and_the_session_survives() {
+async fn m6c151_refused_http_fin_is_retried_and_the_session_survives() {
     let mut fixture = FreezeFixture::new("http-fin-refused", false);
     let _watchers = attach_http(&mut fixture);
     let key = fixture.key.clone();
@@ -2667,11 +2667,11 @@ async fn m6c157_refused_http_fin_is_retried_and_the_session_survives() {
     assert!(fixture.session_alive());
 }
 
-/// M6-C157, the other half: a FIN the writer keeps refusing for the whole
+/// M6-C151, the other half: a FIN the writer keeps refusing for the whole
 /// failure window still fails the session closed.  The retry narrows the
 /// fence to a writer that is really stuck; it does not remove it.
 #[tokio::test]
-async fn m6c157_a_fin_refused_for_the_whole_window_still_fails_closed() {
+async fn m6c151_a_fin_refused_for_the_whole_window_still_fails_closed() {
     let mut fixture = FreezeFixture::new("http-fin-stuck", false);
     let _watchers = attach_http(&mut fixture);
     let key = fixture.key.clone();
@@ -2704,10 +2704,10 @@ async fn m6c157_a_fin_refused_for_the_whole_window_still_fails_closed() {
     );
 }
 
-/// M6-C157: the relay's reply to a connector terminal, refused by a full
+/// M6-C151: the relay's reply to a connector terminal, refused by a full
 /// writer queue, is retained and retried by the tick the same way.
 #[tokio::test]
-async fn m6c157_refused_peer_terminal_reply_is_retried_by_the_tick() {
+async fn m6c151_refused_peer_terminal_reply_is_retried_by_the_tick() {
     let mut fixture = FreezeFixture::new("peer-reply-refused", false);
     let key = fixture.key.clone();
     let generation = fixture.attempt.old_generation;

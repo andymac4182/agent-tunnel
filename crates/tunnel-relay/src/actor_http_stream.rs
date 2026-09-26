@@ -787,7 +787,7 @@ impl RelayActor {
             if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
                 // Keep the FIN for an ordered retry, exactly as a refused
                 // RESET is kept (below): every tick while the failure
-                // deadline runs, and on ACK/WINDOW_UPDATE.  Before M6-C157 a
+                // deadline runs, and on ACK/WINDOW_UPDATE.  Before M6-C151 a
                 // FIN refused by a momentarily full writer queue was marked
                 // failed with nothing left to retry, so the deadline always
                 // expired and a burst of consumer load ended the whole device

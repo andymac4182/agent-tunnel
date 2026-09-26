@@ -6954,7 +6954,7 @@ impl RelayActor {
             if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
                 // Retained for the ordered retry `retry_failed_terminals`
                 // makes on every tick while the failure deadline runs
-                // (M6-C157): a reply refused by a full writer queue with
+                // (M6-C151): a reply refused by a full writer queue with
                 // nothing pending could never be published, so the deadline
                 // was certain to end the session.
                 stream.pending_terminal.get_or_insert(terminal);
