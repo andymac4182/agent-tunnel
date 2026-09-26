@@ -493,12 +493,20 @@ pub async fn serve_with_listener_options(
                     // Release the slot, back off so a pending connection
                     // cannot spin the loop, and keep serving.
                     Some(class) => {
-                        log_accept_error(&ACCEPT_ERROR_LOG, listener_name, class);
                         drop(slot);
+                        let backoff = accept_error_backoff(class);
+                        if backoff.is_zero() {
+                            // Peer-caused: retry at once, as axum does, so a
+                            // client that connects and resets cannot throttle
+                            // the listener.
+                            tracing::debug!(listener = listener_name, class, "accept failed; peer went away");
+                            continue;
+                        }
+                        log_accept_error(&ACCEPT_ERROR_LOG, listener_name, class);
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            _ = tokio::time::sleep(backoff) => {}
                         }
                         continue;
                     }
@@ -919,11 +927,27 @@ fn log_handshake_failure(
     }
 }
 
-/// Pause after a transient `accept` error before accepting again (M6-C155).
+/// Pause after a resource-exhaustion `accept` error before accepting again
+/// (M6-C155); see [`accept_error_backoff`].
 ///
 /// A connection that cannot be accepted stays pending, so without a pause the
 /// accept loop would spin on the same error at full speed.
 pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The pause before accepting again after a transient `accept` error of
+/// `class` (review of M6-C155).
+///
+/// Only resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) waits
+/// [`ACCEPT_ERROR_BACKOFF`]: retrying at once would spin on the same error.
+/// An aborted or reset connection is peer-caused and retried immediately with
+/// no pause, so a client that connects and resets repeatedly cannot throttle
+/// the listener to one accept per backoff.
+pub fn accept_error_backoff(class: &str) -> Duration {
+    match class {
+        "connection_aborted" | "connection_reset" => Duration::ZERO,
+        _ => ACCEPT_ERROR_BACKOFF,
+    }
+}
 
 /// The process-wide limit on `accept failed` lines, keyed by error class.
 static ACCEPT_ERROR_LOG: std::sync::LazyLock<crate::log_limit::RefusalLogLimiter> =
@@ -1439,6 +1463,34 @@ mod accept_error_tests {
             transient_accept_error(&std::io::Error::other("not an OS error")),
             None
         );
+    }
+
+    /// Review of M6-C155: an aborted or reset accept is peer-caused and must
+    /// not pause the listener; only descriptor, buffer and memory exhaustion
+    /// back off.  Red before the fix, which slept 100 ms for every class.
+    #[test]
+    fn aborted_accepts_do_not_pause_and_exhaustion_backs_off() {
+        for class in ["connection_aborted", "connection_reset"] {
+            assert_eq!(accept_error_backoff(class), Duration::ZERO, "{class}");
+        }
+        for class in [
+            "process_file_descriptors_exhausted",
+            "system_file_descriptors_exhausted",
+            "no_buffer_space",
+            "out_of_memory",
+        ] {
+            assert_eq!(accept_error_backoff(class), ACCEPT_ERROR_BACKOFF, "{class}");
+        }
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let class = transient_accept_error(&aborted).expect("aborted is transient");
+        assert!(accept_error_backoff(class).is_zero());
+        #[cfg(unix)]
+        {
+            let aborted =
+                std::io::Error::from_raw_os_error(rustix::io::Errno::CONNABORTED.raw_os_error());
+            let class = transient_accept_error(&aborted).expect("ECONNABORTED is transient");
+            assert!(accept_error_backoff(class).is_zero());
+        }
     }
 
     /// The accept-error line is rate limited per class like the TLS lines.

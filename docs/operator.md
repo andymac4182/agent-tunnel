@@ -1069,10 +1069,13 @@ warning: open-file soft limit N is below the M descriptors ...` when the soft
 `RLIMIT_NOFILE` is lower. Raise it before raising `listener_max_connections`:
 `ulimit -n 4096` in the shell that starts the relay, or `LimitNOFILE=` in the
 systemd unit. If descriptors still run out, `accept` fails with `EMFILE` or
-`ENFILE`; the relay no longer exits on that (before M6-C155 it did). It logs
-`accept failed; backing off and continuing to serve` at `warn` with
-`phase=accept_error` and a fixed `class` (rate limited per class), waits
-100 ms and keeps serving. On macOS the kernel closes the connection whose
+`ENFILE`. The relay no longer exits when that happens (before M6-C155 it
+did). It logs `accept failed; backing off and continuing to serve` at `warn`
+with `phase=accept_error` and a fixed `class` (rate limited per class), waits
+100 ms and keeps serving. `ENOBUFS` and `ENOMEM` are handled the same way. A
+client that aborts or resets before the relay accepts it (`ECONNABORTED`) is
+not an exhaustion signal: the relay retries at once, without a pause, and
+logs only at `debug`. On macOS the kernel closes the connection whose
 accept failed; on Linux it stays queued.
 
 ### 3.3 A cluster

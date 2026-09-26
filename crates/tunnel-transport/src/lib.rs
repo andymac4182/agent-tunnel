@@ -40,8 +40,8 @@ pub use server::{
     DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES, DEFAULT_MAX_HTTP2_STREAMS, DEFAULT_PRE_REQUEST_TIMEOUT,
     DEFAULT_REFUSAL_MARGIN, DEFAULT_REFUSAL_TIMEOUT, ListenerCapacity, ListenerTimeouts,
     MAX_LISTENER_CONNECTIONS, MAX_REFUSAL_BODY_BYTES, MAX_REFUSAL_MARGIN, TransportError,
-    log_tls_refusal, serve, serve_with_listener_options, serve_with_socket_options,
-    transient_accept_error,
+    accept_error_backoff, log_tls_refusal, serve, serve_with_listener_options,
+    serve_with_socket_options, transient_accept_error,
 };
 pub use tls::{
     CertificateRole, ClientTlsConfigError, ProviderAlreadyInstalled, SanName, SpkiSha256,
