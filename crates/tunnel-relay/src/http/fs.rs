@@ -73,7 +73,7 @@ use tunnel_fs_provider::{Record, RecordDecoder, default_limits};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::StreamTeardownCause;
-use crate::http::forward::actor_carriers;
+use crate::http::forward::actor_carriers_without_refusal_reset;
 use crate::routing::{OwnerRoute, OwnerScope};
 use tunnel_http_bridge::{CarrierEvent, CarrierReader as _, CarrierWriter as _};
 
@@ -702,6 +702,13 @@ fn session_close_for_reset(reason: Option<u16>) -> SessionErrorCode {
     }
 }
 
+/// The consumer close code [`session_close_for_reset`] leads to, for tests
+/// outside this module (M6-C190 review).
+#[cfg(test)]
+pub(crate) fn session_close_code_for_reset(reason: Option<u16>) -> Option<u16> {
+    session_close_for_reset(reason).close_code()
+}
+
 /// No verdict published yet.
 ///
 /// `u8::MAX` rather than a sentinel of its own, because a published verdict is
@@ -810,7 +817,10 @@ async fn pump(
     // published in that same turn has to be readable here rather than
     // delivered in order.
     let mut terminal_cause = registration.terminal.clone();
-    let (mut writer, mut reader, signal_task, _freeze) = actor_carriers(&handle, registration);
+    // Without the M6-C190 refusal reset: this session's close code is the
+    // device's RESET reason or the grant timer, never a relay RESET.
+    let (mut writer, mut reader, signal_task, _freeze) =
+        actor_carriers_without_refusal_reset(&handle, registration);
 
     let (mut sink, mut stream) = socket.split();
     let inbound_closed = closed.clone();

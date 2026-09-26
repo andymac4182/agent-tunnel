@@ -62,6 +62,11 @@ pub(super) struct DeviceHttpState {
     request_tracker: RecordTracker,
     pub(super) cancel_received: bool,
     task: Option<JoinHandle<()>>,
+    /// M6-C190: when the exchange started, and when (after how many
+    /// milliseconds) its first authorization confirmation arrived.
+    created_at: std::time::Instant,
+    pub(super) confirmations: u32,
+    pub(super) first_confirmation_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for DeviceHttpState {
@@ -156,6 +161,21 @@ impl DeviceHttpState {
             request_tracker: RecordTracker::new(),
             cancel_received: false,
             task,
+            created_at: std::time::Instant::now(),
+            confirmations: 0,
+            first_confirmation_ms: None,
+        }
+    }
+
+    pub(super) fn age_ms(&self) -> u64 {
+        u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// M6-C190: an authorization confirmation for this stream was accepted.
+    pub(super) fn note_confirmation(&mut self) {
+        self.confirmations = self.confirmations.saturating_add(1);
+        if self.first_confirmation_ms.is_none() {
+            self.first_confirmation_ms = Some(self.age_ms());
         }
     }
 
@@ -483,6 +503,14 @@ impl M2Actor {
                 Ok(())
             }
             HttpActorRequest::Done { mut record } => {
+                if http_exchange_log_enabled()
+                    && record
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| report.error.is_some())
+                {
+                    self.log_failed_http_exchange(&record);
+                }
                 if let Some(http) = self
                     .streams
                     .get(&record.stream_id)
@@ -512,6 +540,76 @@ impl M2Actor {
                 Ok(())
             }
         }
+    }
+
+    /// M6-C190: one stderr line for a failed HTTP exchange, when
+    /// [`HTTP_EXCHANGE_LOG_ENV`] is `1`.  Identifiers, counters, flags and
+    /// elapsed milliseconds only — never a header, path, body or credential.
+    fn log_failed_http_exchange(&self, record: &DeviceHttpExchangeRecord) {
+        let Some(report) = record.report.as_ref() else {
+            return;
+        };
+        let stream_id = record.stream_id;
+        let mut line = serde_json::json!({
+            "stream_id": stream_id,
+            "request": format!("{:?}", report.request),
+            "response": format!("{:?}", report.response),
+            "execution": report.execution.as_str(),
+            "error": report.error.map(tunnel_http_bridge::HttpErrorCode::as_str),
+            "progress_expired": report.progress_expired.map(tunnel_http_bridge::ProgressKind::as_str),
+            "writes_frozen": self.writes_frozen,
+            "pending_outputs": self.pending_outputs.len(),
+            "pending_output_for_stream":
+                has_pending_output_for_stream(&self.pending_outputs, stream_id),
+            "refresh_queued": self.pending_authorization_refreshes.contains_key(&stream_id),
+        });
+        if let Some(stream) = self.streams.get(&stream_id) {
+            let direction = stream.sequence.direction(Direction::ConnectorToRelay);
+            let received = stream.sequence.direction(Direction::RelayToConnector);
+            let extra = serde_json::json!({
+                "auth_confirmed": stream.auth.confirmed,
+                "auth_refresh_in_flight": stream.auth.refresh_in_flight,
+                "auth_invalidated": stream.auth.invalidated,
+                "buffered_inputs": stream.pending.len(),
+                "buffered_input_bytes": stream.pending_bytes,
+                "input_fin": stream.input_fin,
+                "input_reset": stream.input_reset,
+                "output_fin": stream.output_fin,
+                "output_reset": stream.output_reset,
+                "reset_queued": stream.reset_queued,
+                "sent_bytes": direction.sent_bytes(),
+                "send_credit": direction.send_credit(),
+                "replay_bytes": direction.replay_bytes(),
+                "replay_frames": direction.replay_len(),
+                "max_replay_frames": direction.limits().max_replay_frames,
+                "received_contiguous": received.recv_contiguous(),
+            });
+            merge_json(&mut line, extra);
+            if let Some(http) = stream.http.as_ref() {
+                let request = http.request_tracker.snapshot();
+                merge_json(
+                    &mut line,
+                    serde_json::json!({
+                        "age_ms": http.age_ms(),
+                        "confirmations": http.confirmations,
+                        "first_confirmation_ms": http.first_confirmation_ms,
+                        "request_heads": request.heads,
+                        "request_bodies": request.bodies,
+                        "request_ends": request.ends,
+                        "request_fin_ready": http.fin_ready,
+                        "request_fin_delivered": http.fin_delivered,
+                        "receive_buffered": http.buffered,
+                        "parked_bytes": http.parked.as_ref().map_or(0, |(data, _)| data.len()),
+                        "parked_high_water": http.parked_high_water,
+                        "finish_after_parked": http.finish_after_parked.is_some(),
+                        "cancel_received": http.cancel_received,
+                    }),
+                );
+            }
+        } else {
+            merge_json(&mut line, serde_json::json!({ "stream_known": false }));
+        }
+        eprintln!("tunnel-client: http-exchange-failed {line}");
     }
 
     async fn http_read(
@@ -808,6 +906,21 @@ impl M2Actor {
                 http.abort(reason, after_fin);
             }
         }
+    }
+}
+
+/// M6-C190: set to `1` to log each failed HTTP exchange's payload-free
+/// state to stderr (used by the load experiment in `scripts/m6-soak.py`).
+pub const HTTP_EXCHANGE_LOG_ENV: &str = "AGENT_TUNNEL_HTTP_EXCHANGE_LOG";
+
+fn http_exchange_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(HTTP_EXCHANGE_LOG_ENV).is_ok_and(|value| value == "1"))
+}
+
+fn merge_json(target: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(target), serde_json::Value::Object(extra)) = (target.as_object_mut(), extra) {
+        target.extend(extra);
     }
 }
 

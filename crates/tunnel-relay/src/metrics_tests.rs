@@ -47,6 +47,8 @@ fn canary_snapshot() -> RelaySnapshot {
     let mut snapshot = RelaySnapshot {
         lifetime_application_dispatches: 5,
         control_registration_conflicts: 3,
+        http_writer_parks: 11,
+        http_writer_reparks: 12,
         sessions: vec![
             session("active", None),
             session("draining", Some("reply_timeout")),
@@ -158,6 +160,8 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_application_dispatches_total 5",
         "tunnel_relay_control_registration_conflicts_total 3",
         "tunnel_relay_consumer_write_timeouts_total 2",
+        "tunnel_relay_http_writer_parks_total 11",
+        "tunnel_relay_http_writer_reparks_total 12",
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"identity\"} 6",
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"grant\"} 1",
         "tunnel_relay_consumer_refusals_total{route=\"stream\",stage=\"rotation_freeze\"} 8",
