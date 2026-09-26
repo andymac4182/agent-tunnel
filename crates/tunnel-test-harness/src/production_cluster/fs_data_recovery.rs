@@ -426,11 +426,14 @@ pub struct FsDataRecoveryEvidence {
     /// its send credit ([`FailurePoint::ReplyParkedForCredit`] only; zero
     /// otherwise).
     pub credit_filler_reads: usize,
-    /// Whether the device had received the held `Tread` when the socket died.
+    /// Whether the device's receive cursor, at the instant the socket was
+    /// destroyed, was past where it stood immediately before the held `Tread`
+    /// was sent: the device had the held request.
     pub device_received_held_request: bool,
-    /// Whether, when the socket died, the device held the held `Tread`'s
-    /// reply in its pending-output queue with its emit cursor unmoved: parked
-    /// for credit, not sent.
+    /// Whether, at that instant, the device's emit cursor still stood where it
+    /// did immediately before the held `Tread` was sent, with the request
+    /// received: nothing it emitted after the request arrived could carry an
+    /// ACK of it.
     pub device_reply_parked: bool,
 }
 
@@ -625,6 +628,25 @@ pub fn validate_fs_data_recovery_evidence(evidence: &FsDataRecoveryEvidence) -> 
         (
             "exactly one Tattach across the run: no fid was reconstructed".into(),
             evidence.attach_count == 1,
+        ),
+        // Gate 11b (M6-C163).  The lost-ACK state is claimed only when all of
+        // these held at the instant of failure; without them a slow device
+        // could have answered the held request late, and that reply's
+        // replayed ACK would let the run pass without the state it names.
+        (
+            "gate 11b: at least one unread reply spent the device's send credit".into(),
+            evidence.failure_point != FailurePoint::ReplyParkedForCredit
+                || evidence.credit_filler_reads >= 1,
+        ),
+        (
+            "gate 11b: the device had received the held request".into(),
+            evidence.failure_point != FailurePoint::ReplyParkedForCredit
+                || evidence.device_received_held_request,
+        ),
+        (
+            "gate 11b: the device had emitted nothing since the held request was sent".into(),
+            evidence.failure_point != FailurePoint::ReplyParkedForCredit
+                || evidence.device_reply_parked,
         ),
     ];
     for (rule, passed) in checks {
@@ -1116,6 +1138,10 @@ async fn exercise(
         )));
     }
     let device_emitted_before = device_before.emitted_sequences;
+    // The device's status immediately before the held Tread is sent; the
+    // failure point is judged against it, not against `device_before`, which
+    // predates the credit fillers.
+    let mut before_held = device_before.clone();
     let mut next_offset = transferred.len() as u64;
     let mut filler_tags = Vec::new();
 
@@ -1131,6 +1157,7 @@ async fn exercise(
     //    parked, and that Tread is the held one.
     let held_tag = match point {
         FailurePoint::ReplyProduced => {
+            before_held = client.status_snapshot();
             let tag = session
                 .send(Message::Tread {
                     fid: FILE_FID,
@@ -1152,6 +1179,7 @@ async fn exercise(
                 )));
             }
             let before = client.status_snapshot();
+            before_held = before.clone();
             let tag = session
                 .send(Message::Tread {
                     fid: FILE_FID,
@@ -1228,7 +1256,6 @@ async fn exercise(
     let _ = next_offset;
     evidence.credit_filler_reads = filler_tags.len();
     evidence.held_tag = held_tag;
-    let device_received_before = device_before.received_sequences;
 
     // 5. Wait for the owner to show the request dispatched and unanswered,
     //    and for the device to reach the chosen point, then destroy the data
@@ -1245,7 +1272,6 @@ async fn exercise(
     {
         let deadline = Instant::now() + WAIT;
         let mut polls = 0_usize;
-        let parked_emitted = client.status_snapshot().emitted_sequences;
         loop {
             polls += 1;
             let snapshot = owner_snapshot(cluster).await?;
@@ -1261,20 +1287,19 @@ async fn exercise(
                     ..observation.clone()
                 };
                 let device = client.status_snapshot();
+                let received_held = device.received_sequences > before_held.received_sequences;
+                let emitted_since_held = device.emitted_sequences > before_held.emitted_sequences;
                 let reached = match point {
-                    FailurePoint::ReplyProduced => device.emitted_sequences > device_emitted_before,
-                    FailurePoint::ReplyParkedForCredit => {
-                        device.emitted_sequences == parked_emitted
-                    }
+                    FailurePoint::ReplyProduced => emitted_since_held,
+                    FailurePoint::ReplyParkedForCredit => received_held && !emitted_since_held,
                 };
                 // Only a sample that shows the record dispatched and
                 // unanswered, with the device at the chosen point, ends the
                 // wait.
                 if sample.request_outstanding_at_failure() && reached {
                     evidence.failure_polls = polls;
-                    evidence.device_received_held_request =
-                        device.received_sequences > device_received_before;
-                    evidence.device_reply_parked = point == FailurePoint::ReplyParkedForCredit;
+                    evidence.device_received_held_request = received_held;
+                    evidence.device_reply_parked = received_held && !emitted_since_held;
                     observation = sample;
                     break;
                 }
@@ -1630,6 +1655,46 @@ mod tests {
             credit_filler_reads: 0,
             device_received_held_request: true,
             device_reply_parked: false,
+        }
+    }
+
+    fn parked_passing() -> FsDataRecoveryEvidence {
+        FsDataRecoveryEvidence {
+            failure_point: FailurePoint::ReplyParkedForCredit,
+            credit_filler_reads: 1,
+            device_received_held_request: true,
+            device_reply_parked: true,
+            ..passing()
+        }
+    }
+
+    /// Review of gate 11b (M6-C163): the lost-ACK state is claimed only with
+    /// every one of its conditions measured, and each alone defeats it.  The
+    /// same fields do not bind gate 11, whose reply is meant to be produced.
+    #[test]
+    fn gate_11b_rejects_a_run_that_did_not_reach_the_lost_ack_state() {
+        validate_fs_data_recovery_evidence(&parked_passing()).expect("parked evidence");
+        type Mutation = (&'static str, fn(&mut FsDataRecoveryEvidence));
+        let mutations: Vec<Mutation> = vec![
+            ("no credit filler", |e| e.credit_filler_reads = 0),
+            ("held request not received", |e| {
+                e.device_received_held_request = false;
+            }),
+            ("device emitted after the held request", |e| {
+                e.device_reply_parked = false;
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let mut evidence = parked_passing();
+            mutate(&mut evidence);
+            assert!(
+                validate_fs_data_recovery_evidence(&evidence).is_err(),
+                "the validator accepted a gate 11b run short of its state: {label}"
+            );
+            // The same values on a gate 11 run are not gate 11b's claims.
+            evidence.failure_point = FailurePoint::ReplyProduced;
+            validate_fs_data_recovery_evidence(&evidence)
+                .unwrap_or_else(|error| panic!("gate 11 rejected {label}: {error}"));
         }
     }
 

@@ -2026,8 +2026,17 @@ still for 500 ms is the held request, its reply parked because the unread
 fillers spent the relay's 128 KiB window. The device's ACK for the held
 `Tread` dies with the socket, and no frame it replays was emitted after that
 `Tread` arrived, so the relay can learn of the receipt only from the device's
-SNAPSHOT. The gate then asserts everything gate 11 does, reading the filler
-replies before the held one. The device's cursors are summed over its streams,
+SNAPSHOT. At the instant of failure the gate requires, against the device's
+status taken immediately before the held `Tread` was sent, that its receive
+cursor has moved (it has the request) and its emit cursor has not (nothing it
+emitted since could carry an ACK of it); the validator refuses a gate 11b run
+without at least one filler, that receipt, and that unmoved emit cursor, so a
+slow device whose late reply is replayed cannot pass it. The parking is
+observed, not derived: in measured runs the device still had about 64 KiB of
+sequence-level send credit and did not emit, so the limit that parks the reply
+is not the sequence credit alone, and the gate does not claim zero credit. The
+gate then asserts everything gate 11 does, reading the filler replies before
+the held one. The device's cursors are summed over its streams,
 so the gate refuses a run in which the device carries more than this one
 stream. With the M6-C163 fix reverted, gate 11b fails with `retained recovery
 failed` at the recovery deadline; with it, it passes.
