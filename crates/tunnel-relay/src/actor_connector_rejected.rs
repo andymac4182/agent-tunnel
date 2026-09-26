@@ -14,70 +14,118 @@
 //! credentials, control characters or unbounded text into the relay's log
 //! through a refusal.
 //!
-//! **Rate bounds.**  Each session has its own small budget
-//! ([`SESSION_REJECTED_LOG_BURST`] lines per [`SESSION_REJECTED_LOG_WINDOW`]),
-//! so one device cannot crowd out another.  A process-wide limiter is the
-//! overall cap: matched refusals share a budget per code label, and REJECTEDs
-//! that match no relay record (which a device can forge freely) share a
-//! separate `unmatched` budget, so forged ones cannot spend the budget of real
-//! ones.
+//! **Rate bounds, in order.**
+//! 1. Each session: [`SESSION_REJECTED_LOG_BURST`] lines per window, held in
+//!    the session state, so one device cannot spend its tenant's whole
+//!    budget.
+//! 2. Each tenant: [`TENANT_REJECTED_LOG_BURST`] lines per window across all
+//!    of its sessions, held in the actor.  Another tenant's lines are not
+//!    counted here, so no number of devices or reconnects in one tenant can
+//!    silence another tenant's refusals.
+//! 3. The process: [`GLOBAL_REJECTED_LOG_BURST`] lines per window, an I/O
+//!    backstop well above one tenant's burst.  It can only be reached by many
+//!    tenants flooding at once, and then drops lines for everyone.
+//!
+//! Each window is [`REJECTED_LOG_WINDOW`] long.  Matched and forged
+//! (unmatched) REJECTEDs spend the same session and tenant budgets.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use tunnel_protocol::{open_refusal, rotation::RotationPhase};
 use tunnel_transport::log_limit::RefusalLogLimiter;
+use uuid::Uuid;
 
-/// The process-wide cap on `connector rejected` lines, keyed by the code label
-/// for matched refusals and by [`UNMATCHED_KEY`] for unmatched ones.
+/// Lines one session may write per window.
+pub(super) const SESSION_REJECTED_LOG_BURST: u32 = 5;
+/// Lines one tenant may write per window, across all of its sessions.
+pub(super) const TENANT_REJECTED_LOG_BURST: u32 = 10;
+/// Lines the whole process may write per window: an I/O backstop.
+pub(super) const GLOBAL_REJECTED_LOG_BURST: u32 = 200;
+/// The window for all three budgets.
+pub(super) const REJECTED_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// The single key of the process-wide backstop.
+const GLOBAL_KEY: &str = "connector_rejected";
+
 #[cfg(not(test))]
 static CONNECTOR_REJECTED_LOG: std::sync::LazyLock<RefusalLogLimiter> =
-    std::sync::LazyLock::new(RefusalLogLimiter::with_defaults);
+    std::sync::LazyLock::new(|| {
+        RefusalLogLimiter::new(GLOBAL_REJECTED_LOG_BURST, REJECTED_LOG_WINDOW)
+    });
 
-// Unit tests share one process, so each test thread gets its own global
-// limiter with the same defaults; another test's refusals cannot spend this
-// test's budget.
+// Unit tests share one process, so each test thread gets its own backstop
+// with the same size; another test's refusals cannot spend this test's.
 #[cfg(test)]
 thread_local! {
-    static CONNECTOR_REJECTED_LOG: RefusalLogLimiter = RefusalLogLimiter::with_defaults();
+    static CONNECTOR_REJECTED_LOG: RefusalLogLimiter =
+        RefusalLogLimiter::new(GLOBAL_REJECTED_LOG_BURST, REJECTED_LOG_WINDOW);
 }
-
-/// Lines one session may write per window, below the global cap.
-pub(super) const SESSION_REJECTED_LOG_BURST: u32 = 5;
-/// The per-session window.
-pub(super) const SESSION_REJECTED_LOG_WINDOW: Duration = Duration::from_secs(10);
-
-/// Global limiter key for a REJECTED matching no relay record.
-const UNMATCHED_KEY: &str = "unmatched";
 
 /// Label for a code or reason outside the connector's refusal table.
 pub(super) const OTHER: &str = "other";
 
-/// A session's own fixed-window line budget: two counters and a start time,
-/// held in the (bounded) session state.
+/// A fixed-window line budget: a start time and two counters.
 #[derive(Debug, Default)]
-pub(super) struct SessionRejectedLog {
+pub(super) struct RejectedLogWindow {
     window_started: Option<Instant>,
     admitted: u32,
     suppressed: u64,
 }
 
-impl SessionRejectedLog {
-    /// `Some(n)` admits a line and carries the number this session had
-    /// suppressed since its previous admitted line; `None` suppresses it.
-    pub(super) fn admit_at(&mut self, now: Instant) -> Option<u64> {
-        let expired = self.window_started.is_none_or(|started| {
-            now.saturating_duration_since(started) >= SESSION_REJECTED_LOG_WINDOW
-        });
+impl RejectedLogWindow {
+    /// `Some(n)` admits a line and carries the number this budget suppressed
+    /// since its previous admitted line; `None` suppresses it.
+    pub(super) fn admit_at(&mut self, now: Instant, burst: u32) -> Option<u64> {
+        let expired = self
+            .window_started
+            .is_none_or(|started| now.saturating_duration_since(started) >= REJECTED_LOG_WINDOW);
         if expired {
             self.window_started = Some(now);
             self.admitted = 0;
         }
-        if self.admitted >= SESSION_REJECTED_LOG_BURST {
+        if self.admitted >= burst {
             self.suppressed = self.suppressed.saturating_add(1);
             return None;
         }
         self.admitted += 1;
         Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Per-tenant budgets, held by the actor.  An entry is created with a
+/// tenant's first line, and entries for tenants with no live session are
+/// dropped whenever a new tenant's entry is created, so the map never holds
+/// more than the live tenants plus one.
+#[derive(Debug, Default)]
+pub(super) struct TenantRejectedLogs {
+    tenants: HashMap<Uuid, RejectedLogWindow>,
+}
+
+impl TenantRejectedLogs {
+    /// The budget for `tenant_id`, creating it (and first dropping every
+    /// tenant for which `live` is false) if it does not exist.
+    pub(super) fn budget(
+        &mut self,
+        tenant_id: Uuid,
+        live: impl Fn(&Uuid) -> bool,
+    ) -> &mut RejectedLogWindow {
+        if !self.tenants.contains_key(&tenant_id) {
+            self.tenants.retain(|tenant, _| live(tenant));
+        }
+        self.tenants.entry(tenant_id).or_default()
+    }
+
+    /// Whether `tenant_id` already has a budget.
+    pub(super) fn contains(&self, tenant_id: &Uuid) -> bool {
+        self.tenants.contains_key(tenant_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.tenants.len()
     }
 }
 
@@ -108,8 +156,8 @@ pub(super) fn rotation_phase_label(phase: Option<RotationPhase>) -> &'static str
 
 /// Identifiers the relay resolved itself, plus the relay's own answer.
 pub(super) struct ConnectorRejectedContext<'a> {
-    pub tenant_id: &'a uuid::Uuid,
-    pub device_id: &'a uuid::Uuid,
+    pub tenant_id: &'a Uuid,
+    pub device_id: &'a Uuid,
     pub session_id: &'a str,
     pub epoch: u64,
     pub stream_id: u64,
@@ -122,8 +170,14 @@ pub(super) struct ConnectorRejectedContext<'a> {
     pub relay_code: &'static str,
 }
 
+/// The session and tenant budgets a line is charged to.
+pub(super) struct RejectedLogBudgets<'a> {
+    pub session: &'a mut RejectedLogWindow,
+    pub tenant: &'a mut RejectedLogWindow,
+}
+
 pub(super) fn log_connector_rejected(
-    session_log: Option<&mut SessionRejectedLog>,
+    budgets: RejectedLogBudgets<'_>,
     context: &ConnectorRejectedContext<'_>,
     code: &str,
     reason: &str,
@@ -132,7 +186,7 @@ pub(super) fn log_connector_rejected(
     {
         log_connector_rejected_with(
             &CONNECTOR_REJECTED_LOG,
-            session_log,
+            budgets,
             Instant::now(),
             context,
             code,
@@ -142,39 +196,33 @@ pub(super) fn log_connector_rejected(
     #[cfg(test)]
     {
         CONNECTOR_REJECTED_LOG.with(|limiter| {
-            log_connector_rejected_with(limiter, session_log, Instant::now(), context, code, reason)
+            log_connector_rejected_with(limiter, budgets, Instant::now(), context, code, reason)
         })
     }
 }
 
-/// [`log_connector_rejected`] against an explicit global limiter and clock;
-/// returns whether the line was written.  The session budget is checked
-/// first, then the global cap.  An admitted line carries `suppressed` (global,
-/// for its key) and `session_suppressed` (this session's own).
+/// [`log_connector_rejected`] against an explicit backstop and clock; returns
+/// whether the line was written.  The session budget is charged first, then
+/// the tenant's, then the backstop.  An admitted line carries each budget's
+/// suppressed count since its previous admitted line.
 pub(super) fn log_connector_rejected_with(
-    limiter: &RefusalLogLimiter,
-    session_log: Option<&mut SessionRejectedLog>,
+    backstop: &RefusalLogLimiter,
+    budgets: RejectedLogBudgets<'_>,
     now: Instant,
     context: &ConnectorRejectedContext<'_>,
     code: &str,
     reason: &str,
 ) -> bool {
-    let session_suppressed = match session_log {
-        Some(session_log) => match session_log.admit_at(now) {
-            Some(suppressed) => suppressed,
-            None => return false,
-        },
-        None => 0,
-    };
-    let code_label = code_label(code);
-    let key = if context.matched == "none" {
-        UNMATCHED_KEY
-    } else {
-        code_label
-    };
-    let Some(suppressed) = limiter.admit_at(key, now) else {
+    let Some(session_suppressed) = budgets.session.admit_at(now, SESSION_REJECTED_LOG_BURST) else {
         return false;
     };
+    let Some(tenant_suppressed) = budgets.tenant.admit_at(now, TENANT_REJECTED_LOG_BURST) else {
+        return false;
+    };
+    let Some(suppressed) = backstop.admit_at(GLOBAL_KEY, now) else {
+        return false;
+    };
+    let code_label = code_label(code);
     tracing::info!(
         phase = "connector_rejected",
         tenant_id = %context.tenant_id,
@@ -190,8 +238,9 @@ pub(super) fn log_connector_rejected_with(
         reason_category = reason_category(reason),
         reason_len = reason.len(),
         relay_code = context.relay_code,
-        suppressed,
         session_suppressed,
+        tenant_suppressed,
+        suppressed,
         "connector rejected an OPEN"
     );
     true
@@ -201,88 +250,121 @@ pub(super) fn log_connector_rejected_with(
 mod tests {
     use std::{
         sync::{Arc, Mutex},
-        time::Duration,
+        time::Instant,
     };
-
-    use std::time::Instant;
 
     use tunnel_transport::log_limit::RefusalLogLimiter;
 
     use super::{
-        ConnectorRejectedContext, OTHER, SESSION_REJECTED_LOG_BURST, SESSION_REJECTED_LOG_WINDOW,
-        SessionRejectedLog, code_label, log_connector_rejected_with, reason_category,
+        ConnectorRejectedContext, GLOBAL_REJECTED_LOG_BURST, OTHER, REJECTED_LOG_WINDOW,
+        RejectedLogBudgets, RejectedLogWindow, SESSION_REJECTED_LOG_BURST,
+        TENANT_REJECTED_LOG_BURST, TenantRejectedLogs, code_label, log_connector_rejected_with,
+        reason_category,
     };
+    use uuid::Uuid;
 
-    fn context(matched: &'static str) -> ConnectorRejectedContext<'static> {
-        static NIL: uuid::Uuid = uuid::Uuid::nil();
+    fn context(tenant_id: &Uuid) -> ConnectorRejectedContext<'_> {
         ConnectorRejectedContext {
-            tenant_id: &NIL,
-            device_id: &NIL,
-            session_id: "m7c160-rate",
+            tenant_id,
+            device_id: tenant_id,
+            session_id: "m7c160-budget",
             epoch: 1,
             stream_id: 1,
             operation_id: "unmatched",
             rotation_phase: None,
-            matched,
+            matched: "stream",
             relay_code: "none",
         }
     }
 
     #[test]
-    fn the_global_cap_is_per_code_label_and_unmatched_has_its_own_key() {
-        let limiter = RefusalLogLimiter::new(2, Duration::from_secs(3600));
-        let now = Instant::now();
-        let matched = context("stream");
-        let log = |context: &ConnectorRejectedContext<'_>, code: &str| {
-            log_connector_rejected_with(&limiter, None, now, context, code, "x")
-        };
-        let written: Vec<bool> = (0..3).map(|_| log(&matched, "GOAWAY")).collect();
-        assert_eq!(written, [true, true, false]);
-        // Hostile codes share one label, so they share one budget.
-        assert!(log(&matched, "A"));
-        assert!(log(&matched, "B"));
-        assert!(!log(&matched, "C"));
-        // Unmatched REJECTEDs spend only their own key, whatever their code.
-        let unmatched = context("none");
-        assert!(log(&unmatched, "RESOURCE_EXHAUSTED"));
-        assert!(log(&unmatched, "RESOURCE_EXHAUSTED"));
-        assert!(!log(&unmatched, "RESOURCE_EXHAUSTED"));
-        assert!(log(&matched, "RESOURCE_EXHAUSTED"));
+    fn session_then_tenant_then_backstop_budgets_apply_in_order() {
+        let backstop = RefusalLogLimiter::new(GLOBAL_REJECTED_LOG_BURST, REJECTED_LOG_WINDOW);
+        let start = Instant::now();
+        let tenant_a = Uuid::from_u128(1);
+        let tenant_b = Uuid::from_u128(2);
+        let mut tenant_a_budget = RejectedLogWindow::default();
+        let mut tenant_b_budget = RejectedLogWindow::default();
+        let mut log =
+            |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow, tenant_id: &Uuid| {
+                log_connector_rejected_with(
+                    &backstop,
+                    RejectedLogBudgets { session, tenant },
+                    start,
+                    &context(tenant_id),
+                    "GOAWAY",
+                    "x",
+                )
+            };
+        // One session stops at its own burst.
+        let mut noisy = RejectedLogWindow::default();
+        let written = (0..SESSION_REJECTED_LOG_BURST * 2)
+            .filter(|_| log(&mut noisy, &mut tenant_a_budget, &tenant_a))
+            .count();
+        assert_eq!(written, SESSION_REJECTED_LOG_BURST as usize);
+        // Further sessions of the same tenant stop at the tenant's burst.
+        let mut more = 0;
+        for _ in 0..8 {
+            let mut session = RejectedLogWindow::default();
+            more += (0..SESSION_REJECTED_LOG_BURST)
+                .filter(|_| log(&mut session, &mut tenant_a_budget, &tenant_a))
+                .count();
+        }
+        assert_eq!(
+            written + more,
+            TENANT_REJECTED_LOG_BURST as usize,
+            "one tenant is capped at its own burst"
+        );
+        // Another tenant is untouched.
+        let mut other = RejectedLogWindow::default();
+        assert!(log(&mut other, &mut tenant_b_budget, &tenant_b));
+        // A new window admits again and reports what was suppressed.
+        let later = start + REJECTED_LOG_WINDOW;
+        assert_eq!(
+            noisy.admit_at(later, SESSION_REJECTED_LOG_BURST),
+            Some(u64::from(SESSION_REJECTED_LOG_BURST))
+        );
+        assert!(GLOBAL_REJECTED_LOG_BURST >= TENANT_REJECTED_LOG_BURST * 10);
     }
 
     #[test]
-    fn each_session_has_its_own_budget_below_the_global_cap() {
-        let limiter = RefusalLogLimiter::with_defaults();
-        let start = Instant::now();
-        let matched = context("stream");
-        let mut noisy = SessionRejectedLog::default();
-        let mut quiet = SessionRejectedLog::default();
-        let burst = SESSION_REJECTED_LOG_BURST as usize;
-        let written = (0..burst * 2)
-            .filter(|_| {
+    fn the_backstop_is_one_process_wide_cap() {
+        let backstop = RefusalLogLimiter::new(3, REJECTED_LOG_WINDOW);
+        let now = Instant::now();
+        let written = (0..5u128)
+            .filter(|tenant| {
+                let tenant_id = Uuid::from_u128(*tenant);
                 log_connector_rejected_with(
-                    &limiter,
-                    Some(&mut noisy),
-                    start,
-                    &matched,
+                    &backstop,
+                    RejectedLogBudgets {
+                        session: &mut RejectedLogWindow::default(),
+                        tenant: &mut RejectedLogWindow::default(),
+                    },
+                    now,
+                    &context(&tenant_id),
                     "GOAWAY",
                     "x",
                 )
             })
             .count();
-        assert_eq!(written, burst);
-        assert!(log_connector_rejected_with(
-            &limiter,
-            Some(&mut quiet),
-            start,
-            &matched,
-            "GOAWAY",
-            "x"
-        ));
-        // A new window admits the noisy session again and reports what it
-        // suppressed.
-        let later = start + SESSION_REJECTED_LOG_WINDOW;
-        assert_eq!(noisy.admit_at(later), Some(burst as u64));
+        assert_eq!(written, 3);
+    }
+
+    #[test]
+    fn tenant_budgets_are_bounded_by_live_tenants() {
+        let mut logs = TenantRejectedLogs::default();
+        for tenant in 0..100u128 {
+            // Only the tenant being created is live.
+            let tenant_id = Uuid::from_u128(tenant);
+            logs.budget(tenant_id, |candidate| *candidate == tenant_id);
+            assert!(logs.len() <= 2, "{} entries", logs.len());
+        }
+        // Live tenants keep their entries (and their spent budgets).
+        let live = [Uuid::from_u128(500), Uuid::from_u128(501)];
+        for tenant_id in live {
+            logs.budget(tenant_id, |candidate| live.contains(candidate));
+        }
+        assert_eq!(logs.len(), 2);
     }
 
     #[test]
@@ -343,8 +425,9 @@ mod actor_tests {
 
     use super::Captured;
     use crate::actor::{
-        ConsumerStreamRegistration, DataCarrier, RelayActor, RuntimeProfile, SessionKey,
-        runtime::CarrierContext, stream_identity_tests::admitted_control_actor,
+        ConsumerStreamRegistration, ControlRegistration, DataCarrier, DataOutbound, RelayActor,
+        RuntimeProfile, SessionKey, runtime::CarrierContext,
+        stream_identity_tests::admitted_control_actor,
     };
 
     /// Synthetic marker standing in for payload bytes or a credential that a
@@ -362,29 +445,48 @@ mod actor_tests {
         (captured, guard)
     }
 
-    struct Device {
-        actor: RelayActor,
-        key: SessionKey,
-        streams: Vec<ConsumerStreamRegistration>,
-        _data_rx: mpsc::Receiver<crate::actor::DataOutbound>,
-        _control: crate::actor::ControlRegistration,
+    fn uuid(tenant: u128, device: u128, role: u128) -> Uuid {
+        Uuid::from_u128(0xc160_0000_0000 + (tenant << 16) + (device << 4) + role)
     }
 
-    impl Device {
-        /// One admitted M2 session for its own tenant and device, with `opens`
-        /// pending OPENs the relay issued.
-        async fn open(seed: u128, opens: usize) -> Self {
+    /// One admitted M2 session with the OPENs the relay issued to it.
+    struct Device {
+        key: SessionKey,
+        streams: Vec<ConsumerStreamRegistration>,
+    }
+
+    /// One relay actor holding every session, as a real relay does.
+    struct Relay {
+        actor: Option<RelayActor>,
+        _keep: Vec<(ControlRegistration, mpsc::Receiver<DataOutbound>)>,
+    }
+
+    impl Relay {
+        fn new() -> Self {
+            Self {
+                actor: None,
+                _keep: Vec::new(),
+            }
+        }
+
+        fn actor(&mut self) -> &mut RelayActor {
+            self.actor.as_mut().expect("a device was added")
+        }
+
+        /// Admit one M2 session for (`tenant`, `device`) with `opens`
+        /// pending OPENs.  Every device of a tenant shares its principal.
+        async fn device(&mut self, tenant: u128, device: u128, opens: usize) -> Device {
             let now = Utc::now();
-            let tenant_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 1);
-            let device_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 2);
-            let principal_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 3);
-            let service_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 4);
+            let tenant_id = uuid(tenant, 0, 1);
+            let principal_id = uuid(tenant, 0, 3);
+            let device_id = uuid(tenant, device, 2);
+            let service_id = uuid(tenant, device, 4);
             let identity = DeviceIdentity {
                 tenant_id,
                 device_id,
                 owner_user_id: principal_id,
-                credential_id: Uuid::from_u128(0xc160_0000 + seed * 16 + 5),
-                spki_fingerprint: format!("m7c160-spki-{seed}"),
+                credential_id: uuid(tenant, device, 5),
+                spki_fingerprint: format!("m7c160-spki-{tenant}-{device}"),
                 credential_not_before: now - Duration::minutes(1),
                 expires_at: now + Duration::minutes(1),
                 credential_revoked_at: None,
@@ -397,23 +499,29 @@ mod actor_tests {
             let key = SessionKey {
                 tenant_id,
                 device_id,
-                session_id: format!("m7c160-session-{seed}"),
+                session_id: format!("m7c160-session-{tenant}-{device}"),
                 epoch: 1,
             };
-            let (mut actor, control) = admitted_control_actor(identity, key.clone());
-            let (data_tx, data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
-            if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-                session.profile = RuntimeProfile::M2;
-                session.active_carrier = Some(DataCarrier {
-                    context: CarrierContext::new(
-                        key.session_id.clone(),
-                        key.epoch,
-                        1,
-                        format!("m7c160-data-{seed}"),
-                    ),
-                    tx: data_tx,
-                });
-            }
+            let (mut single, control) = admitted_control_actor(identity, key.clone());
+            let (data_tx, data_rx) = mpsc::channel(single.options.limits.max_queue_messages);
+            let mut session = single
+                .sessions
+                .remove(&key.scope())
+                .expect("admitted session");
+            session.profile = RuntimeProfile::M2;
+            session.active_carrier = Some(DataCarrier {
+                context: CarrierContext::new(
+                    key.session_id.clone(),
+                    key.epoch,
+                    1,
+                    format!("m7c160-data-{tenant}-{device}"),
+                ),
+                tx: data_tx,
+            });
+            self._keep.push((control, data_rx));
+            let actor = self.actor.get_or_insert(single);
+            actor.sessions.insert(key.scope(), session);
+
             let consumer = AuthenticatedConsumer {
                 tenant_id,
                 principal_id,
@@ -444,39 +552,29 @@ mod actor_tests {
                 );
                 streams.push(rx.await.expect("registration").expect("M2 admission"));
             }
-            Self {
-                actor,
-                key,
-                streams,
-                _data_rx: data_rx,
-                _control: control,
-            }
+            Device { key, streams }
         }
 
-        fn open_message_id(&self, stream_id: u64) -> String {
-            self.actor
+        /// Send a REJECTED answering `device`'s `index`th OPEN.
+        async fn reject(&mut self, device: &Device, index: usize, code: &str, reason: &str) {
+            let stream = &device.streams[index];
+            let reply_to = self
+                .actor()
                 .sessions
-                .get(&self.key.scope())
-                .and_then(|session| session.streams.get(&stream_id))
-                .map(|stream| stream.open_message_id.clone())
-                .expect("OPEN correlation")
-        }
-
-        /// Send a REJECTED answering this device's `index`th OPEN.
-        async fn reject(&mut self, index: usize, code: &str, reason: &str) {
-            let stream_id = self.streams[index].stream_id;
-            let operation_id = self.streams[index].operation_id.clone();
-            let reply_to = self.open_message_id(stream_id);
-            self.actor
+                .get(&device.key.scope())
+                .and_then(|session| session.streams.get(&stream.stream_id))
+                .map(|pending| pending.open_message_id.clone())
+                .expect("OPEN correlation");
+            self.actor()
                 .inbound_control(
-                    self.key.clone(),
+                    device.key.clone(),
                     ControlMessage::Rejected(tunnel_protocol::Rejected::new(
                         format!("m7c160-rejected-{index}"),
                         reply_to,
-                        self.key.session_id.clone(),
-                        self.key.epoch,
-                        stream_id,
-                        operation_id,
+                        device.key.session_id.clone(),
+                        device.key.epoch,
+                        stream.stream_id,
+                        stream.operation_id.clone(),
                         code,
                         reason,
                     )),
@@ -485,15 +583,15 @@ mod actor_tests {
         }
 
         /// Send a REJECTED for a stream the relay never opened.
-        async fn reject_invented(&mut self, stream_id: u64) {
-            self.actor
+        async fn reject_invented(&mut self, device: &Device, stream_id: u64) {
+            self.actor()
                 .inbound_control(
-                    self.key.clone(),
+                    device.key.clone(),
                     ControlMessage::Rejected(tunnel_protocol::Rejected::new(
                         format!("m7c160-forged-{stream_id}"),
                         "forged-open",
-                        self.key.session_id.clone(),
-                        self.key.epoch,
+                        device.key.session_id.clone(),
+                        device.key.epoch,
                         stream_id,
                         "forged-operation",
                         "GOAWAY",
@@ -510,26 +608,40 @@ mod actor_tests {
             .collect()
     }
 
+    fn lines_for<'a>(text: &'a str, device: &Device) -> Vec<&'a str> {
+        let session = format!("session_id=\"{}\"", device.key.session_id);
+        rejected_lines(text)
+            .into_iter()
+            .filter(|line| line.contains(&session))
+            .collect()
+    }
+
+    fn lines_for_tenant(text: &str, tenant_id: Uuid) -> usize {
+        let tenant = format!("tenant_id={tenant_id}");
+        rejected_lines(text)
+            .into_iter()
+            .filter(|line| line.contains(&tenant))
+            .count()
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn m7c160_connector_rejected_is_logged_with_code_category_and_phase_only() {
         let (captured, _guard) = capture();
-        let mut device = Device::open(0, 2).await;
-        let device_id = device.key.device_id;
-        let (first, second) = (
-            (
-                device.streams[0].stream_id,
-                device.streams[0].operation_id.clone(),
-            ),
-            device.streams[1].stream_id,
-        );
+        let mut relay = Relay::new();
+        let device = relay.device(0, 0, 2).await;
+        let first = &device.streams[0];
 
         // A known refusal: the shipped connector's draining GOAWAY.
-        device.reject(0, "GOAWAY", "connector is draining").await;
+        relay
+            .reject(&device, 0, "GOAWAY", "connector is draining")
+            .await;
         // A hostile refusal: free-form code and reason carrying a synthetic
         // secret and terminal control characters.
         let hostile_code = format!("X_{SYNTHETIC_SECRET}");
         let hostile_reason = format!("\u{1b}[2J\r\nfake log line {SYNTHETIC_SECRET}");
-        device.reject(1, &hostile_code, &hostile_reason).await;
+        relay
+            .reject(&device, 1, &hostile_code, &hostile_reason)
+            .await;
 
         let text = captured.text();
         let lines = rejected_lines(&text);
@@ -537,10 +649,10 @@ mod actor_tests {
         let known = lines[0];
         for field in [
             " INFO ",
-            &format!("stream_id={}", first.0),
-            &format!("operation_id=\"{}\"", first.1),
-            &format!("device_id={device_id}"),
-            "session_id=\"m7c160-session-0\"",
+            &format!("stream_id={}", first.stream_id),
+            &format!("operation_id=\"{}\"", first.operation_id),
+            &format!("device_id={}", device.key.device_id),
+            &format!("session_id=\"{}\"", device.key.session_id),
             "rotation_phase=\"none\"",
             "matched=\"stream\"",
             "connector_code=\"GOAWAY\"",
@@ -552,7 +664,7 @@ mod actor_tests {
         }
         let hostile = lines[1];
         for field in [
-            &format!("stream_id={second}"),
+            &format!("stream_id={}", device.streams[1].stream_id),
             "connector_code=\"other\"",
             &format!("connector_code_len={}", hostile_code.len()),
             "reason_category=\"other\"",
@@ -569,41 +681,75 @@ mod actor_tests {
         );
     }
 
-    /// Review of PR #207: a device flooding REJECTEDs for stream IDs the relay
-    /// never opened must not spend the budget another tenant's genuine
-    /// refusal needs.
+    /// Review of PR #207: one session flooding REJECTEDs for stream IDs the
+    /// relay never opened stays within its own budget, and another tenant's
+    /// refusal is still logged.
     #[tokio::test(flavor = "current_thread")]
-    async fn m7c160_a_forged_rejected_flood_cannot_silence_another_tenants_refusal() {
+    async fn m7c160_one_session_forging_rejecteds_is_bounded_by_its_session_budget() {
         let (captured, _guard) = capture();
-        let mut flooder = Device::open(1, 0).await;
-        let mut victim = Device::open(2, 1).await;
+        let mut relay = Relay::new();
+        let flooder = relay.device(1, 0, 0).await;
+        let victim = relay.device(2, 0, 1).await;
         let flood = u64::from(tunnel_transport::log_limit::DEFAULT_REFUSAL_LOG_BURST) * 3;
         for stream_id in 0..flood {
-            flooder.reject_invented(1_000_000 + stream_id).await;
+            relay.reject_invented(&flooder, 1_000_000 + stream_id).await;
         }
-        victim.reject(0, "GOAWAY", "connector is draining").await;
+        relay
+            .reject(&victim, 0, "GOAWAY", "connector is draining")
+            .await;
 
         let text = captured.text();
-        let victim_session = format!("session_id=\"{}\"", victim.key.session_id);
-        let victim_lines: Vec<&str> = rejected_lines(&text)
-            .into_iter()
-            .filter(|line| line.contains(&victim_session))
-            .collect();
-        assert_eq!(
-            victim_lines.len(),
-            1,
-            "the victim's matched GOAWAY must be logged despite the flood: {text}"
-        );
+        let victim_lines = lines_for(&text, &victim);
+        assert_eq!(victim_lines.len(), 1, "victim line missing: {text}");
         assert!(victim_lines[0].contains("matched=\"stream\""));
-        let flooder_session = format!("session_id=\"{}\"", flooder.key.session_id);
-        let flooder_lines = rejected_lines(&text)
-            .into_iter()
-            .filter(|line| line.contains(&flooder_session))
-            .count();
+        let flooder_lines = lines_for(&text, &flooder).len();
+        assert!(flooder_lines > 0, "the flood must have been logged at all");
         assert!(
             flooder_lines <= super::SESSION_REJECTED_LOG_BURST as usize,
             "one session is bounded by its own budget: {flooder_lines} lines"
         );
+    }
+
+    /// Re-review of PR #207: one tenant holding `max_devices_per_user`
+    /// sessions, each flooding matched and forged GOAWAYs, cannot silence
+    /// another tenant's GOAWAY.
+    #[tokio::test(flavor = "current_thread")]
+    async fn m7c160_a_tenant_flooding_from_every_device_cannot_silence_another_tenant() {
+        let (captured, _guard) = capture();
+        let mut relay = Relay::new();
+        let devices = crate::config::RelayLimits::default().max_devices_per_user;
+        let per_session = super::SESSION_REJECTED_LOG_BURST as usize + 1;
+        let mut flooders = Vec::new();
+        for device in 0..devices {
+            flooders.push(relay.device(3, device as u128, per_session).await);
+        }
+        let victim = relay.device(4, 0, 1).await;
+        let flooder_tenant = flooders[0].key.tenant_id;
+        for flooder in &flooders {
+            for index in 0..per_session {
+                relay
+                    .reject(flooder, index, "GOAWAY", "connector is draining")
+                    .await;
+                relay
+                    .reject_invented(flooder, 1_000_000 + index as u64)
+                    .await;
+            }
+        }
+        relay
+            .reject(&victim, 0, "GOAWAY", "connector is draining")
+            .await;
+
+        let text = captured.text();
+        assert_eq!(
+            lines_for(&text, &victim).len(),
+            1,
+            "another tenant's GOAWAY must be logged despite the flood"
+        );
+        let flooder_lines = lines_for_tenant(&text, flooder_tenant);
         assert!(flooder_lines > 0, "the flood must have been logged at all");
+        assert!(
+            flooder_lines <= super::TENANT_REJECTED_LOG_BURST as usize,
+            "one tenant is bounded by its own budget: {flooder_lines} lines"
+        );
     }
 }

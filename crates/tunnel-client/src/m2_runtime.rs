@@ -4178,8 +4178,8 @@ impl M2Actor {
             self.session.epoch,
             open.stream_id,
             open.operation_id.clone(),
-            refusal.code,
-            refusal.reason,
+            refusal.code(),
+            refusal.reason(),
         ));
         let response = Self::encode_control_message(&response)?;
         let response_bytes = match Self::open_response_bytes(std::slice::from_ref(&response)) {
@@ -4743,8 +4743,8 @@ impl M2Actor {
                 self.session.epoch,
                 open.stream_id,
                 open.operation_id.clone(),
-                refusal.code,
-                refusal.reason,
+                refusal.code(),
+                refusal.reason(),
             )),
             None,
         )

@@ -1,21 +1,22 @@
 //! The fixed set of OPEN refusals a connector sends as `REJECTED`.
 //!
 //! The connector sends only entries of this table (its refusal helpers take an
-//! [`OpenRefusal`], not free text), and the relay logs a received refusal only
+//! [`OpenRefusal`], not free text, and an `OpenRefusal` can be neither built
+//! nor modified outside this module), and the relay logs a received refusal only
 //! by looking it up here (task row M7-C160).  A refusal the table does not
 //! contain did not come from the shipped connector, and the relay logs it as
 //! `other` plus its length, never its text.
 
 /// One refusal: the wire `code` and `reason`, and a stable, payload-free
-/// `category` a relay may log in place of the reason.  `non_exhaustive`, so
-/// code outside this crate cannot build one: every refusal a connector sends
-/// is one of the constants below.
+/// `category` a relay may log in place of the reason.  The fields are private
+/// and only this module constructs values, so code outside it can neither
+/// build a refusal nor alter a copy of one: every refusal a connector sends
+/// is one of the constants below, unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub struct OpenRefusal {
-    pub code: &'static str,
-    pub reason: &'static str,
-    pub category: &'static str,
+    code: &'static str,
+    reason: &'static str,
+    category: &'static str,
 }
 
 impl OpenRefusal {
@@ -25,6 +26,24 @@ impl OpenRefusal {
             reason,
             category,
         }
+    }
+
+    /// The wire `REJECTED.code`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The wire `REJECTED.reason`.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    /// The payload-free category a relay logs in place of the reason.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        self.category
     }
 }
 

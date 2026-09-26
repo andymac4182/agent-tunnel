@@ -1698,8 +1698,8 @@ impl SessionActor {
                 self.session.epoch,
                 open.stream_id,
                 open.operation_id.clone(),
-                refusal.code,
-                refusal.reason,
+                refusal.code(),
+                refusal.reason(),
             )),
             None,
         )
@@ -1813,8 +1813,8 @@ impl SessionActor {
                     self.session.epoch,
                     cancel.stream_id,
                     cancel.operation_id,
-                    open_refusal::ECHO_CANCELLED.code,
-                    open_refusal::ECHO_CANCELLED.reason,
+                    open_refusal::ECHO_CANCELLED.code(),
+                    open_refusal::ECHO_CANCELLED.reason(),
                 )),
                 None,
             )
@@ -3023,8 +3023,8 @@ mod open_refusal_source_tests {
                 "{name}: a literal in a Rejected::new call: {arguments}"
             );
             let from_table = |field: &str| {
-                arguments.contains(&format!("refusal.{field},"))
-                    || arguments.contains(&format!("open_refusal::ECHO_CANCELLED.{field},"))
+                arguments.contains(&format!("refusal.{field}(),"))
+                    || arguments.contains(&format!("open_refusal::ECHO_CANCELLED.{field}(),"))
             };
             assert!(
                 from_table("code") && from_table("reason"),
