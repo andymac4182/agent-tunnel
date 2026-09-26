@@ -2022,8 +2022,8 @@ parked for send credit. The consumer sends unread `Tread`s with the
 connector-to-relay direction paused; each is classified from the device's own
 status once received: an emit cursor that moves is a filler whose reply was
 sent (and is waited on until emission settles), and an emit cursor that holds
-still for 500 ms is the held request, its reply parked because the unread
-fillers spent the relay's 128 KiB window. The device's ACK for the held
+still for 500 ms is the held request, its reply parked for send credit that
+the unread filler spent. The device's ACK for the held
 `Tread` dies with the socket, and no frame it replays was emitted after that
 `Tread` arrived, so the relay can learn of the receipt only from the device's
 SNAPSHOT. At the instant of failure the gate requires, against the device's
@@ -2031,11 +2031,20 @@ status taken immediately before the held `Tread` was sent, that its receive
 cursor has moved (it has the request) and its emit cursor has not (nothing it
 emitted since could carry an ACK of it); the validator refuses a gate 11b run
 without at least one filler, that receipt, and that unmoved emit cursor, so a
-slow device whose late reply is replayed cannot pass it. The parking is
-observed, not derived: in measured runs the device still had about 64 KiB of
-sequence-level send credit and did not emit, so the limit that parks the reply
-is not the sequence credit alone, and the gate does not claim zero credit. The
-gate then asserts everything gate 11 does, reading the filler replies before
+slow device whose late reply is replayed cannot pass it. Why one filler is
+enough, derived from the source and matching the measured runs exactly: each
+`Rread` is one full 65,536-byte 9P message (the negotiated msize) in a record
+with a 5-byte header (`RECORD_HEADER_LEN` in `tunnel-fs-provider`), 65,541
+bytes. The relay's initial window is 128 KiB, so the unread filler leaves
+131,072 - 65,541 = 65,531 bytes of send credit, the figure measured in every
+run. The export offers the held reply to the carrier in 64 KiB pieces
+(`next_chunk` in `fs_export.rs`, bounded by the bridge's `HANDOFF_CAPACITY`),
+and the connector's write check (`WriteRoom::fits` in `m2_http.rs`) is
+all-or-nothing, so the first 65,536-byte piece does not fit 65,531 bytes and is
+parked whole (`park_write`): a 5-byte shortfall. Credit grows only as the
+consumer reads, which it does not do until after the recovery, so the reply
+stays parked. Remaining credit is therefore not zero, and the gate does not
+require it to be. The gate then asserts everything gate 11 does, reading the filler replies before
 the held one. The device's cursors are summed over its streams,
 so the gate refuses a run in which the device carries more than this one
 stream. With the M6-C163 fix reverted, gate 11b fails with `retained recovery

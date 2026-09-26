@@ -188,15 +188,17 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// Upper bound on unread `Tread`s sent to find the one whose reply the
 /// device parks for send credit ([`FailurePoint::ReplyParkedForCredit`]).
-/// The relay's receive window is 128 KiB and every `Rread` here is one
-/// 64 KiB message, and the relay grants more only as the consumer reads,
-/// which it does not do until after the recovery; so at most two replies can
-/// be sent before one is parked.  The bound only turns a wrong credit
-/// assumption into a named failure.
+/// **One filler is expected**: each `Rread` record is 65,541 bytes (a
+/// 65,536-byte msize message plus a 5-byte record header), so one unread
+/// filler leaves 65,531 bytes of the relay's 128 KiB window, and the next
+/// reply's first 64 KiB piece does not fit that all-or-nothing and is parked.
+/// The relay grants more only as the consumer reads, which it does not do
+/// until after the recovery.  Four is only a safety bound: it turns a wrong
+/// credit assumption into a named failure rather than an unbounded loop.
 const MAX_CREDIT_PROBE_READS: usize = 4;
 
 /// How long the device's emit cursor must hold still after it received a
-/// `Tread` for the reply to count as parked.  Credit exhaustion is what parks
+/// `Tread` for the reply to count as parked.  A send-credit shortfall parks
 /// it; an answerable reply is emitted within milliseconds of the request
 /// (every filler in the measured runs), so the window only has to exceed
 /// that, and the emit cursor is checked again at the instant of failure.
