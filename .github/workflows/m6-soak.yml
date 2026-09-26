@@ -18,6 +18,9 @@ on:
       load_args:
         description: Extra arguments for the load experiment only, e.g. "--payload 65536 --steps 1,8" (letters, digits, space , . = - only). Harness wiring flags (--redis, --logs, --bin-dir, --bin-head, --max-load) are refused, since they would override the workflow's own
         default: ""
+      fairness_args:
+        description: Extra arguments for the fairness experiment only, e.g. "--flood-processes 2 --honor-retry-after" (same character set and refusals as load_args)
+        default: ""
 
 permissions:
   contents: read
@@ -77,6 +80,7 @@ jobs:
           MATRIX_EXPERIMENTS: ${{ matrix.experiments }}
           INPUT_EXPERIMENTS: ${{ inputs.experiments }}
           INPUT_LOAD_ARGS: ${{ inputs.load_args }}
+          INPUT_FAIRNESS_ARGS: ${{ inputs.fairness_args }}
         run: |
           if [ "$MATRIX_EXPERIMENTS" = dispatch ]; then
             M6_SOAK_EXPERIMENTS=$INPUT_EXPERIMENTS
@@ -95,6 +99,12 @@ jobs:
             case "$word" in --redis*|--logs*|--bin-dir*|--bin-head*|--max-load*) echo "load_args may not override $word" >&2; exit 2;; esac
           done
           export M6_SOAK_LOAD_ARGS="$INPUT_LOAD_ARGS"
+          # Task rows M6-C182/M6-C183: the same checks for fairness arguments.
+          case "$INPUT_FAIRNESS_ARGS" in *[!A-Za-z0-9\ ,.=-]*) echo "invalid fairness_args" >&2; exit 2;; esac
+          for word in $INPUT_FAIRNESS_ARGS; do
+            case "$word" in --redis*|--logs*|--bin-dir*|--bin-head*|--max-load*) echo "fairness_args may not override $word" >&2; exit 2;; esac
+          done
+          export M6_SOAK_FAIRNESS_ARGS="$INPUT_FAIRNESS_ARGS"
           echo "M6_SOAK_EXPERIMENTS=$M6_SOAK_EXPERIMENTS" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/logs"
           { echo "uptime=$(uptime)"; echo "nproc=$(nproc)"; echo "head=$GITHUB_SHA"; \

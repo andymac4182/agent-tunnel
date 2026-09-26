@@ -1599,8 +1599,14 @@ async def fairness(args: argparse.Namespace) -> None:
                 until = time.time() + args.phase_seconds
                 quiet = [Worker(stack, rec, "echo", "b", target, f"quiet-{target}-{phase}-{i}")
                          for i in range(args.quiet_workers)]
-                flooders = [Worker(stack, rec, "echo", "a", "a", f"flood-{target}-{i}")
-                            for i in range(flood)]
+                # `--flood-processes N` moves A's flood off this loop into N
+                # client processes (M6-C183).
+                off_flood = flood > 0 and args.flood_processes > 0
+                flooders = [] if off_flood else [
+                    Worker(stack, rec, "echo", "a", "a", f"flood-{target}-{i}")
+                    for i in range(flood)]
+                for w in flooders:
+                    w.honor_retry_after = args.honor_retry_after
                 # M6-C183: the same quiet workload again, timed on its own
                 # event loop in a separate process, beside the in-loop one.
                 # Both of B's clients open their keep-alive connections before
@@ -1611,16 +1617,22 @@ async def fairness(args: argparse.Namespace) -> None:
                 off_loop = await start_clients(stack, rec, "b", target, f"offloop-{target}-{phase}",
                                                args.quiet_workers, 1, until, rate=args.quiet_rate,
                                                preconnect=True)
+                flood_clients = (await start_clients(
+                    stack, rec, "a", "a", f"flood-{target}", flood, args.flood_processes, until,
+                    honor_retry_after=args.honor_retry_after)
+                    if off_flood else asyncio.sleep(0, {}))
                 lag = LoopLag()
                 cpu_before = cpu_snapshot(stack)
                 results = await asyncio.gather(
                     off_loop,
+                    flood_clients,
                     lag.run(until),
                     *(w.loop_rate(args.quiet_rate, until) for w in quiet),
                     *(w.loop_closed(until) for w in flooders))
                 attribution[rec.phase] = {"driver_loop_lag_ms": lag.summary(),
                                           "cpu_percent": cpu_percent(cpu_before, cpu_snapshot(stack)),
-                                          "off_loop_clients": results[0]["processes"]}
+                                          "off_loop_clients": results[0]["processes"],
+                                          "flood_processes": results[1].get("processes", [])}
                 for w in quiet + flooders:
                     await w.shutdown()
                 await asyncio.sleep(3)
@@ -1642,7 +1654,9 @@ async def fairness(args: argparse.Namespace) -> None:
                             **attribution.get(name, {})}
     write_summary(run_dir, {"experiment": "fairness", "nonce": nonce, "head": head_sha(),
                             "flood_workers": args.flood_workers, "quiet_workers": args.quiet_workers,
-                            "quiet_rate_per_worker": args.quiet_rate, "phases": report,
+                            "quiet_rate_per_worker": args.quiet_rate,
+                            "flood_processes": args.flood_processes,
+                            "honor_retry_after": args.honor_retry_after, "phases": report,
                             "processes": summarize_samples(run_dir / "samples.csv")})
 
 
@@ -1956,6 +1970,11 @@ def main() -> None:
             p.add_argument("--quiet-workers", type=int, default=2)
             p.add_argument("--quiet-rate", type=float, default=5)
             p.add_argument("--phase-seconds", type=float, default=60)
+            p.add_argument("--flood-processes", type=int, default=0,
+                           help="run user A's flood in this many separate client processes "
+                                "(M6-C183); 0 keeps it on the driver's loop")
+            p.add_argument("--honor-retry-after", action="store_true",
+                           help="flood workers refused CONNECTION_LIMIT wait its retry_after_ms")
     sub.add_parser("client", help="internal: echo workers on their own event loop; "
                                   "configuration on stdin")
     args = parser.parse_args()
