@@ -1514,15 +1514,22 @@ refused` lines come after authentication and are not limited:
   `committing`, `retiring`, `aborting`, `recovering` or `closed`), `matched`
   (`unary`, `stream` or `none`), `connector_code`, `reason_category`,
   `connector_code_len`, `reason_len`, `relay_code` (what the consumer was
-  told, `stream_closed` or `none`), `suppressed` and `session_suppressed`.
+  told, `stream_closed` or `none`), and `session_suppressed`,
+  `tenant_suppressed` and `suppressed` (lines each budget dropped since its
+  last written line).
   The code and reason come from the device, so neither is written: a code or
   reason from the connector's fixed refusal table
   (`tunnel_protocol::open_refusal`) is logged as its code and category, and
-  anything else as `other` with its byte length. **Rate limited twice:** each
-  session may write at most 5 lines in any 10 s, and across the process at
-  most 20 lines per code label in any 10 s, with REJECTEDs that match no relay
-  record counted under their own `unmatched` key so forged ones cannot use up
-  the budget of real ones.
+  anything else as `other` with its byte length. **Rate limited three ways,
+  each over 10 s:** at most 5 lines per device session, at most 10 per tenant
+  across all of its sessions, and at most 200 for the whole relay. The tenant
+  budget is what isolates tenants: no number of devices or forged REJECTEDs
+  in one tenant can silence another tenant's lines. A tenant's budget is kept
+  while any of its sessions is live, so reconnecting some devices does not
+  reset it; it may be dropped once the tenant has no live session. The relay-wide
+  200 is only an I/O backstop; many tenants flooding at once can reach it,
+  and then lines are dropped for everyone. Within one tenant, a device's
+  forged REJECTEDs spend the same budget as its genuine ones.
 
 The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay
 writes it when it admits the device's session and at every owner-lease renewal

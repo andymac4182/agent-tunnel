@@ -20,8 +20,10 @@
 //!    budget.
 //! 2. Each tenant: [`TENANT_REJECTED_LOG_BURST`] lines per window across all
 //!    of its sessions, held in the actor.  Another tenant's lines are not
-//!    counted here, so no number of devices or reconnects in one tenant can
-//!    silence another tenant's refusals.
+//!    counted here, so no number of devices or forged REJECTEDs in one
+//!    tenant can silence another tenant's refusals.  The budget is kept while
+//!    any of the tenant's sessions is live, so reconnecting some devices does
+//!    not reset it.
 //! 3. The process: [`GLOBAL_REJECTED_LOG_BURST`] lines per window, an I/O
 //!    backstop well above one tenant's burst.  It can only be reached by many
 //!    tenants flooding at once, and then drops lines for everyone.
