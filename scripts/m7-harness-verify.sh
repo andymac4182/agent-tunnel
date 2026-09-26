@@ -74,6 +74,8 @@ gate "relay binary startup tests" \
   cargo test -p tunnel-relay --test m7_startup --locked -- --test-threads=1
 gate "relay health endpoint tests" \
   cargo test -p tunnel-relay --test m7_health_endpoints --locked -- --test-threads=1
+gate "membership re-sign re-binding tests (M7-C80/C83)" \
+  cargo test -p tunnel-relay --test m7_membership_resign --locked -- --test-threads=1
 gate "relay membership persistence tests" \
   cargo test -p tunnel-relay --test m7_membership_persistence --locked -- --test-threads=1
 gate "configured relay process Redis TLS and checkpoint acceptance" \
@@ -134,6 +136,8 @@ gate "M7 peer-key revocation during rotation acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-key-rotation
 gate "M7 signed peer trust expiry after a missed invalidation hint" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-trust-expiry
+gate "M7 long-lived peer stream across same-key and back-to-back membership re-signs" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-resign-stream
 gate "M7 membership convergence from the bounded refresh with the hint dropped" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-membership-hint-drop
 gate "M7 peer-route readiness loss and recovery acceptance" \
