@@ -530,60 +530,6 @@ async fn a_shrunk_checkpoint_window_invalidates_the_admission() {
 
 // ---------------------------------------------------------------- M7-C86
 
-/// **M7-C86.** A *local* unready state -- this relay's own certificate no
-/// longer approved by its own record -- keeps the verified pin set installed
-/// and withdraws readiness instead; a *rejected* record withdraws the set.
-#[tokio::test]
-async fn only_rejected_trust_evidence_withdraws_the_pin_set() {
-    let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    assert_eq!(wired.publisher.publish(), PinPublication::Published);
-
-    // Local: a record that no longer approves this relay's own key.
-    fixture
-        .publish(fixture.record(2, "key-2", OTHER_SPKI_SHA256, 30))
-        .await;
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("an unapproved local key makes membership unready");
-    assert_eq!(
-        fixture.runtime.readiness(),
-        MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
-    );
-    let pins = wired.publisher.pins().snapshot();
-    assert!(
-        pins.contains(pin(PEER_SPKI_SHA256)),
-        "M7-C86: a local unready state withdrew the peer's still-approved pin"
-    );
-    assert!(
-        !pins.contains(local_pin()),
-        "retention keeps only keys the newest verified evidence approves: this \
-         relay's own former key is no longer approved and must be unpinned"
-    );
-    assert!(!wired.peer.is_ready(), "readiness is withdrawn instead");
-
-    // Rejected evidence: a record that fails verification.
-    *fixture.source.records.write().await = vec![SignedMembershipRecord {
-        version: 3,
-        bytes: b"not a signed membership record".to_vec(),
-    }];
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("a rejected record makes membership unready");
-    assert_eq!(
-        fixture.runtime.readiness(),
-        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
-    );
-    assert!(
-        wired.publisher.pins().snapshot().is_empty(),
-        "rejected trust evidence must withdraw the pin set"
-    );
-}
-
 /// **M7-C86, the security half.** Retention may only *shrink* the pin set.
 /// A reconcile that revokes peer X's key and, in the same candidate, makes
 /// this relay locally unready must still unpin X at once: the unready
@@ -644,39 +590,37 @@ async fn a_peer_revoked_during_a_local_blip_is_unpinned() {
     );
 }
 
-/// Every reason is classified, so a new one has to choose deliberately.
+/// **M7-C86 is held on this branch.** Every unready reason withdraws the
+/// pin set, as before the split, because the split regresses
+/// `verify-m7-trust-expiry` (base 20/20, split 10/20). Naming every reason
+/// keeps that a deliberate, one-line decision.
 #[test]
-fn the_retention_split_names_every_unready_reason() {
+fn while_the_retention_split_is_held_every_unready_reason_withdraws() {
     for reason in [
         MembershipUnreadyReason::UnknownAuthority,
         MembershipUnreadyReason::MembershipRejected,
         MembershipUnreadyReason::CheckpointExpired,
-    ] {
-        assert!(reason.withdraws_peer_trust(), "{reason:?} must fail closed");
-    }
-    for reason in [
         MembershipUnreadyReason::MissingLocalMembership,
         MembershipUnreadyReason::MissingLocalKey,
         MembershipUnreadyReason::CatalogUnavailable,
         MembershipUnreadyReason::PersistenceUnavailable,
         MembershipUnreadyReason::Cancelled,
     ] {
-        assert!(
-            !reason.withdraws_peer_trust(),
-            "{reason:?} is local or transient and keeps the verified set"
-        );
+        assert!(reason.withdraws_peer_trust(), "{reason:?} must fail closed");
     }
 }
 
 // ---------------------------------------------------------------- M7-C90
 
-/// **M7-C90.** The refresh tick, with no admission active and membership
-/// unready for a transient reason (a failed catalog read), keeps the verified
-/// pin set and withdraws readiness only -- the branch whose comment it always
-/// carried and could never reach, because the tick had already emptied the
-/// set.
+/// **M7-C90.** The refresh tick's behaviour with no admission active, now
+/// that the serving relay and the fixture run the same library tick: a
+/// transient unready state (a failed catalog read) withdraws the pin set at
+/// the readiness transition itself -- no invalidation callback is needed --
+/// and the tick then withdraws peer trust, consistently with it. The
+/// reconcile that restores membership republishes at once (M7-C91), so the
+/// withdrawal lasts exactly as long as the unready state.
 #[tokio::test]
-async fn the_refresh_tick_keeps_the_verified_set_while_transiently_unready() {
+async fn the_refresh_tick_and_the_transition_agree_with_no_admission_active() {
     let fixture = Fixture::ready().await;
     let wired = wired(&fixture.runtime);
     wired.publisher.publish();
@@ -688,9 +632,9 @@ async fn the_refresh_tick_keeps_the_verified_set_while_transiently_unready() {
         .reconcile_once()
         .await
         .expect_err("a failed catalog read makes membership unready");
-    assert_eq!(
-        fixture.runtime.readiness(),
-        MembershipReadiness::Unready(MembershipUnreadyReason::CatalogUnavailable)
+    assert!(
+        wired.publisher.pins().snapshot().is_empty(),
+        "M7-C90: the unready transition must be published with no admission active"
     );
     let tick = peer_trust_tick(
         &wired.publisher,
@@ -700,14 +644,21 @@ async fn the_refresh_tick_keeps_the_verified_set_while_transiently_unready() {
         &CancellationToken::new(),
     )
     .await;
-    assert_eq!(
-        tick,
-        PeerTrustTick::ReadinessWithdrawn,
-        "M7-C90: the tick withdrew peer trust (emptied the pin set) for a transient \
-         unready state with no admission active"
-    );
-    assert!(!wired.publisher.pins().snapshot().is_empty());
+    assert_eq!(tick, PeerTrustTick::TrustWithdrawn);
     assert!(!wired.peer.is_ready());
+
+    fixture.source.fail_reads.store(false, Ordering::Release);
+    fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect("membership recovers");
+    assert!(
+        !wired.publisher.pins().snapshot().is_empty(),
+        "M7-C91: the recovering reconcile republishes the pin set at once"
+    );
+    // Route and capacity readiness, withdrawn with trust by the tick, come
+    // back through the next authenticated probe pass, as before.
 }
 
 /// The control for M7-C90: rejected trust evidence withdraws the pin set at
@@ -787,8 +738,9 @@ async fn readiness_returns_within_the_reconcile_that_restores_membership() {
 
 /// **M7-C83 part 1.** Back-to-back re-signs -- three versions reconciled with
 /// no gap, one of them racing a failed catalog read and one an unapproved
-/// local key -- never leave peer trust withdrawn, and peer readiness is back
-/// after the last reconcile without any refresh tick. The admission taken
+/// local key -- leave peer trust and readiness back within each re-sign's own
+/// reconcile, without any refresh tick (M7-C91). While M7-C86 is held a
+/// transient blip still withdraws the pin set for its own duration. The admission taken
 /// before the first re-sign survives every one of them (M7-C80).
 #[tokio::test]
 async fn back_to_back_resigns_recover_peer_readiness_without_a_tick() {
@@ -818,12 +770,13 @@ async fn back_to_back_resigns_recover_peer_readiness_without_a_tick() {
             }
             None => {}
         }
-        assert!(
-            !wired.publisher.pins().snapshot().is_empty(),
-            "M7-C83: a re-sign racing a transient unready state emptied the pin set"
-        );
         fixture.resign(version).await;
         version += 1;
+        assert!(
+            !wired.publisher.pins().snapshot().is_empty() && wired.peer.is_ready(),
+            "M7-C83: peer trust and readiness were not back within the re-sign \
+             that followed a transient unready state"
+        );
     }
     assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
     assert!(

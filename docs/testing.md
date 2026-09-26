@@ -488,19 +488,7 @@ pin set, and only a local or transient unready state retains it. Red-then-green
 in both directions at the fix revision: with the retention widened back the gate
 fails at this phase in 65 s, and with the split in place it passes in 68 s.
 
-The retention split is **landed** (M7-C86, branch `m7-membership`), together
-with the change that made it safe to land: the serving relay and the
-production-cluster fixture now install one shared pin wiring from the relay
-library (`peer_pins.rs`, M7-C90). The fixture used to derive its pins from the
-redacted membership snapshot, which keeps an expired key's SPKI, so a relay
-never dropped a peer key that had left its signed window; it now derives them
-from verifier-filtered route targets like the product. On the earlier branch
-`verify-m7-trust-expiry` regressed from 10 of 10 to 6 of 10 with the split
-alone. Its one failing condition is still possible, and at the base too:
-`ingress_last_receive` is `Closed` where `TrustExpired` is required. See
-M7-C86 for the interleaved measurement on this branch against `origin/main`.
-Attributing a peer reset to trust expiry was not changed. The dispatcher latch
-and the monotonic-deadline arm remain the only evidence, as recorded on M7-C83. Every transition
+The retention split is **held** as M7-C86 because it regresses this gate. Measured interleaved through the gate limiter against `origin/main` `6830ba79`: base 20 of 20, split branch 10 of 20, every failure `ingress_last_receive=(IngressReceive, Closed)`. The shared pin wiring (M7-C90), the Ready republication (M7-C91) and the re-sign re-binding (M7-C80) landed without it; see M7-C86 for this gate's measurement on that branch. Attributing a peer reset to trust expiry was not changed. Every transition
 asserts payload-free, credential-free process diagnostics, and cleanup joins
 both relay processes, the impostor, the checkpoint authority, both Redis
 forwarders and the catalog namespace. The deterministic statement of the same

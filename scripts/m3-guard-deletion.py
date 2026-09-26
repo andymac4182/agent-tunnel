@@ -721,8 +721,8 @@ READINESS_PINS_CASES: list[Case] = [
     ),
 ]
 
-#: **M7-C80, M7-C86, M7-C90 and M7-C91: membership re-signs and the shared
-#: peer-pin wiring.**  Each case defeats one fix in `membership_runtime.rs`
+#: **M7-C80 and M7-C91: membership re-signs and the shared peer-pin wiring.**
+#: (M7-C86's retention split is held on this branch, so it has no case here.)  Each case defeats one fix in `membership_runtime.rs`
 #: and names the regression in `tests/m7_membership_resign.rs` that sees it.
 #: The witnesses drive the real `MembershipRuntime` and the library
 #: `PeerPinPublisher` / `peer_trust_tick` that the serving relay and the
@@ -740,32 +740,6 @@ MEMBERSHIP_RESIGN_TEST = [
 ]
 
 MEMBERSHIP_RESIGN_CASES: list[Case] = [
-    Case(
-        # M7-C86 / M7-C90.  Defeated, every unready reason withdraws the pin
-        # set again -- the pre-split rule -- so a transient catalog failure or
-        # an unapproved local key empties it, and the refresh tick with no
-        # admission active withdraws peer trust instead of readiness.
-        "only rejected trust evidence withdraws the verified pin set",
-        [
-            (
-                MEMBERSHIP_RUNTIME,
-                "            Self::UnknownAuthority | Self::MembershipRejected "
-                "| Self::CheckpointExpired => true,\n"
-                "            Self::MissingLocalMembership\n"
-                "            | Self::MissingLocalKey\n"
-                "            | Self::CatalogUnavailable\n"
-                "            | Self::PersistenceUnavailable\n"
-                "            | Self::Cancelled => false,",
-                "            _ => true,",
-            )
-        ],
-        frozenset(
-            {
-                "only_rejected_trust_evidence_withdraws_the_pin_set",
-                "the_refresh_tick_keeps_the_verified_set_while_transiently_unready",
-            }
-        ),
-    ),
     Case(
         # M7-C91.  Defeated, no readiness transition reaches the change
         # observer, so the reconcile that restores membership leaves the pin

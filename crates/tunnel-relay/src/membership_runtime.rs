@@ -526,12 +526,18 @@ impl MembershipUnreadyReason {
     #[must_use]
     pub const fn withdraws_peer_trust(self) -> bool {
         match self {
-            Self::UnknownAuthority | Self::MembershipRejected | Self::CheckpointExpired => true,
-            Self::MissingLocalMembership
+            // M7-C86 (the retention split) is held: until its trust-expiry
+            // regression is understood, every unready reason withdraws the
+            // pin set, exactly as before the split. The classification stays
+            // named per reason so the split is a one-line decision to revisit.
+            Self::UnknownAuthority
+            | Self::MembershipRejected
+            | Self::CheckpointExpired
+            | Self::MissingLocalMembership
             | Self::MissingLocalKey
             | Self::CatalogUnavailable
             | Self::PersistenceUnavailable
-            | Self::Cancelled => false,
+            | Self::Cancelled => true,
         }
     }
 }
