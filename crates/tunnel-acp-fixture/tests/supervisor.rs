@@ -726,6 +726,14 @@ async fn nothing_holds_the_child_handle_once_the_child_is_gone() {
 /// destroy it.
 #[test]
 fn a_runtime_torn_down_without_draining_still_kills_the_group() {
+    tear_down_a_runtime_mid_flight(None);
+}
+
+/// The body both teardown tests share. `expect_armed`, when given, is the
+/// number of parent-death sentinels the supervisor must report having armed,
+/// read from its own diagnostics before the teardown, so a run that meant to
+/// exclude the sentinel cannot silently have had one.
+fn tear_down_a_runtime_mid_flight(expect_armed: Option<u64>) {
     let workspace = tempfile::tempdir().expect("workspace");
     let script = wrapper_script(workspace.path());
     let mut config =
@@ -744,6 +752,13 @@ fn a_runtime_torn_down_without_draining_still_kills_the_group() {
         let ticket = supervisor.prompt(&session, "ok").expect("prompt");
         within(ticket.stop_reason()).await.expect("turn completed");
         let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+        if let Some(armed) = expect_armed {
+            assert_eq!(
+                supervisor.diagnostics().deadman_armed,
+                armed,
+                "the sentinel was armed exactly as this run requires"
+            );
+        }
         // Park the supervisor inside the runtime, so nothing outside it can
         // end the child and the teardown is the only thing left.
         tokio::spawn(async move {
@@ -775,6 +790,55 @@ fn a_runtime_torn_down_without_draining_still_kills_the_group() {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("grandchild {pid} outlived the runtime that supervised it");
+}
+
+/// **The same teardown with no parent-death sentinel to fall back on** (task
+/// row M4-42).
+///
+/// The test above is not, on its own, evidence for the synchronous group kill
+/// in `ChildHandle::drop`. Tearing the runtime down drops the supervisor task
+/// with its `Deadman`, which closes the sentinel's pipe with no stand-down
+/// token, so whenever the `tunnel-deadman` executable is locatable the
+/// sentinel kills the group too, and the grandchild dies whether or not
+/// `Drop` does anything. Measured: with that `kill_group` call deleted the
+/// test above stayed green in two full guard-deletion runs.
+///
+/// So this runs the identical teardown in a child copy of this test binary
+/// with the sentinel deliberately unlocatable -- a path that is not a file,
+/// the same device `process_residue.rs` uses for its no-sentinel control --
+/// and requires that copy to pass. It cannot mutate this process's
+/// environment, which other tests read concurrently.
+#[test]
+fn a_runtime_torn_down_with_no_sentinel_still_kills_the_group() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let absent = scratch.path().join("no-such-sentinel");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "runtime_teardown_with_the_sentinel_unlocatable",
+            "--include-ignored",
+            "--test-threads=1",
+        ])
+        .env(tunnel_deadman::SENTINEL_PATH_ENV, &absent)
+        .output()
+        .expect("run the teardown in a child test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the teardown without a sentinel left the group alive or did not run \
+         (status {:?}):\n{stdout}\n{stderr}",
+        output.status
+    );
+}
+
+/// Run only by [`a_runtime_torn_down_with_no_sentinel_still_kills_the_group`],
+/// which starts it with the sentinel unlocatable. Run directly it would arm
+/// the sentinel and fail its own zero-armed check, so it is ignored.
+#[test]
+#[ignore = "run by a_runtime_torn_down_with_no_sentinel_still_kills_the_group with no sentinel"]
+fn runtime_teardown_with_the_sentinel_unlocatable() {
+    tear_down_a_runtime_mid_flight(Some(0));
 }
 
 /// **The escaping descendant, measured rather than assumed.**

@@ -133,6 +133,17 @@ pub(crate) fn count_consumer_refusal(route: &'static str, stage: &'static str) {
     *count = count.saturating_add(1);
 }
 
+/// Count one consumer request this relay, as the device's owner, refused
+/// `ROTATION_FREEZE` itself (stage `rotation_freeze`).  These refusals reach
+/// the consumer through the local admission answers, not through
+/// `log_consumer_refusal`, and are counted without a log line: the hold's own
+/// counters say why.  A freeze refusal for a request that arrived through a
+/// peer hop is not counted here; it is a peer fault with cause
+/// `rotation_freeze`.
+pub(crate) fn count_local_rotation_freeze(route: &'static str) {
+    count_consumer_refusal(route, "rotation_freeze");
+}
+
 /// The route label for a grant refusal, from the closed set of public
 /// routes.  A service type the relay does not name is `other`.
 pub(crate) fn route_label(route: &str) -> &'static str {
@@ -147,7 +158,7 @@ pub(crate) fn route_label(route: &str) -> &'static str {
     }
 }
 
-fn consumer_refusals() -> BTreeMap<(&'static str, &'static str), u64> {
+pub(crate) fn consumer_refusals() -> BTreeMap<(&'static str, &'static str), u64> {
     CONSUMER_REFUSALS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -206,6 +217,83 @@ fn counter(out: &mut Writer, name: &str, help: &str, value: u64) {
 
 fn usize_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// The owner's admission hold across a data-rotation freeze (task row M3-15),
+/// from [`crate::RotationFreezeHoldSnapshot`].  Every held OPEN leaves the
+/// hold through exactly one `released_total{outcome}`, `refused_total{reason=
+/// "after_bound"}` or `cancelled_total` sample, so an operator can check
+/// `held_total == current + released + refused(after_bound) + cancelled`.
+/// Every label value is a fixed word; the snapshot carries no identifier.
+fn render_rotation_freeze_hold(out: &mut Writer, hold: &crate::RotationFreezeHoldSnapshot) {
+    counter(
+        out,
+        "tunnel_relay_rotation_freeze_hold_held_total",
+        "New consumer OPENs held at the owner across a data-rotation freeze.",
+        hold.held,
+    );
+    gauge(
+        out,
+        "tunnel_relay_rotation_freeze_hold_current",
+        "OPENs in the rotation-freeze hold now.",
+        hold.currently_held,
+    );
+    counter(
+        out,
+        "tunnel_relay_rotation_freeze_hold_admitted_total",
+        "Held OPENs admitted once the hold ended.",
+        hold.admitted_after_hold,
+    );
+    out.family(
+        "tunnel_relay_rotation_freeze_hold_released_total",
+        "counter",
+        "Held OPENs released, by what ended the hold.",
+    );
+    for (outcome, count) in [
+        ("commit", hold.released_on_commit),
+        ("abort", hold.released_on_abort),
+        ("recovery", hold.released_on_recovery),
+        ("session_loss", hold.released_on_session_loss),
+    ] {
+        out.sample(
+            "tunnel_relay_rotation_freeze_hold_released_total",
+            &[("outcome", outcome)],
+            count,
+        );
+    }
+    counter(
+        out,
+        "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total",
+        "Hold releases that found deferred writes still queued on the session.",
+        hold.released_with_deferred_writes,
+    );
+    out.family(
+        "tunnel_relay_rotation_freeze_hold_refused_total",
+        "counter",
+        "OPENs refused ROTATION_FREEZE by the hold: held past its bound, or never held because the hold was full.",
+    );
+    for (reason, count) in [
+        ("after_bound", hold.refused_after_bound),
+        ("hold_full", hold.refused_hold_full),
+    ] {
+        out.sample(
+            "tunnel_relay_rotation_freeze_hold_refused_total",
+            &[("reason", reason)],
+            count,
+        );
+    }
+    counter(
+        out,
+        "tunnel_relay_rotation_freeze_hold_cancelled_total",
+        "Held OPENs whose consumer went away during the hold.",
+        hold.cancelled,
+    );
+    gauge(
+        out,
+        "tunnel_relay_rotation_freeze_hold_max_wait_ms",
+        "The longest any OPEN spent in the rotation-freeze hold, in milliseconds.",
+        hold.max_hold_wait_ms,
+    );
 }
 
 /// Render one scrape.  Pure: identifiers in `input` are only counted.
@@ -322,6 +410,8 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         "Public response writes that timed out.",
         snapshot.consumer_write_diagnostics.timeout_count,
     );
+
+    render_rotation_freeze_hold(&mut out, &snapshot.rotation_freeze_hold);
 
     out.family(
         "tunnel_relay_consumer_refusals_total",

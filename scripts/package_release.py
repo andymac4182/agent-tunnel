@@ -19,9 +19,17 @@ BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 DEVICE_BINARIES = ("tunnel-client", "tunnel-deadman")
 
 
-def binaries_for(target):
-    """The binaries one target's bundle carries."""
-    return DEVICE_BINARIES if target.endswith("windows-msvc") else BINARIES
+def binaries_for(target, root=None):
+    """The binaries one target's bundle carries.
+
+    Windows and every CI-only target (M6-C115) are the device half.
+    """
+    return DEVICE_BINARIES if device_only(target, root) else BINARIES
+
+
+def device_only(target, root=None):
+    """Whether a target's archive is the device half: no relay, no relay examples."""
+    return target.endswith("windows-msvc") or target in ci_only_targets(root or ROOT)
 
 
 TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
@@ -77,9 +85,33 @@ def advertised_targets(root=ROOT):
     return tuple(sorted(targets))
 
 
+def ci_only_targets(root=ROOT):
+    """Targets CI builds, verifies and attests but never publishes (M6-C115).
+
+    `[workspace.metadata.release] ci-only-targets`; absent means none.  The
+    same acceptance rule as `advertised-targets`, and the two must not share
+    a triple: a target is either offered to the public or it is not.
+    """
+    table = tomllib.loads((root / "Cargo.toml").read_text())
+    release = table.get("workspace", {}).get("metadata", {}).get("release", {})
+    targets = release.get("ci-only-targets", [])
+    if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+        raise ValueError("ci-only-targets must be a list of strings")
+    if len(set(targets)) != len(targets):
+        raise ValueError("ci-only-targets repeats a triple")
+    malformed = [t for t in targets if not TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise ValueError(f"ci-only-targets are not target triples: {malformed}")
+    shared = sorted(set(targets) & set(advertised_targets(root)))
+    if shared:
+        raise ValueError(f"ci-only-targets and advertised-targets share {shared}")
+    return tuple(sorted(targets))
+
+
 #: Kept as a module-level name because `scripts/test_package_release.py`
 #: imports it, but it is now *derived* rather than declared.
 TARGETS = advertised_targets()
+CI_ONLY_TARGETS = ci_only_targets()
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +235,64 @@ def unresolved_links(bundle):
     return problems
 
 
+# --------------------------------------------------------------------------
+# Examples in the archive (docs/tasks.md M6-C102)
+#
+# The archive used to carry `m1-client.toml` and `m1-relay.toml` only, while
+# the guide it ships runs `m6-catalog*.toml`, `m7-cluster-relay.toml` and the
+# `examples/service/` units, so a tester holding only the archive reached
+# section 2.3 of the guide without its records examples.  **The set is now
+# derived from the shipped documents' own text**: every `examples/...` path
+# any of them names ships, and a directory named with a trailing `/` ships
+# every file under it.  So a document that starts using a new example ships
+# it with no second edit, and `scripts/verify_release_archive.py` checks the
+# same rule against the *unpacked* archive's own documents.
+#
+# A Windows archive is the device half (M6-C83): it carries only the
+# device-side examples the documents name -- client profiles -- because the
+# relay, its records documents and the systemd/launchd units do not run there.
+# --------------------------------------------------------------------------
+EXAMPLE_RE = re.compile(r"examples/[A-Za-z0-9_./-]*[A-Za-z0-9_/]")
+
+
+def device_side_example(path):
+    """Whether an example path belongs in the device-only (Windows) archive."""
+    name = PurePosixPath(path).name
+    return "/" not in path.removeprefix("examples/") and "client" in name and name.endswith(".toml")
+
+
+def named_examples(texts):
+    """Every `examples/...` path the given document texts name, as written."""
+    return sorted({match for text in texts for match in EXAMPLE_RE.findall(text)})
+
+
+def release_examples(root, target):
+    """The example files one target's archive carries, as repository paths."""
+    texts = [(root / document).read_bytes().decode("utf-8") for document in release_documents(root)]
+    shipped = set()
+    for named in named_examples(texts):
+        path = root / named
+        if named.endswith("/") or path.is_dir():
+            if not path.is_dir():
+                raise ValueError(f"the shipped documents name {named!r}, which is not a directory")
+            files = [f for f in sorted(path.rglob("*")) if f.is_file()]
+            if not files:
+                raise ValueError(f"the shipped documents name {named!r}, which is empty")
+            shipped.update(f.relative_to(root).as_posix() for f in files)
+        elif path.is_file():
+            shipped.add(named)
+        else:
+            raise ValueError(f"the shipped documents name {named!r}, which does not exist")
+    if device_only(target, root):
+        shipped = {path for path in shipped if device_side_example(path)}
+    if "examples/m1-client.toml" not in shipped:
+        # `scripts/verify_release_archive.py` runs `config check` on it from
+        # the unpacked archive; its absence is a packaging fault, not a
+        # documentation choice.
+        raise ValueError("the shipped documents no longer name examples/m1-client.toml")
+    return sorted(shipped)
+
+
 def version(root, sha, run):
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[1-9][0-9]*", run):
         raise ValueError("invalid source SHA or CI run ID")
@@ -231,7 +321,7 @@ def package(root, target, sha, run, output, metadata):
     # Read from the manifest under `root` rather than from the module-level
     # TARGETS, so a caller packaging a different checkout is checked against
     # *that* checkout's declaration.
-    if target not in advertised_targets(root):
+    if target not in advertised_targets(root) + ci_only_targets(root):
         raise ValueError("unsupported target")
     tag = version(root, sha, run)
     output.mkdir(parents=True, exist_ok=True)
@@ -241,7 +331,7 @@ def package(root, target, sha, run, output, metadata):
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary)
         (staging / "bin").mkdir()
-        for binary in binaries_for(target):
+        for binary in binaries_for(target, root):
             name = binary + (".exe" if windows else "")
             source = root / "target" / target / "release" / name
             if not source.is_file() or source.stat().st_size == 0:
@@ -252,10 +342,11 @@ def package(root, target, sha, run, output, metadata):
         dangling = unresolved_links(staging)
         if dangling:
             raise ValueError(f"shipped documents link files the archive lacks: {dangling[:3]}")
-        (staging / "examples").mkdir()
-        examples = ("m1-client.toml",) if windows else ("m1-client.toml", "m1-relay.toml")
-        for name in examples:
-            shutil.copy2(root / "examples" / name, staging / "examples" / name)
+        for example in release_examples(root, target):
+            destination = staging.joinpath(*example.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Bytes, so a CRLF checkout cannot change what ships.
+            destination.write_bytes((root / example).read_bytes())
         notices = staging / "notices"
         notices.mkdir()
         dependencies = []
@@ -276,6 +367,8 @@ def package(root, target, sha, run, output, metadata):
         keep = (
             "Keep tunnel-client and tunnel-deadman together. This Windows bundle is the device half: the relay runs only on Linux and macOS.\n"
             if windows
+            else "Keep tunnel-client and tunnel-deadman together. This is a client-only CI build (not a published release target): it carries no relay.\n"
+            if device_only(target, root)
             else "Keep all three binaries together, including tunnel-deadman.\n"
         )
         (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting. Start with docs/operator.md in this archive; it and the documents it links describe this build's source commit.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
@@ -298,7 +391,7 @@ def package(root, target, sha, run, output, metadata):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, choices=TARGETS)
+    parser.add_argument("--target", required=True, choices=TARGETS + CI_ONLY_TARGETS)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--run", required=True)
     parser.add_argument("--output", type=Path, required=True)

@@ -4399,6 +4399,26 @@ async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
         assert!(value >= least, "{series} = {value}:\n{text}");
     }
     assert_eq!(m6c24_value(&text, "tunnel_relay_device_sessions"), Some(1));
+    // The owner's rotation-freeze admission hold (M3-15) is exported from
+    // the same snapshot; no freeze was held here, so every series is zero
+    // but present, and the hold's partition holds.
+    let freeze_hold_series = [
+        "tunnel_relay_rotation_freeze_hold_held_total",
+        "tunnel_relay_rotation_freeze_hold_current",
+        "tunnel_relay_rotation_freeze_hold_admitted_total",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"commit\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"abort\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"recovery\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"session_loss\"}",
+        "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"}",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"hold_full\"}",
+        "tunnel_relay_rotation_freeze_hold_cancelled_total",
+        "tunnel_relay_rotation_freeze_hold_max_wait_ms",
+    ];
+    for series in freeze_hold_series {
+        assert!(m6c24_value(&text, series).is_some(), "no {series}:\n{text}");
+    }
     let redis_url = env::var("TEST_REDIS_URL").unwrap_or_default();
     for canary in [
         payload.as_str(),
@@ -4436,9 +4456,10 @@ async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
     .expect("public /metrics");
     assert_eq!(public.0, 404, "/metrics must stay off the public listener");
     println!(
-        "m6c24-metrics ok nonce={nonce} series={} bytes={} sessions=1 refusal_identity>=1",
+        "m6c24-metrics ok nonce={nonce} series={} bytes={} sessions=1 refusal_identity>=1 freeze_hold_series={}",
         text.lines().filter(|line| !line.starts_with('#')).count(),
-        text.len()
+        text.len(),
+        freeze_hold_series.len()
     );
     drop(device);
     drop(fixture);

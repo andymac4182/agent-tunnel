@@ -666,6 +666,22 @@ async fn output_credit_stalls_are_bounded_and_the_event_is_never_skipped() {
         diagnostics.messages_dropped_on_closed_stream, 0,
         "nothing was dropped and continued past: {diagnostics:?}"
     );
+
+    // **And nothing after the stalled message was attempted** (task row
+    // M4-42). The checks above all hold at the instant of the first stall,
+    // including for a dispatcher that abandons the stalled message and goes on
+    // to the next one: the connection is already out of the map by then, and
+    // `messages_dropped_on_closed_stream` counts only messages for a stream
+    // that was already closed. The prompt asked for 512 updates and the
+    // subscriber still reads none of them, so a dispatcher that continued past
+    // the stall would stall again on the very next message, one bound later.
+    // Three bounds with the stall count unmoved is that continuation, absent.
+    tokio::time::sleep(Duration::from_millis(3 * 400)).await;
+    let after = export.diagnostics();
+    assert_eq!(
+        after.output_stalls, 1,
+        "the dispatcher went on past the stalled message and stalled again: {after:?}"
+    );
     export.shutdown();
 }
 

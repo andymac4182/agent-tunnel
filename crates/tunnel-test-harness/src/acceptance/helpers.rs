@@ -188,6 +188,7 @@ pub(crate) fn write_device_profile(
                 device_canary: Some(canary.to_owned()),
                 mcp: None,
                 acp: None,
+                cua: None,
                 fs: None,
             },
         )]

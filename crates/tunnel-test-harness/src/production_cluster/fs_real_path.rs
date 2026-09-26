@@ -728,6 +728,7 @@ async fn run(
                 device_canary: None,
                 mcp: None,
                 acp: None,
+                cua: None,
                 fs: Some(FsExportSettings {
                     root: fixture.directory.path().to_path_buf(),
                     // The device's own allowlist is the same for every export:

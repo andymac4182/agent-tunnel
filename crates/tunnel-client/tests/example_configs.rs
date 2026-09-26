@@ -46,6 +46,7 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("m6-catalog.toml", ExampleParser::Relay),
     // The per-service-type records documents (task row M6-C57).
     ("m6-catalog-acp.toml", ExampleParser::Relay),
+    ("m6-catalog-cua.toml", ExampleParser::Relay),
     ("m6-catalog-fs.toml", ExampleParser::Relay),
     ("m6-catalog-mcp.toml", ExampleParser::Relay),
     ("m7-cluster-relay.toml", ExampleParser::Relay),

@@ -63,9 +63,9 @@
 //! while a live connection keeps its place.  The probe is never the caller's
 //! command.
 //!
-//! A lane does not serialize its callers.  The lane lock is held only across
-//! the bounded probe that verifies the physical connection (never across a
-//! reconnect, see above);
+//! A lane does not serialize its callers.  The lane lock is held only for
+//! bookkeeping: never across the probe that verifies the physical connection
+//! (M6-C95) nor across a reconnect (M6-C74, see above);
 //! every caller then runs its own command on a handle to that multiplexed
 //! connection, so concurrent commands pipeline on one socket and the
 //! per-command deadline measures the authority's reply, never the time spent
@@ -500,6 +500,14 @@ struct ReconnectAttempt {
 /// What [`AuthorityLane::verify`] found.
 enum Verified {
     Ready(Admitted),
+    /// A sibling lane observed a transport loss since this connection was
+    /// last verified: probe this handle, outside the lane lock, before the
+    /// caller's command (M6-C95).
+    Probe {
+        connection: MultiplexedConnection,
+        connection_generation: u64,
+        loss_generation: u64,
+    },
     /// The lane has no connection and a reconnect is in flight.
     Reconnecting(watch::Receiver<ReconnectOutcome>),
 }
@@ -707,28 +715,62 @@ impl AuthorityLane {
 
     /// Hand out a handle to this lane's verified physical connection.
     ///
-    /// Waiting for the lane lock is not part of any authority deadline: the
-    /// lock is only ever held across the bounded probe in [`Self::verify`]
-    /// and short bookkeeping, so a caller queued behind a sibling waits at
-    /// most one such probe and then shares the same multiplexed connection.
-    /// From then on the caller has [`REDIS_OPERATION_TIMEOUT`] in total, for
-    /// the probe and for waiting on a reconnect in flight (M6-C74).  A
-    /// verification that exceeds it leaves the lane state as it found it, and
-    /// a reconnect that exceeds it keeps running for the next command; a
-    /// caller's command that times out releases the connection (see
-    /// [`Self::execute`]).
+    /// The caller has [`REDIS_OPERATION_TIMEOUT`] in total, from its arrival:
+    /// for the lane lock, the sibling-loss probe and waiting on a reconnect
+    /// in flight.  The lock is held only for bookkeeping -- never across the
+    /// probe (M6-C95) or a reconnect (M6-C74) -- so a caller never queues
+    /// behind another caller's probe; concurrent callers each probe the same
+    /// multiplexed connection under their own deadline.  A probe that
+    /// exceeds it leaves the lane state as it found it, and a reconnect that
+    /// exceeds it keeps running for the next command; a caller's command
+    /// that times out releases the connection (see [`Self::execute`]).
     async fn admit(&self) -> Result<Admitted, CatalogError> {
-        let mut state = self.state.lock().await;
         let deadline = tokio::time::Instant::now() + REDIS_OPERATION_TIMEOUT;
         let timed_out = |_| CatalogError::Database(redis_timeout());
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
+            .await
+            .map_err(timed_out)?;
         loop {
-            let mut outcome = match tokio::time::timeout_at(deadline, self.verify(&mut state)).await
-            {
-                Err(elapsed) => return Err(timed_out(elapsed)),
-                Ok(verified) => match verified? {
-                    Verified::Ready(admitted) => return Ok(admitted),
-                    Verified::Reconnecting(outcome) => outcome,
-                },
+            let mut outcome = match self.verify(&mut state)? {
+                Verified::Ready(admitted) => return Ok(admitted),
+                Verified::Probe {
+                    mut connection,
+                    connection_generation,
+                    loss_generation,
+                } => {
+                    // Never hold the lane lock while the probe waits for the
+                    // authority's reply.
+                    drop(state);
+                    let probed = tokio::time::timeout_at(
+                        deadline,
+                        redis::cmd("PING").query_async::<String>(&mut connection),
+                    )
+                    .await
+                    .map_err(timed_out)?;
+                    state = tokio::time::timeout_at(deadline, self.state.lock())
+                        .await
+                        .map_err(timed_out)?;
+                    // Record the result only for the connection it probed: a
+                    // sibling caller may have released or replaced it since.
+                    let current = state.connection_generation == connection_generation
+                        && state.connection.is_some();
+                    match probed {
+                        Ok(_) => {
+                            if current {
+                                state.verified_generation = loss_generation;
+                            }
+                        }
+                        Err(error) if lane_lost(&error) => {
+                            if current {
+                                state.connection = None;
+                                state.connection_generation += 1;
+                            }
+                        }
+                        Err(error) => return Err(CatalogError::Database(error)),
+                    }
+                    continue;
+                }
+                Verified::Reconnecting(outcome) => outcome,
             };
             // Never hold the lane lock while a reconnect connects.
             drop(state);
@@ -753,23 +795,22 @@ impl AuthorityLane {
         }
     }
 
-    async fn verify(&self, state: &mut LaneState) -> Result<Verified, CatalogError> {
+    /// Decide, under the lane lock and without I/O, what the caller does
+    /// next.
+    fn verify(&self, state: &mut LaneState) -> Result<Verified, CatalogError> {
         let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
         if state.verified_generation != loss_generation
-            && let Some(connection) = state.connection.as_mut()
+            && let Some(connection) = state.connection.as_ref()
         {
             // A sibling lane observed a transport loss since this
             // connection was last verified.  Probe before the caller's
             // command so a connection severed by the same event
             // reconnects here instead of failing this caller closed.
-            match redis::cmd("PING").query_async::<String>(connection).await {
-                Ok(_) => {}
-                Err(error) if lane_lost(&error) => {
-                    state.connection = None;
-                    state.connection_generation += 1;
-                }
-                Err(error) => return Err(CatalogError::Database(error)),
-            }
+            return Ok(Verified::Probe {
+                connection: connection.clone(),
+                connection_generation: state.connection_generation,
+                loss_generation,
+            });
         }
         if state.connection.is_none() {
             let outcome = match state.reconnect.as_ref() {
@@ -1706,16 +1747,19 @@ mod tests {
         );
     }
 
-    /// A resolver that answers after `delay` with the fake authority's
-    /// address, standing in for the cold DNS lookup measured on a fresh Fly
-    /// machine (M6-C73), and counts its lookups.
-    struct DelayedResolver {
-        delay: Duration,
+    /// A resolver that answers with the fake authority's address only once
+    /// the test releases it, standing in for the cold DNS lookup measured on
+    /// a fresh Fly machine (M6-C73), and counts its lookups.  The test, not
+    /// a wall-clock delay, decides when the reconnect can finish (M6-C117:
+    /// a fixed delay let the reconnect land inside a late caller's deadline
+    /// on Windows' coarse timers).
+    struct GatedResolver {
+        release: tokio::sync::watch::Receiver<bool>,
         address: std::net::SocketAddr,
         lookups: Arc<AtomicUsize>,
     }
 
-    impl redis::io::AsyncDNSResolver for DelayedResolver {
+    impl redis::io::AsyncDNSResolver for GatedResolver {
         fn resolve<'a, 'b: 'a>(
             &'a self,
             _host: &'b str,
@@ -1724,7 +1768,8 @@ mod tests {
         {
             Box::pin(async move {
                 self.lookups.fetch_add(1, Ordering::AcqRel);
-                tokio::time::sleep(self.delay).await;
+                let mut release = self.release.clone();
+                let _ = release.wait_for(|released| *released).await;
                 Ok(Box::new(std::iter::once(self.address))
                     as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
             })
@@ -1780,8 +1825,9 @@ mod tests {
         let slow_client =
             redis::Client::open(format!("redis://m6c74-cold-dns.invalid:{}/", server.port))
                 .expect("slow-resolver URL");
-        let config = connection_config(REDIS_CONNECT_TIMEOUT).set_dns_resolver(DelayedResolver {
-            delay: SLOW_RECONNECT,
+        let (release_resolver, release) = tokio::sync::watch::channel(false);
+        let config = connection_config(REDIS_CONNECT_TIMEOUT).set_dns_resolver(GatedResolver {
+            release,
             address: std::net::SocketAddr::from(([127, 0, 0, 1], server.port)),
             lookups: Arc::clone(&lookups),
         });
@@ -1835,7 +1881,25 @@ mod tests {
             "concurrent callers share one single-flight reconnect"
         );
 
-        // The reconnect outlives its callers and is installed.
+        // The reconnect outlives its callers: it is still in flight, held at
+        // the resolver, after every caller has given up.  Only now, and not
+        // before it has run for SLOW_RECONNECT (longer than any caller's
+        // deadline), is the lookup answered (M6-C117).
+        tokio::time::sleep_until(reconnect_started + SLOW_RECONNECT).await;
+        {
+            let state = lane.state.lock().await;
+            assert!(
+                state.connection.is_none(),
+                "nothing installed before the lookup answers"
+            );
+            assert!(
+                state.reconnect.is_some(),
+                "the reconnect is still in flight"
+            );
+        }
+        release_resolver.send_replace(true);
+
+        // The reconnect then completes and is installed.
         loop {
             if lane.state.lock().await.connection.is_some() {
                 break;
@@ -1875,6 +1939,58 @@ mod tests {
         );
         assert_eq!(server.accepted(), 2);
         assert_eq!(lookups.load(Ordering::Acquire), 1);
+        server.shutdown().await;
+    }
+
+    /// M6-C95 regression: after a sibling lane observed a transport loss,
+    /// the next callers probe this lane's connection before their commands.
+    /// With the authority stalled past the command deadline, two concurrent
+    /// callers must each fail closed with a timeout within their own
+    /// deadline.  Before the fix the probe ran under the lane lock and the
+    /// second caller's deadline started only once it had the lock, so it
+    /// took about two deadlines.  The stall then clears and the lane keeps
+    /// serving on the connection it probed.
+    #[tokio::test]
+    async fn m6c95_callers_behind_a_stalled_sibling_probe_stay_bounded() {
+        let server = FakeAuthority::start("lane-run-a").await;
+        let client = redis::Client::open(server.url()).expect("fake authority URL");
+        let group = Arc::new(LaneGroup::default());
+        let lane = Arc::new(lane_with_outer_deadline_only(&client, "lane-run-a", &group).await);
+        assert_eq!(ping(&lane).await.expect("healthy lane"), "PONG");
+
+        // A sibling lane observed a loss: this lane must probe first.
+        group.loss_generation.fetch_add(1, Ordering::AcqRel);
+        server.set_reply_delay(STALLED_REPLY_DELAY);
+        let mut callers = JoinSet::new();
+        for _ in 0..2 {
+            let lane = Arc::clone(&lane);
+            callers.spawn(async move { timed_ping(&lane).await });
+        }
+        let mut observed = Vec::with_capacity(2);
+        while let Some(joined) = callers.join_next().await {
+            observed.push(joined.expect("caller task"));
+        }
+        for (result, elapsed) in &observed {
+            assert!(
+                *elapsed < REDIS_OPERATION_TIMEOUT + DEADLINE_SLACK,
+                "a caller waited {elapsed:?} behind a stalled probe; each caller must stay \
+                 bounded at {REDIS_OPERATION_TIMEOUT:?}: {observed:?}"
+            );
+            match result {
+                Err(CatalogError::Database(error)) if timed_out(error) => {}
+                other => panic!("a caller behind the stalled probe reported {other:?}"),
+            }
+        }
+
+        // The stall clears: the probe passes on the same connection.
+        server.set_reply_delay(Duration::ZERO);
+        assert_eq!(ping(&lane).await.expect("the probed lane serves"), "PONG");
+        assert_eq!(server.accepted(), 1, "no reconnect for a stalled probe");
+        assert_eq!(
+            lane.state.lock().await.verified_generation,
+            group.loss_generation.load(Ordering::Acquire),
+            "the passed probe is recorded"
+        );
         server.shutdown().await;
     }
 }

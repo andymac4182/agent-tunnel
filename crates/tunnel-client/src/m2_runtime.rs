@@ -1671,6 +1671,11 @@ struct M2Actor {
     /// Every `expire_stream` call, for the M6-C88 regression test.
     #[cfg(test)]
     expire_stream_calls: u64,
+    /// Every snapshot `publish_status` sent, in order, for the M7-C123
+    /// regression test.  The watch channel coalesces snapshots, so a torn
+    /// intermediate one is only deterministically observable here.
+    #[cfg(test)]
+    published_statuses: std::sync::Mutex<Vec<ConnectionStatus>>,
     pending_outputs: VecDeque<PendingOutput>,
     pending_output_bytes: usize,
     peer_fence: Option<FenceSnapshot>,
@@ -1837,6 +1842,8 @@ async fn run_m2_session(
         auth_expired_streams: 0,
         #[cfg(test)]
         expire_stream_calls: 0,
+        #[cfg(test)]
+        published_statuses: std::sync::Mutex::new(Vec::new()),
         pending_outputs: VecDeque::new(),
         pending_output_bytes: 0,
         peer_fence: None,
@@ -2430,22 +2437,29 @@ impl M2Actor {
             .as_ref()
             .and(rotation_status.deadline_ms)
             .or(self.last_recovery_attempt_deadline_ms);
+        // A completed episode is reported only once its verified reset
+        // marker is recorded (M7-C123).  Activation moves the attempt into
+        // `completed_recovery` and then flushes queued output, which
+        // publishes, before it records the marker and the attempt number
+        // alongside it; reporting the completed episode's deadline and
+        // closure roster in that window tore the snapshot into closures
+        // without an attempt.  Gated on the marker, that window publishes no
+        // recovery fields at all, and the next snapshot publishes all of them.
+        let completed_recovery = self
+            .completed_recovery
+            .as_ref()
+            .filter(|_| self.last_recovery_reset_reason.is_some());
         let recovery_episode_deadline_ms = self
             .recovery
             .as_ref()
             .map(|recovery| recovery.deadline_ms)
-            .or_else(|| {
-                self.completed_recovery
-                    .as_ref()
-                    .map(|recovery| recovery.deadline_ms)
-            });
+            .or_else(|| completed_recovery.map(|recovery| recovery.deadline_ms));
         let recovery_closed_connection_ids = self
             .recovery
             .as_ref()
             .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
             .or_else(|| {
-                self.completed_recovery
-                    .as_ref()
+                completed_recovery
                     .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
             })
             .unwrap_or_default();
@@ -2542,6 +2556,11 @@ impl M2Actor {
             active_local_addr: self.active.local_addr,
             candidate_local_addr,
         };
+        #[cfg(test)]
+        self.published_statuses
+            .lock()
+            .expect("test status history lock")
+            .push(status.clone());
         let _ = self.status.send(status);
     }
 
@@ -7263,6 +7282,27 @@ impl M2Actor {
                 &quiesce.attempt.new_connection_id,
             )
         });
+        if !pending_attempt_matches
+            && !candidate_attempt_matches
+            && self
+                .pending_candidate_close
+                .as_ref()
+                .is_some_and(|(closed, _)| closed == &quiesce.attempt)
+        {
+            // Task row M2-07: the candidate of this very attempt closed while
+            // the owner's QUIESCE was already on the wire.  The owner has not
+            // observed the close yet; it will, and its ROTATE_ABORT decides
+            // the attempt.  Admission and old writes are already frozen by
+            // `defer_candidate_abort`, and there is no candidate to barrier,
+            // so the crossed QUIESCE is not applied and no actor state keeps
+            // it.  The rotation journal already holds it as a pending entry
+            // (observed before this handler runs), so a retransmission is a
+            // pending duplicate; the owner's ABORT, or else the overlap
+            // deadline, settles the attempt.
+            // Failing the session here would turn a candidate loss the
+            // protocol recovers from into a terminal protocol error.
+            return Ok(());
+        }
         if !pending_attempt_matches && !candidate_attempt_matches {
             return Err(ClientError::Protocol(
                 "ROTATE_QUIESCE candidate identity mismatch".to_owned(),
@@ -9212,6 +9252,8 @@ mod tests {
             auth_expired_streams: 0,
             #[cfg(test)]
             expire_stream_calls: 0,
+            #[cfg(test)]
+            published_statuses: std::sync::Mutex::new(Vec::new()),
             pending_outputs: VecDeque::new(),
             pending_output_bytes: 0,
             peer_fence: None,
@@ -13313,6 +13355,175 @@ mod tests {
         );
     }
 
+    /// M7-C123: recovery activation moves the attempt into
+    /// `completed_recovery` and then flushes queued output, which publishes a
+    /// status snapshot, before it records the verified reset marker and the
+    /// attempt number.  Every snapshot published on the way must describe
+    /// either the attempt or its verified completion, never a torn mix such
+    /// as the completed attempt's closure roster with no attempt number
+    /// (hosted CI run 36128683568: "attempt timing without an attempt").
+    #[tokio::test]
+    async fn recovery_activation_never_publishes_a_torn_attempt_status() {
+        let (mut actor, old_key, _old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, _candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &old_key);
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "recovery-torn",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("recovery-torn-snapshot", vec![]);
+        let now = actor.now_ms();
+        let recovery_timeout_ms = actor.rotation.config().recovery_timeout_ms;
+        let deadline = now
+            .checked_add(recovery_timeout_ms)
+            .expect("test recovery deadline does not overflow");
+        actor
+            .rotation
+            .transport_lost(&attempt, now, RecoveryReason::OldTransportLost)
+            .expect("carrier loss enters recovery");
+        let closed_evidence = ClosureEvidence::closed(old_key.connection_id.clone());
+        actor
+            .rotation
+            .close_for_recovery(old_key.connection_id.clone(), closed_evidence.clone(), now)
+            .expect("carrier closure releases its rotation allocation");
+        actor
+            .rotation
+            .begin_recovery(
+                attempt.clone(),
+                roster.clone(),
+                now,
+                RecoveryReason::OldTransportLost,
+                deadline,
+            )
+            .expect("recovery attempt starts");
+        actor
+            .rotation
+            .reserve_recovery_socket(now)
+            .expect("replacement is reserved");
+        let begin = RecoveryBegin {
+            message_id: "recovery-torn-begin".to_owned(),
+            reply_to: String::new(),
+            attempt,
+            episode_id: "recovery-torn-episode".to_owned(),
+            attempt_no: 1,
+            roster,
+            remaining_ms: recovery_timeout_ms,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "recovery-torn-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: begin.attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![old_key.connection_id.clone()],
+            closure_digest: "recovery-torn-digest".to_owned(),
+        };
+        actor
+            .closed_for_recovery
+            .insert(old_key.connection_id.clone(), closed_evidence);
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: None,
+            peer_closed: None,
+            combined_digest: Some("recovery-torn-combined".to_owned()),
+            deadline_ms: deadline,
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [true, true],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [true, true],
+            ready_replies: [true, true],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: true,
+        });
+        actor
+            .published_statuses
+            .lock()
+            .expect("test status history lock")
+            .clear();
+
+        actor
+            .maybe_finish_recovery()
+            .await
+            .expect("recovery activates its replacement");
+
+        let statuses = actor
+            .published_statuses
+            .lock()
+            .expect("test status history lock")
+            .clone();
+        assert!(
+            !statuses.is_empty(),
+            "activation must publish at least one status snapshot"
+        );
+        for (index, status) in statuses.iter().enumerate() {
+            let identity_present = status.recovery_old_generation.is_some()
+                || status.recovery_old_connection_id.is_some()
+                || status.recovery_successor_generation.is_some()
+                || status.recovery_successor_connection_id.is_some();
+            if status.recovery_attempt.is_some() {
+                assert!(
+                    status.recovery_attempt_started_at_ms.is_some()
+                        && status.recovery_attempt_deadline_ms.is_some()
+                        && status.recovery_episode_deadline_ms.is_some()
+                        && identity_present,
+                    "snapshot {index} named an attempt without its timing/identity: {status:?}"
+                );
+            } else {
+                assert!(
+                    status.recovery_attempt_started_at_ms.is_none()
+                        && status.recovery_attempt_deadline_ms.is_none()
+                        && status.recovery_episode_deadline_ms.is_none()
+                        && status.recovery_closed_connection_ids.is_empty(),
+                    "snapshot {index} reported attempt timing, an episode deadline or closures \
+                     without an attempt: {status:?}"
+                );
+                assert!(
+                    status.recovery_reset_reason.is_some() || !identity_present,
+                    "snapshot {index} carried identity without a reset reason: {status:?}"
+                );
+            }
+        }
+        let last = statuses.last().expect("checked non-empty above");
+        assert_eq!(last.recovery_attempt, Some(1));
+        assert_eq!(
+            last.recovery_reset_reason,
+            Some(M2_RECOVERY_RESET_FENCED_SUCCESSOR)
+        );
+        assert_eq!(
+            last.recovery_closed_connection_ids,
+            vec![old_key.connection_id.clone()]
+        );
+        assert_eq!(last.recovery_episode_deadline_ms, Some(deadline));
+    }
+
     #[tokio::test]
     async fn successive_recovery_does_not_reuse_completed_episode_closures() {
         let (mut actor, old_key, _old_receiver, _control_receiver) =
@@ -16393,5 +16604,158 @@ mod tests {
         old_carrier_task
             .await
             .expect("old carrier task joins after the forced closure");
+    }
+
+    /// Task row M2-07: an actor whose candidate closed in `Preparing` and
+    /// which then read the owner's crossed `ROTATE_QUIESCE` for that attempt.
+    async fn actor_after_a_crossed_quiesce() -> (
+        M2Actor,
+        RotationAttemptIdentity,
+        CarrierKey,
+        RotateQuiesce,
+        mpsc::Receiver<crate::QueuedMessage>,
+    ) {
+        let (mut actor, active_key, _active_receiver, control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        // The receiver is dropped: the carrier has no task, so its close is
+        // joined at once and the local closure is evidenced.
+        let (candidate_tx, _) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor.rotation_prepare_message_id = Some("prepare".to_owned());
+
+        // The candidate socket closes before QUIESCE is read.
+        actor
+            .mark_carrier_closed(&candidate_key, true, true)
+            .await
+            .expect("a precommit candidate close defers to the owner's ABORT");
+        assert!(actor.candidate.is_none());
+        assert!(actor.pending_candidate.is_none());
+        assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
+        assert!(actor.writes_frozen && !actor.accepting);
+
+        // The owner's QUIESCE for that attempt arrives after the close.
+        let quiesce = RotateQuiesce {
+            message_id: "quiesce".to_owned(),
+            reply_to: "prepare".to_owned(),
+            attempt: attempt.clone(),
+            roster: tunnel_protocol::rotation_control::StreamRoster::new("snapshot", Vec::new()),
+            remaining_ms: 5_000,
+        };
+        actor
+            .handle_control(ControlMessage::RotateQuiesce(quiesce.clone()))
+            .await
+            .expect("a QUIESCE crossing the candidate close is not a protocol error");
+        assert!(actor.pending_quiesce.is_none(), "nothing to barrier");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Preparing);
+        assert!(actor.writes_frozen && !actor.accepting);
+
+        (actor, attempt, candidate_key, quiesce, control_receiver)
+    }
+
+    /// Task row M2-07: the owner sends `ROTATE_QUIESCE` as soon as the
+    /// candidate is data-ready, and the candidate can close while that
+    /// QUIESCE is on the wire (the M2 candidate-abort gate closes it in any
+    /// precommit phase).  The connector then holds the closure for the
+    /// owner's ABORT and has neither a pending nor an installed candidate.
+    /// The crossed QUIESCE must not fail the session with a candidate
+    /// identity mismatch; the owner's ABORT must still settle the attempt.
+    #[tokio::test]
+    async fn a_quiesce_crossing_the_candidate_close_waits_for_the_owner_abort() {
+        let (mut actor, attempt, candidate_key, quiesce, mut control_receiver) =
+            actor_after_a_crossed_quiesce().await;
+        // A QUIESCE for any other attempt is still refused.
+        let mut other = quiesce;
+        other.message_id = "quiesce-other".to_owned();
+        other.attempt.new_connection_id = "other-candidate".to_owned();
+        let refused = actor
+            .handle_rotate_quiesce(other)
+            .expect_err("an unrelated attempt keeps the identity check");
+        assert!(
+            refused.to_string().contains("candidate identity mismatch"),
+            "{refused}"
+        );
+
+        // The owner observes the close and aborts; the connector answers
+        // with its closure evidence.
+        actor
+            .handle_control(ControlMessage::RotateAbort(RotateAbort {
+                message_id: "abort".to_owned(),
+                reply_to: String::new(),
+                attempt: attempt.clone(),
+                reason: "candidate transport lost".to_owned(),
+                remaining_ms: 5_000,
+            }))
+            .await
+            .expect("the owner's ABORT settles the crossed attempt");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Aborting);
+        assert!(actor.pending_candidate_close.is_none());
+        let aborted = drain_control_messages(&mut control_receiver)
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::RotateAborted(aborted) => Some(aborted),
+                _ => None,
+            })
+            .expect("ROTATE_ABORTED is sent to the owner");
+        assert_eq!(aborted.reply_to, "abort");
+        assert_eq!(aborted.attempt, attempt);
+        assert_eq!(aborted.closed_connection_id, candidate_key.connection_id);
+    }
+
+    /// Task row M2-07, review: a crossed QUIESCE never replaces the owner's
+    /// decision.  If ROTATE_ABORT never arrives, the overlap deadline moves
+    /// the attempt to `Recovering` and the session fails with the bounded,
+    /// retryable transport error, as it does for any undecided candidate
+    /// loss; the crossed QUIESCE does not keep the attempt alive.
+    #[tokio::test]
+    async fn a_crossed_quiesce_without_an_abort_reaches_the_overlap_deadline() {
+        let (mut actor, _attempt, _candidate_key, _quiesce, _control_receiver) =
+            actor_after_a_crossed_quiesce().await;
+        cross_overlap_deadline_and_grace(&mut actor);
+        let mut failure = None;
+        for _ in 0..4 {
+            if let Err(error) = actor.handle_rotation_deadline().await {
+                failure = Some(error);
+                break;
+            }
+        }
+        let failure = failure.expect("the overlap deadline ends the undecided attempt");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Recovering);
+        assert!(failure.retryable(), "{failure:?}");
+        assert!(
+            matches!(
+                &failure,
+                ClientError::Transport { scope: "data rotation", detail }
+                    if detail == "candidate abort owner decision not received before overlap deadline"
+            ),
+            "{failure:?}"
+        );
     }
 }

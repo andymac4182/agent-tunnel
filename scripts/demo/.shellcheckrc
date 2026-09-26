@@ -1,0 +1,5 @@
+# The demo scripts share variables across sourced files (lib/common.sh and
+# the feature plug-ins set variables the other scripts read), which SC2034
+# cannot see across files.
+disable=SC2034
+external-sources=true

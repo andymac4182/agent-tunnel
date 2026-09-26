@@ -173,6 +173,65 @@ fn an_unknown_subcommand_exits_two_and_prints_usage() {
     );
 }
 
+/// Demo-readiness defect D6: `connect --help` printed a one-line usage and
+/// the global help to stderr and exited `2`. Every subcommand now treats
+/// `--help`/`-h` as a request for help: the usage on stdout, exit `0`,
+/// wherever the flag sits -- including after other flags, and when the
+/// subcommand's own required arguments are absent.
+#[test]
+fn help_on_every_subcommand_exits_zero_and_prints_usage() {
+    let invocations: &[&[&str]] = &[
+        &["connect", "--help"],
+        &["connect", "-h"],
+        &[
+            "connect",
+            "--config",
+            "profile.toml",
+            "--no-reconnect",
+            "--help",
+        ],
+        &["config", "--help"],
+        &["config", "check", "--help"],
+        &["doctor", "--help"],
+        &["doctor", "--json", "-h"],
+        &["credentials", "--help"],
+        &["credentials", "create", "--help"],
+        &["credentials", "import", "--config", "p.toml", "--help"],
+        &["check-config", "--help"],
+    ];
+    for args in invocations {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?} must exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Usage:")
+                && stdout.contains("connect --config PATH [--json] [--no-reconnect]"),
+            "{args:?} must print the usage on stdout: {stdout}"
+        );
+    }
+}
+
+/// `--help` as the *value* of a PATH flag is a path, not a help request, so
+/// the subcommand still runs (and here fails on the missing file, exit 2).
+/// The one-line usage an invalid `connect` prints names every flag the
+/// global usage names.
+#[test]
+fn help_as_a_path_value_is_not_a_help_request() {
+    let output = run(&["config", "check", "--config", "--help"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing config is still an error"
+    );
+    let output = run(&["connect", "--bogus"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage: tunnel-client connect --config PATH [--json] [--no-reconnect]"),
+        "the one-line usage must match the global usage: {stderr}"
+    );
+}
+
 #[test]
 fn an_unreadable_configuration_exits_two_through_the_cli_error_path() {
     let root = tempdir().expect("create missing-config directory");
