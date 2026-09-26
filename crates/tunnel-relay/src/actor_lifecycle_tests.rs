@@ -642,6 +642,69 @@ async fn shutdown_releases_claim_committed_before_registration_result_delivery()
     );
 }
 
+/// **Task row M6-C178.** A registration task aborted mid-claim together with
+/// its actor must not leave the committed claim fenced until its lease
+/// expires.  The claim commits and is then held inside `claim_owner`, so the
+/// task is still running when the actor is aborted; the actor's `JoinSet`
+/// aborts it, and its guard, armed with the full claim request, used to be
+/// dropped onto a cleanup worker that was aborted with the actor.  The guard
+/// is now parked by the actor before the task starts, so the supervisor finds
+/// it and releases the exact claim.  The lease is 30 s; the bound is 2 s.
+#[tokio::test]
+async fn an_actor_aborted_while_a_claim_is_in_flight_releases_that_claim() {
+    let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;
+    catalog
+        .hold_claim_after_commit
+        .store(true, Ordering::Release);
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let registration_task = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .register_forwarded_control(
+                    identity,
+                    LIFECYCLE_SPKI.to_owned(),
+                    lifecycle_hello(device_id),
+                )
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), catalog.wait_for_claim())
+        .await
+        .expect("catalog claim committed while the task is still running");
+
+    // No relay cancellation first: the actor is aborted as a panic would end
+    // it, with the claim future still held inside the registration task.
+    handle.abort_actor_task().await;
+
+    let mut released = false;
+    for _ in 0..200 {
+        if catalog
+            .inner
+            .current_owner(tenant_id, device_id, Utc::now())
+            .await
+            .expect("read lifecycle owner")
+            .is_none()
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    catalog.release_claim.notify_one();
+    let _ = timeout(Duration::from_secs(1), registration_task).await;
+    assert!(
+        released,
+        "a claim committed by a registration task aborted with its actor must be released, \
+         not left fenced until its lease expires"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_joins_inflight_owner_renewal_before_cleanup_worker() {
     let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;

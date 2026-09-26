@@ -409,7 +409,10 @@ struct Connection {
     principal: Option<String>,
     workspace: String,
     limits: AcpLimits,
-    subscribe_deadline: Duration,
+    /// The connection GET's window and a session GET's window, bounded
+    /// separately (task row M8-C12).
+    connection_subscribe_deadline: Duration,
+    session_subscribe_deadline: Duration,
     state: Mutex<ConnectionState>,
     counters: Arc<Counters>,
     shutdown: CancellationToken,
@@ -847,7 +850,8 @@ impl AcpExport {
             principal: binding,
             workspace: validated.workspace.to_string_lossy().into_owned(),
             limits: validated.limits,
-            subscribe_deadline: validated.subscribe_deadline,
+            connection_subscribe_deadline: validated.connection_subscribe_deadline,
+            session_subscribe_deadline: validated.session_subscribe_deadline,
             state: Mutex::new(ConnectionState {
                 connection: Arc::new(Target::new()),
                 sessions: BTreeMap::new(),
@@ -1383,8 +1387,13 @@ async fn pump_stream(
 /// is recorded with the bound it exceeded, so a test reads what happened
 /// rather than the constant it was configured with.
 async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
-    let bound = connection.subscribe_deadline;
-    let bound_us = u64::try_from(bound.as_micros()).unwrap_or(u64::MAX);
+    // **Two windows, two bounds (M8-C12).** One configured value used to
+    // bound both, so shortening the session window shortened the connection
+    // window with it.
+    let connection_bound = connection.connection_subscribe_deadline;
+    let connection_bound_us = u64::try_from(connection_bound.as_micros()).unwrap_or(u64::MAX);
+    let session_bound = connection.session_subscribe_deadline;
+    let session_bound_us = u64::try_from(session_bound.as_micros()).unwrap_or(u64::MAX);
     let mut ticker = tokio::time::interval(WATCHDOG_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1422,7 +1431,7 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
             return;
         }
         let target = connection.with(|state| Arc::clone(&state.connection));
-        if !target.is_subscribed() && target.created.elapsed() > bound {
+        if !target.is_subscribed() && target.created.elapsed() > connection_bound {
             let elapsed = u64::try_from(target.created.elapsed().as_micros()).unwrap_or(u64::MAX);
             // The measurement is published **before** the counter that makes it
             // findable. A reader that sees the count and then reads a stale
@@ -1437,7 +1446,7 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
             connection
                 .counters
                 .last_expiry_bound_us
-                .store(bound_us, Ordering::Relaxed);
+                .store(connection_bound_us, Ordering::Relaxed);
             connection
                 .counters
                 .connection_subscribe_expired
@@ -1475,7 +1484,7 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 .filter(|target| {
                     !target.is_subscribed()
                         && !target.is_closed()
-                        && target.created.elapsed() > bound
+                        && target.created.elapsed() > session_bound
                 })
                 .cloned()
                 .collect()
@@ -1490,7 +1499,7 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
             connection
                 .counters
                 .last_expiry_bound_us
-                .store(bound_us, Ordering::Relaxed);
+                .store(session_bound_us, Ordering::Relaxed);
             connection
                 .counters
                 .session_subscribe_expired
@@ -1786,7 +1795,8 @@ mod ending_tests {
             principal: None,
             workspace: workspace.to_string_lossy().into_owned(),
             limits: export.inner.validated.limits,
-            subscribe_deadline: export.inner.validated.subscribe_deadline,
+            connection_subscribe_deadline: export.inner.validated.connection_subscribe_deadline,
+            session_subscribe_deadline: export.inner.validated.session_subscribe_deadline,
             state: Mutex::new(ConnectionState {
                 connection: Arc::new(Target::new()),
                 sessions: std::collections::BTreeMap::new(),

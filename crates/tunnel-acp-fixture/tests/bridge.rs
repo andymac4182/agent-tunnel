@@ -1003,7 +1003,9 @@ async fn a_connection_whose_subscriber_never_arrives_is_ended_after_its_measured
     let workspace = workspace();
     let export = acp_export_with(
         workspace.path(),
-        "[deadlines]\nsubscribe_ms = 200\npermission_ms = 60000\n",
+        // The session window at the ceiling, so only the connection window is
+        // in play here.
+        "[deadlines]\nconnection_subscribe_ms = 200\nsession_subscribe_ms = 600000\npermission_ms = 60000\n",
     );
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let started = Instant::now();
@@ -1088,26 +1090,61 @@ async fn the_documented_ten_second_deadline_is_the_one_that_elapses() {
     export.shutdown();
 }
 
+/// A short session window beside a connection window at the ceiling
+/// (`MAX_SUBSCRIBE_DEADLINE_MS`), so only the session's can close in a test.
+const SESSION_WINDOW_ONLY: &str =
+    "[deadlines]\nsession_subscribe_ms = 300\nconnection_subscribe_ms = 600000\n";
+
+/// **The connection window is not bounded by the session window** (M8-C12).
+///
+/// One configured `subscribe_ms` used to bound both. This shortens only the
+/// session window, then sends the connection GET well after that window
+/// would have closed -- deliberately late, rather than hoping a loaded
+/// machine is slow -- and requires the connection to still be there. With
+/// the shared bound restored the connection has expired by then and the GET
+/// is refused 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shortening_the_session_window_does_not_shorten_the_connection_window() {
+    let workspace = workspace();
+    let export = acp_export_with(
+        workspace.path(),
+        "[deadlines]\nsession_subscribe_ms = 200\nconnection_subscribe_ms = 600000\n",
+    );
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+    let connection = initialize(&export, &profile).await;
+
+    // Four session windows, and a margin of watchdog ticks past them. Load only
+    // lengthens this wait, which only makes a shared bound more certain to
+    // have fired.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let diagnostics = export.diagnostics();
+    assert_eq!(
+        diagnostics.connection_subscribe_expired, 0,
+        "the connection window must be its own bound, not the session's: {diagnostics:?}"
+    );
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    assert_eq!(
+        stream.status(),
+        StatusCode::OK,
+        "a connection GET inside the connection's own window is served"
+    );
+    assert_eq!(export.diagnostics().live_connections, 1);
+    drop(stream);
+    export.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
     let workspace = workspace();
-    // **1500 ms, not 300.** The bound applies to the *connection* GET as well
-    // as the session GET, and 300 ms is the wall time between `initialize`
-    // returning and this test getting round to sending the connection GET on a
-    // loaded machine. When that window closed first the connection ended, the
-    // session's window never expired, and this test failed for a reason that
-    // had nothing to do with what it measures. It surfaced as a test reddening
-    // at random across a whole guard-deletion suite, which is how it was
-    // found. The deadline is still observed and still elapses; only the
-    // fragility is gone.
-    //
-    // **1500 ms was not enough either.** Running all five ACP guard suites back
-    // to back keeps this machine compiling and running the workspace for half
-    // an hour, and the connection GET still missed a 1500 ms window under it.
-    // 5000 ms is chosen against that load rather than against an idle machine.
-    // The underlying coupling — one configuration value bounding two different
-    // windows — is what M8-C12 records as not fixed.
-    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 5000\n");
+    // **The session window only (M8-C12).** One `subscribe_ms` used to bound
+    // the *connection* GET as well, and on a loaded machine the wall time
+    // between `initialize` returning and this test sending the connection GET
+    // exceeded it: the connection's window closed first, the session's never
+    // expired, and this test reddened at random across the guard-deletion
+    // suites for a reason unrelated to what it measures. The windows are now
+    // bounded separately, so the session window is short and the connection
+    // window is set to the ceiling, which this test's own setup cannot reach.
+    let export = acp_export_with(workspace.path(), SESSION_WINDOW_ONLY);
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let connection = initialize(&export, &profile).await;
     let stream = send(&export, &profile, get_connection(&connection)).await;
@@ -1156,10 +1193,8 @@ async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_session_window_is_counted_once_not_once_per_watchdog_tick() {
     let workspace = workspace();
-    // 5000 ms for the reason recorded on the test above: this bound is shared
-    // with the connection GET, and a shorter one closes the wrong window
-    // first on a loaded machine.
-    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 5000\n");
+    // The session window only, for the reason recorded on the test above.
+    let export = acp_export_with(workspace.path(), SESSION_WINDOW_ONLY);
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let connection = initialize(&export, &profile).await;
     let stream = send(&export, &profile, get_connection(&connection)).await;
