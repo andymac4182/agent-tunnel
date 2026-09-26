@@ -826,7 +826,11 @@ class McpSessionPool:
     a load step measures concurrent MCP calls instead of the leaked-session
     bound.  A session is dropped from the pool only on 404 (the export no
     longer knows it); a timeout or connection error resets the worker's
-    connection, never the session, so it is not orphaned.
+    connection, never the session, so it is not orphaned.  A session whose
+    `notifications/initialized` failed is not usable: it is DELETEd at once or,
+    if that fails, kept in `orphans` so `close` DELETEs it.  `stats` accounts
+    for every opened session: deleted, a recorded DELETE failure, or forgotten
+    on 404; anything else is `unaccounted`.
     """
 
     def __init__(self, size: int):
@@ -835,10 +839,14 @@ class McpSessionPool:
         self.opened = 0
         self.deleted = 0
         self.delete_failures: dict[str, int] = {}
+        self.orphans: list[str] = []
+        self.forgotten_on_404 = 0
+        self.init_timeouts = 0
 
     def forget(self, slot: int, session: str) -> None:
         if self.sessions[slot] == session:
             self.sessions[slot] = None
+            self.forgotten_on_404 += 1
 
     async def close(self, worker: "Worker", attempts: int = 3) -> None:
         """DELETE every open session through `worker`'s connection.
@@ -847,10 +855,10 @@ class McpSessionPool:
         `CONNECTION_LIMIT`) is retried on a fresh connection, so a session is
         left to the export's idle expiry only after `attempts` failures.
         """
-        for slot, session in enumerate(self.sessions):
-            if session is None:
-                continue
-            self.sessions[slot] = None
+        pending = [x for x in self.sessions if x is not None] + self.orphans
+        self.sessions = [None] * len(self.sessions)
+        self.orphans = []
+        for session in pending:
             key = ""
             for attempt in range(attempts):
                 if attempt:
@@ -877,8 +885,24 @@ class McpSessionPool:
                 self.delete_failures[key] = self.delete_failures.get(key, 0) + 1
 
     def stats(self) -> dict:
+        failures = sum(self.delete_failures.values())
         return {"size": len(self.sessions), "opened": self.opened, "deleted": self.deleted,
-                "delete_failures": dict(self.delete_failures)}
+                "delete_failures": dict(self.delete_failures),
+                "forgotten_on_404": self.forgotten_on_404,
+                "init_timeouts": self.init_timeouts,
+                "unaccounted": self.opened - self.deleted - failures - self.forgotten_on_404}
+
+    def leaked(self) -> bool:
+        """True if a session may still hold an export slot after `close`."""
+        stats = self.stats()
+        return stats["unaccounted"] != 0 or any(
+            key == "HTTP_503" or key.startswith("CONN_") for key in self.delete_failures)
+
+
+def report_mcp_pool(stack: "Stack", pool: McpSessionPool, where: str) -> None:
+    """Make a possibly leaked session visible in the driver log (M6-C146)."""
+    if pool.leaked():
+        stack.event("mcp-session-leak", where=where, mcp_sessions=pool.stats())
 
 
 class Worker:
@@ -953,22 +977,40 @@ class Worker:
         init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-11-25", "capabilities": {},
             "clientInfo": {"name": "m6-03-soak", "version": "1"}}}).encode()
-        status, headers, body = await self.call("POST", base, init)
+        try:
+            status, headers, body = await self.call("POST", base, init)
+        except (asyncio.TimeoutError, TimeoutError):
+            # The export may have opened a session whose ID never arrived; only
+            # its idle expiry can end it.  Counted so the step shows it.
+            self.mcp_pool.init_timeouts += 1
+            raise
         if status != 200 or "mcp-session-id" not in headers:
             code, execution = classify(status, body)
             return None, (status, body, code or "MCP_INIT_NO_SESSION", execution, False)
         session = headers["mcp-session-id"]
         self.mcp_pool.opened += 1
         hdrs = {**base, "mcp-protocol-version": "2025-11-25", "mcp-session-id": session}
-        status, _, body = await self.call(
-            "POST", hdrs, b'{"jsonrpc":"2.0","method":"notifications/initialized"}')
+        try:
+            status, _, body = await self.call(
+                "POST", hdrs, b'{"jsonrpc":"2.0","method":"notifications/initialized"}')
+        except BaseException:
+            # A timeout or connection error here must not orphan the session:
+            # the pool's close DELETEs it.  The caller records the error.
+            self.mcp_pool.orphans.append(session)
+            raise
         if status != 202:
-            # Not usable: DELETE it rather than leave it holding a child slot.
+            # Not usable: DELETE it rather than leave it holding a child slot;
+            # if that fails, the pool's close tries again.
+            deleted = False
             try:
-                await self.delete_mcp_session(session)
+                deleted = await self.delete_mcp_session(session) in (200, 202, 204)
             except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError,
                     asyncio.IncompleteReadError, ssl.SSLError, ValueError, IndexError):
                 await self.conn.close()
+            if deleted:
+                self.mcp_pool.deleted += 1
+            else:
+                self.mcp_pool.orphans.append(session)
             code, execution = classify(status, body)
             return None, (status, body, code, execution, False)
         return session, None
@@ -1032,6 +1074,8 @@ class Worker:
     async def shutdown(self) -> None:
         if self.owns_pool:
             await self.mcp_pool.close(self)
+            if self.kind == "mcp":
+                report_mcp_pool(self.stack, self.mcp_pool, self.worker_id)
         await self.conn.close()
 
 
@@ -1252,6 +1296,7 @@ async def load(args: argparse.Namespace) -> None:
                     for w in workers:
                         await w.conn.close()
                     await pool.close(workers[0])
+                    report_mcp_pool(stack, pool, rec.phase)
                 for w in workers:
                     await w.shutdown()
                 s = summarize_rows(rec.rows, kind, rec.phase)
@@ -1261,7 +1306,7 @@ async def load(args: argparse.Namespace) -> None:
                 results.append(s)
                 stack.event("load-step-done", kind=kind, concurrency=concurrency,
                             ok_per_s=s["throughput_ok_per_s"], p99=s["latency_ms_ok"]["p99"],
-                            errors=s["errors_by_code"])
+                            errors=s["errors_by_code"], mcp_sessions=s.get("mcp_sessions"))
                 await asyncio.sleep(3)
     finally:
         if sampler:
