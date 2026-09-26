@@ -78,6 +78,9 @@ mod freeze_hold;
 use freeze_hold::sleep_until_hold_deadline;
 pub(crate) use freeze_hold::{ROTATION_FREEZE_ECHO_CODE, ROTATION_FREEZE_RETRY_AFTER_MS};
 
+#[path = "actor_connector_rejected.rs"]
+mod connector_rejected;
+
 #[path = "actor_http_stream.rs"]
 mod http_stream;
 pub(crate) use http_stream::{
@@ -10968,6 +10971,16 @@ impl RelayActor {
                 if rejected.session_id != key.session_id || rejected.epoch != key.epoch {
                     return;
                 }
+                // M7-C160: what the diagnostic below reports, captured before
+                // this REJECTED changes the session.
+                let rotation_phase = self.session_for(&key).and_then(|session| {
+                    session
+                        .rotation
+                        .as_ref()
+                        .map(|rotation| rotation.state.phase())
+                });
+                let mut matched = "none";
+                let mut relay_code = "none";
                 let mut unary_rejected = false;
                 if let Some(session) = self.session_mut(&key)
                     && session
@@ -11014,6 +11027,8 @@ impl RelayActor {
                     } else {
                         "DEVICE_REJECTED"
                     };
+                    matched = "unary";
+                    relay_code = code;
                     let _ = pending.response.send(EchoOutcome::Failure {
                         code,
                         execution: "not_dispatched",
@@ -11034,6 +11049,7 @@ impl RelayActor {
                     .and_then(|session| session.streams.get(&rejected.stream_id))
                     .is_some_and(|stream| stream.operation_id == rejected.operation_id);
                 if rejected_m2 {
+                    matched = "stream";
                     let pending = self
                         .session_for(&key)
                         .and_then(|session| session.streams.get(&rejected.stream_id))
@@ -11044,6 +11060,7 @@ impl RelayActor {
                                 && stream.open_message_id == rejected.reply_to
                         });
                     if pending {
+                        relay_code = "stream_closed";
                         let final_state = ResumeDirectionState {
                             stream_id: rejected.stream_id,
                             ..ResumeDirectionState::default()
@@ -11061,6 +11078,27 @@ impl RelayActor {
                         let _ = self.flush_owner_stream_forgets(&key);
                     }
                 }
+                connector_rejected::log_connector_rejected(
+                    &connector_rejected::ConnectorRejectedContext {
+                        tenant_id: &key.tenant_id,
+                        device_id: &key.device_id,
+                        session_id: &key.session_id,
+                        epoch: key.epoch,
+                        stream_id: rejected.stream_id,
+                        // Echoed by the device: logged only when it equals
+                        // the relay's own record for this stream.
+                        operation_id: if matched == "none" {
+                            "unmatched"
+                        } else {
+                            &rejected.operation_id
+                        },
+                        rotation_phase,
+                        matched,
+                        relay_code,
+                    },
+                    &rejected.code,
+                    &rejected.reason,
+                );
             }
             ControlMessage::AuthorizationInvalidated(invalidated) => {
                 if invalidated.session_id != key.session_id || invalidated.epoch != key.epoch {
