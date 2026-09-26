@@ -1052,12 +1052,52 @@ impl Gate<'_> {
                 // as a status for a caller to describe as a broken route.
                 return Err(HarnessError::Process(format!(
                     "ACP POST refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
-                     (coincided with an observed freeze: {coincides}); {}",
-                    self.freeze.unexplained()
+                     (coincided with an observed freeze: {coincides}); {}; M7-C130 forensics: \
+                     refusal code={} retry_after_ms={}; {}",
+                    self.freeze.unexplained(),
+                    serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|value| value
+                            .pointer("/error/code")
+                            .or_else(|| value.get("code"))
+                            .cloned())
+                        .map_or("-".to_owned(), |code| code.to_string()),
+                    headers
+                        .get("x-agent-tunnel-retry-after-ms")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("-"),
+                    self.membership_forensics().await,
                 )));
             }
             return Ok((status, headers, body));
         }
+    }
+
+    /// Per-relay membership, peer and ownership state for a refusal, payload
+    /// free: readiness labels, counters and the pin/fault forensics line.
+    async fn membership_forensics(&self) -> String {
+        let mut parts = vec![self.cluster.peer_path_forensics().await];
+        for relay in self
+            .cluster
+            .relays
+            .iter()
+            .filter(|relay| relay.running.is_some())
+        {
+            let membership = relay.membership.snapshot();
+            let owned = match tokio::time::timeout(Duration::from_secs(2), relay.snapshot()).await {
+                Ok(Ok(snapshot)) => format!("sessions={}", snapshot.sessions.len()),
+                Ok(Err(error)) => format!("snapshot_error={error}"),
+                Err(_) => "snapshot_timed_out".to_owned(),
+            };
+            parts.push(format!(
+                "{}: membership={:?} generation={} active_peers={} {owned}",
+                relay.node_id,
+                membership.readiness,
+                membership.generation,
+                membership.active_peer_count
+            ));
+        }
+        parts.join(" || ")
     }
 
     /// Open an SSE stream and hold it.
