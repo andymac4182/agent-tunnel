@@ -755,6 +755,25 @@ ROUTE_PROOF_CASES: list[Case] = [
                 "a_pin_addition_keeps_a_route_proven_with_a_still_approved_key"
             }
         ),
+    ),    Case(
+        # An unreachable mark must withdraw the proof with the reachability,
+        # or a later overlap record could preserve evidence for a route the
+        # request path had just seen fail.
+        "an unreachable mark withdraws the route's probe proof",
+        [
+            (
+                PEER_READINESS,
+                "            required.available_capacity = None;\n"
+                "            required.proven_spki = None;\n",
+                "            required.available_capacity = None;\n",
+            )
+        ],
+        frozenset(
+            {
+                "peer_runtime::peer_readiness::tests::"
+                "an_unreachable_route_is_not_revived_by_an_overlap_record"
+            }
+        ),
     ),
 ]
 
