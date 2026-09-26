@@ -560,11 +560,13 @@ impl ActorSink for mpsc::Sender<HttpActorRequest> {
 /// until the last sender is dropped. The exchange task's own sink is such a
 /// sender, so an unbounded wait could only end by aborting the task. A reply
 /// sent before the receiver went away is still returned; `None` means none.
+/// The closed signal is polled first so such a reply is taken by the
+/// `try_recv` arm deterministically.
 async fn actor_reply<S: ActorSink, T>(sink: &S, receiver: &mut oneshot::Receiver<T>) -> Option<T> {
     tokio::select! {
         biased;
-        reply = &mut *receiver => reply.ok(),
         () = sink.closed() => receiver.try_recv().ok(),
+        reply = &mut *receiver => reply.ok(),
     }
 }
 
@@ -747,6 +749,20 @@ mod stranded_reply_tests {
     }
 
     const BOUND: Duration = Duration::from_secs(2);
+
+    /// A reply the actor sent before its receiver went away is still
+    /// returned: the reply is sent, then the receiver dropped, then waited on.
+    #[tokio::test]
+    async fn a_reply_sent_before_the_actor_receiver_closed_is_still_returned() {
+        let (sink, actor_rx) = mpsc::channel::<HttpActorRequest>(1);
+        let (reply, mut receiver) = tokio::sync::oneshot::channel();
+        reply.send(true).expect("receiver alive");
+        drop(actor_rx);
+        let outcome = tokio::time::timeout(BOUND, super::actor_reply(&sink, &mut receiver))
+            .await
+            .expect("the reply wait returns once the actor's receiver is gone");
+        assert_eq!(outcome, Some(true));
+    }
 
     #[tokio::test]
     async fn a_stranded_write_behind_an_exited_actor_reports_carrier_closed() {

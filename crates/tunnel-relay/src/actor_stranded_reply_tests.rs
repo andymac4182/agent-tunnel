@@ -20,7 +20,10 @@ use std::{
 use chrono::{Duration as ChronoDuration, Utc};
 use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
-use tunnel_catalog::{ApprovedJwk, DeviceIdentity, MemoryCatalog, OidcConfig, OidcVerifier};
+use tunnel_catalog::{
+    ApprovedJwk, AuthenticatedConsumer, DeviceIdentity, GrantSnapshot, MemoryCatalog, OidcConfig,
+    OidcVerifier, PermissionSet,
+};
 use uuid::Uuid;
 
 use super::{
@@ -96,6 +99,248 @@ async fn a_stranded_snapshot_returns_shutdown() {
         .expect("a snapshot stranded behind an ended actor waited for a reply it could never get");
     assert!(matches!(outcome, Err(RelayError::Shutdown)));
     assert_parked(owner).await;
+}
+
+const TENANT: Uuid = Uuid::from_u128(1);
+const DEVICE: Uuid = Uuid::from_u128(2);
+const PRINCIPAL: Uuid = Uuid::from_u128(3);
+const SERVICE: Uuid = Uuid::from_u128(5);
+
+fn device_identity() -> DeviceIdentity {
+    let now = Utc::now();
+    DeviceIdentity {
+        tenant_id: TENANT,
+        device_id: DEVICE,
+        owner_user_id: PRINCIPAL,
+        credential_id: Uuid::from_u128(4),
+        spki_fingerprint: "stranded-spki".to_owned(),
+        credential_not_before: now - ChronoDuration::minutes(1),
+        expires_at: now + ChronoDuration::minutes(1),
+        credential_revoked_at: None,
+        device_active: true,
+        credential_active: true,
+        device_version: 1,
+        owner_epoch: 1,
+        last_seen_at: Some(now),
+    }
+}
+
+/// A device TLS identity parsed by the transport crate's own leaf parser
+/// from a synthetic self-signed certificate carrying the device role URI.
+fn tls_identity() -> tunnel_transport::TlsIdentity {
+    let key = rcgen::KeyPair::generate().expect("synthetic key");
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        format!("urn:agent-tunnel:device:{DEVICE}")
+            .try_into()
+            .expect("URI"),
+    ));
+    let certificate = params.self_signed(&key).expect("synthetic certificate");
+    tunnel_transport::leaf_identity_from_der(certificate.der()).expect("device identity")
+}
+
+fn hello() -> tunnel_protocol::Hello {
+    tunnel_protocol::Hello::new(
+        "stranded-registration",
+        DEVICE.to_string(),
+        u16::from(crate::PROTOCOL_MAJOR),
+        0,
+    )
+}
+
+fn consumer() -> AuthenticatedConsumer {
+    AuthenticatedConsumer {
+        tenant_id: TENANT,
+        principal_id: PRINCIPAL,
+    }
+}
+
+fn grant() -> GrantSnapshot {
+    let now = Utc::now();
+    GrantSnapshot {
+        tenant_id: TENANT,
+        principal_id: PRINCIPAL,
+        device_id: DEVICE,
+        service_id: SERVICE,
+        revision: 1,
+        permissions: PermissionSet {
+            operations: std::collections::BTreeSet::from(["echo:invoke".to_owned()]),
+        },
+        constraints: serde_json::json!({}),
+        valid_until: now + ChronoDuration::minutes(1),
+        read_started_at: now,
+    }
+}
+
+fn expires() -> chrono::DateTime<Utc> {
+    Utc::now() + ChronoDuration::minutes(1)
+}
+
+#[tokio::test]
+async fn a_stranded_control_registration_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.register_control(
+            tls_identity(),
+            tunnel_protocol::ControlMessage::Hello(hello()),
+        ),
+    )
+    .await
+    .expect("a registration stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_forwarded_control_registration_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.register_forwarded_control(device_identity(), "stranded-spki".to_owned(), hello()),
+    )
+    .await
+    .expect("a registration stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_data_attach_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.attach_data(tls_identity(), "ticket".to_owned()),
+    )
+    .await
+    .expect("an attach stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_forwarded_echo_open_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.open_forwarded_echo_stream(
+            consumer(),
+            DEVICE,
+            SERVICE,
+            grant(),
+            expires(),
+            "request".to_owned(),
+        ),
+    )
+    .await
+    .expect("an OPEN stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_http_open_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.open_http_stream(consumer(), DEVICE, SERVICE, grant(), expires(), None),
+    )
+    .await
+    .expect("an OPEN stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_fs_open_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.open_fs_stream(
+            consumer(),
+            DEVICE,
+            SERVICE,
+            grant(),
+            expires(),
+            None,
+            "read".to_owned(),
+        ),
+    )
+    .await
+    .expect("an OPEN stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+#[tokio::test]
+async fn a_stranded_echo_dispatch_returns_shutdown() {
+    let (handle, owner) = stranded_handle().await;
+    let outcome = timeout(
+        BOUND,
+        handle.dispatch_echo(
+            consumer(),
+            DEVICE,
+            SERVICE,
+            grant(),
+            b"x".to_vec(),
+            expires(),
+        ),
+    )
+    .await
+    .expect("a dispatch stranded behind an ended actor waited for a reply it could never get");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
+    assert_parked(owner).await;
+}
+
+/// The completion arm must still return a reply the actor sent before it
+/// ended: the reply is sent, then completion is recorded, then waited on.
+#[tokio::test]
+async fn a_reply_sent_before_the_actor_ended_is_still_returned() {
+    let completion = ActorCompletion::default();
+    let (response, mut receiver) = tokio::sync::oneshot::channel();
+    response.send(42_u32).expect("receiver alive");
+    completion.mark_done(false);
+    let reply = timeout(BOUND, completion.reply(&mut receiver))
+        .await
+        .expect("the reply wait returns once the actor has ended");
+    assert_eq!(reply, Some(42));
+}
+
+/// Aborting the actor or maintenance task by any route -- here the join
+/// handle directly, not `abort_actor_task` -- must still record completion,
+/// or every later reply wait on the handle would be unbounded again.
+#[tokio::test]
+async fn aborting_the_actor_and_maintenance_tasks_records_their_completion() {
+    let handle = spawned_handle();
+    let actor = handle
+        .actor_task
+        .lock()
+        .expect("actor slot")
+        .take()
+        .expect("actor task");
+    let maintenance = handle
+        .maintenance_task
+        .lock()
+        .expect("maintenance slot")
+        .take()
+        .expect("maintenance task");
+    actor.abort();
+    maintenance.abort();
+    let _ = actor.await;
+    let _ = maintenance.await;
+    assert!(
+        handle.actor_completion.done.load(Ordering::Acquire),
+        "an aborted actor task left its completion unset"
+    );
+    assert!(handle.actor_completion.failed());
+    assert!(
+        handle.maintenance_completion.done.load(Ordering::Acquire),
+        "an aborted maintenance task left its completion unset"
+    );
+    let outcome = timeout(BOUND, handle.snapshot())
+        .await
+        .expect("a request to an aborted actor returns");
+    assert!(matches!(outcome, Err(RelayError::Shutdown)));
 }
 
 #[tokio::test]

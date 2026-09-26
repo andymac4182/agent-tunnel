@@ -370,12 +370,28 @@ impl ActorCompletion {
     /// sender, so an unbounded `receiver.await` would wait forever after an
     /// actor panic or abort. A finished actor answers nothing more; a reply
     /// it sent before it finished is still returned. `None` means no reply.
+    ///
+    /// Completion is polled first so that a reply already sent by an actor
+    /// that has since ended is taken by the `try_recv` arm deterministically
+    /// (the actor sends before it records completion).
     async fn reply<T>(&self, receiver: &mut oneshot::Receiver<T>) -> Option<T> {
         tokio::select! {
             biased;
-            reply = &mut *receiver => reply.ok(),
             () = self.wait() => receiver.try_recv().ok(),
+            reply = &mut *receiver => reply.ok(),
         }
+    }
+}
+
+/// Records an actor or maintenance task's completion as aborted if its future
+/// is dropped before it records an outcome itself, so every abort route --
+/// including one that never reaches `abort_actor_task`, or a task aborted
+/// before its first poll -- leaves the completion set (task row M6-C162).
+struct CompletionOnDrop(ActorCompletion);
+
+impl Drop for CompletionOnDrop {
+    fn drop(&mut self) {
+        self.0.mark_aborted();
     }
 }
 
@@ -2413,21 +2429,24 @@ impl RelayHandle {
         // Keep the actor failure boundary attached to the relay-wide
         // cancellation token.  A panic in the actor must not leave listener
         // tasks serving with no owner for their state.
+        let actor_completion = CompletionOnDrop(actor_completion);
         let actor_task = tokio::spawn(async move {
+            let completion = actor_completion;
             let failed = AssertUnwindSafe(actor.run()).catch_unwind().await.is_err();
             // Any actor termination leaves the listener pair without an
             // owner, including a normal explicit shutdown or a terminal
             // cleanup overflow.  Propagate it to every relay task.
             actor_cancel.cancel();
-            actor_completion.mark_done(failed);
+            completion.0.mark_done(failed);
         });
         *actor_task_slot
             .lock()
             .expect("actor task slot mutex poisoned") = Some(actor_task);
         let ticker = handle.clone();
         let maintenance_shared_cancel = maintenance_cancel.clone();
-        let maintenance_completion_for_task = maintenance_completion.clone();
+        let maintenance_completion_for_task = CompletionOnDrop(maintenance_completion.clone());
         let maintenance_task = tokio::spawn(async move {
+            let completion = maintenance_completion_for_task;
             let failed = AssertUnwindSafe(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(500));
                 loop {
@@ -2452,7 +2471,7 @@ impl RelayHandle {
             if failed && !maintenance_shared_cancel.is_cancelled() {
                 maintenance_shared_cancel.cancel();
             }
-            maintenance_completion_for_task.mark_done(failed);
+            completion.0.mark_done(failed);
         });
         *maintenance_task_slot
             .lock()
