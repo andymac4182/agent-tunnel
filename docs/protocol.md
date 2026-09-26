@@ -495,9 +495,13 @@ data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
    Initial snapshots establish immutable obligations: each local receive
    cursor must cover the peer's emitted fence, and each local emitted fence
    must be acknowledged. The peer's SNAPSHOT receive cursor is itself that
-   acknowledgement, applied as a cumulative ACK on receipt: an ACK for a frame
-   received on the failed carrier can die with it, and a peer with nothing to
-   replay and frozen writes sends no later frame to carry another (M6-C163). Track progress against those fences; do not compare
+   acknowledgement. Each endpoint applies it as a cumulative ACK once the
+   complete SNAPSHOT pair has reconciled, never before and never for a pair
+   that fails reconciliation: the connector when it queues its replay, the
+   relay when it prepares its replay plans, before READY. An ACK for a frame
+   received on the failed carrier can die with that carrier, and a peer with
+   nothing to replay and frozen writes sends no later frame to carry another
+   (M6-C163). Track progress against those fences; do not compare
    an advanced acknowledgement cursor against a stale initial snapshot as if
    it were a new peer assertion. ACKs, window updates and in-range replay must
    remain processable before activation. Replay rides the candidate data socket and the

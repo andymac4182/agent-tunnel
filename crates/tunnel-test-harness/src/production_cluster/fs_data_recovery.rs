@@ -122,8 +122,8 @@ use super::{
 use crate::acceptance::helpers::write_device_profile;
 use crate::oidc::OidcTokenOptions;
 use crate::{
-    Direction as ProxyDirection, Harness, HarnessError, HarnessOptions, ProxyConfig, ProxyHandle,
-    Result, TcpProxy,
+    ConnectionId, Direction as ProxyDirection, Harness, HarnessError, HarnessOptions, ProxyConfig,
+    ProxyHandle, Result, TcpProxy,
 };
 
 /// The subprotocol the server must select.
@@ -185,6 +185,51 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(60);
 const POST_RECOVERY_REPLY: Duration = Duration::from_secs(30);
 /// The poll interval for every bounded wait here.
 const POLL: Duration = Duration::from_millis(20);
+
+/// Upper bound on unread `Tread`s sent to find the one whose reply the
+/// device parks for send credit ([`FailurePoint::ReplyParkedForCredit`]).
+/// The relay's receive window is 128 KiB and every `Rread` here is one
+/// 64 KiB message, and the relay grants more only as the consumer reads,
+/// which it does not do until after the recovery; so at most two replies can
+/// be sent before one is parked.  The bound only turns a wrong credit
+/// assumption into a named failure.
+const MAX_CREDIT_PROBE_READS: usize = 4;
+
+/// How long the device's emit cursor must hold still after it received a
+/// `Tread` for the reply to count as parked.  Credit exhaustion is what parks
+/// it; an answerable reply is emitted within milliseconds of the request
+/// (every filler in the measured runs), so the window only has to exceed
+/// that, and the emit cursor is checked again at the instant of failure.
+const DEVICE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Where in the held exchange the data socket is destroyed (M6-C163).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FailurePoint {
+    /// After the device has produced the held `Rread` into the paused
+    /// direction: the reply dies with the carrier and is replayed, and the
+    /// replayed frame's cumulative ACK covers the `Tread`.  Gate 11.
+    #[default]
+    ReplyProduced,
+    /// After the device has **received** the held `Tread` but while its
+    /// `Rread` is parked for send credit, which earlier unread replies have
+    /// spent.  The device's ACK for the `Tread` dies with the carrier, no
+    /// frame it replays was emitted after the `Tread` arrived, and its writes
+    /// stay frozen until READY, so the relay learns the `Tread` was received
+    /// only from the device's SNAPSHOT.  This is the lost-ACK state M6-C163
+    /// fixed; gate 11b.
+    ReplyParkedForCredit,
+}
+
+impl FailurePoint {
+    /// The fixed label printed with the evidence.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReplyProduced => "reply_produced",
+            Self::ReplyParkedForCredit => "reply_parked_for_credit",
+        }
+    }
+}
 /// The whole scenario's bound.
 ///
 /// Deliberately far below the device's default 300-second rotation interval,
@@ -374,6 +419,19 @@ pub struct FsDataRecoveryEvidence {
     /// version of it would need the client to count sends, which no fs gate
     /// does.
     pub attach_count: usize,
+
+    /// Where the socket was destroyed in the held exchange (M6-C163).
+    pub failure_point: FailurePoint,
+    /// Unread `Tread`s the device answered ahead of the held one, spending
+    /// its send credit ([`FailurePoint::ReplyParkedForCredit`] only; zero
+    /// otherwise).
+    pub credit_filler_reads: usize,
+    /// Whether the device had received the held `Tread` when the socket died.
+    pub device_received_held_request: bool,
+    /// Whether, when the socket died, the device held the held `Tread`'s
+    /// reply in its pending-output queue with its emit cursor unmoved: parked
+    /// for credit, not sent.
+    pub device_reply_parked: bool,
 }
 
 impl FsDataRecoveryEvidence {
@@ -619,6 +677,16 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// # Errors
 /// Any harness, cluster or validation failure.
 pub async fn verify() -> Result<FsDataRecoveryEvidence> {
+    verify_at(FailurePoint::ReplyProduced).await
+}
+
+/// Run the gate with the data socket destroyed at `point` in the held
+/// exchange.
+///
+/// # Errors
+/// Any harness, cluster or validation failure, including a run that did not
+/// reach `point`.
+pub async fn verify_at(point: FailurePoint) -> Result<FsDataRecoveryEvidence> {
     let options = HarnessOptions::from_env()?.fs_services(true);
     let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
         .await
@@ -632,7 +700,7 @@ pub async fn verify() -> Result<FsDataRecoveryEvidence> {
             return Err(error);
         }
     };
-    let scenario = match timeout(SCENARIO_TIMEOUT, run(&mut cluster, &harness)).await {
+    let scenario = match timeout(SCENARIO_TIMEOUT, run(&mut cluster, &harness, point)).await {
         Ok(result) => result.and_then(|evidence| {
             if let Err(error) = validate_fs_data_recovery_evidence(&evidence) {
                 // Payload-free: identifiers, labels and counters only.  A
@@ -665,10 +733,12 @@ pub async fn verify() -> Result<FsDataRecoveryEvidence> {
 async fn run(
     cluster: &mut ProductionCluster,
     harness: &RunningHarness,
+    point: FailurePoint,
 ) -> Result<FsDataRecoveryEvidence> {
     let mut evidence = FsDataRecoveryEvidence {
         relay_count: cluster.relays.len(),
         transfer_expected_bytes: RECOVERY_FILE_BYTES,
+        failure_point: point,
         ..FsDataRecoveryEvidence::default()
     };
     let device = harness
@@ -866,6 +936,7 @@ async fn exercise(
     session_id: &str,
     evidence: &mut FsDataRecoveryEvidence,
 ) -> Result<()> {
+    let point = evidence.failure_point;
     // The owner claim, so the gate is speaking to the relay that owns the
     // device rather than to whichever relay answered first.  The token read
     // here is also the **before** half of the same-owner qualifier.
@@ -1030,39 +1101,151 @@ async fn exercise(
         observation.emitted_before = stream.last_emitted_relay_to_connector;
         observation.recv_contiguous_before = stream.recv_contiguous_connector_to_relay;
     }
-    // The device's own emit cursor, also fixed while paused: step 5 waits for
-    // it to move, which is the device sequencing the `Rread` into the paused
-    // direction (M6-C163).
-    let device_emitted_before = client.status_snapshot().emitted_sequences;
+    // The device's own cursors, also fixed while paused.  `ConnectionStatus`
+    // reports them summed over every stream, so they are this stream's
+    // cursors only while the device carries exactly this one stream, which is
+    // checked rather than assumed.
+    let device_before = client.status_snapshot();
+    if device_before.streams != 1 {
+        let _ = proxy
+            .resume(ProxyDirection::ClientToTarget, connection)
+            .await;
+        return Err(HarnessError::Process(format!(
+            "the device carries {} streams, so its summed cursors are not this stream's",
+            device_before.streams
+        )));
+    }
+    let device_emitted_before = device_before.emitted_sequences;
+    let mut next_offset = transferred.len() as u64;
+    let mut filler_tags = Vec::new();
 
-    // 4. Send one Tread and deliberately do not read its reply.  The request
-    //    crosses on the still-flowing relay→connector direction; the device
-    //    performs it and sequences the Rread into the paused socket.
-    let held_offset = transferred.len() as u64;
-    let held_tag = session
-        .send(Message::Tread {
-            fid: FILE_FID,
-            offset: held_offset,
-            count: READ_COUNT,
-        })
-        .await?;
+    // 4. Send the held Tread and deliberately do not read its reply.  The
+    //    request crosses on the still-flowing relay→connector direction.
+    //
+    //    `ReplyParkedForCredit` sends unread Treads until the device parks
+    //    one's reply for send credit.  Each is classified from the device's
+    //    own status once it has received the request: an emit cursor that
+    //    moved means the reply was sent into the paused direction (a filler,
+    //    and the next Tread is sent once emission has settled); an emit
+    //    cursor that holds still for [`DEVICE_SETTLE`] means the reply is
+    //    parked, and that Tread is the held one.
+    let held_tag = match point {
+        FailurePoint::ReplyProduced => {
+            let tag = session
+                .send(Message::Tread {
+                    fid: FILE_FID,
+                    offset: next_offset,
+                    count: READ_COUNT,
+                })
+                .await?;
+            next_offset += u64::from(READ_COUNT);
+            tag
+        }
+        FailurePoint::ReplyParkedForCredit => loop {
+            if filler_tags.len() >= MAX_CREDIT_PROBE_READS {
+                let _ = proxy
+                    .resume(ProxyDirection::ClientToTarget, connection)
+                    .await;
+                return Err(HarnessError::Process(format!(
+                    "the device answered {MAX_CREDIT_PROBE_READS} unread Treads without \
+                     parking a reply for credit"
+                )));
+            }
+            let before = client.status_snapshot();
+            let tag = session
+                .send(Message::Tread {
+                    fid: FILE_FID,
+                    offset: next_offset,
+                    count: READ_COUNT,
+                })
+                .await?;
+            next_offset += u64::from(READ_COUNT);
+            let deadline = Instant::now() + WAIT;
+            let mut received_at: Option<Instant> = None;
+            let parked = loop {
+                let now = client.status_snapshot();
+                if now.received_sequences > before.received_sequences {
+                    // Answered, wholly or in part.  A reply split across
+                    // frames may be sent in part and parked for the rest; the
+                    // next Tread's reply then queues behind it.
+                    if now.emitted_sequences > before.emitted_sequences {
+                        break false;
+                    }
+                    // Received, and nothing emitted for the settle window
+                    // since: parked for credit.  The filesystem stream parks
+                    // a reply inside its own stream state, not in the
+                    // connector's pending-output queue, so the emit cursor
+                    // holding still is the observable.
+                    let since = *received_at.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= DEVICE_SETTLE {
+                        break true;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    let _ = proxy
+                        .resume(ProxyDirection::ClientToTarget, connection)
+                        .await;
+                    return Err(HarnessError::Process(format!(
+                        "an unread Tread was neither answered nor parked by the device: \
+                         received={}->{} emitted={}->{} queue_frames={}->{}",
+                        before.received_sequences,
+                        now.received_sequences,
+                        before.emitted_sequences,
+                        now.emitted_sequences,
+                        before.queue_frames,
+                        now.queue_frames
+                    )));
+                }
+                sleep(POLL).await;
+            };
+            if parked {
+                break tag;
+            }
+            // Answered: let whatever the device can send reach the paused
+            // direction before the next Tread, so no frame it emits after the
+            // held Tread's arrival can carry an ACK of it.
+            let deadline = Instant::now() + WAIT;
+            let mut last = client.status_snapshot().emitted_sequences;
+            loop {
+                sleep(POLL * 5).await;
+                let now = client.status_snapshot().emitted_sequences;
+                if now == last {
+                    break;
+                }
+                last = now;
+                if Instant::now() >= deadline {
+                    let _ = proxy
+                        .resume(ProxyDirection::ClientToTarget, connection)
+                        .await;
+                    return Err(HarnessError::Process(
+                        "a credit-filler reply never stopped emitting".into(),
+                    ));
+                }
+            }
+            filler_tags.push(tag);
+        },
+    };
+    let _ = next_offset;
+    evidence.credit_filler_reads = filler_tags.len();
     evidence.held_tag = held_tag;
+    let device_received_before = device_before.received_sequences;
 
     // 5. Wait for the owner to show the request dispatched and unanswered,
-    //    **and** for the device to have sequenced its reply into the paused
-    //    direction, then destroy the data socket.  The owner's cursors move
-    //    when the relay *emits* the `Tread`, not when the device has it: on
-    //    the owner's evidence alone the socket could die with the `Tread`
-    //    still in flight, or delivered but not yet answered, and which of
-    //    those happened was socket timing (M6-C163: with Nagle on the relay's
-    //    accepted socket the `Tread` died in flight and the relay replayed it;
-    //    with `TCP_NODELAY` it arrived and the socket died before the device
-    //    answered, so nothing was replayed at all).  Waiting for the device's
-    //    emit cursor makes step 6's premise -- a produced `Rread` dies inside
-    //    the failed carrier -- a measured condition rather than a race.
+    //    and for the device to reach the chosen point, then destroy the data
+    //    socket.  The owner's cursors move when the relay *emits* the `Tread`,
+    //    not when the device has it, so on the owner's evidence alone the
+    //    socket could die with the `Tread` in flight, delivered but not yet
+    //    answered, or answered, and which one happened was socket timing
+    //    (M6-C163: with Nagle on the relay's accepted socket it died in
+    //    flight; with `TCP_NODELAY` it was delivered and unanswered).  The
+    //    device's own cursors make the point a measured condition:
+    //    `ReplyProduced` waits for its emit cursor to move (the `Rread` is in
+    //    the paused direction); `ReplyParkedForCredit` has already seen the
+    //    reply parked above and re-checks it at the instant of failure.
     {
         let deadline = Instant::now() + WAIT;
         let mut polls = 0_usize;
+        let parked_emitted = client.status_snapshot().emitted_sequences;
         loop {
             polls += 1;
             let snapshot = owner_snapshot(cluster).await?;
@@ -1077,13 +1260,21 @@ async fn exercise(
                     recv_contiguous_at_failure: stream.recv_contiguous_connector_to_relay,
                     ..observation.clone()
                 };
-                // Only a sample that actually shows the record dispatched and
-                // unanswered, with the device's reply already produced into
-                // the paused direction, ends the wait.
-                if sample.request_outstanding_at_failure()
-                    && client.status_snapshot().emitted_sequences > device_emitted_before
-                {
+                let device = client.status_snapshot();
+                let reached = match point {
+                    FailurePoint::ReplyProduced => device.emitted_sequences > device_emitted_before,
+                    FailurePoint::ReplyParkedForCredit => {
+                        device.emitted_sequences == parked_emitted
+                    }
+                };
+                // Only a sample that shows the record dispatched and
+                // unanswered, with the device at the chosen point, ends the
+                // wait.
+                if sample.request_outstanding_at_failure() && reached {
                     evidence.failure_polls = polls;
+                    evidence.device_received_held_request =
+                        device.received_sequences > device_received_before;
+                    evidence.device_reply_parked = point == FailurePoint::ReplyParkedForCredit;
                     observation = sample;
                     break;
                 }
@@ -1093,11 +1284,14 @@ async fn exercise(
                 let _ = proxy
                     .resume(ProxyDirection::ClientToTarget, connection)
                     .await;
+                let device = client.status_snapshot();
                 return Err(HarnessError::Process(format!(
                     "the held Tread was never observed dispatched and unanswered at the owner \
-                     with the device's reply produced into the paused direction: \
-                     device_emitted_before={device_emitted_before} device_emitted_now={}",
-                    client.status_snapshot().emitted_sequences
+                     with the device at point {}: device_emitted_before={device_emitted_before} \
+                     device_emitted_now={} queue_frames={}",
+                    point.label(),
+                    device.emitted_sequences,
+                    device.queue_frames
                 )));
             }
             sleep(POLL).await;
@@ -1258,6 +1452,24 @@ async fn exercise(
     // reports as "exceeded its bounded deadline" with nothing attached.  A
     // timeout per step keeps the failure attributable to a named step and lets
     // that dump execute.
+    // `ReplyParkedForCredit`: the unread filler replies come first, in order,
+    // on the same fid.
+    for filler_tag in filler_tags {
+        let reply = timeout(POST_RECOVERY_REPLY, session.recv_frame())
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout(
+                    "a credit-filler reply never arrived on the replacement carrier".into(),
+                )
+            })??;
+        match reply.message {
+            Message::Rread { data } if reply.tag == filler_tag && !data.is_empty() => {
+                messages += 1;
+                transferred.extend_from_slice(&data);
+            }
+            other => return Err(unexpected("the credit-filler Rread", &other)),
+        }
+    }
     let held = timeout(POST_RECOVERY_REPLY, session.recv_frame())
         .await
         .map_err(|_| {
@@ -1414,6 +1626,10 @@ mod tests {
             attach_fid_survived_walk: true,
             post_recovery_tag_correlated: true,
             attach_count: 1,
+            failure_point: FailurePoint::ReplyProduced,
+            credit_filler_reads: 0,
+            device_received_held_request: true,
+            device_reply_parked: false,
         }
     }
 

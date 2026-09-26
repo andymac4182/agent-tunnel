@@ -48,6 +48,9 @@ gate "M4 filesystem gate 10: a 9P mutation outstanding while the connector's rea
 gate "M4 filesystem gate 11: a 9P session held across the replacement of a failed data socket, resumed by retained recovery (M4-29)" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-data-recovery
 
+gate "M4 filesystem gate 11b: the same failure while the device's reply is parked for credit, so its ACK for the held Tread is lost (M6-C163)" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-data-recovery-lost-ack
+
 gate "M4 filesystem gate 12: a Twrite and a Tflush held across two real scheduled rotations, classified from the export's own host directory" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation-write
 

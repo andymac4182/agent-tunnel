@@ -187,8 +187,9 @@ pub use fs_consumer_loss::{
     verify as verify_fs_consumer_loss,
 };
 pub use fs_data_recovery::{
-    FailureObservation, FsDataRecoveryEvidence, validate_fs_data_recovery_evidence,
-    verify as verify_fs_data_recovery,
+    FailureObservation, FailurePoint as FsDataRecoveryFailurePoint, FsDataRecoveryEvidence,
+    validate_fs_data_recovery_evidence, verify as verify_fs_data_recovery,
+    verify_at as verify_fs_data_recovery_at,
 };
 pub use fs_epoch_change::{
     EpochChangeObservation, FsEpochChangeEvidence, validate_fs_epoch_change_evidence,

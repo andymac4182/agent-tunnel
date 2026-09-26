@@ -2007,6 +2007,32 @@ reissued (**M4-52**). With all four fixed the gate is green on both hosts and
 runs in the `m4-acceptance` CI job. When it fails it prints the connector's
 terminal error and the owner's session terminal reasons, both payload-free.
 
+### Implementation gate 11b: the same failure with the ACK for the held request lost (`verify-m4-fs-data-recovery-lost-ack`)
+
+Gate 11 destroys the data socket once the device has **produced** the held
+`Rread` into the paused direction. That reply is replayed on the successor, and
+its cumulative ACK covers the held `Tread`, so gate 11 never reaches the state
+task row M6-C163 fixed and passes with that fix reverted (measured locally).
+Gate 11b, the same scenario in
+`crates/tunnel-test-harness/src/production_cluster/fs_data_recovery.rs`
+(`FailurePoint::ReplyParkedForCredit`) and registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh), destroys the
+socket after the device has **received** the held `Tread` while its reply is
+parked for send credit. The consumer sends unread `Tread`s with the
+connector-to-relay direction paused; each is classified from the device's own
+status once received: an emit cursor that moves is a filler whose reply was
+sent (and is waited on until emission settles), and an emit cursor that holds
+still for 500 ms is the held request, its reply parked because the unread
+fillers spent the relay's 128 KiB window. The device's ACK for the held
+`Tread` dies with the socket, and no frame it replays was emitted after that
+`Tread` arrived, so the relay can learn of the receipt only from the device's
+SNAPSHOT. The gate then asserts everything gate 11 does, reading the filler
+replies before the held one. The device's cursors are summed over its streams,
+so the gate refuses a run in which the device carries more than this one
+stream. With the M6-C163 fix reverted, gate 11b fails with `retained recovery
+failed` at the recovery deadline; with it, it passes.
+
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.
