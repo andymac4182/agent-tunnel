@@ -52,6 +52,7 @@ use tokio_tungstenite::{
     },
 };
 use tokio_util::sync::CancellationToken;
+use tunnel_protocol::open_refusal::{self, OpenRefusal};
 use tunnel_protocol::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
     CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
@@ -1595,32 +1596,24 @@ impl SessionActor {
         let export = self.config.exports.get(&open.service_id).cloned();
         if !self.accepting {
             return self
-                .send_rejected(&open, "GOAWAY", "connector is draining")
+                .send_rejected(&open, open_refusal::CONNECTOR_DRAINING)
                 .await;
         }
         if self.streams.len() >= self.config.limits.max_streams {
-            return self
-                .send_rejected(&open, "RESOURCE_EXHAUSTED", "stream limit reached")
-                .await;
+            return self.send_rejected(&open, open_refusal::STREAM_LIMIT).await;
         }
         let Some(export) = export else {
             return self
-                .send_rejected(&open, "EXPORT_DENIED", "service is not locally allowlisted")
+                .send_rejected(&open, open_refusal::EXPORT_NOT_ALLOWLISTED)
                 .await;
         };
         if export.kind != ExportKind::Echo || open.operation != "echo" {
             return self
-                .send_rejected(
-                    &open,
-                    "OPERATION_DENIED",
-                    "only the local echo operation is enabled",
-                )
+                .send_rejected(&open, open_refusal::ECHO_OPERATION_ONLY)
                 .await;
         }
         if self.streams.contains_key(&open.stream_id) {
-            return self
-                .send_rejected(&open, "STREAM_EXISTS", "stream ID is already active")
-                .await;
+            return self.send_rejected(&open, open_refusal::STREAM_ACTIVE).await;
         }
         let opened = ControlMessage::Opened(Opened::new(
             message_id(),
@@ -1699,12 +1692,7 @@ impl SessionActor {
         self.send_control(challenge, None).await
     }
 
-    async fn send_rejected(
-        &self,
-        open: &Open,
-        code: &str,
-        reason: &str,
-    ) -> Result<(), ClientError> {
+    async fn send_rejected(&self, open: &Open, refusal: OpenRefusal) -> Result<(), ClientError> {
         self.send_control(
             ControlMessage::Rejected(Rejected::new(
                 message_id(),
@@ -1713,8 +1701,8 @@ impl SessionActor {
                 self.session.epoch,
                 open.stream_id,
                 open.operation_id.clone(),
-                code,
-                reason,
+                refusal.code(),
+                refusal.reason(),
             )),
             None,
         )
@@ -1828,8 +1816,8 @@ impl SessionActor {
                     self.session.epoch,
                     cancel.stream_id,
                     cancel.operation_id,
-                    "CANCELLED",
-                    "local echo cancelled",
+                    open_refusal::ECHO_CANCELLED.code(),
+                    open_refusal::ECHO_CANCELLED.reason(),
                 )),
                 None,
             )
@@ -3065,6 +3053,67 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "TRANSPORT_ERROR"
+        );
+    }
+}
+
+/// Task row M7-C160: the connector sends only refusals from
+/// `tunnel_protocol::open_refusal`, which the relay's diagnostic looks up.
+/// The refusal helpers take an `OpenRefusal`, so a literal cannot be passed to
+/// them; this pins the remaining escape, a `Rejected` built directly.
+#[cfg(test)]
+mod open_refusal_source_tests {
+    fn production(source: &str) -> &str {
+        source
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or(source)
+    }
+
+    /// Every production `Rejected` is built in exactly the expected places,
+    /// from a table entry, with no string literal among its arguments.
+    fn assert_rejected_built_only_from_the_table(name: &str, source: &str, expected: usize) {
+        let source = production(source);
+        assert_eq!(
+            source.matches("Rejected {").count(),
+            0,
+            "{name}: a Rejected struct literal bypasses the refusal table"
+        );
+        let calls: Vec<usize> = source
+            .match_indices("Rejected::new(")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            expected,
+            "{name}: Rejected::new call sites changed; route new refusals through the table"
+        );
+        for start in calls {
+            let arguments = &source[start..];
+            let end = arguments.find("))").expect("end of the Rejected::new call");
+            let arguments = &arguments[..end];
+            assert!(
+                !arguments.contains('"'),
+                "{name}: a literal in a Rejected::new call: {arguments}"
+            );
+            let from_table = |field: &str| {
+                arguments.contains(&format!("refusal.{field}(),"))
+                    || arguments.contains(&format!("open_refusal::ECHO_CANCELLED.{field}(),"))
+            };
+            assert!(
+                from_table("code") && from_table("reason"),
+                "{name}: Rejected::new code and reason must come from the table: {arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_connector_rejected_comes_from_the_refusal_table() {
+        assert_rejected_built_only_from_the_table("lib.rs", include_str!("lib.rs"), 2);
+        assert_rejected_built_only_from_the_table(
+            "m2_runtime.rs",
+            include_str!("m2_runtime.rs"),
+            2,
         );
     }
 }

@@ -78,6 +78,9 @@ mod freeze_hold;
 use freeze_hold::sleep_until_hold_deadline;
 pub(crate) use freeze_hold::{ROTATION_FREEZE_ECHO_CODE, ROTATION_FREEZE_RETRY_AFTER_MS};
 
+#[path = "actor_connector_rejected.rs"]
+mod connector_rejected;
+
 #[path = "actor_http_stream.rs"]
 mod http_stream;
 pub(crate) use http_stream::{
@@ -2372,6 +2375,8 @@ struct DeviceSession {
     /// (M7-C92).  Bounded with `pending` by the retained-stream factor at
     /// admission; see [`UnaryTombstone`].
     unary_tombstones: HashMap<u64, UnaryTombstone>,
+    /// M7-C160: this session's own budget of `connector rejected` lines.
+    connector_rejected_log: connector_rejected::RejectedLogWindow,
     streams: HashMap<u64, M2Stream>,
     /// Highest stream ID whose authenticated owner FORGET completed. Stream
     /// IDs never reuse, so late frames at or below this watermark are stale
@@ -2753,6 +2758,7 @@ impl RelayHandle {
             terminal_cleanup_overflowed: terminal_cleanup.overflowed.clone(),
             terminal_cleanup_notify: terminal_cleanup.notify.clone(),
             sessions: HashMap::new(),
+            connector_rejected_tenants: Default::default(),
             registering: HashSet::new(),
             pending_registering: HashSet::new(),
             tickets: HashMap::new(),
@@ -3573,6 +3579,8 @@ struct RelayActor {
     terminal_cleanup_overflowed: Arc<AtomicBool>,
     terminal_cleanup_notify: Arc<Notify>,
     sessions: HashMap<DeviceScope, DeviceSession>,
+    /// M7-C160: each tenant's budget of `connector rejected` lines.
+    connector_rejected_tenants: connector_rejected::TenantRejectedLogs,
     /// Registrations that have already resolved a catalog tenant and are
     /// being admitted through the peer path.
     registering: HashSet<DeviceScope>,
@@ -4781,6 +4789,7 @@ impl RelayActor {
                 next_stream_id: 1,
                 pending: HashMap::new(),
                 unary_tombstones: HashMap::new(),
+                connector_rejected_log: connector_rejected::RejectedLogWindow::default(),
                 streams: HashMap::new(),
                 forgotten_stream_through: 0,
                 owner_forget_deadline: None,
@@ -11602,6 +11611,16 @@ impl RelayActor {
                 if rejected.session_id != key.session_id || rejected.epoch != key.epoch {
                     return;
                 }
+                // M7-C160: what the diagnostic below reports, captured before
+                // this REJECTED changes the session.
+                let rotation_phase = self.session_for(&key).and_then(|session| {
+                    session
+                        .rotation
+                        .as_ref()
+                        .map(|rotation| rotation.state.phase())
+                });
+                let mut matched = "none";
+                let mut relay_code = "none";
                 let mut unary_rejected = false;
                 if let Some(session) = self.session_mut(&key)
                     && session
@@ -11648,6 +11667,8 @@ impl RelayActor {
                     } else {
                         "DEVICE_REJECTED"
                     };
+                    matched = "unary";
+                    relay_code = code;
                     let _ = pending.response.send(EchoOutcome::Failure {
                         code,
                         execution: "not_dispatched",
@@ -11668,6 +11689,7 @@ impl RelayActor {
                     .and_then(|session| session.streams.get(&rejected.stream_id))
                     .is_some_and(|stream| stream.operation_id == rejected.operation_id);
                 if rejected_m2 {
+                    matched = "stream";
                     let pending = self
                         .session_for(&key)
                         .and_then(|session| session.streams.get(&rejected.stream_id))
@@ -11678,6 +11700,7 @@ impl RelayActor {
                                 && stream.open_message_id == rejected.reply_to
                         });
                     if pending {
+                        relay_code = "stream_closed";
                         let final_state = ResumeDirectionState {
                             stream_id: rejected.stream_id,
                             ..ResumeDirectionState::default()
@@ -11695,6 +11718,50 @@ impl RelayActor {
                         let _ = self.flush_owner_stream_forgets(&key);
                     }
                 }
+                // Only a live session's REJECTED reaches here; charge its
+                // session and tenant budgets (M7-C160).
+                let live_tenants: std::collections::HashSet<Uuid> =
+                    if self.connector_rejected_tenants.contains(&key.tenant_id) {
+                        std::collections::HashSet::new()
+                    } else {
+                        self.sessions.keys().map(|scope| scope.tenant_id).collect()
+                    };
+                let Some(session) = self
+                    .sessions
+                    .get_mut(&key.scope())
+                    .filter(|session| session.key == key)
+                else {
+                    return;
+                };
+                let session_log = &mut session.connector_rejected_log;
+                let tenant_log = self
+                    .connector_rejected_tenants
+                    .budget(key.tenant_id, |tenant| live_tenants.contains(tenant));
+                connector_rejected::log_connector_rejected(
+                    connector_rejected::RejectedLogBudgets {
+                        session: session_log,
+                        tenant: tenant_log,
+                    },
+                    &connector_rejected::ConnectorRejectedContext {
+                        tenant_id: &key.tenant_id,
+                        device_id: &key.device_id,
+                        session_id: &key.session_id,
+                        epoch: key.epoch,
+                        stream_id: rejected.stream_id,
+                        // Echoed by the device: logged only when it equals
+                        // the relay's own record for this stream.
+                        operation_id: if matched == "none" {
+                            "unmatched"
+                        } else {
+                            &rejected.operation_id
+                        },
+                        rotation_phase,
+                        matched,
+                        relay_code,
+                    },
+                    &rejected.code,
+                    &rejected.reason,
+                );
             }
             ControlMessage::AuthorizationInvalidated(invalidated) => {
                 if invalidated.session_id != key.session_id || invalidated.epoch != key.epoch {
@@ -17719,6 +17786,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
@@ -17755,6 +17823,7 @@ mod stream_identity_tests {
             terminal_cleanup_overflowed: dispatcher.overflowed.clone(),
             terminal_cleanup_notify: dispatcher.notify.clone(),
             sessions,
+            connector_rejected_tenants: Default::default(),
             registering: Default::default(),
             pending_registering: Default::default(),
             tickets: Default::default(),
@@ -19690,6 +19759,7 @@ mod stream_identity_tests {
                     next_stream_id: 1,
                     pending: HashMap::new(),
                     unary_tombstones: HashMap::new(),
+                    connector_rejected_log: Default::default(),
                     streams: HashMap::new(),
                     forgotten_stream_through: 0,
                     owner_forget_deadline: None,
@@ -23641,6 +23711,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,

@@ -29,6 +29,7 @@ use tunnel_protocol::control::{MAX_METADATA_VALUE_BYTES, MAX_ROTATION_RECOVERY_T
 use tunnel_protocol::control_journal::{
     ControlJournal, MAX_JOURNAL_BYTES, MAX_JOURNAL_ENTRIES, Observation as JournalObservation,
 };
+use tunnel_protocol::open_refusal::{self, OpenRefusal};
 use tunnel_protocol::rotation::{
     ClosureEvidence, RecoveryReason, RotationConfig, RotationPhase, RotationSide, RotationState,
     ValidatedRecovery,
@@ -4168,8 +4169,7 @@ impl M2Actor {
     fn send_open_rejected_journaled(
         &mut self,
         open: &Open,
-        code: &str,
-        reason: &str,
+        refusal: OpenRefusal,
     ) -> Result<(), ClientError> {
         let response = ControlMessage::Rejected(Rejected::new(
             message_id(),
@@ -4178,8 +4178,8 @@ impl M2Actor {
             self.session.epoch,
             open.stream_id,
             open.operation_id.clone(),
-            code,
-            reason,
+            refusal.code(),
+            refusal.reason(),
         ));
         let response = Self::encode_control_message(&response)?;
         let response_bytes = match Self::open_response_bytes(std::slice::from_ref(&response)) {
@@ -4344,11 +4344,7 @@ impl M2Actor {
         // STREAM_EXISTS path in `try_admit_open` stays for a stream ID this
         // session still retains, whose own STREAM_FORGET releases it.
         if self.open_is_past_retry_horizon(&open) {
-            return self.send_rejected(
-                &open,
-                "STREAM_EXISTS",
-                "stream ID was already forgotten; start a fresh session",
-            );
+            return self.send_rejected(&open, open_refusal::STREAM_FORGOTTEN);
         }
         let canonical = encode_control(&ControlMessage::Open(open.clone()))
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
@@ -4378,11 +4374,7 @@ impl M2Actor {
                 if self.active_stream_count() < self.config.limits.max_streams {
                     self.note_open_retention_exhausted();
                 }
-                return self.send_rejected(
-                    &open,
-                    "RESOURCE_EXHAUSTED",
-                    "OPEN idempotency retention is full; start a fresh session",
-                );
+                return self.send_rejected(&open, open_refusal::OPEN_IDEMPOTENCY_FULL);
             }
             Err(OpenJournalError::MissingMessage | OpenJournalError::ConflictingResponse) => {
                 return Err(ClientError::Protocol(
@@ -4397,11 +4389,7 @@ impl M2Actor {
                 deadlines,
             } => return self.replay_open_responses(responses, deadlines),
             OpenJournalObservation::Tombstone => {
-                return self.send_rejected(
-                    &open,
-                    "STALE_REQUEST",
-                    "OPEN was already forgotten; start a fresh session",
-                );
+                return self.send_rejected(&open, open_refusal::OPEN_FORGOTTEN);
             }
             OpenJournalObservation::New => {}
         }
@@ -4409,11 +4397,7 @@ impl M2Actor {
         let reservation = match self.reserve_pending_open(&open) {
             Ok(reservation) => reservation,
             Err(ClientError::QueueLimit) => {
-                return self.send_open_rejected_journaled(
-                    &open,
-                    "RESOURCE_EXHAUSTED",
-                    "parsed OPEN retention is full; start a fresh session",
-                );
+                return self.send_open_rejected_journaled(&open, open_refusal::OPEN_RETENTION_FULL);
             }
             Err(error) => return Err(error),
         };
@@ -4428,8 +4412,7 @@ impl M2Actor {
             {
                 return self.send_open_rejected_journaled(
                     &pending.open,
-                    "RESOURCE_EXHAUSTED",
-                    "bounded OPEN admission is full",
+                    open_refusal::OPEN_ADMISSION_FULL,
                 );
             }
             self.pending_open_queue.push_back(pending);
@@ -4472,7 +4455,7 @@ impl M2Actor {
     fn try_admit_open(&mut self, pending: &mut PendingOpen) -> Result<(), ClientError> {
         let open = &pending.open;
         if !self.accepting {
-            return self.send_open_rejected_journaled(open, "GOAWAY", "connector is draining");
+            return self.send_open_rejected_journaled(open, open_refusal::CONNECTOR_DRAINING);
         }
         if self.active_stream_count() >= self.config.limits.max_streams
             || self.streams.len() >= retained_stream_limit(self.config.limits.max_streams)
@@ -4482,18 +4465,10 @@ impl M2Actor {
             if self.active_stream_count() < self.config.limits.max_streams {
                 self.note_open_retention_exhausted();
             }
-            return self.send_open_rejected_journaled(
-                open,
-                "RESOURCE_EXHAUSTED",
-                "stream limit reached",
-            );
+            return self.send_open_rejected_journaled(open, open_refusal::STREAM_LIMIT);
         }
         let Some(export) = self.config.exports.get(&open.service_id).cloned() else {
-            return self.send_open_rejected_journaled(
-                open,
-                "EXPORT_DENIED",
-                "service is not locally allowlisted",
-            );
+            return self.send_open_rejected_journaled(open, open_refusal::EXPORT_NOT_ALLOWLISTED);
         };
         // An HTTP export needs both the local allowlist entry and a
         // registered in-process handler; the OPEN cannot select anything else.
@@ -4547,11 +4522,7 @@ impl M2Actor {
         let echo = export.kind == super::ExportKind::Echo
             && matches!(open.operation.as_str(), "echo" | "echo_stream");
         if !echo && http_export.is_none() && fs_export.is_none() {
-            return self.send_open_rejected_journaled(
-                open,
-                "OPERATION_DENIED",
-                "only the local echo operations are enabled",
-            );
+            return self.send_open_rejected_journaled(open, open_refusal::OPERATION_NOT_ENABLED);
         }
         // The first received OPEN reserves a stream ID for the session even
         // when it is rejected or later compacted. Compare its receive ordinal,
@@ -4563,18 +4534,12 @@ impl M2Actor {
                 .open_journal
                 .stream_message_is_reserved_by_other(open.stream_id, &open.message_id)
         {
-            return self.send_open_rejected_journaled(
-                open,
-                "STREAM_EXISTS",
-                "stream ID is already active or was already forgotten",
-            );
+            return self
+                .send_open_rejected_journaled(open, open_refusal::STREAM_ACTIVE_OR_FORGOTTEN);
         }
         if pending.operation_deadline.expired() {
-            return self.send_open_rejected_journaled(
-                open,
-                "AUTHORIZATION_EXPIRED",
-                "OPEN authorization window expired before admission",
-            );
+            return self
+                .send_open_rejected_journaled(open, open_refusal::AUTHORIZATION_WINDOW_EXPIRED);
         }
         if pending.authorization.is_none() {
             let started = Instant::now();
@@ -4610,11 +4575,8 @@ impl M2Actor {
             .as_ref()
             .expect("OPEN authorization was prepared above");
         if authorization.auth_deadline.expired() || pending.operation_deadline.expired() {
-            return self.send_open_rejected_journaled(
-                open,
-                "AUTHORIZATION_EXPIRED",
-                "OPEN authorization window expired before admission",
-            );
+            return self
+                .send_open_rejected_journaled(open, open_refusal::AUTHORIZATION_WINDOW_EXPIRED);
         }
         let auth_deadline = authorization.auth_deadline;
         let operation_deadline = pending.operation_deadline;
@@ -4772,7 +4734,7 @@ impl M2Actor {
         Ok(())
     }
 
-    fn send_rejected(&mut self, open: &Open, code: &str, reason: &str) -> Result<(), ClientError> {
+    fn send_rejected(&mut self, open: &Open, refusal: OpenRefusal) -> Result<(), ClientError> {
         self.send_critical_control(
             ControlMessage::Rejected(Rejected::new(
                 message_id(),
@@ -4781,8 +4743,8 @@ impl M2Actor {
                 self.session.epoch,
                 open.stream_id,
                 open.operation_id.clone(),
-                code,
-                reason,
+                refusal.code(),
+                refusal.reason(),
             )),
             None,
         )
