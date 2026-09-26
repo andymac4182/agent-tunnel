@@ -1,6 +1,6 @@
 # Milestone task tracker
 
-Last updated: 2026-09-26T23:43:52+10:00
+Last updated: 2026-09-26T23:54:16+10:00
 
 This tracker follows the roadmap. It records implementation work, discovered defects, owners, exact acceptance scope, and the evidence needed to close each gate.
 
