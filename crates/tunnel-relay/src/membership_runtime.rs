@@ -525,11 +525,13 @@ impl MembershipUnreadyReason {
     /// prerequisites are unmet, or an infrastructure read failed, while the
     /// signed peer keys it already verified are untouched. Withdrawing trust
     /// there turned one relay's transient local failure into a cluster-wide
-    /// trust blackout (M7-C81, M7-C83). Those retain the verified set and
-    /// withdraw *readiness* instead, which is what the readiness contract in
-    /// `docs/cluster.md` requires. Admission is not weakened: every forwarded
-    /// stream still binds against the verifier, and an unready relay fails
-    /// `/readyz` and public admission closed.
+    /// trust blackout (M7-C81, M7-C83). The decision is that those should
+    /// retain the verified set and withdraw *readiness* instead.
+    ///
+    /// **Held: today every reason returns `true`.** Retaining regresses
+    /// `verify-m7-trust-expiry` (M7-C86, M7-C131), so nothing is retained
+    /// until that is understood. The reasons are split out now so that the
+    /// labels are accurate and the retention is a one-line change here.
     #[must_use]
     pub const fn withdraws_peer_trust(self) -> bool {
         match self {
@@ -1762,8 +1764,9 @@ impl MembershipRuntime {
             // minimum version. That is `MissingLocalMembership`, the same
             // condition as a checkpoint that does not name this node, and
             // deliberately not `MembershipRejected`, which means a record
-            // failed verification: rejected evidence withdraws peer pins,
-            // this local condition retains them (M7-C86).
+            // failed verification. (M7-C86 would retain peer pins for this
+            // local condition; that retention is held, so it withdraws them
+            // like every other unready reason today.)
             let version_state = candidate_verifier.version_state();
             self.persist_if_changed(version_state, checkpoint_received_wall)
                 .await?;
@@ -1816,9 +1819,10 @@ impl MembershipRuntime {
                 // This relay's own certificate is not an approved key of its
                 // own record: a statement about this relay's right to serve,
                 // not about the peer keys it verified. Readiness, ownership
-                // and admission still fail closed; the peer pin set is
-                // retained (M7-C86). The *expired* local pin above stays
-                // `CheckpointExpired` and still withdraws.
+                // and admission still fail closed. (M7-C86 would retain the
+                // peer pin set here; that retention is held, so the set is
+                // withdrawn today.) The *expired* local pin above stays
+                // `CheckpointExpired`.
                 (
                     MembershipUnreadyReason::MissingLocalKey,
                     MembershipRuntimeError::PeerRejected,
