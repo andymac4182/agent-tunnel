@@ -1648,6 +1648,15 @@ struct DataCarrier {
     tx: mpsc::Sender<DataOutbound>,
 }
 
+/// Hard bound on the ACKs one session may owe at once (review of #199).  An
+/// entry needs a stream the session still retains, and one device retains
+/// at most `max_streams_per_device × RETAINED_ECHO_STREAM_FACTOR` (128 at
+/// the defaults); a session asked to owe more is fenced
+/// `FLOW_CONTROL_OWED_LIMIT` rather than grow the table.
+const MAX_OWED_ACKS: usize = 128;
+/// Typed close reason when a session would owe more than `MAX_OWED_ACKS`.
+const FLOW_CONTROL_OWED_LIMIT: &str = "FLOW_CONTROL_OWED_LIMIT";
+
 /// One relay ACK a live data carrier refused for backpressure (task row
 /// M6-C160).  An ACK is cumulative and idempotent, so a later ACK for the
 /// same stream on the same carrier supersedes it; it is retried on the carrier
@@ -2043,6 +2052,11 @@ struct DeviceSession {
     /// cleared when nothing is owed.  A carrier that takes no owed ACK for
     /// the whole window closes the session `FLOW_CONTROL_UNDELIVERABLE`.
     flow_control_owed_deadline: Option<Instant>,
+    /// When each stream now marked `terminal_fin_failure` was first refused
+    /// (review of #199).  The session's `terminal_fin_failure_deadline` is
+    /// the earliest of these plus the window, so one stream's progress never
+    /// extends another stream's window.
+    terminal_fin_failed_at: BTreeMap<u64, Instant>,
     /// The writer-freeze state last published to this session's HTTP
     /// exchange tasks; streams are re-published only when it changes.
     http_freeze_published: bool,
@@ -4393,6 +4407,7 @@ impl RelayActor {
                 owner_forget_deadline: None,
                 terminal_fin_failure_deadline: None,
                 owed_acks: Default::default(),
+                terminal_fin_failed_at: Default::default(),
                 flow_control_owed_deadline: None,
                 http_freeze_published: false,
                 rotation,
@@ -5780,12 +5795,37 @@ impl RelayActor {
     /// debt: an unrelated FORGET may complete and clear its own deadline
     /// while the failed-FIN tombstone remains impossible to compact.
     fn arm_terminal_fin_failure_deadline(&mut self, key: &SessionKey) {
-        if let Some(session) = self.session_mut(key)
-            && session.terminal_fin_failure_deadline.is_none()
-        {
-            session.terminal_fin_failure_deadline =
-                Some(Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let now = Instant::now();
+        let failing = session
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.terminal_fin_failure)
+            .map(|(stream_id, _)| *stream_id)
+            .collect::<Vec<_>>();
+        for stream_id in failing {
+            session
+                .terminal_fin_failed_at
+                .entry(stream_id)
+                .or_insert(now);
         }
+        if session.terminal_fin_failure_deadline.is_none() {
+            session.terminal_fin_failure_deadline = Some(
+                Self::earliest_terminal_fin_deadline(session)
+                    .unwrap_or(now + OWNER_FORGET_FAILURE_TIMEOUT),
+            );
+        }
+    }
+
+    /// The earliest per-stream terminal-failure window still running.
+    fn earliest_terminal_fin_deadline(session: &DeviceSession) -> Option<Instant> {
+        session
+            .terminal_fin_failed_at
+            .values()
+            .min()
+            .map(|first| *first + OWNER_FORGET_FAILURE_TIMEOUT)
     }
 
     /// Queue a relay ACK on the carrier the acknowledged frame arrived on, or
@@ -5811,14 +5851,17 @@ impl RelayActor {
         generation: u64,
         stream_id: u64,
         sequence: u64,
-    ) -> Result<(), QueueRefusal> {
+    ) -> Result<(), &'static str> {
         self.retry_owed_acks(key);
         match queue_flow_control(data_tx, budget, bytes) {
             Ok(()) => {
+                // A later cumulative ACK for the stream supersedes the owed
+                // one, whichever carrier took it (review of #199).
                 if let Some(session) = self.session_mut(key)
-                    && session.owed_acks.get(&stream_id).is_some_and(|owed| {
-                        owed.tx.same_channel(data_tx) && owed.sequence <= sequence
-                    })
+                    && session
+                        .owed_acks
+                        .get(&stream_id)
+                        .is_some_and(|owed| owed.sequence <= sequence)
                 {
                     session.owed_acks.remove(&stream_id);
                     if session.owed_acks.is_empty() {
@@ -5827,36 +5870,83 @@ impl RelayActor {
                 }
                 Ok(())
             }
-            Err(QueueRefusal::Closed) => Err(QueueRefusal::Closed),
+            Err(QueueRefusal::Closed) => Err(QueueRefusal::Closed.flow_control_close_reason()),
             Err(QueueRefusal::Budget | QueueRefusal::Full) => {
-                if let Some(session) = self.session_mut(key) {
-                    let owed = session.owed_acks.entry(stream_id).or_insert(OwedAck {
+                let Some(session) = self.session_mut(key) else {
+                    return Ok(());
+                };
+                if !session.owed_acks.contains_key(&stream_id)
+                    && session.owed_acks.len() >= MAX_OWED_ACKS
+                {
+                    return Err(FLOW_CONTROL_OWED_LIMIT);
+                }
+                let owed = session.owed_acks.entry(stream_id).or_insert(OwedAck {
+                    tx: data_tx.clone(),
+                    generation,
+                    sequence,
+                });
+                if owed.tx.same_channel(data_tx) {
+                    owed.sequence = owed.sequence.max(sequence);
+                } else {
+                    *owed = OwedAck {
                         tx: data_tx.clone(),
                         generation,
                         sequence,
-                    });
-                    if owed.tx.same_channel(data_tx) {
-                        owed.sequence = owed.sequence.max(sequence);
-                    } else {
-                        *owed = OwedAck {
-                            tx: data_tx.clone(),
-                            generation,
-                            sequence,
-                        };
-                    }
-                    session
-                        .flow_control_owed_deadline
-                        .get_or_insert_with(|| Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+                    };
                 }
+                session
+                    .flow_control_owed_deadline
+                    .get_or_insert_with(|| Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
                 Ok(())
             }
         }
     }
 
+    /// Drop owed ACKs whose stream the session no longer retains, or whose
+    /// stream is at or below the forgotten watermark: the connector ignores
+    /// a late ACK for a stream it has forgotten, so owing one is pointless
+    /// and would keep the table and its deadline alive (review of #199).
+    fn prune_owed_acks(session: &mut DeviceSession) {
+        let forgotten = session.forgotten_stream_through;
+        let DeviceSession {
+            owed_acks,
+            streams,
+            pending,
+            unary_tombstones,
+            ..
+        } = session;
+        owed_acks.retain(|stream_id, _| {
+            *stream_id > forgotten
+                && (streams.contains_key(stream_id)
+                    || pending.contains_key(stream_id)
+                    || unary_tombstones.contains_key(stream_id))
+        });
+        if session.owed_acks.is_empty() {
+            session.flow_control_owed_deadline = None;
+        }
+    }
+
+    /// Drop owed ACKs addressed to a carrier generation the session no longer
+    /// writes to, at a rotation commit (review of #199).  The retired
+    /// carrier is closing; the connector's cursors on the committed carrier
+    /// are carried by the rotation's own fence and the next ACK.
+    fn drop_retired_owed_acks(session: &mut DeviceSession) {
+        let generation = session.generation;
+        session
+            .owed_acks
+            .retain(|_, owed| owed.generation == generation);
+        if session.owed_acks.is_empty() {
+            session.flow_control_owed_deadline = None;
+        }
+    }
+
     /// Put the ACKs this session owes back on their carriers, in stream
-    /// order, until a carrier refuses one (task row M6-C160).  An ACK whose
-    /// carrier is gone is dropped.  Progress moves the fail-closed deadline
-    /// forward; nothing owed clears it.
+    /// order (task row M6-C160).  A carrier that is full is skipped for the
+    /// rest of this pass, so one full carrier never holds back another's
+    /// ACKs; a spent session budget stops the pass.  An ACK whose carrier is
+    /// gone is dropped: carrier loss is detected and recovered on its own
+    /// path, and unacknowledged frames replay.  Progress moves the
+    /// fail-closed deadline forward; nothing owed clears it.
     fn retry_owed_acks(&mut self, key: &SessionKey) {
         let Some(session) = self.session_mut(key) else {
             return;
@@ -5868,11 +5958,15 @@ impl RelayActor {
         let epoch = session.key.epoch;
         let budget = session.queue_budget.clone();
         let mut progressed = false;
+        let mut full: Vec<mpsc::Sender<DataOutbound>> = Vec::new();
         let stream_ids = session.owed_acks.keys().copied().collect::<Vec<_>>();
         for stream_id in stream_ids {
             let Some(owed) = session.owed_acks.get(&stream_id).cloned() else {
                 continue;
             };
+            if full.iter().any(|tx| tx.same_channel(&owed.tx)) {
+                continue;
+            }
             let Ok(bytes) = Frame::ack(epoch, owed.generation, stream_id, owed.sequence).encode()
             else {
                 session.owed_acks.remove(&stream_id);
@@ -5886,7 +5980,8 @@ impl RelayActor {
                 Err(QueueRefusal::Closed) => {
                     session.owed_acks.remove(&stream_id);
                 }
-                Err(QueueRefusal::Budget | QueueRefusal::Full) => break,
+                Err(QueueRefusal::Full) => full.push(owed.tx.clone()),
+                Err(QueueRefusal::Budget) => break,
             }
         }
         if session.owed_acks.is_empty() {
@@ -5909,6 +6004,7 @@ impl RelayActor {
         });
         if clear && let Some(session) = self.session_mut(key) {
             session.terminal_fin_failure_deadline = None;
+            session.terminal_fin_failed_at.clear();
         }
     }
 
@@ -5975,6 +6071,11 @@ impl RelayActor {
                                 )
                             }),
                     )
+                    // The connector's FORGET proof needs this relay's final
+                    // ACK; a stream whose ACK is still owed is not yet
+                    // forgettable, so an owed ACK is never dropped by its own
+                    // FORGET (review of #199).
+                    .filter(|(stream_id, _, _)| !session.owed_acks.contains_key(stream_id))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -6093,6 +6194,7 @@ impl RelayActor {
                     // The FORGET is queued: the owner can never retry this
                     // OPEN, and nothing else references the tombstone.
                     session.unary_tombstones.remove(&stream_id);
+                    session.owed_acks.remove(&stream_id);
                     session.forgotten_stream_through =
                         session.forgotten_stream_through.max(stream_id);
                     true
@@ -6105,6 +6207,7 @@ impl RelayActor {
                     Self::record_http_owner_stream(&mut stream, &http_diagnostics);
                     Self::record_http_forget(&stream, &http_diagnostics);
                     Self::release_echo_stream_state(&mut stream, &session.queue_budget, true);
+                    session.owed_acks.remove(&stream_id);
                     session.forgotten_stream_through =
                         session.forgotten_stream_through.max(stream_id);
                     true
@@ -6346,18 +6449,18 @@ impl RelayActor {
                 stream.pending_terminal = None;
                 stream.terminal_fin_failure = false;
             }
-            self.clear_terminal_fin_failure_deadline_if_clear(key);
-            // A refused terminal reached the wire: the writer is making
-            // progress, so the window restarts for the ones still refused.
-            // Under sustained load new refusals keep some marker set, and an
-            // absolute deadline from the first one ended a session whose
-            // writer was draining (task row M6-C160).
-            if let Some(session) = self.session_mut(key)
-                && session.terminal_fin_failure_deadline.is_some()
-            {
-                session.terminal_fin_failure_deadline =
-                    Some(Instant::now() + OWNER_FORGET_FAILURE_TIMEOUT);
+            // This stream's terminal reached the wire, so its own window
+            // ends; the session deadline is re-derived from the streams still
+            // refused, each from its own first refusal (task row M6-C160,
+            // review of #199).  Another stream's progress never extends it.
+            if let Some(session) = self.session_mut(key) {
+                session.terminal_fin_failed_at.remove(&stream_id);
+                if session.terminal_fin_failure_deadline.is_some() {
+                    session.terminal_fin_failure_deadline =
+                        Self::earliest_terminal_fin_deadline(session);
+                }
             }
+            self.clear_terminal_fin_failure_deadline_if_clear(key);
         } else {
             if let Some(session) = self.session_mut(key)
                 && let Some(stream) = session.streams.get_mut(&stream_id)
@@ -9103,6 +9206,7 @@ impl RelayActor {
                 .map(|carrier| carrier.tx.clone());
             session.generation = committed.attempt.new_generation;
             session.connection_id = committed.attempt.new_connection_id.clone();
+            Self::drop_retired_owed_acks(session);
             if let Some(old) = old {
                 let _ = old.tx.try_send(DataOutbound::Close);
             }
@@ -10725,6 +10829,15 @@ impl RelayActor {
                 .map(|carrier| carrier.tx.clone());
             session.generation = attempt.new_generation;
             session.connection_id = attempt.new_connection_id.clone();
+            {
+                let generation = session.generation;
+                session
+                    .owed_acks
+                    .retain(|_, owed| owed.generation == generation);
+                if session.owed_acks.is_empty() {
+                    session.flow_control_owed_deadline = None;
+                }
+            }
             Self::retain_rotation_tombstone(rotation);
             rotation.recovery = None;
             rotation.attempt = None;
@@ -12631,12 +12744,11 @@ impl RelayActor {
                         // a dead carrier, or the relay's own backpressure
                         // (M4-37 review follow-up).
                         let _ = response.send(EchoOutcome::Failure {
-                            code: refusal.flow_control_close_reason(),
+                            code: refusal,
                             execution: "unknown",
                         });
                     }
-                    self.protocol_failure(&key, refusal.flow_control_close_reason())
-                        .await;
+                    self.protocol_failure(&key, refusal).await;
                     return;
                 }
                 if let ResponseFrameUpdate::Complete(body, response) = update {
@@ -12785,8 +12897,7 @@ impl RelayActor {
                     frame.sequence,
                 ) {
                     self.fail_pending(&key, stream_id, "DEVICE_RESET", "unknown");
-                    self.protocol_failure(&key, refusal.flow_control_close_reason())
-                        .await;
+                    self.protocol_failure(&key, refusal).await;
                     return;
                 }
                 let execution = if self
@@ -13493,8 +13604,7 @@ impl RelayActor {
                 sequence,
             )
         {
-            self.protocol_failure(&key, refusal.flow_control_close_reason())
-                .await;
+            self.protocol_failure(&key, refusal).await;
             return;
         }
         if let Some((data_tx, budget, bytes)) = window_queue {
@@ -13701,7 +13811,11 @@ impl RelayActor {
             self.redrive_owed_http_credit(&key);
             // ACKs a full carrier refused are owed, not dropped; a carrier
             // that takes none of them for the whole window is fenced under
-            // the typed backpressure reason (task row M6-C160).
+            // the typed backpressure reason (task row M6-C160).  ACKs for
+            // streams the session no longer retains are dropped first.
+            if let Some(session) = self.session_mut(&key) {
+                Self::prune_owed_acks(session);
+            }
             self.retry_owed_acks(&key);
             let flow_control_owed_expired = self.session_for(&key).is_some_and(|session| {
                 session
@@ -17141,6 +17255,7 @@ mod stream_identity_tests {
             owner_forget_deadline: None,
             terminal_fin_failure_deadline: None,
             owed_acks: Default::default(),
+            terminal_fin_failed_at: Default::default(),
             flow_control_owed_deadline: None,
             http_freeze_published: false,
             rotation: None,
@@ -19110,6 +19225,7 @@ mod stream_identity_tests {
                     owner_forget_deadline: None,
                     terminal_fin_failure_deadline: None,
                     owed_acks: Default::default(),
+                    terminal_fin_failed_at: Default::default(),
                     flow_control_owed_deadline: None,
                     http_freeze_published: false,
                     rotation: None,
@@ -21897,6 +22013,240 @@ mod stream_identity_tests {
         drop(registration);
     }
 
+    /// A one-slot carrier channel whose only slot is taken, and its receiver.
+    fn m6c160_full_channel(
+        budget: &QueueBudget,
+    ) -> (mpsc::Sender<DataOutbound>, mpsc::Receiver<DataOutbound>) {
+        let (tx, rx) = mpsc::channel(1);
+        m6c160_fill_live_carrier(&tx, budget);
+        (tx, rx)
+    }
+
+    /// Review of #199, item 1: an owed ACK for a stream the session no
+    /// longer retains is dropped by the next tick, with its deadline, so the
+    /// table cannot grow with streams that are gone.
+    #[tokio::test]
+    async fn m6c160_an_owed_ack_for_a_forgotten_stream_is_dropped() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_384, "m6-c160-forgotten").await;
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
+        let fin = Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 0);
+        actor.inbound_m2_stream_data(carrier, fin, false).await;
+        assert!(
+            actor.sessions[&key.scope()]
+                .owed_acks
+                .contains_key(&registration.stream_id)
+        );
+
+        // The stream is reclaimed while its ACK is still owed.
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.streams.remove(&registration.stream_id);
+            session.forgotten_stream_through = registration.stream_id;
+        }
+        actor.tick().await;
+        let session = &actor.sessions[&key.scope()];
+        assert!(
+            session.owed_acks.is_empty(),
+            "the ACK for a gone stream is dropped"
+        );
+        assert_eq!(session.flow_control_owed_deadline, None);
+        let _ = m6c160_drain_kinds(&mut data_rx);
+        drop(registration);
+    }
+
+    /// Review of #199, item 1: the table is hard-capped.  A session asked to
+    /// owe more than `MAX_OWED_ACKS` is fenced under its own typed reason.
+    #[tokio::test]
+    async fn m6c160_owing_more_than_the_cap_fences_with_a_typed_reason() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_385, "m6-c160-cap").await;
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            for stream_id in 0..super::MAX_OWED_ACKS as u64 {
+                session.owed_acks.insert(
+                    1_000 + stream_id,
+                    super::OwedAck {
+                        tx: data_tx.clone(),
+                        generation: carrier.generation,
+                        sequence: 1,
+                    },
+                );
+            }
+        }
+        let fin = Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 0);
+        actor.inbound_m2_stream_data(carrier, fin, false).await;
+        assert!(!actor.sessions.contains_key(&key.scope()), "fenced");
+        assert_eq!(
+            actor
+                .session_terminal_events
+                .back()
+                .map(|event| event.reason),
+            Some(super::FLOW_CONTROL_OWED_LIMIT)
+        );
+        let _ = m6c160_drain_kinds(&mut data_rx);
+        drop(registration);
+    }
+
+    /// Review of #199, item 2: a later cumulative ACK for the stream clears
+    /// the owed one whichever carrier took it, so a stale entry on a carrier
+    /// that stopped draining cannot outlive the stream's progress.
+    #[tokio::test]
+    async fn m6c160_a_later_ack_on_another_carrier_clears_the_owed_one() {
+        let (mut actor, _control, mut data_rx, _carrier, key, registration) =
+            m4_37_opened_echo_stream(4_386, "m6-c160-other-carrier").await;
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        let (old_tx, mut old_rx) = m6c160_full_channel(&budget);
+        let (new_tx, mut new_rx) = mpsc::channel(8);
+        let stream_id = registration.stream_id;
+        let ack = |generation| {
+            Frame::ack(key.epoch, generation, stream_id, 3)
+                .encode()
+                .expect("ack encodes")
+        };
+        assert_eq!(
+            actor.queue_ack_or_owe(&key, &old_tx, &budget, ack(1), 1, stream_id, 3),
+            Ok(())
+        );
+        assert!(
+            actor.sessions[&key.scope()]
+                .owed_acks
+                .contains_key(&stream_id)
+        );
+        assert_eq!(
+            actor.queue_ack_or_owe(&key, &new_tx, &budget, ack(2), 2, stream_id, 3),
+            Ok(())
+        );
+        let session = &actor.sessions[&key.scope()];
+        assert!(
+            session.owed_acks.is_empty(),
+            "the ACK on the new carrier supersedes the owed one on the old"
+        );
+        assert_eq!(session.flow_control_owed_deadline, None);
+        assert_eq!(m6c160_drain_kinds(&mut new_rx), vec![FrameKind::Ack]);
+        let _ = m6c160_drain_kinds(&mut old_rx);
+        let _ = m6c160_drain_kinds(&mut data_rx);
+        drop(registration);
+    }
+
+    /// Review of #199, item 2: one full carrier does not hold back the ACKs
+    /// owed on another; the retry skips past it.
+    #[tokio::test]
+    async fn m6c160_a_full_carrier_does_not_block_owed_acks_on_another() {
+        let (mut actor, _control, mut data_rx, _carrier, key, registration) =
+            m4_37_opened_echo_stream(4_387, "m6-c160-skip-full").await;
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        let (full_tx, mut full_rx) = m6c160_full_channel(&budget);
+        let (open_tx, mut open_rx) = mpsc::channel(8);
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.owed_acks.insert(
+                10,
+                super::OwedAck {
+                    tx: full_tx.clone(),
+                    generation: 1,
+                    sequence: 1,
+                },
+            );
+            session.owed_acks.insert(
+                11,
+                super::OwedAck {
+                    tx: open_tx.clone(),
+                    generation: 2,
+                    sequence: 1,
+                },
+            );
+            session.flow_control_owed_deadline = Some(std::time::Instant::now());
+        }
+        actor.retry_owed_acks(&key);
+        let session = &actor.sessions[&key.scope()];
+        assert!(
+            session.owed_acks.contains_key(&10),
+            "still owed on the full carrier"
+        );
+        assert!(
+            !session.owed_acks.contains_key(&11),
+            "the ACK owed on the other carrier went out past the full one"
+        );
+        assert!(
+            session
+                .flow_control_owed_deadline
+                .is_some_and(|deadline| deadline > std::time::Instant::now()),
+            "progress restarted the window"
+        );
+        assert_eq!(m6c160_drain_kinds(&mut open_rx), vec![FrameKind::Ack]);
+        let _ = m6c160_drain_kinds(&mut full_rx);
+        let _ = m6c160_drain_kinds(&mut data_rx);
+        drop(registration);
+    }
+
+    /// Review of #199, item 4: an echo `WINDOW_UPDATE` a full live carrier
+    /// refuses is re-sent by the tick's credit redrive, not lost and not
+    /// fenced.
+    #[tokio::test]
+    async fn m6c160_a_refused_window_update_is_resent_by_the_tick() {
+        let (mut actor, mut control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_388, "m6-c160-window").await;
+        let stream_id = registration.stream_id;
+        // The device's authorization answer is not part of this fixture.
+        if let Some(stream) = actor
+            .sessions
+            .get_mut(&key.scope())
+            .and_then(|session| session.streams.get_mut(&stream_id))
+        {
+            stream.authorized_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        let (response, _reply) = oneshot::channel();
+        actor.write_echo_stream(
+            key.clone(),
+            stream_id,
+            registration.operation_id.clone(),
+            b"window".to_vec(),
+            response,
+        );
+        assert_eq!(m6c160_drain_kinds(&mut data_rx), vec![FrameKind::Data]);
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
+
+        let mut payload = (b"window".len() as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(b"window");
+        let data = Frame::data(key.epoch, carrier.generation, stream_id, 1, 1, payload);
+        actor.inbound_m2_stream_data(carrier, data, false).await;
+        let close = m4_37_session_close_code(&mut control);
+        assert!(
+            actor.sessions.contains_key(&key.scope()),
+            "a refused WINDOW_UPDATE must not end the session (it closed as {close:?})"
+        );
+        assert!(
+            actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending,
+            "the refused credit is marked for reissue"
+        );
+        assert!(m6c160_drain_kinds(&mut data_rx).is_empty());
+
+        actor.tick().await;
+        assert!(actor.sessions.contains_key(&key.scope()));
+        let kinds = m6c160_drain_kinds(&mut data_rx);
+        assert!(
+            kinds.contains(&FrameKind::WindowUpdate),
+            "the tick re-sent the refused WINDOW_UPDATE: {kinds:?}"
+        );
+        assert!(!actor.sessions[&key.scope()].streams[&stream_id].credit_reissue_pending);
+        drop(registration);
+    }
+
     /// Task row M4-37, the control: a carrier whose receiver is gone is the
     /// one event `REVERSE_CHANNEL_UNAVAILABLE` names, and it keeps that
     /// reason.  Green before and after the fix; it pins that the split did not
@@ -22539,6 +22889,7 @@ mod stream_identity_tests {
             owner_forget_deadline: None,
             terminal_fin_failure_deadline: None,
             owed_acks: Default::default(),
+            terminal_fin_failed_at: Default::default(),
             flow_control_owed_deadline: None,
             http_freeze_published: false,
             rotation: None,

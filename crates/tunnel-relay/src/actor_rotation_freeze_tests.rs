@@ -115,6 +115,62 @@ fn assert_held(receiver: &mut oneshot::Receiver<Result<Vec<u8>, EchoOutcome>>, l
     );
 }
 
+/// The admitted M2 stream the fixture builds, for `stream_id`.
+#[allow(clippy::too_many_arguments)]
+fn fixture_stream(
+    stream_id: u64,
+    open_message_id: &str,
+    operation_id: &str,
+    service_id: Uuid,
+    consumer: &AuthenticatedConsumer,
+    grant: &GrantSnapshot,
+    consumer_expires_at: DateTime<Utc>,
+    open_pending: bool,
+) -> M2Stream {
+    let sequence = StreamState::new(stream_id, wire::M2_INITIAL_WINDOW_BYTES as u64)
+        .expect("fixture stream sequence");
+    M2Stream {
+        // These fixtures build admitted streams; a deferred
+        // pre-admission terminal cause never applies to them.
+        deferred_terminal_cause: None,
+        credit_held: false,
+        open_message_id: open_message_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        request_id: None,
+        service_id,
+        consumer: consumer.clone(),
+        grant: grant.clone(),
+        sequence,
+        response_bytes: Vec::new(),
+        response_records: VecDeque::new(),
+        orphaned_response_records: 0,
+        credit_reissue_pending: false,
+        late_response_records: 0,
+        send_bytes: 0,
+        receive_bytes: 0,
+        authorized_until: Some(Instant::now() + StdDuration::from_secs(60)),
+        consumer_expires_at,
+        challenge_id: None,
+        authorization_in_flight: false,
+        authorization_started_at_ms: None,
+        authorization_deadline_ms: None,
+        authorization_admission_deadline_ms: None,
+        pending_records: VecDeque::new(),
+        pending_record_bytes: 0,
+        budget_bytes: 0,
+        terminal: false,
+        pending_terminal: None,
+        terminal_fin_failure: false,
+        open_pending,
+        registration_dropped: false,
+        closed: CancellationToken::new(),
+        admission_lease: CancellationToken::new(),
+        admission_deadline: Instant::now() + StdDuration::from_secs(60),
+        authorization_failure_code: None,
+        http: None,
+    }
+}
+
 struct FreezeFixture {
     actor: RelayActor,
     key: SessionKey,
@@ -228,8 +284,6 @@ impl FreezeFixture {
             read_started_at: now,
         };
         let consumer_expires_at = now + Duration::minutes(10);
-        let sequence = StreamState::new(STREAM_ID, wire::M2_INITIAL_WINDOW_BYTES as u64)
-            .expect("fixture stream sequence");
         let session = actor
             .sessions
             .get_mut(&key.scope())
@@ -246,46 +300,16 @@ impl FreezeFixture {
         session.next_stream_id = STREAM_ID + 1;
         session.streams.insert(
             STREAM_ID,
-            M2Stream {
-                // These fixtures build admitted streams; a deferred
-                // pre-admission terminal cause never applies to them.
-                deferred_terminal_cause: None,
-                credit_held: false,
-                open_message_id: OPEN_MESSAGE_ID.to_owned(),
-                operation_id: OPERATION_ID.to_owned(),
-                request_id: None,
+            fixture_stream(
+                STREAM_ID,
+                OPEN_MESSAGE_ID,
+                OPERATION_ID,
                 service_id,
-                consumer: consumer.clone(),
-                grant: grant.clone(),
-                sequence,
-                response_bytes: Vec::new(),
-                response_records: VecDeque::new(),
-                orphaned_response_records: 0,
-                credit_reissue_pending: false,
-                late_response_records: 0,
-                send_bytes: 0,
-                receive_bytes: 0,
-                authorized_until: Some(Instant::now() + StdDuration::from_secs(60)),
+                &consumer,
+                &grant,
                 consumer_expires_at,
-                challenge_id: None,
-                authorization_in_flight: false,
-                authorization_started_at_ms: None,
-                authorization_deadline_ms: None,
-                authorization_admission_deadline_ms: None,
-                pending_records: VecDeque::new(),
-                pending_record_bytes: 0,
-                budget_bytes: 0,
-                terminal: false,
-                pending_terminal: None,
-                terminal_fin_failure: false,
                 open_pending,
-                registration_dropped: false,
-                closed: CancellationToken::new(),
-                admission_lease: CancellationToken::new(),
-                admission_deadline: Instant::now() + StdDuration::from_secs(60),
-                authorization_failure_code: None,
-                http: None,
-            },
+            ),
         );
         Self {
             actor,
@@ -316,6 +340,27 @@ impl FreezeFixture {
             .sessions
             .get(&self.key.scope())
             .expect("fixture session")
+    }
+
+    /// Add another admitted stream to the fixture session.
+    fn add_stream(&mut self, stream_id: u64) {
+        let stream = fixture_stream(
+            stream_id,
+            &format!("{OPEN_MESSAGE_ID}-{stream_id}"),
+            &format!("{OPERATION_ID}-{stream_id}"),
+            self.service_id,
+            &self.consumer,
+            &self.grant,
+            self.consumer_expires_at,
+            false,
+        );
+        let session = self
+            .actor
+            .sessions
+            .get_mut(&self.key.scope())
+            .expect("fixture session");
+        session.next_stream_id = session.next_stream_id.max(stream_id + 1);
+        session.streams.insert(stream_id, stream);
     }
 
     fn stream(&self) -> &M2Stream {
@@ -3972,3 +4017,129 @@ async fn a_unary_echo_abandoned_during_a_freeze_keeps_the_roster_and_resets_afte
 
 #[path = "actor_freeze_hold_tests.rs"]
 mod freeze_hold_tests;
+
+/// Mark `stream_id`'s FIN refused by the full writer, as the refusal paths
+/// do, and arm the session's terminal-failure window.
+fn m6c160_refuse_fin(fixture: &mut FreezeFixture, stream_id: u64) {
+    if let Some(stream) = fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .and_then(|session| session.streams.get_mut(&stream_id))
+    {
+        stream.pending_terminal = Some(Terminal::Fin);
+        stream.terminal_fin_failure = true;
+    }
+    let key = fixture.key.clone();
+    fixture.actor.arm_terminal_fin_failure_deadline(&key);
+}
+
+/// Back-date `stream_id`'s first refusal, and the session window with it,
+/// so its 5 s window has already run out.
+fn m6c160_backdate_fin_failure(fixture: &mut FreezeFixture, stream_id: u64) -> Instant {
+    let first = Instant::now() - StdDuration::from_secs(10);
+    let session = fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .expect("fixture session");
+    session.terminal_fin_failed_at.insert(stream_id, first);
+    session.terminal_fin_failure_deadline = Some(first + StdDuration::from_secs(5));
+    first + StdDuration::from_secs(5)
+}
+
+/// Review of #199, item 3: the terminal-failure window is per stream.
+/// Another stream's FIN reaching the wire must not extend the window of a
+/// stream whose FIN is still refused.
+#[tokio::test]
+async fn m6c160_another_streams_progress_does_not_extend_a_fin_window() {
+    let mut fixture = FreezeFixture::new("fin-window-other", false);
+    fixture.add_stream(STREAM_ID + 2);
+    let other = STREAM_ID + 2;
+    m6c160_refuse_fin(&mut fixture, STREAM_ID);
+    m6c160_refuse_fin(&mut fixture, other);
+    let expired = m6c160_backdate_fin_failure(&mut fixture, STREAM_ID);
+
+    let key = fixture.key.clone();
+    fixture.actor.flush_pending_terminal(&key, other);
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Fin, 1, fixture.attempt.old_generation)],
+        "the other stream's FIN reached the wire"
+    );
+    assert_eq!(
+        fixture.session().terminal_fin_failure_deadline,
+        Some(expired),
+        "the still-refused stream keeps its own, expired window"
+    );
+}
+
+/// Review of #199, item 3: when the stream whose window is oldest makes
+/// progress, the session window restarts from the next stream's own first
+/// refusal.  Red if the re-derivation in `flush_pending_terminal` is removed.
+#[tokio::test]
+async fn m6c160_a_streams_own_progress_restarts_the_fin_window() {
+    let mut fixture = FreezeFixture::new("fin-window-restart", false);
+    fixture.add_stream(STREAM_ID + 2);
+    let other = STREAM_ID + 2;
+    m6c160_refuse_fin(&mut fixture, STREAM_ID);
+    m6c160_refuse_fin(&mut fixture, other);
+    m6c160_backdate_fin_failure(&mut fixture, STREAM_ID);
+
+    let key = fixture.key.clone();
+    fixture.actor.flush_pending_terminal(&key, STREAM_ID);
+    assert!(fixture.stream().pending_terminal.is_none());
+    assert!(
+        fixture
+            .session()
+            .terminal_fin_failure_deadline
+            .is_some_and(|deadline| deadline > Instant::now()),
+        "the window now runs from the other stream's own refusal"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// Review of #199, item 2: an ACK owed on the carrier a rotation retires is
+/// dropped at the commit, so it can neither be sent on the retired
+/// generation nor keep a deadline running that would close the healthy
+/// session.
+#[tokio::test]
+async fn m6c160_an_ack_owed_on_the_retired_carrier_is_dropped_at_commit() {
+    let mut fixture = FreezeFixture::new("owed-ack-rotation", false);
+    let _reply = fixture.write(b"owed");
+    let _ = drain_data(&mut fixture.old_rx);
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    let mut payload = (b"owed".len() as u32).to_be_bytes().to_vec();
+    payload.extend_from_slice(b"owed");
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::data(1, generation, STREAM_ID, 1, 1, payload))
+        .await;
+    assert!(fixture.session_alive());
+    assert!(
+        fixture
+            .session()
+            .owed_acks
+            .get(&STREAM_ID)
+            .is_some_and(|owed| owed.generation == generation),
+        "the ACK is owed on the old carrier"
+    );
+    let _ = drain_data(&mut fixture.old_rx);
+
+    fixture.quiesce();
+    let _ = fixture.complete_barrier();
+    fixture.connector_frozen(1).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    assert!(fixture.session_alive());
+    assert!(
+        fixture.session().owed_acks.is_empty(),
+        "the ACK owed on the retired generation was dropped at the commit"
+    );
+    assert_eq!(fixture.session().flow_control_owed_deadline, None);
+}
