@@ -1100,7 +1100,7 @@ impl PeerRuntime {
 
         let mut probes = stream::iter(targets.into_iter().map(|target| async move {
             let result = self
-                .probe_route_until(&target, TokioInstant::now() + PEER_PROBE_TIMEOUT)
+                .probe_route_with_deadline(&target, PEER_PROBE_TIMEOUT)
                 .await;
             (target, result)
         }))
@@ -1143,17 +1143,19 @@ impl PeerRuntime {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Probe one route within `deadline`, returning the approved SPKI digest
+    /// the peer proved.
     async fn probe_route_with_deadline(
         &self,
         target: &PeerRouteTarget,
         deadline: Duration,
-    ) -> Result<(), PeerRuntimeError> {
+    ) -> Result<String, PeerRuntimeError> {
         let expires_at = TokioInstant::now() + deadline;
         // A failed health stream is reachability evidence, not authority to
         // cancel unrelated admitted requests on its pooled connection.
         // QUIC closure and explicit identity/pin invalidation still retire
         // unusable connections through their existing lifecycle paths.
-        self.probe_route_until(target, expires_at).await.map(|_| ())
+        self.probe_route_until(target, expires_at).await
     }
 
     /// Probe one route and return the approved SPKI digest the peer proved.
