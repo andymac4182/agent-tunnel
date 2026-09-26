@@ -476,7 +476,7 @@ pub struct AcpClusterEvidence {
     ///
     /// The withdrawn key is the owner's *own* serving key and the incoming one
     /// is a phantom no certificate presents, so the key arm also takes the
-    /// owner's membership runtime through `MembershipRejected`, which
+    /// owner's membership runtime through `MissingLocalKey` (M7-C86), which
     /// invalidates every admission the owner holds — including its admission
     /// of the ingress. These two fields are the owner's own decision about the
     /// ingress, so a reader can see that the key arm tears down from both ends
@@ -1696,28 +1696,19 @@ const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
 
 /// Install a recording invalidation callback on one relay.
 ///
-/// It **chains the fixture's own pin publication**, including the failed-closed
-/// handling and the `pin_publication_pending` latch (M7-C81), so installing it
-/// changes what the fixture records and nothing about what it does. A recorder
-/// that replaced the pin publication would have quietly turned this case into
-/// a second hint-drop gate.
+/// It **chains the relay's own shared pin publisher** (M7-C90), so installing
+/// it changes what the fixture records and nothing about what it does. A
+/// recorder that replaced the pin publication would have quietly turned this
+/// case into a second hint-drop gate.
 fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
-    let membership = Arc::clone(&relay.membership);
-    let pins = relay.pins.clone();
-    let pending = Arc::clone(&relay.pin_publication_pending);
+    let publisher = Arc::clone(&relay.pin_publisher);
     let ledger = Arc::clone(ledger);
     let observer = relay.node_id.clone();
     relay
         .membership
         .set_invalidation_callback(Some(Arc::new(move |identity, reason| {
             ledger.record(&observer, &identity.node_id, reason);
-            if let Err(error) = publish_verified_pins(&membership, &pins) {
-                tracing::warn!(?error, "key-rotation pin publication failed closed");
-                let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
-                pending.store(true, Ordering::SeqCst);
-            } else {
-                pending.store(false, Ordering::SeqCst);
-            }
+            publisher.publish();
         })));
 }
 
@@ -2280,7 +2271,7 @@ impl Gate<'_> {
     /// fixture certificate presents, so the key the key arm withdraws is the
     /// owner's **own serving key** and its replacement is a phantom.  The
     /// owner's own membership runtime therefore cannot find its local key in
-    /// the record it just reconciled, takes the `MembershipRejected` branch of
+    /// the record it just reconciled, takes the `MissingLocalKey` branch (M7-C86) of
     /// `membership_runtime.rs`, goes **Unready**, and invalidates *every*
     /// admission it holds — including its admission of the ingress — with the
     /// same `MembershipRevoked`.  The run's own logs say so: a
@@ -2420,7 +2411,7 @@ impl Gate<'_> {
         // of uncorrelated refusals.
         self.wait_owner_membership_ready().await?;
         for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
-            publish_verified_pins(&relay.membership, &relay.pins)?;
+            publish_verified_pins(&relay.pin_publisher)?;
         }
         self.wait_peers_ready().await?;
         self.settle_key_rotation_route().await?;
@@ -2757,12 +2748,9 @@ impl Gate<'_> {
         // --- half one: the pin withdrawal, on its own ---
         {
             let relay = self.cluster.relay("relay-c")?;
-            relay
-                .pins
-                .replace(std::iter::empty::<tunnel_transport::SpkiSha256>())
-                .map_err(|error| {
-                    HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
-                })?;
+            relay.pin_publisher.withdraw_and_hold().map_err(|error| {
+                HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
+            })?;
         }
         // Observed for a bounded window rather than asserted either way: the
         // point is to record what a pin withdrawal alone does to a stream that
@@ -2803,7 +2791,7 @@ impl Gate<'_> {
         self.cluster
             .set_peer_path_drop_from("relay-a", "relay-c", false)?;
         let relay = self.cluster.relay("relay-c")?;
-        super::publish_verified_pins(&relay.membership, &relay.pins)?;
+        super::publish_verified_pins(&relay.pin_publisher)?;
         // The route has to be answering again before the next case starts, or
         // that case would be measuring this one's recovery.
         self.wait_peers_ready().await?;
@@ -4181,8 +4169,19 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // a label nobody checked.  Exact equality here too: an earlier
             // version was `!is_empty && !any(revoked)`, whose first conjunct
             // no falsification ever exercised.
-            "the same-key control arm was attributed to the record version, naming no key",
-            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],
+            // **Since M7-C80 the control arm invalidates nothing.**  A same-key
+            // re-sign at a newer version re-binds the admission rather than
+            // replacing it, so the stream survives and no reason is latched.
+            // That is a stronger control than the old `membership_changed`:
+            // whatever the key arm tears down is now attributable to the key
+            // alone, with the version bump shown to be inert beside it.
+            // `version_bump_interrupted` is recorded but not asserted: the
+            // arm watches its stream for up to 45 s, longer than the ACP
+            // exchange itself is bounded, so a stream that later ends on its
+            // own exchange deadline is not a membership event -- and a
+            // membership invalidation would have latched a reason here.
+            "the same-key control arm invalidated nothing (M7-C80)",
+            evidence.version_bump_reasons.is_empty(),
         ),
         (
             // **The disclosure, made load-bearing.**  The key arm withdraws
@@ -4684,7 +4683,7 @@ mod tests {
             owner_loss_no_stop_reason: true,
             key_overlap_staged: true,
             version_bump_interrupted: true,
-            version_bump_reasons: vec!["membership_changed".to_owned()],
+            version_bump_reasons: Vec::new(),
             key_rotation_interrupted: true,
             key_rotation_no_stop_reason: true,
             key_rotation_reasons: vec!["membership_revoked".to_owned()],
@@ -5108,18 +5107,20 @@ mod tests {
                     // evidence of nothing.
                     e.version_bump_reasons = vec!["membership_revoked".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
             ),
             (
                 // The other half of that rule.  It used to read
                 // `!is_empty && !any(revoked)` with only the second conjunct
                 // falsified, so a control arm that invalidated *nothing* --
                 // and therefore controlled for nothing -- would have passed.
-                "version_bump_reasons empty",
+                // M7-C80 regressed: a same-key version bump invalidating the
+                // admission again, as it did before the re-bind.
+                "version_bump_reasons membership_changed",
                 |e| {
-                    e.version_bump_reasons = Vec::new();
+                    e.version_bump_reasons = vec!["membership_changed".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
             ),
             (
                 "key_rotation_owner_unready",

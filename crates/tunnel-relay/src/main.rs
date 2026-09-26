@@ -28,8 +28,11 @@ use tunnel_core::RelayConfig;
 use tunnel_relay::{
     MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
     MembershipUnreadyReason, MembershipVersionStateIdentity, MembershipVersionStateStore,
-    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRouteTarget, PeerRuntime,
-    RelayOptions, ServeConfig,
+    PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRuntime, RelayOptions, ServeConfig,
+    peer_pins::{
+        PeerPinPublisher, PeerTrustTick, decode_hex_digest, peer_trust_tick,
+        publish_membership_pins, required_peer_routes,
+    },
     recovery::{
         QuiescenceAcknowledgement, RecoverRequest, RecoveryApprovalVersionStore,
         RecoveryFenceIdentity, RecoveryWorkflowConfig,
@@ -1137,6 +1140,7 @@ async fn start_cluster(
         )
         .into());
     }
+    let pin_publisher = PeerPinPublisher::new(Arc::clone(&membership), pins.clone());
     if let Err(error) = publish_membership_pins(&membership, &pins) {
         membership_handle.cancel();
         let _ = membership_handle.shutdown().await;
@@ -1155,14 +1159,14 @@ async fn start_cluster(
     // stream handles same-pin record/deadline changes.  Do not clear the
     // entire readiness route set for one peer: unrelated owner routes remain
     // usable and every new request still performs its exact binding check.
-    let pin_membership = Arc::clone(&membership);
-    let pin_updates = pins.clone();
-    membership.set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
-        if let Err(error) = publish_membership_pins(&pin_membership, &pin_updates) {
-            tracing::warn!(?error, "membership pin publication failed closed");
-            let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
-        }
-    })));
+    //
+    // The publisher is the shared library wiring (M7-C90): it republishes on
+    // every admission invalidation, on every readiness transition and
+    // verified directory change -- so the reconcile that returns membership
+    // to `Ready` republishes at once rather than on the next tick (M7-C91) --
+    // and on the refresh tick below, which remains the recovery path for a
+    // publication that failed closed.
+    pin_publisher.install();
     let running = match config
         .start_with_peer(
             options,
@@ -1193,8 +1197,7 @@ async fn start_cluster(
     // Public admission remains unready until the first authenticated pass,
     // avoiding a startup dependency cycle between otherwise trusted relays.
     let peer_task = tokio::spawn(peer_refresh_loop(
-        Arc::clone(&membership),
-        pins,
+        pin_publisher,
         Arc::clone(&peer_runtime),
         config.node_id.clone(),
         peer_capacity,
@@ -1315,6 +1318,9 @@ fn membership_readiness_code(
             MembershipUnreadyReason::MissingLocalMembership => {
                 ("unready", "missing_local_membership", "membership")
             }
+            MembershipUnreadyReason::MissingLocalKey => {
+                ("unready", "missing_local_key", "membership")
+            }
             MembershipUnreadyReason::PersistenceUnavailable => {
                 ("unready", "persistence_unavailable", "persistence")
             }
@@ -1339,53 +1345,9 @@ fn membership_shutdown_code(error: &MembershipRuntimeError) -> &'static str {
     }
 }
 
-/// Reconcile the transport's dynamic pins from verifier-filtered current
-/// route targets. Any malformed digest or unready state publishes an empty
-/// snapshot, which makes both peer directions fail closed.
-fn publish_membership_pins(
-    membership: &MembershipRuntime,
-    pins: &SharedPeerPins,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if !matches!(membership.readiness(), MembershipReadiness::Ready) {
-        pins.replace(std::iter::empty::<SpkiSha256>())?;
-        return Ok(());
-    }
-    // Derive the pin set from current, verifier-filtered route targets rather
-    // than the redacted diagnostic snapshot.  The latter intentionally keeps
-    // bounded historical key metadata, so publishing it could retain an
-    // expired/revoked SPKI in the transport trust set until the next full
-    // candidate swap.  Route targets filter record/key windows at `now` and
-    // are the same evidence used by readiness probes.
-    let mut digests = Vec::new();
-    for target in membership.verified_peer_route_targets() {
-        for digest in target.approved_spki_sha256() {
-            let bytes = decode_hex_digest(digest).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid membership SPKI digest",
-                )
-            })?;
-            digests.push(SpkiSha256::from_bytes(bytes));
-        }
-    }
-    pins.replace(digests)?;
-    Ok(())
-}
-
-fn required_peer_routes(
-    membership: &MembershipRuntime,
-    local_node_id: &str,
-) -> Vec<PeerRouteTarget> {
-    membership
-        .verified_peer_route_targets()
-        .into_iter()
-        .filter(|target| target.node_id() != local_node_id)
-        .collect()
-}
-
+/// Run the shared peer-trust tick on the bounded refresh interval.
 async fn peer_refresh_loop(
-    membership: Arc<MembershipRuntime>,
-    pins: SharedPeerPins,
+    publisher: Arc<PeerPinPublisher>,
     peer: Arc<PeerRuntime>,
     local_node_id: String,
     configured_capacity: usize,
@@ -1398,40 +1360,16 @@ async fn peer_refresh_loop(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = ticker.tick() => {
-                if let Err(error) = publish_membership_pins(&membership, &pins) {
-                    tracing::warn!(?error, "membership pin refresh failed closed");
-                    let _ = pins.replace(std::iter::empty::<SpkiSha256>());
-                }
-                if let Err(error) = peer.refresh_peer_pins().await {
-                    tracing::warn!(?error, "stale peer pin connection cleanup failed");
-                }
-                if pins.snapshot().is_empty() {
-                    // No current signed peer key material could be published,
-                    // so there is no trust evidence for any peer at all.
-                    peer.withdraw_peer_trust();
-                    continue;
-                }
-                if !matches!(membership.readiness(), MembershipReadiness::Ready) {
-                    // This relay's own cluster prerequisites are unmet, so
-                    // readiness and admission fail closed. The verified route
-                    // and pin set stays installed so an authenticated peer's
-                    // bounded reachability probe is still answered; otherwise
-                    // two relays wait on each other and neither converges.
-                    peer.withdraw_peer_readiness();
-                    continue;
-                }
-                // The configured ceiling supplies the global capacity floor;
-                // every successful route probe separately proves an actual
-                // HTTP/3 request slot and response path for that destination.
-                peer.set_peer_capacity(configured_capacity);
-                let targets = required_peer_routes(&membership, &local_node_id);
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    result = peer.refresh_required_routes(targets) => {
-                        if result.is_err() {
-                            tracing::warn!("authenticated peer readiness probe failed");
-                        }
-                    }
+                let tick = peer_trust_tick(
+                    &publisher,
+                    &peer,
+                    &local_node_id,
+                    configured_capacity,
+                    &shutdown,
+                )
+                .await;
+                if tick == PeerTrustTick::Shutdown {
+                    break;
                 }
             }
         }
@@ -1519,28 +1457,6 @@ fn decode_public_key(bytes: &[u8]) -> Result<[u8; 32], Box<dyn Error>> {
     let mut key = [0_u8; 32];
     key.copy_from_slice(&decoded);
     Ok(key)
-}
-
-fn decode_hex_digest(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
-        bytes[index] = (high << 4) | low;
-    }
-    Some(bytes)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[derive(Deserialize)]
@@ -1789,6 +1705,11 @@ mod tests {
             (
                 MembershipUnreadyReason::MissingLocalMembership,
                 "missing_local_membership",
+                "membership",
+            ),
+            (
+                MembershipUnreadyReason::MissingLocalKey,
+                "missing_local_key",
                 "membership",
             ),
             (
