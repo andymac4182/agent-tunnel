@@ -1724,6 +1724,14 @@ struct M2Actor {
     /// OPEN journal, or the retained stream table full of terminal streams)
     /// was exhausted, reset by the next reclamation (task row M7-C95).
     open_retention_exhausted_since: Option<Instant>,
+    /// When the M6-C120 read gate last stopped control reads, while it still
+    /// holds them stopped.  The M7-C95 give-up clock does not run while reads
+    /// are stopped: the `STREAM_FORGET`s that would reclaim retention arrive
+    /// on control (task row M6-C148).
+    open_retention_paused_at: Option<Instant>,
+    /// Test-only record of the read gate's changes (task row M6-C148).
+    #[cfg(test)]
+    read_gate_probe: Option<super::WriterTestGate>,
     /// Highest terminal stream ID whose carrier barriers have completed.
     /// Relay stream IDs are allocated monotonically for a session, so this
     /// scalar keeps late frames from forgotten streams from creating an
@@ -1784,6 +1792,8 @@ async fn run_m2_session(
         M2_CONTROL_QUEUE_BYTES.min(config.limits.max_queue_bytes),
         cancellation.clone(),
     );
+    #[cfg(test)]
+    let read_gate_probe = test_writer_gate.clone();
     #[cfg(test)]
     let mut forget_tick_hook = test_writer_gate.as_ref().and_then(|gate| {
         gate.forget_tick
@@ -1900,6 +1910,9 @@ async fn run_m2_session(
         pending_pongs: BTreeMap::new(),
         pending_forgets: BTreeMap::new(),
         open_retention_exhausted_since: None,
+        open_retention_paused_at: None,
+        #[cfg(test)]
+        read_gate_probe: read_gate_probe.clone(),
         forgotten_stream_through: 0,
         retired_streams: RetiredStreamIds::default(),
         peer_fence_message_id: None,
@@ -1917,6 +1930,9 @@ async fn run_m2_session(
     );
     deadline_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
+        // The same gate the control branch below is guarded by: note a pause
+        // or a resume for the M7-C95 give-up clock (task row M6-C148).
+        actor.observe_control_read_gate_at(Instant::now());
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break Ok(()),
@@ -4237,6 +4253,47 @@ impl M2Actor {
         .saturating_add(OPEN_RETENTION_EXHAUSTION_MARGIN)
     }
 
+    /// Pause the M7-C95 give-up clock while the M6-C120 read gate has stopped
+    /// control reads, and credit the paused time back when reads resume
+    /// (task row M6-C148).  Only the part of a pause that fell inside the
+    /// current exhaustion is credited, so the clock counts exactly the
+    /// exhausted time during which the session was reading control and could
+    /// have received a reclaiming `STREAM_FORGET`.  This bounds the *reading*
+    /// time a session may spend exhausted before it gives up, not its total
+    /// wall time.  Paused time is bounded elsewhere, per spilled item: each
+    /// critical control spilled while reads are stopped carries a
+    /// [`M2_CRITICAL_CONTROL_TIMEOUT`] deadline, and one that expires before
+    /// the writer takes it ends the session.
+    fn observe_control_read_gate_at(&mut self, now: Instant) {
+        if !self.control_read_ready() {
+            if self.open_retention_paused_at.is_none() {
+                self.open_retention_paused_at = Some(now);
+                #[cfg(test)]
+                self.record_read_gate_event(true, now);
+            }
+            return;
+        }
+        #[cfg(test)]
+        if self.open_retention_paused_at.is_some() {
+            self.record_read_gate_event(false, now);
+        }
+        if let Some(paused_at) = self.open_retention_paused_at.take()
+            && let Some(since) = self.open_retention_exhausted_since
+        {
+            let paused = now.saturating_duration_since(paused_at.max(since));
+            self.open_retention_exhausted_since = Some(since.checked_add(paused).unwrap_or(now));
+        }
+    }
+
+    #[cfg(test)]
+    fn record_read_gate_event(&self, stopped: bool, now: Instant) {
+        if let Some(gate) = self.read_gate_probe.as_ref()
+            && let Ok(mut events) = gate.read_gate_events.lock()
+        {
+            events.push((stopped, now));
+        }
+    }
+
     /// Give the session up once OPEN retention has been exhausted for longer
     /// than [`Self::open_retention_exhaustion_grace`] with no reclamation
     /// (task row M7-C95).  Before this a connector whose retention was full
@@ -4257,6 +4314,13 @@ impl M2Actor {
         // concurrent work, so the give-up clock restarts.
         if self.active_stream_count() >= self.config.limits.max_streams {
             self.open_retention_exhausted_since = None;
+        }
+        // While control reads are stopped the clock is paused: the session
+        // cannot read the STREAM_FORGETs that would reclaim its retention.
+        // Each spilled critical control's own deadline bounds that stall.
+        self.observe_control_read_gate_at(now);
+        if self.open_retention_paused_at.is_some() {
+            return Ok(());
         }
         match self.open_retention_exhausted_since {
             Some(since)
@@ -9372,11 +9436,38 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
         .await,
         Ok(Ok(()))
     );
+    // The writer can exit on the session's cancellation while this Close is
+    // being queued.  tokio's receiver drains its queue when it is dropped,
+    // but a send that reserved its slot before the drop and stores its value
+    // after the drain leaves the Close stranded until the last sender (held
+    // here) is dropped, so its reply never comes.  A finished writer answers
+    // no command, so its completion ends the wait as well (task row
+    // M6-C158); without this, shutdown waited the whole close timeout.
+    let mut writer_finished = false;
     let _writer_closed = if sent_close {
-        tokio::time::timeout(M2_CLOSE_TIMEOUT, wait).await.is_ok()
+        match carrier.writer.as_mut() {
+            Some(writer) => tokio::time::timeout(M2_CLOSE_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    reply = wait => reply.is_ok(),
+                    _ = writer => {
+                        writer_finished = true;
+                        false
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false),
+            None => tokio::time::timeout(M2_CLOSE_TIMEOUT, wait).await.is_ok(),
+        }
     } else {
         false
     };
+    // A writer whose completion was observed above has been joined; its
+    // handle must not be polled again.
+    if writer_finished {
+        carrier.writer = None;
+    }
     let writer_joined = if let Some(writer) = carrier.writer.take() {
         join_carrier_task(writer).await
     } else {
@@ -9602,6 +9693,9 @@ mod tests {
             pending_pongs: BTreeMap::new(),
             pending_forgets: BTreeMap::new(),
             open_retention_exhausted_since: None,
+            open_retention_paused_at: None,
+            #[cfg(test)]
+            read_gate_probe: None,
             forgotten_stream_through: 0,
             retired_streams: RetiredStreamIds::default(),
             peer_fence_message_id: None,
@@ -16887,6 +16981,52 @@ mod tests {
         }
     }
 
+    /// Task row M6-C158.  A carrier writer that exits on the session's
+    /// cancellation can leave the Close that `close_carrier` queued stranded
+    /// behind its dropped receiver (a send that reserved its slot before the
+    /// drop and stored its value after the drain), so the Close is never
+    /// answered.  This forces the same state deterministically: the writer
+    /// task parks its receiver elsewhere, unread, and finishes.  The close
+    /// must end once the writer has finished instead of waiting out the
+    /// whole close timeout, and must still report the carrier locally
+    /// closed.  Before the fix it waited `M2_CLOSE_TIMEOUT` (5 s), which is
+    /// how `m6c120_read_gate_stops_control_reads_under_back_pressure` came
+    /// to be aborted by its 2 s cleanup bound on hosted Linux.
+    #[tokio::test]
+    async fn closing_a_carrier_whose_writer_already_exited_does_not_wait_for_a_reply() {
+        let (tx, receiver) = mpsc::channel::<CarrierCommand>(M2_CARRIER_QUEUE_FRAMES);
+        let (park, parked) = std::sync::mpsc::channel();
+        let exited = Arc::new(Notify::new());
+        let writer_exited = exited.clone();
+        let writer = tokio::spawn(async move {
+            // Keep the receiver alive but unread, as the stranded Close is.
+            let _ = park.send(receiver);
+            writer_exited.notify_one();
+        });
+        exited.notified().await;
+        let carrier = Carrier {
+            key: CarrierKey::new(1, "connection"),
+            local_addr: None,
+            tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: Some(writer),
+        };
+        let started = Instant::now();
+        let closed = timeout(M2_CLOSE_TIMEOUT * 2, close_carrier(carrier))
+            .await
+            .expect("close_carrier is bounded");
+        let elapsed = started.elapsed();
+        drop(parked);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "closing a carrier whose writer had exited waited {elapsed:?} for a reply \
+             no writer could send"
+        );
+        assert!(closed.local_closed, "the finished writer counts as joined");
+    }
+
     /// M6-C120, review: the read gate on the real session loop.  With the
     /// control writer held, an OPEN flood fills the writer queue and then the
     /// critical spill with refusals.  Once the spill lacks headroom the actor
@@ -16902,6 +17042,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
         let (control_client, mut control_peer) = test_websocket_pair().await?;
@@ -17097,6 +17238,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
 
@@ -17352,6 +17494,227 @@ mod tests {
         ));
     }
 
+    /// Task row M6-C148, on the real session loop.  OPEN retention is
+    /// exhausted while control is read normally, so the M7-C95 give-up clock
+    /// starts.  Part-way through its grace the control writer is held and an
+    /// OPEN flood fills the critical spill, so the M6-C120 read gate stops
+    /// control reads.  The hold outlasts the rest of the grace (but not the
+    /// critical-control deadline).  While reads are stopped the session
+    /// cannot read a reclaiming `STREAM_FORGET`, so it must stay up; once
+    /// the writer is released and reads resume, retention that is still not
+    /// reclaimed must give the session up with `OpenRetentionFull` after the
+    /// unpaused remainder of the grace, and not at the moment reads resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_control_reads_pause_the_open_retention_give_up_clock() -> Result<(), String> {
+        let gate = Arc::new(test_hooks::ControlWriterGate {
+            block_once: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+            forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
+        });
+        let _gate_guard = ControlWriterGateGuard(gate.clone());
+        let (control_client, mut control_peer) = test_websocket_pair().await?;
+        let (data_client, mut data_peer) = test_websocket_pair().await?;
+        let (control_sink, control_stream) = control_client.split();
+        let (data_sink, data_stream) = data_client.split();
+        let cancellation = CancellationToken::new();
+        let (readiness, _readiness_receiver) = watch::channel(Readiness::Connecting);
+        let (status, _status_receiver) = watch::channel(ConnectionStatus::default());
+        let mut config = RuntimeConfig::default();
+        // A small live limit keeps the journal and the spill small.
+        config.limits.max_streams = 2;
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        // Grace = 100 + 200 ms + the 5 s margin = 5.3 s.
+        let rotation_config = RotationConfig::new(300_000, 100, 200)
+            .map_err(|error| format!("test rotation config: {error:?}"))?;
+        let grace = Duration::from_millis(300) + OPEN_RETENTION_EXHAUSTION_MARGIN;
+        let mut actor = tokio::spawn(run_m2_session(
+            config,
+            session,
+            runtime_welcome(),
+            "owner".to_owned(),
+            None,
+            rotation_config,
+            control_sink,
+            control_stream,
+            data_sink,
+            data_stream,
+            cancellation.clone(),
+            readiness,
+            status,
+            None,
+            None,
+            Some(gate.clone()),
+            HttpHandlers::default(),
+        ));
+        tokio::spawn(async move { while data_peer.next().await.is_some() {} });
+        // Every OPEN names a service this connector does not export, so each
+        // is refused and journaled, and no stream is live: the retention that
+        // fills is terminal work the owner never forgets.
+        let unexported_open = |stream_id: u64| {
+            let mut open = test_open(stream_id);
+            open.service_id = "not_exported".to_owned();
+            open
+        };
+
+        let proof = async {
+            // 1. Exhaust OPEN retention with the writer free.
+            let mut stream_id = 1;
+            let mut exhausted_at = None;
+            while exhausted_at.is_none() && stream_id <= 200 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(unexported_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN {stream_id} should reach the actor: {error}"))?;
+                stream_id += 1;
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    timeout(Duration::from_millis(50), control_peer.next()).await
+                {
+                    if let Ok(ControlMessage::Rejected(rejected)) = decode_control(text.as_bytes())
+                        && rejected.code == "RESOURCE_EXHAUSTED"
+                        && rejected
+                            .reason
+                            .contains("OPEN idempotency retention is full")
+                    {
+                        exhausted_at = Some(Instant::now());
+                    }
+                }
+            }
+            let exhausted_at = exhausted_at
+                .ok_or_else(|| "the OPEN journal never reported exhaustion".to_owned())?;
+            // 2. Read control, unpaused, for part of the grace.
+            tokio::time::sleep_until((exhausted_at + Duration::from_secs(3)).into()).await;
+            if actor.is_finished() {
+                return Err("the session gave up before the grace elapsed".to_owned());
+            }
+            // 3. Hold the writer and flood, so the read gate stops reads.
+            gate.block_once.store(true, Ordering::Release);
+            let entered = gate.entered.notified();
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(unexported_open(
+                    stream_id,
+                ))))
+                .await
+                .map_err(|error| format!("held OPEN should reach the actor: {error}"))?;
+            stream_id += 1;
+            timeout(TEST_SETUP_TIMEOUT, entered)
+                .await
+                .map_err(|_| "control writer did not enter the deterministic hold".to_owned())?;
+            for _ in 0..47 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(unexported_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN flood should reach the socket: {error}"))?;
+                stream_id += 1;
+            }
+            // Time the rest from the instant the session itself stopped
+            // reading, as its give-up clock does, not from the test's sends.
+            let paused_at = timeout(TEST_SETUP_TIMEOUT, read_gate_event(&gate, true))
+                .await
+                .map_err(|_| "the read gate never stopped control reads".to_owned())?;
+            let read_before_pause = paused_at.saturating_duration_since(exhausted_at);
+            if read_before_pause < Duration::from_secs(2) {
+                return Err(format!(
+                    "reads stopped only {read_before_pause:?} into the exhaustion; the test \
+                     cannot tell a credited clock from a restarted one"
+                ));
+            }
+            // 4. Hold past the rest of the grace, inside the critical deadline
+            // of the first spilled refusal (spilled just before the pause).
+            tokio::time::sleep_until((paused_at + Duration::from_millis(3_300)).into()).await;
+            if exhausted_at.elapsed() < grace {
+                return Err("the hold did not outlast the grace".to_owned());
+            }
+            if actor.is_finished() {
+                return Err(format!(
+                    "the session was given up {:?} after its retention was exhausted, while \
+                     control reads were paused",
+                    exhausted_at.elapsed()
+                ));
+            }
+            Ok::<_, String>((control_peer, read_before_pause))
+        }
+        .await;
+
+        // 5. Release: reads resume; nothing reclaims, so the rest of the grace
+        // runs out and the session gives up.
+        gate.release.notify_waiters();
+        let proof = match proof {
+            Ok((mut control_peer, read_before_pause)) => {
+                tokio::spawn(async move { while control_peer.next().await.is_some() {} });
+                match timeout(TEST_SETUP_TIMEOUT, read_gate_event(&gate, false)).await {
+                    Ok(resumed_at) => Ok((read_before_pause, resumed_at)),
+                    Err(_) => Err("control reads never resumed after the release".to_owned()),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let joined = if proof.is_ok() {
+            timeout(Duration::from_secs(15), &mut actor).await.ok()
+        } else {
+            None
+        };
+        let ended_at = Instant::now();
+        cancellation.cancel();
+        let actor_result = match joined {
+            Some(joined) => joined,
+            None => match timeout(TEST_ACTOR_CLEANUP_TIMEOUT, &mut actor).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    actor.abort();
+                    (&mut actor).await
+                }
+            },
+        };
+        let (read_before_pause, resumed_at) = proof?;
+        assert!(
+            matches!(&actor_result, Ok(Err(ClientError::OpenRetentionFull))),
+            "unreclaimed retention still gives the session up once reads resume: {actor_result:?}"
+        );
+        // Credited, the clock has `grace - read_before_pause` left when reads
+        // resume.  Restarted, it would have the whole grace; not paused, none.
+        // `read_before_pause` is at least 2 s, so the window below excludes
+        // both: its upper edge is at most `grace - 1 s`.
+        let remainder = grace.saturating_sub(read_before_pause);
+        let ended_after = ended_at.saturating_duration_since(resumed_at);
+        assert!(
+            ended_after + Duration::from_millis(500) >= remainder,
+            "the paused time is credited back, so the give-up waits for the reading \
+             remainder of the grace ({remainder:?}): ended {ended_after:?} after reads resumed"
+        );
+        assert!(
+            ended_after < remainder + Duration::from_secs(1),
+            "only the paused time is credited back, not a fresh grace: the remainder was \
+             {remainder:?} but the session ended {ended_after:?} after reads resumed"
+        );
+        Ok(())
+    }
+
+    /// The first change of the read gate to `stopped` that the session loop
+    /// recorded (task row M6-C148), polled until it appears.
+    async fn read_gate_event(gate: &test_hooks::ControlWriterGate, stopped: bool) -> Instant {
+        loop {
+            if let Some(at) = gate.read_gate_events.lock().ok().and_then(|events| {
+                events
+                    .iter()
+                    .find(|(event, _)| *event == stopped)
+                    .map(|(_, at)| *at)
+            }) {
+                return at;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Task row M7-C84, forced end to end on the real session loop.  A
     /// `STREAM_FORGET` whose carrier barrier could not be queued yet (the
     /// carrier queue was full when it arrived) is retried from the deadline
@@ -17410,6 +17773,7 @@ mod tests {
                 entered: entered.clone(),
                 release: release.clone(),
             })),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
 
         let (control_client, _control_peer) = test_websocket_pair().await?;

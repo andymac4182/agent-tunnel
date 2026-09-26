@@ -265,7 +265,17 @@ plus one handshake budget plus 5 s, it ends the session with the typed,
 retryable `RESOURCE_EXHAUSTED` (`OpenRetentionFull`). The owner withholds
 `STREAM_FORGET` only while a rotation holds the roster, and that window is
 bounded, so a longer stall is retention the owner will never reclaim. Any
-reclamation restarts the clock. A supervisor such as `connect` then starts a
+reclamation restarts the clock. The clock counts only time during which the
+connector is reading control (task row M6-C148): while back-pressure has
+stopped control reads (the critical-control spill lacks headroom, task row
+M6-C120), the `STREAM_FORGET`s that would reclaim retention cannot be read,
+so the clock is paused, and when reads resume the paused time that fell
+inside the exhaustion is credited back. The rule therefore bounds how long
+a session may stay exhausted *while reading control*, not its total wall
+time. Paused time is bounded separately, per spilled item: every critical
+control spilled while reads are stopped carries a 5 s deadline, and one that
+expires before the writer takes it ends the session as a retryable transport
+failure. A supervisor such as `connect` then starts a
 fresh session, whose journal is empty. What no longer exists is a
 lifetime ceiling: an unattended long-lived session serves an unbounded number
 of sequential streams.

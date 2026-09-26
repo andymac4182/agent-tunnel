@@ -20,7 +20,7 @@ Axum is the web framework for public HTTP and device WebSockets. Its documented 
 
 ### Bounded listener connection permits
 
-Both public listeners supervise at most 64 concurrent TLS handshakes and HTTP connections, and one permit is held for the whole HTTP connection. A permit is therefore bounded in time as well as in count by three validated `ListenerTimeouts` values, so an anonymous consumer connection (or a connection presenting one valid device certificate) cannot hold a permit by completing the TLS handshake and then staying silent:
+Both public listeners supervise at most 64 concurrent TLS handshakes and HTTP connections by default (`listener_max_connections`, `1..=4096`, applied to each listener separately), and one permit is held for the whole HTTP connection. A permit is therefore bounded in time as well as in count by three validated `ListenerTimeouts` values, so an anonymous consumer connection (or a connection presenting one valid device certificate) cannot hold a permit by completing the TLS handshake and then staying silent:
 
 | Bound | Default | Accepted range | Phase it covers |
 | --- | --- | --- | --- |
@@ -29,6 +29,28 @@ Both public listeners supervise at most 64 concurrent TLS handshakes and HTTP co
 | `http1_header_read_timeout` | 10 s | 100 ms..=300 s, not above `pre_request_timeout` | Each single HTTP/1 request-head read, including an idle keep-alive gap between requests |
 
 A silent connection therefore holds a permit for at most 25 seconds by default, then is closed and returns it. The pre-request bound is disarmed permanently by the first dispatched request, so an established device WebSocket upgrade, an in-flight consumer request, and a streaming response body are never closed by it; `http1_header_read_timeout` is armed by Hyper only when it can read a new request head, so it does not apply during an in-flight request, a streaming body, or after an upgrade. HTTP/2 has no header-read deadline of its own, and `hyper_util`'s protocol sniffer has no deadline at all, which is why the pre-request bound is enforced by the listener rather than delegated to Hyper. Hyper discards a configured header-read deadline unless a timer is installed on its builder, so the listener installs a Tokio timer on both the HTTP/1 and HTTP/2 builders. Raising the permit count is not a substitute for these deadlines. An invalid value fails closed: the listener returns a typed error and releases the socket instead of accepting with an unbounded permit.
+
+### Connections over the limit (M6-C153)
+
+A connection that arrives while every permit is held is **refused explicitly, never reset**. Applied by default pending owner confirmation (2026-09-25):
+
+1. **Refusal margin.** The listener accepts up to `listener_refusal_margin` (default 16, `0..=256`) extra connections only to refuse them. Each completes TLS (the device listener still requires a valid client certificate), reads one request head and at most 64 KiB of body, answers, and is closed with a TLS `close_notify`:
+
+   ```
+   HTTP/1.1 503 Service Unavailable
+   retry-after: 1
+   connection: close
+   {"code":"CONNECTION_LIMIT","execution":"not_dispatched",
+    "message":"relay listener connection limit reached",
+    "retryable":true,"retry_after_ms":1000}
+   ```
+
+   The request is never routed, so nothing is dispatched to a device and no authentication is attempted. HTTP/2 gets the same answer followed by GOAWAY. A device WebSocket upgrade gets the same `503`; the client treats it as a retryable transport failure and reconnects with its usual back-off. The whole over-capacity connection is bounded by a 5 s refusal deadline (`DEFAULT_REFUSAL_TIMEOUT`); a peer that has not finished by then is dropped and frees the slot.
+2. **Backlog when the margin is full.** While both the permits and the refusal slots are taken, the listener does not call `accept`. Further connections wait in the kernel listen backlog (128 as the relay binds it through Tokio, capped by the OS `somaxconn`; measured `kern.ipc.somaxconn` 128 on the macOS test host) and are served or refused as slots free. The listener never accepts a socket and then drops it unanswered; only the kernel can refuse a connection, when its backlog is full.
+
+**Why this option.** The owner brief offered three: (a) complete TLS within a small margin and answer `503`; (b) accept into a bounded queue and hold each connection until a permit frees, then `503` on timeout; (c) leave excess connections in the kernel backlog. Option (c) alone gives a client no answer at all: under a keep-alive flood the served connections never close, so a backlogged client waits until its own timeout, which is no more distinguishable from a dead relay than a reset. Option (b) holds a file descriptor and a TLS session per queued connection for the whole wait and still ends in the same `503`, so it costs more than (a) for the same answer. Option (a) is the smallest amount of work that yields a distinguishable, retryable answer, and its cost is bounded by the margin: at most 16 extra TLS handshakes and 16 x 64 KiB of buffered body at any moment, each for at most 5 s. Falling back to (c) when the margin is full removes the remaining reset without adding work. Setting `listener_refusal_margin = 0` selects pure (c). The 64 limit is unchanged: no measurement justifies another value, and keep-alive connections still count against it for as long as they stay open.
+
+**Operator signals.** Each listener logs `refusing connection over the listener connection limit` at `info` with `phase=listener_capacity`, `listener`, `max_connections` and a `suppressed` count, rate limited like the TLS refusal lines (20 lines per 10 s per listener). A load-balancer health check that lands while a listener is full also gets `503 CONNECTION_LIMIT`, distinguishable from `/readyz`'s `503 {"status":"unready"}` by its body. The refusal count is not yet a `/metrics` series.
 
 The two steady-state WebSockets belong to each CLI device connection. Peer QUIC connections and consumer connections are separate. Private HTTP/3 forwarding does not add a third steady-state device socket. During data rotation, one control plus old and candidate data sockets remain bounded by the existing overlap deadline.
 

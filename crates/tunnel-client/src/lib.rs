@@ -143,6 +143,10 @@ pub(crate) mod test_hooks {
         /// `STREAM_FORGET` barriers (task row M7-C84).  It lets a test force
         /// a stop to land inside that tick body on the real loop.
         pub(crate) forget_tick: std::sync::Mutex<Option<ForgetTickHook>>,
+        /// Every change of the M2 control-read gate as the session loop saw
+        /// it: `true` when reads stopped, `false` when they resumed, with the
+        /// instant the retention give-up clock used (task row M6-C148).
+        pub(crate) read_gate_events: std::sync::Mutex<Vec<(bool, std::time::Instant)>>,
     }
 
     /// Seeds actor state; the argument is the M2 actor as `dyn Any`.

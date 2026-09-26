@@ -1033,6 +1033,34 @@ A relay that is not ready refuses public work with `503` and
 M7-C86 and M7-C90 (when a relay withdraws peer trust) and M7-C80, M7-C81 and
 M7-C83 (membership re-signs).
 
+**Connection limit (M6-C153).** Each public listener serves at most
+`listener_max_connections` connections at once (a top-level key, default 64,
+`1..=4096`, applied to the consumer and device listeners separately). A
+keep-alive connection counts for as long as it stays open. A connection over
+the limit is answered, not reset:
+
+```
+HTTP/1.1 503 Service Unavailable
+retry-after: 1
+connection: close
+{"code":"CONNECTION_LIMIT","execution":"not_dispatched",
+ "message":"relay listener connection limit reached",
+ "retryable":true,"retry_after_ms":1000}
+```
+
+Nothing was dispatched, so a client may retry after `Retry-After`. The relay
+does this TLS work for at most `listener_refusal_margin` extra connections at
+a time (default 16, `0..=256`), each for at most 5 s. Beyond that it stops
+accepting and the kernel's listen backlog holds further connections until a
+slot frees; `0` means no work over the limit, only the backlog. The relay logs
+`refusing connection over the listener connection limit` at `info` with
+`phase=listener_capacity` and the `listener`, rate limited per listener.
+A health check that lands while the listener is full gets this `503` too;
+tell it from `/readyz`'s `503 {"status":"unready"}` by the body, or give
+health checks headroom by raising the limit. Before M6-C153 such a connection
+was dropped before TLS and the client saw a connection reset. Design and
+rationale: [runtime.md](runtime.md#connections-over-the-limit-m6-c153).
+
 ### 3.3 A cluster
 
 **A cluster cannot be brought up with what this alpha ships** (M6-C22). Each
