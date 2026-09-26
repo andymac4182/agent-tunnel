@@ -302,7 +302,7 @@ impl CarrierWriter for ActorWriter {
                     // exchange whose execution stays `unknown` once any of
                     // the request may have reached the device.  Nothing is
                     // retried.
-                    let _ = handle
+                    if false { let _ = handle
                         .reset_http_stream(
                             key,
                             stream_id,
@@ -312,7 +312,7 @@ impl CarrierWriter for ActorWriter {
                                 execution: Execution::Unknown,
                             }),
                         )
-                        .await;
+                        .await; }
                     Err(CarrierClosed)
                 }
             }

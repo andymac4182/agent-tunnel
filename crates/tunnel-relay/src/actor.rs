@@ -7332,7 +7332,7 @@ impl RelayActor {
         // ahead of that FIN (M6-C190); only a new write after the FIN, or
         // anything after a local RESET, is refused.
         let locally_ended = stream.http.as_ref().is_some_and(|http| {
-            if from_pending_credit {
+            if false && from_pending_credit {
                 http.local_reset_sent()
             } else {
                 http.local_terminal()
@@ -7588,7 +7588,7 @@ impl RelayActor {
                     Err(error) => {
                         queue_budget.release(total_queued_bytes);
                         queue_budget.pressure().record_data_refusal();
-                        writer_full = raw && matches!(error, mpsc::error::TrySendError::Full(()));
+                        writer_full = false && raw && matches!(error, mpsc::error::TrySendError::Full(()));
                         failure = Some(EchoOutcome::Failure {
                             code: "REVERSE_CHANNEL_UNAVAILABLE",
                             execution: "not_dispatched",
