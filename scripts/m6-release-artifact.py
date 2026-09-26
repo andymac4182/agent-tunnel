@@ -1219,6 +1219,23 @@ def check_assets(bundle: Path) -> Result:
 # Each CLI probe names the substring that proves the command actually produced
 # its output.  Asserting exit status alone would pass a binary that printed
 # nothing, which is the whole reason these are (command, witness) pairs.
+#: The environment variable only a `--features test-hooks` client reads
+#: (docs/tasks.md M6-C132, the M6-06 review).  Its name is compiled into the
+#: binary exactly when the hook is, so its absence from every bundled
+#: executable is the observable proof that no shipped binary can have its
+#: rotation held by an environment value.
+TEST_HOOK_MARKER = b"TUNNEL_CLIENT_TEST_HOLD"
+
+
+def binaries_carrying_test_hooks(bundle: Path) -> list[str]:
+    """Names of bundled executables whose bytes contain the test-hook marker."""
+    carrying = []
+    for binary in sorted((bundle / "bin").iterdir()):
+        if binary.is_file() and TEST_HOOK_MARKER in binary.read_bytes():
+            carrying.append(binary.name)
+    return carrying
+
+
 CLI_PROBES = (
     ("tunnel-client", ["--help"], "tunnel-client"),
     ("tunnel-client", ["--version"], "tunnel-client "),
@@ -1241,6 +1258,15 @@ def check_cli(bundle: Path) -> Result:
                                   f"{env['PATH']!r}; the clean-environment claim "
                                   f"would be untested",
                           witness="environment-not-scrubbed")
+        # Before anything runs: a shipped binary built with the rotation test
+        # hook is refused outright (M6-C132).
+        carrying = binaries_carrying_test_hooks(bundle)
+        if carrying:
+            return Result("cli", False,
+                          summary=f"{', '.join(carrying)} carries the test-only "
+                                  f"{TEST_HOOK_MARKER.decode()} hook; it was built "
+                                  f"with --features test-hooks",
+                          witness="test-hook-in-shipped-binary")
         for name, args, needle in CLI_PROBES:
             binary = bundle / "bin" / name
             if not binary.is_file():
@@ -1317,6 +1343,8 @@ def check_cli(bundle: Path) -> Result:
                             f"and {len(serving)} serving dry run(s), all from the "
                             f"unpacked bundle")
     result.note("each probe asserts an expected substring, not exit status alone")
+    result.note(f"no bundled executable carries {TEST_HOOK_MARKER.decode()} "
+                f"(the test-only rotation hook)")
     result.note("run with cwd in a temporary directory, PATH narrowed to the system "
                 "directories and every CARGO_*/RUST* variable dropped; cargo proven "
                 "unfindable on that PATH before the probes ran")
@@ -3094,6 +3122,20 @@ def control_cli_content_not_exit_status(bundle: Path) -> tuple[bool, str]:
         return expect_red("cli", copy, "output-content")
 
 
+def control_cli_test_hook_in_shipped_binary(bundle: Path) -> tuple[bool, str]:
+    """A client carrying the test-only rotation hook must not pass (M6-C132).
+
+    Appends the hook's variable name to the bundled client, which is exactly
+    what a `--features test-hooks` build adds to the binary's bytes.  The scan
+    runs before any probe, so the modified executable is never run.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        client = copy / "bin" / "tunnel-client"
+        client.write_bytes(client.read_bytes() + TEST_HOOK_MARKER)
+        return expect_red("cli", copy, "test-hook-in-shipped-binary")
+
+
 def control_cli_config_check_is_real(bundle: Path) -> tuple[bool, str]:
     """The config check must actually parse the example.
 
@@ -4143,6 +4185,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     ],
     "cli": [
         ("a binary that exits 0 printing nothing", control_cli_content_not_exit_status),
+        ("a client built with the test-only rotation hook",
+         control_cli_test_hook_in_shipped_binary),
         ("a corrupted configuration example", control_cli_config_check_is_real),
         ("cargo reachable on the probe PATH", control_cli_environment_scrub_is_checked),
         ("a corrupted serving example", control_cli_serving_dry_run_is_real),
