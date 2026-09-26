@@ -1307,12 +1307,24 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
 /// every stock client -- curl's `*/*`, httpx's `*/*` -- sends one, so without
 /// this its first request was refused `HTTP_INVALID_HEAD`. MCP and ACP
 /// allowlist `accept` and still receive it unchanged.
-const DROPPED_CLIENT_HEADERS: [http::HeaderName; 5] = [
+///
+/// `cache-control` (task row M3-46) is what the official MCP Python SDK
+/// (mcp 2.2.0) adds, as `no-store`, to the 2025-11-25 standalone GET stream
+/// through httpx2's SSE helper; refusing it failed that stream on every
+/// Python client.  Like every entry here it is dropped for **every**
+/// http-forward profile -- `mcp-2025-11-25`, `mcp-2026-07-28` and
+/// `acp-http-v1` alike -- unless that profile allowlists it (none does).  A
+/// request cache directive has no authority, the relay and the device cache
+/// nothing, and each profile's backend serves its responses uncached whatever
+/// the request said, so dropping it changes nothing the export or the
+/// consumer can observe.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 6] = [
     header::USER_AGENT,
     header::ACCEPT_ENCODING,
     header::ACCEPT_LANGUAGE,
     http::HeaderName::from_static("sec-fetch-mode"),
     header::ACCEPT,
+    header::CACHE_CONTROL,
 ];
 
 /// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
@@ -2426,6 +2438,32 @@ mod tests {
                     });
             }
         }
+        // M3-46: the official MCP Python SDK (mcp 2.2.0) opens the 2025-11-25
+        // standalone GET stream through httpx2's SSE helper, which adds
+        // `Cache-Control: no-store` (`httpx2/_client.py`).  Captured on the
+        // wire through a real relay by scripts/m3-sdk-conformance.sh.
+        let python_sdk_get: &[(&str, &str)] = &[
+            ("host", "127.0.0.1"),
+            ("accept", "text/event-stream"),
+            ("cache-control", "no-store"),
+            ("accept-encoding", "gzip, deflate"),
+            ("connection", "keep-alive"),
+            ("user-agent", "python-httpx2/2.13.1"),
+            ("mcp-session-id", "0123abcd"),
+            ("mcp-protocol-version", "2025-11-25"),
+        ];
+        let policies = tunnel_mcp::McpProfile::V2025_11_25
+            .policies(tunnel_mcp::McpLimits::default())
+            .expect("MCP profile");
+        let mut request = http::Request::get("/mcp").version(http::Version::HTTP_11);
+        for (name, value) in python_sdk_get {
+            request = request.header(*name, *value);
+        }
+        let mut parts = request.body(()).expect("request").into_parts().0;
+        strip_default_client_headers(&mut parts.headers, &policies.request.headers);
+        tunnel_http_bridge::normalize::request_head(&parts, &policies.request).unwrap_or_else(
+            |error| panic!("the Python SDK's standalone GET head was refused: {error:?}"),
+        );
         // Nit: a header over the name bound is skipped, and the next
         // unlisted one is named instead of none.
         let policies = tunnel_mcp::McpProfile::V2025_11_25
@@ -2573,6 +2611,59 @@ mod tests {
         strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
         tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
             .unwrap_or_else(|error| panic!("a stock ACP client's head was refused: {error:?}"));
+    }
+
+    /// M3-46: `cache-control` is dropped for **every** http-forward profile,
+    /// not only the MCP 2025-11-25 one whose Python SDK client sends it: a
+    /// request carrying it is refused by each profile's codec on its own and
+    /// admitted once the ingress has dropped it.
+    #[test]
+    fn cache_control_is_dropped_for_every_http_forward_profile() {
+        let mut cases: Vec<(String, tunnel_http_bridge::Profile, http::request::Parts)> =
+            Vec::new();
+        for profile in tunnel_mcp::McpProfile::ALL {
+            let policies = profile
+                .policies(tunnel_mcp::McpLimits::default())
+                .expect("MCP profile");
+            let mut request = http::Request::post("/mcp")
+                .version(http::Version::HTTP_11)
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .header("content-length", "2")
+                .header("cache-control", "no-store")
+                .header("mcp-protocol-version", profile.protocol_version());
+            if profile == tunnel_mcp::McpProfile::V2026_07_28 {
+                request = request.header("mcp-method", "tools/list");
+            }
+            let parts = request.body(()).expect("request").into_parts().0;
+            cases.push((profile.id().to_owned(), policies, parts));
+        }
+        let acp = tunnel_acp::AcpProfile::HttpV1
+            .policies(tunnel_acp::AcpLimits::default())
+            .expect("ACP profile");
+        let parts = http::Request::post(tunnel_acp::ACP_ENDPOINT_PATH)
+            .version(http::Version::HTTP_2)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("content-length", "2")
+            .header("cache-control", "no-store")
+            .body(())
+            .expect("request")
+            .into_parts()
+            .0;
+        cases.push(("acp-http-v1".to_owned(), acp, parts));
+        assert_eq!(cases.len(), 3, "both MCP profiles and the ACP profile");
+        for (id, policies, parts) in cases {
+            assert!(
+                tunnel_http_bridge::normalize::request_head(&parts, &policies.request).is_err(),
+                "{id}: the codec refuses cache-control on its own"
+            );
+            let mut stripped = parts;
+            strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
+            assert!(!stripped.headers.contains_key("cache-control"), "{id}");
+            tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
+                .unwrap_or_else(|error| panic!("{id}: refused after the drop: {error:?}"));
+        }
     }
 
     /// Gate 5: a service selects its profile only through the catalog

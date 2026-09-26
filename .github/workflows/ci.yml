@@ -335,6 +335,18 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal
       - name: Run M3 harness gates
         run: sh scripts/m3-harness-verify.sh
+      # M3-17: the official MCP TypeScript and Python SDKs and the official
+      # conformance suite, each pinned by lockfile or hash in
+      # tests/mcp-sdk-conformance, through real local relays.  The binaries
+      # are the ones the step above built; the job's plaintext Redis is
+      # fronted with TLS by the script itself.  It prints payload-free case
+      # lines only and publishes nothing.
+      - name: Install Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Off-the-shelf MCP SDKs and conformance suite through the relay
+        run: sh scripts/m3-sdk-conformance.sh
 
   # M4: the filesystem gates 4 to 14 over the three-relay cluster fixture,
   # including gate 11 (a 9P session across a failed data socket's retained
