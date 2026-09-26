@@ -2234,11 +2234,22 @@ impl RuntimeState {
                         .map_or(binding.valid_until(), |expires_at| {
                             expires_at.min(binding.valid_until())
                         });
-                    let peer_deadline = monotonic_deadline(now, now_mono, binding.valid_until());
-                    let renewed = self
-                        .trust_deadline
-                        .map_or(peer_deadline, |deadline| deadline.min(peer_deadline))
-                        .max(peer.admission.deadline.expires_at);
+                    // Re-convert only when the signed boundary actually
+                    // moved later. An unchanged boundary keeps the monotonic
+                    // deadline it was first converted to: re-converting the
+                    // same wall-clock instant from each reconcile's receipt
+                    // and keeping the latest would ratchet it later by
+                    // clock-conversion drift, past the peer's own conversion
+                    // of the same boundary (the M7-C86 trust-expiry race).
+                    let renewed = if signed_boundary > peer.admission.deadline.trust_expires_at() {
+                        let peer_deadline =
+                            monotonic_deadline(now, now_mono, binding.valid_until());
+                        self.trust_deadline
+                            .map_or(peer_deadline, |deadline| deadline.min(peer_deadline))
+                            .max(peer.admission.deadline.expires_at)
+                    } else {
+                        peer.admission.deadline.expires_at
+                    };
                     peer.admission.deadline = AdmissionDeadline {
                         started_at: peer.admission.deadline.started_at,
                         expires_at: renewed,
