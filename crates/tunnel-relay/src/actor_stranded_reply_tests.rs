@@ -46,9 +46,8 @@ fn spawned_handle() -> RelayHandle {
 /// so the stranded command, and its reply sender, stay alive.
 async fn stranded_handle() -> (RelayHandle, JoinHandle<mpsc::Receiver<Command>>) {
     let real = spawned_handle();
-    real.shutdown()
-        .await
-        .expect("the real actor shuts down cleanly");
+    // Only the stranded tests' own assertions may fail them.
+    let _ = real.shutdown().await;
     let (tx, mut parked) = mpsc::channel(8);
     let mut handle = real.clone();
     handle.tx = tx;
@@ -341,6 +340,47 @@ async fn aborting_the_actor_and_maintenance_tasks_records_their_completion() {
         .await
         .expect("a request to an aborted actor returns");
     assert!(matches!(outcome, Err(RelayError::Shutdown)));
+}
+
+/// Aborting the maintenance ticker is not a failure (task row M6-C175): its
+/// completion is recorded without `failed` ever being set, whether the join
+/// handle is aborted directly or through `abort_maintenance_task`, and the
+/// relay still shuts down cleanly afterwards.
+#[tokio::test]
+async fn an_aborted_maintenance_task_is_done_without_ever_failing() {
+    let handle = spawned_handle();
+    let maintenance = handle
+        .maintenance_task
+        .lock()
+        .expect("maintenance slot")
+        .take()
+        .expect("maintenance task");
+    maintenance.abort();
+    let _ = maintenance.await;
+    assert!(
+        handle.maintenance_completion.done.load(Ordering::Acquire),
+        "an aborted maintenance task left its completion unset"
+    );
+    assert!(
+        !handle.maintenance_completion.failed(),
+        "an aborted maintenance task was recorded as failed"
+    );
+    let outcome = timeout(BOUND, handle.shutdown())
+        .await
+        .expect("shutdown returns after the maintenance task was aborted");
+    assert!(
+        outcome.is_ok(),
+        "an aborted maintenance task made shutdown fail: {outcome:?}"
+    );
+
+    let handle = spawned_handle();
+    handle.abort_maintenance_task().await;
+    assert!(handle.maintenance_completion.done.load(Ordering::Acquire));
+    assert!(
+        !handle.maintenance_completion.failed(),
+        "abort_maintenance_task recorded the abort as a failure"
+    );
+    let _ = timeout(BOUND, handle.shutdown()).await;
 }
 
 #[tokio::test]

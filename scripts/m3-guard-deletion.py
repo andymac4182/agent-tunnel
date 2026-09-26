@@ -1767,11 +1767,30 @@ M7_CONNECTOR_RELAY_CASES.append(
         [
             (
                 ACTOR,
-                "        self.0.mark_aborted();\n",
-                "        let _ = &self.0;\n",
+                "        if self.abort_is_failure {\n"
+                "            self.completion.mark_aborted();\n"
+                "        } else {\n"
+                "            self.completion.mark_stopped();\n"
+                "        }\n",
+                "        let _ = &self.completion;\n",
             )
         ],
         frozenset({STRANDED + "aborting_the_actor_and_maintenance_tasks_records_their_completion"}),
+    )
+)
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M6-C175 (review of #200): an aborted maintenance ticker is done but
+        # never recorded as failed, even briefly.
+        "an aborted relay maintenance task is not recorded as a failure",
+        [
+            (
+                ACTOR,
+                "            completion,\n            abort_is_failure: false,\n",
+                "            completion,\n            abort_is_failure: true,\n",
+            )
+        ],
+        frozenset({STRANDED + "an_aborted_maintenance_task_is_done_without_ever_failing"}),
     )
 )
 #: M6-C162: the device http-forward writer/reader reply waits.  Their tests

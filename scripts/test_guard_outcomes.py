@@ -400,7 +400,10 @@ EXPECTED_GUARD_ANCHORS = {
     # Then **88** after the review of PR #200 added the try_recv-arm cases
     # (relay and client) and the abort-completion case: `--check-anchors`
     # reports 88 across 22 suites; 89 fails naming m3.
-    "m3-guard-deletion.py": 88,
+    # Then **89** on branch `fix-soak-mcp` (M6-C175), which adds the
+    # maintenance clean-abort case to `m7-connector-relay`: `--check-anchors`
+    # reports 89 across 22 suites; 90 fails naming m3.
+    "m3-guard-deletion.py": 89,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
