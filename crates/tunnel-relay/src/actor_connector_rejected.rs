@@ -431,7 +431,7 @@ mod tests {
             suppressed: 4,
             ..RejectedLogWindow::default()
         };
-        let mut log = |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow| {
+        let log = |session: &mut RejectedLogWindow, tenant: &mut RejectedLogWindow| {
             log_connector_rejected_with(
                 &backstop,
                 RejectedLogBudgets { session, tenant },
