@@ -2184,6 +2184,18 @@ pub(crate) async fn handle_peer_http_stream(
             );
             return request.reject_stream_limit().await;
         }
+        // M6-C144: the owner lost the device's session after the ingress
+        // resolved it here.  Nothing was dispatched, so the ingress gets the
+        // retryable owner-not-ready refusal rather than a closed exchange it
+        // must report as `unknown`.
+        Err(RelayError::DeviceOffline) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::OwnerNotReady,
+            );
+            return request.reject_owner_not_ready().await;
+        }
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     let key = registration.base.key.clone();

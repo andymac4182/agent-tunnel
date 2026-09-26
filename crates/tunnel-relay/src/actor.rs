@@ -835,6 +835,12 @@ pub enum RelayError {
     StreamLimit,
     Conflict(&'static str),
     NotFound,
+    /// A stream OPEN for an authorized consumer found no live session for
+    /// the device at this relay (task row M6-C144).  Nothing was dispatched,
+    /// and the answer is the echo route's `DEVICE_OFFLINE`, never the
+    /// catalog's "no such service": the route has already proven the service
+    /// exists and is granted before the actor is asked.
+    DeviceOffline,
     Overloaded(&'static str),
     Protocol(String),
     /// A device HELLO named a protocol major this relay does not speak (task
@@ -862,6 +868,7 @@ impl std::fmt::Display for RelayError {
             Self::StreamLimit => formatter.write_str("stream limit reached"),
             Self::Conflict(message) => formatter.write_str(message),
             Self::NotFound => formatter.write_str("device or service was not found"),
+            Self::DeviceOffline => formatter.write_str("device is not connected"),
             Self::Overloaded(message) => formatter.write_str(message),
             Self::Shutdown => formatter.write_str("relay is shutting down"),
             Self::UnsupportedProtocolMajor => formatter.write_str("unsupported protocol major"),
@@ -5224,7 +5231,7 @@ impl RelayActor {
         }
         let scope = DeviceScope::new(consumer.tenant_id, device_id);
         let Some(session) = self.sessions.get_mut(&scope) else {
-            let _ = response.send(Err(RelayError::NotFound));
+            let _ = response.send(Err(RelayError::DeviceOffline));
             return freeze_hold::Admission::Refused;
         };
         if !session.profile.supports_rotation() {

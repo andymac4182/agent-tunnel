@@ -4735,6 +4735,10 @@ fn local_consumer_admission_response(route: &'static str, error: RelayError) -> 
             "device or service was not found",
             "not_dispatched",
         ),
+        // M6-C144: the same answer as the echo route's for the same state.
+        // Only reached after the route authorized the consumer for this
+        // service, so it reveals nothing a grant does not already show.
+        RelayError::DeviceOffline => failure_outcome("DEVICE_OFFLINE", "not_dispatched"),
         _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "REVERSE_CHANNEL_UNAVAILABLE",
@@ -5932,3 +5936,6 @@ mod tenant_admission_tests;
 mod consumer_refusal_tests;
 #[cfg(test)]
 mod mcp_authorization_tests;
+
+#[cfg(test)]
+mod offline_refusal_tests;
