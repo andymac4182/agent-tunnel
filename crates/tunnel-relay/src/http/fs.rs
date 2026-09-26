@@ -163,6 +163,16 @@ fn fs_admission_refusal(error: &crate::actor::RelayError) -> Response {
     if matches!(error, crate::actor::RelayError::RotationFreeze) {
         return rotation_freeze_fs_error();
     }
+    // M6-C144: the device's session ended between the availability check
+    // above and the OPEN; the contract's own offline code, as that check
+    // gives.
+    if matches!(error, crate::actor::RelayError::DeviceOffline) {
+        return fs_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DEVICE_OFFLINE",
+            "the device is not connected",
+        );
+    }
     fs_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "BACKEND_UNAVAILABLE",

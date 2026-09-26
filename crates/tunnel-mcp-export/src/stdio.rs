@@ -59,8 +59,8 @@ use tunnel_mcp::message::{
 use tunnel_mcp::{McpLimits, McpProfile, headers};
 
 use crate::body::{
-    ChannelResponseBody, CollectError, ExportBody, StreamFailure, collect_limited, json_response,
-    local_error, no_body, rejection, sse_event, sse_head,
+    ChannelResponseBody, CollectError, ExportBody, StreamFailure, capacity_refusal,
+    collect_limited, json_response, local_error, no_body, rejection, sse_event, sse_head,
 };
 use crate::child::{self, ChildCounters, ChildEvent, ChildHandle};
 use crate::config::StdioBackend;
@@ -317,8 +317,7 @@ impl StdioExport {
             }));
         };
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
-            return Ok(local_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+            return Ok(capacity_refusal(
                 "the export is at its child process limit",
                 Some(id),
             ));
@@ -550,8 +549,7 @@ impl StdioExport {
     ) -> Result<Response<ExportBody>, ExportError> {
         let id = message.id.clone().unwrap_or(Value::Null);
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
-            return Ok(local_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+            return Ok(capacity_refusal(
                 "the export is at its session limit",
                 Some(id),
             ));
