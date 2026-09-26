@@ -2466,6 +2466,86 @@ mod tests {
         assert!(Some(*last_at) < closed_at.get());
     }
 
+    /// M7-C167 re-review: a change to a field other than the counts is never
+    /// delayed by the refusal rate bound.  A count at 0 ms is printed, a count
+    /// at 100 ms is held back, and a generation change at 200 ms must be
+    /// printed at 200 ms carrying the latest counts, leaving nothing for a
+    /// trailing event at 1 s.
+    #[tokio::test(start_paused = true)]
+    async fn m7c167_a_non_count_change_is_printed_at_once_inside_the_refusal_window() {
+        use tunnel_protocol::open_refusal;
+
+        let initial = m7c167_ready_status();
+        let (status_tx, mut status_rx) = tokio::sync::watch::channel(initial.clone());
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(m7c167_ready());
+        status_rx.borrow_and_update();
+        ready_rx.borrow_and_update();
+        let mut emitter = ConnectStatusEmitter::new(&initial);
+        let mut events: Vec<(std::time::Duration, tunnel_client::ConnectionStatus)> = Vec::new();
+        let started = tokio::time::Instant::now();
+        let step = std::time::Duration::from_millis(10);
+        // The watch sees a publication within a couple of producer steps.
+        let promptly = 3 * step;
+        let generation_at = std::cell::Cell::new(None);
+
+        let producer = async {
+            let mut refusals = tunnel_client::OpenRefusalCounts::default();
+            refusals.record(open_refusal::CONNECTOR_DRAINING);
+            status_tx.send_modify(|status| status.open_refusals_sent = refusals);
+            for _ in 0..10 {
+                tokio::time::advance(step).await;
+            }
+            refusals.record(open_refusal::CONNECTOR_DRAINING);
+            status_tx.send_modify(|status| status.open_refusals_sent = refusals);
+            for _ in 0..10 {
+                tokio::time::advance(step).await;
+            }
+            generation_at.set(Some(tokio::time::Instant::now() - started));
+            status_tx.send_modify(|status| status.active_generation = Some(2));
+            // Past where a trailing event would fall (about 1 s).
+            for _ in 0..120 {
+                tokio::time::advance(step).await;
+            }
+            ready_tx
+                .send(tunnel_client::Readiness::Closed {
+                    reason: "synthetic close".to_owned(),
+                })
+                .expect("watch receiver alive");
+        };
+        let watch = watch_session(
+            std::future::pending(),
+            &mut ready_rx,
+            &mut status_rx,
+            &mut emitter,
+            |_| {},
+            |status| events.push((tokio::time::Instant::now() - started, status.clone())),
+        );
+        let (end, ()) = tokio::join!(watch, producer);
+        assert!(matches!(end, SessionWatchEnd::Closed(_)), "{end:?}");
+
+        let summary: Vec<_> = events
+            .iter()
+            .map(|(at, status)| (*at, goaway_count(status), status.active_generation))
+            .collect();
+        assert_eq!(events.len(), 2, "events: {summary:?}");
+        let (first_at, first) = &events[0];
+        assert!(*first_at < promptly, "events: {summary:?}");
+        assert_eq!(goaway_count(first), Some(1));
+        let (second_at, second) = &events[1];
+        let generation_at = generation_at.get().expect("generation published");
+        assert_eq!(generation_at, 20 * step);
+        assert!(
+            *second_at >= generation_at && *second_at < generation_at + promptly,
+            "the generation change was delayed: {summary:?}"
+        );
+        assert_eq!(second.active_generation, Some(2));
+        assert_eq!(
+            goaway_count(second),
+            Some(2),
+            "it carries the latest counts"
+        );
+    }
+
     /// M7-C167 review: counts published together with the end of the session
     /// (a readiness close or a stop request) are printed before the watch
     /// returns, even while the rate bound is holding them back.
