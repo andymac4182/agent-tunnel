@@ -816,9 +816,14 @@ async fn m8c45_without_the_switch_withdrawing_the_served_key_still_fails_closed(
         .await
         .expect_err("the served key left the record");
     assert!(matches!(error, MembershipRuntimeError::PeerRejected));
+    // The served key left this relay's own record: that is `MissingLocalKey`
+    // (a statement about this relay's right to serve), not
+    // `MembershipRejected`, which is kept for evidence that failed
+    // verification (M7-C86's reason split, landed with M7-C80).  It still
+    // fails closed: readiness, ownership and admission are withdrawn.
     assert_eq!(
         fixture.runtime.readiness(),
-        MembershipReadiness::Unready(MembershipUnreadyReason::MembershipRejected)
+        MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
     );
 }
 
