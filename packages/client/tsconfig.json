@@ -21,5 +21,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "fuzz/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "fuzz/**/*.ts", "demo/**/*.ts", "scripts/**/*.ts"]
 }

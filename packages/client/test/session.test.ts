@@ -454,7 +454,11 @@ describe('the session state machine', () => {
       },
     });
     open.push(endpoint);
-    const session = await openSession(endpoint, { maxInflightRequests: 1, requestTimeoutMs: 30 });
+    // The deadline also governs `Tversion` and `Tattach` inside `open()`. At
+    // 30 ms a loaded host missed it there (M4-65: 3 failures in 6 runs at load
+    // average ~150), failing before the walk this test is about. The walk is
+    // never answered, so a longer deadline changes only how long it waits.
+    const session = await openSession(endpoint, { maxInflightRequests: 1, requestTimeoutMs: 1000 });
     const walk = session.request({ kind: 'Twalk', tag: 0, fid: 0, newfid: 5, wnames: ['notes.txt'] });
     await assert.rejects(walk, (error: FilesystemError) => {
       assert.equal(error.code, 'DEADLINE_EXCEEDED');
