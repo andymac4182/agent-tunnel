@@ -1356,7 +1356,9 @@ ended), `rotation_freeze_hold_released_total{outcome}` (`commit`, `abort`,
 `recovery`, `session_loss`),
 `rotation_freeze_hold_released_with_deferred_writes_total`,
 `rotation_freeze_hold_refused_total{reason}` (`after_bound`: held past the
-bound; `hold_full`: never held because the hold was full),
+bound; `hold_full`: never held because the hold was full; both answered
+`ROTATION_FREEZE`; `revocation`: the consumer's grant was revoked while it was
+held (M3-16), answered as a revocation, not a freeze),
 `rotation_freeze_hold_cancelled_total` (the consumer went away while held) and
 the gauge `rotation_freeze_hold_max_wait_ms`. **Do not add
 `consumer_refusals_total{stage="rotation_freeze"}` to
@@ -1370,7 +1372,8 @@ freeze that has begun again, which is refused without being held twice. Read
 the first for which local route was refused and the second for why the hold
 refused. Every held OPEN leaves the hold
 exactly once, so `held_total` equals `current` plus every `released_total`,
-`refused_total{reason="after_bound"}` and `cancelled_total`; a scrape where it
+`refused_total{reason="after_bound"}`, `refused_total{reason="revocation"}`
+and `cancelled_total`; a scrape where it
 does not is a relay defect worth reporting. Every value is a count, a gauge or a byte
 total, and every label value is a fixed word from a closed set: **no tenant,
 device, session, connection, stream or request identifier, subject, issuer,
