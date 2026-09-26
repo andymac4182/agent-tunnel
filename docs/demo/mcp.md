@@ -144,7 +144,7 @@ notifications/resources/updated=received`.
 | --- | --- |
 | `DEMO_PROFILE` | `mcp-2025-11-25` (default; sessions and `initialize`) or `mcp-2026-07-28` (stateless, `server/discover`). |
 | `DEMO_KEEP=1` | Leave the relay, the device and the Redis container running after a successful run. The script prints the endpoint, the server CA path and the token file, so you can point another client at it. It also prints the `kill` and `docker rm` commands that stop everything. |
-| `DEMO_DIR` | The work directory (default: a new directory under `$TMPDIR`). It is removed after a successful run and kept after a failure. |
+| `DEMO_DIR` | The work directory (default: a new directory under `$TMPDIR`). Docker must be able to bind-mount it. It is removed after a successful run and kept after a failure. |
 | `CARGO_TARGET_DIR` | Honoured when building and when locating the binaries. |
 
 To use your own client against a kept demo, point it at the printed endpoint.
@@ -163,6 +163,10 @@ AGENTUPLINK_TOKEN=$(cat "$DEMO_DIR/consumer-token") \
 
 - **`docker: … Unable to find image`**: run `docker pull redis:8.4.0-alpine`
   first. The script does not pull images for you.
+- **`docker run did not return within 60 s`**: Docker could not start the
+  Redis container. Check that `docker run --rm alpine:3 true` returns. On
+  2026-09-26 this host's Docker daemon kept running containers but left every
+  new one in `Created`, and the script used to wait forever there.
 - **`activate-first-incarnation` keeps failing**: the Redis container did not
   come up. Run `docker logs agentuplink-mcp-demo-<nonce>`. After a failure the
   script keeps the work directory, and you can look at `activate.log` there.

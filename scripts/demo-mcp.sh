@@ -110,7 +110,19 @@ say "start TLS Redis container $container on 127.0.0.1:$redis_port"
 docker run -d --rm --name "$container" -p "127.0.0.1:$redis_port:6380" \
   -v "$work/redis:/tls:ro" "$redis_image" redis-server --port 0 --tls-port 6380 \
   --tls-cert-file /tls/cert.pem --tls-key-file /tls/key.pem --tls-ca-cert-file /tls/ca.pem \
-  --tls-auth-clients no --save '' --appendonly no >/dev/null
+  --tls-auth-clients no --save '' --appendonly no >/dev/null &
+docker_pid=$!
+attempt=0
+while kill -0 "$docker_pid" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 240 ]; then
+    kill "$docker_pid" 2>/dev/null || true
+    say "docker run did not return within 60 s; check that Docker can start containers (docker run --rm alpine:3 true)"
+    exit 1
+  fi
+  sleep 0.25
+done
+wait "$docker_pid" || { say "docker run failed"; exit 1; }
 
 # 4. A synthetic identity issuer: an RSA key published to the relay as JWKS.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/issuer-key.pem" 2>/dev/null
