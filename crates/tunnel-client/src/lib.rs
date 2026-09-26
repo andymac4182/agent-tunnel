@@ -714,6 +714,9 @@ async fn open_socket(
     config.accept_unmasked_frames = false;
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
+        // `true` is `disable_nagle`: TCP_NODELAY on the control and data
+        // sockets, which carry small frames that wait for replies (task row
+        // M6-C124; `open_socket_sets_tcp_nodelay` is the gate).
         connect_async_tls_with_config(request, Some(config), true, Some(connector)),
     );
     tokio::pin!(handshake);
@@ -2661,9 +2664,80 @@ mod barrier_detail_tests {
     }
 }
 
+/// `TCP_NODELAY` on the TCP socket under a device WebSocket, `None` when it
+/// cannot be read (task row M6-C124).
+#[cfg(test)]
+fn socket_nodelay(socket: &ClientWebSocket) -> Option<bool> {
+    let tcp = match socket.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => stream.get_ref().0,
+        _ => return None,
+    };
+    tcp.nodelay().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task row M6-C124: the device's control and data WebSockets are opened
+    /// by `open_socket`, which must leave `TCP_NODELAY` set on the socket.
+    // The handshake callback's error type is tungstenite's, not ours.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn open_socket_sets_tcp_nodelay() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        const PROTOCOL: &str = "agent-tunnel.test.v1";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind nodelay test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_request: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", HeaderValue::from_static(PROTOCOL));
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("server handshake");
+            // Hold the socket until the client has inspected its end.
+            let mut socket = socket;
+            let _ = socket.next().await;
+        });
+        let tls = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let url = Url::parse(&format!("ws://{address}/v1/device/control")).expect("url");
+        let socket = open_socket(
+            &url,
+            tls,
+            None,
+            PROTOCOL,
+            64 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("open_socket");
+        assert_eq!(
+            socket_nodelay(&socket),
+            Some(true),
+            "device WebSockets must be opened with TCP_NODELAY set"
+        );
+        drop(socket);
+        server.await.expect("server task");
+    }
 
     #[test]
     fn data_endpoint_replaces_control_path_without_ticket_leak() {

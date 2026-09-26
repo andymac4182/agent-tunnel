@@ -54,6 +54,19 @@ A connection that arrives while every permit is held is **refused explicitly, ne
 
 The two steady-state WebSockets belong to each CLI device connection. Peer QUIC connections and consumer connections are separate. Private HTTP/3 forwarding does not add a third steady-state device socket. During data rotation, one control plus old and candidate data sockets remain bounded by the existing overlap deadline.
 
+### TCP_NODELAY
+
+Every TCP socket that carries request/reply traffic has Nagle's algorithm disabled (task row M6-C124):
+
+| Socket | Where it is set | Gate |
+| --- | --- | --- |
+| Relay consumer and device listeners, every accepted socket | `tunnel-transport` `set_accepted_nodelay`, before the TLS handshake; a failure (a peer that already reset) is logged at debug and the connection is still served; it is counted only when `AcceptedSocketDiagnostics` are attached (tests), not in production | `accepted_sockets_have_nodelay_set_by_default` |
+| Device control and data WebSockets (outbound) | `tunnel-client` `open_socket`, tokio-tungstenite `disable_nagle = true` | `open_socket_sets_tcp_nodelay` |
+| Catalog Redis lanes, the recovery scanner and the primary connection | `tunnel-catalog` `catalog_connection_info` (redis-rs defaults it off) | `catalog_clients_disable_nagle_on_every_connection` |
+| Relay membership runtime's checkpoint-authority HTTPS connection (TCP, then TLS and HTTP/1.1; not Redis) | `membership_runtime.rs` (already set before this change) | none added |
+
+Without it, a small write that followed an unacknowledged one waited for the peer's delayed ACK, which is 40 ms on Linux: the hosted load experiment's single echo worker went from p50 42.4 ms to 1.65 ms when it was set, and a 64 KiB echo from 23.8 to 266.6 requests per second. Bulk writes fill whole segments, which Nagle never delayed, so the option costs bulk transfer nothing measurable. Measurements and runs: [soak-2026-09-26.md](soak-2026-09-26.md#update-tcp_nodelay-m6-c124). The private metrics listener and test-only proxies are not on the request path and are left at the platform default.
+
 ## Rust stack and dependency gate
 
 Use Tokio for async execution, Axum for the two TCP listener roles, rustls/tokio-rustls for explicit TLS handling, tokio-tungstenite for the CLI WSS client, and tracing for structured events. Use hyper/hyper-util where connection setup needs more control than `axum::serve` provides. The device acceptor must preserve authenticated TLS metadata through HTTP upgrade and into the connection actor.

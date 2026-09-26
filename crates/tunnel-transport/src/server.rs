@@ -265,6 +265,10 @@ impl ListenerCapacity {
 pub struct AcceptedSocketDiagnostics {
     last_send_buffer_bytes: Arc<AtomicUsize>,
     capacity_refusals: Arc<AtomicUsize>,
+    /// Accepted sockets whose `TCP_NODELAY` read back as set (M6-C124).
+    nodelay_set: Arc<AtomicUsize>,
+    /// Accepted sockets whose `TCP_NODELAY` read back as clear or unreadable.
+    nodelay_unset: Arc<AtomicUsize>,
 }
 
 impl AcceptedSocketDiagnostics {
@@ -295,6 +299,25 @@ impl AcceptedSocketDiagnostics {
 
     fn record_send_buffer_bytes(&self, bytes: usize) {
         self.last_send_buffer_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Accepted sockets observed with `TCP_NODELAY` set, and observed with it
+    /// clear (or unreadable), in that order.  Task row M6-C124: every
+    /// accepted socket is expected in the first count.
+    pub fn nodelay_counts(&self) -> (usize, usize) {
+        (
+            self.nodelay_set.load(Ordering::Acquire),
+            self.nodelay_unset.load(Ordering::Acquire),
+        )
+    }
+
+    fn record_nodelay(&self, set: bool) {
+        let counter = if set {
+            &self.nodelay_set
+        } else {
+            &self.nodelay_unset
+        };
+        counter.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -719,11 +742,36 @@ fn validate_socket_options(options: &AcceptedSocketOptions) -> Result<(), Transp
     Ok(())
 }
 
+/// Disable Nagle's algorithm on an accepted socket (task row M6-C124).
+///
+/// Both listeners carry request/reply traffic in small TLS records: a
+/// WebSocket frame to a device and the device's reply, or an HTTP response
+/// head and body to a consumer.  With Nagle on, a small write that follows an
+/// unacknowledged one waits for the peer's delayed ACK (40 ms on Linux).
+/// Bulk transfers are unaffected in kind: they fill whole segments, which
+/// Nagle never held back.  Listener-option inheritance differs across
+/// platforms, so the option is set on each accepted socket.  A failure is
+/// connection-local (a peer that already reset makes some platforms refuse
+/// the option) and the connection is still served; the diagnostics count it.
+fn set_accepted_nodelay(
+    stream: &TcpStream,
+    diagnostics: Option<&AcceptedSocketDiagnostics>,
+    remote_addr: std::net::SocketAddr,
+) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%remote_addr, %error, "TCP_NODELAY could not be set on an accepted socket");
+    }
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_nodelay(stream.nodelay().unwrap_or(false));
+    }
+}
+
 fn configure_accepted_socket(
     stream: &TcpStream,
     options: &AcceptedSocketOptions,
     remote_addr: std::net::SocketAddr,
 ) -> Result<(), TransportError> {
+    set_accepted_nodelay(stream, options.diagnostics.as_ref(), remote_addr);
     if options.send_buffer_bytes.is_none() && options.diagnostics.is_none() {
         return Ok(());
     }
@@ -1249,6 +1297,64 @@ mod tests {
 
         cancel.cancel();
         drop(client);
+        let result = timeout(Duration::from_secs(1), server)
+            .await
+            .expect("transport supervisor did not join after cancellation")
+            .expect("transport supervisor task panicked");
+        assert!(result.is_ok(), "cancellation returned an error: {result:?}");
+    }
+
+    /// Task row M6-C124: every accepted socket has `TCP_NODELAY` set, with no
+    /// socket option requested — the listener default, which is what the
+    /// relay's consumer and device listeners use.
+    #[tokio::test]
+    async fn accepted_sockets_have_nodelay_set_by_default() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind nodelay test listener");
+        let address = listener.local_addr().expect("listener address");
+        let cancel = CancellationToken::new();
+        let diagnostics = AcceptedSocketDiagnostics::new();
+        let server = tokio::spawn(serve_with_socket_options(
+            listener,
+            Router::new(),
+            test_server_config(),
+            cancel.clone(),
+            AcceptedSocketOptions {
+                send_buffer_bytes: None,
+                diagnostics: Some(diagnostics.clone()),
+                listener: None,
+                capacity: ListenerCapacity::default(),
+            },
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            clients.push(
+                TcpStream::connect(address)
+                    .await
+                    .expect("connect nodelay test client"),
+            );
+        }
+        let counts = timeout(Duration::from_secs(5), async {
+            loop {
+                let (set, unset) = diagnostics.nodelay_counts();
+                if set + unset >= 3 {
+                    break (set, unset);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted sockets were not observed before the deadline");
+        assert_eq!(
+            counts,
+            (3, 0),
+            "every accepted socket must have TCP_NODELAY set (set, unset)"
+        );
+
+        cancel.cancel();
+        drop(clients);
         let result = timeout(Duration::from_secs(1), server)
             .await
             .expect("transport supervisor did not join after cancellation")
