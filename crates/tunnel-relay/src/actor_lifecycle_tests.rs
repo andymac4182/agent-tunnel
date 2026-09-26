@@ -1141,6 +1141,253 @@ async fn tick_releases_more_closed_session_owners_than_the_cleanup_queue_holds()
     drop(registrations);
 }
 
+fn synthetic_owner(label: &str) -> OwnerToken {
+    OwnerToken {
+        deployment_incarnation: "c186-review".to_owned(),
+        tenant_id: Uuid::from_u128(0xC186_9001),
+        device_id: Uuid::from_u128(0xC186_9100),
+        node_id: "node".to_owned(),
+        boot_id: "boot".to_owned(),
+        session_id: label.to_owned(),
+        epoch: 1,
+    }
+}
+
+/// Wait up to 5 s for every one of `device_ids` to be released.
+async fn wait_released(catalog: &HeldCatalog, tenant_id: Uuid, device_ids: &[Uuid]) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let claimed = still_claimed(catalog, tenant_id, device_ids).await;
+        if claimed == 0 || tokio::time::Instant::now() >= deadline {
+            return claimed;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **Task row M6-C186 (review of PR #215).** A tick closes 133 sessions and
+/// keeps 69 owner tokens; with the cleanup queue full, a registration's
+/// armed owner-claim guard is then dropped.  The owner-cleanup dispatcher
+/// shared the terminal-cleanup overflow flag, so that refusal cancelled the
+/// whole relay.  An owner-cleanup refusal must never cancel the relay, and
+/// the kept owners must still all be released.
+#[tokio::test]
+async fn an_owner_guard_dropped_while_owners_are_kept_does_not_cancel_the_relay() {
+    const LIVE: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) =
+        register_live_sessions(&handle, &catalog, LIVE).await;
+
+    expire_owner_forget_deadlines(&handle).await;
+    handle
+        .tx
+        .send(Command::TestMutate(Box::new(|actor| {
+            let dispatcher = actor
+                .cleanup_dispatcher
+                .clone()
+                .expect("cleanup dispatcher present while running");
+            let filler = synthetic_owner("filler");
+            while dispatcher
+                .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
+            {
+            }
+            let mut guard = super::OwnerClaimCleanup::new(dispatcher);
+            guard.arm_token(synthetic_owner("guard"));
+            drop(guard);
+        })))
+        .await
+        .expect("actor accepts the test mutation");
+
+    let claimed = wait_released(&catalog, tenant_id, &device_ids).await;
+    assert!(
+        !cancel.is_cancelled(),
+        "an owner-cleanup refusal while owners were kept cancelled the relay"
+    );
+    assert_eq!(
+        claimed, 0,
+        "{claimed} of {LIVE} kept owners were left fenced"
+    );
+    cancel.cancel();
+    let _ = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    drop(registrations);
+}
+
+/// **Task row M6-C186 (review of PR #215), cap refusal.** With the backlog
+/// at its bound and the queue full, one more owner cleanup is refused: it is
+/// logged, the backlog does not grow, the owner stays claimed until its
+/// lease expires, and the relay keeps running.
+#[tokio::test]
+async fn an_owner_cleanup_refused_at_the_backlog_cap_is_left_to_lease_expiry() {
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) = register_live_sessions(&handle, &catalog, 2).await;
+    let captured = super::connector_rejected::Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_env_filter("info")
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    // Callsite interest is cached process-wide; another test thread can
+    // cache "never" for a shared callsite just before this subscriber exists.
+    tracing::callsite::rebuild_interest_cache();
+
+    let kept_after = Arc::new(AtomicUsize::new(usize::MAX));
+    let refused_device = Arc::new(std::sync::Mutex::new(None));
+    {
+        let kept_after = kept_after.clone();
+        let refused_device = refused_device.clone();
+        handle
+            .tx
+            .send(Command::TestMutate(Box::new(move |actor| {
+                const CAP: usize = 2;
+                let dispatcher = actor
+                    .cleanup_dispatcher
+                    .clone()
+                    .expect("cleanup dispatcher present while running");
+                actor.owner_backlog.set_cap(CAP);
+                let filler = synthetic_owner("filler");
+                while dispatcher
+                    .enqueue_if_room(|| Some(super::OwnerCleanupItem::Token(filler.clone())))
+                {
+                }
+                for index in 0..CAP {
+                    dispatcher.enqueue(super::OwnerCleanupItem::Token(synthetic_owner(&format!(
+                        "kept-{index}"
+                    ))));
+                }
+                // Take one live session out without releasing it, and drop
+                // its owner through an armed guard past the full backlog.
+                let scope = actor
+                    .sessions
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("a live session");
+                let session = actor.sessions.remove(&scope).expect("live session");
+                *refused_device.lock().expect("refused device") = Some(session.owner.device_id);
+                let mut refused = super::OwnerClaimCleanup::new(dispatcher);
+                refused.arm_token(session.owner.clone());
+                drop(refused);
+                kept_after.store(actor.owner_backlog.len(), Ordering::Release);
+                drop(session);
+            })))
+            .await
+            .expect("actor accepts the test mutation");
+    }
+    let snapshot_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while kept_after.load(Ordering::Acquire) == usize::MAX
+        && tokio::time::Instant::now() < snapshot_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give the worker time to drain the queue and the kept items.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    drop(guard);
+
+    assert_eq!(
+        kept_after.load(Ordering::Acquire),
+        2,
+        "the refused cleanup grew the backlog past its cap"
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "an owner cleanup refused at the backlog cap cancelled the relay"
+    );
+    let refused_device = refused_device
+        .lock()
+        .expect("refused device")
+        .expect("the mutation ran");
+    assert!(
+        catalog
+            .inner
+            .current_owner(tenant_id, refused_device, Utc::now())
+            .await
+            .expect("read refused owner")
+            .is_some(),
+        "the refused owner was released instead of left to lease expiry"
+    );
+    let text = captured.text();
+    assert!(
+        text.contains("owner cleanup refused past the cleanup queue and its backlog")
+            && text.contains("backlog_cap=2"),
+        "the refusal was not logged: {text}"
+    );
+    assert_eq!(device_ids.len(), 2);
+    cancel.cancel();
+    let _ = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    drop(registrations);
+}
+
+/// **Task row M6-C187 (review of PR #215).** A deadline that passes while
+/// releases are in flight counts those in flight as abandoned with the ones
+/// never started: 960 kept owners at 20 ms each against a 1 s deadline.
+#[tokio::test(start_paused = true)]
+async fn kept_owner_release_counts_releases_in_flight_at_the_deadline() {
+    const KEPT: usize = 960;
+    let catalog = HeldCatalog::new();
+    catalog.release_delay_ms.store(20, Ordering::Release);
+    let backlog = super::OwnerBacklog::new(usize::MAX);
+    for index in 0..KEPT {
+        backlog.push(super::OwnerCleanupItem::Token(synthetic_owner(&format!(
+            "in-flight-{index}"
+        ))));
+    }
+    let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
+    let (attempted, abandoned) = super::release_backlog_until(
+        &shared,
+        &backlog,
+        tokio::time::Instant::now() + Duration::from_millis(1_010),
+    )
+    .await;
+    assert!(backlog.is_empty());
+    assert_eq!(
+        attempted + abandoned,
+        KEPT,
+        "{attempted} attempted and {abandoned} abandoned do not account for all {KEPT}"
+    );
+    assert!(attempted > 0 && abandoned > 0);
+}
+
+/// **Task row M6-C187 (review of PR #215).** A deadline already passed
+/// abandons the whole backlog without starting a release.
+#[tokio::test(start_paused = true)]
+async fn kept_owner_release_past_its_deadline_starts_nothing() {
+    let catalog = HeldCatalog::new();
+    let backlog = super::OwnerBacklog::new(usize::MAX);
+    for index in 0..20 {
+        backlog.push(super::OwnerCleanupItem::Token(synthetic_owner(&format!(
+            "late-{index}"
+        ))));
+    }
+    let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
+    let deadline = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let result = super::release_backlog_until(&shared, &backlog, deadline).await;
+    assert_eq!(result, (0, 20));
+    assert!(backlog.is_empty());
+    assert_eq!(
+        catalog.max_releases_in_flight.load(Ordering::Acquire),
+        0,
+        "a release was started after the deadline had passed"
+    );
+}
+
 /// **Task row M6-C187 (b).** Up to `max_devices` (default 1024) session
 /// owners can be kept past the cleanup queue at shutdown, and a release
 /// against a remote Redis takes about 20 ms.  Released one at a time, 960 of
@@ -1152,9 +1399,9 @@ async fn kept_owner_release_is_concurrent_and_bounded() {
     const KEPT: usize = 960;
     let catalog = HeldCatalog::new();
     catalog.release_delay_ms.store(20, Ordering::Release);
-    let backlog = super::OwnerBacklog::default();
+    let backlog = super::OwnerBacklog::new(usize::MAX);
     for index in 0..KEPT {
-        backlog.push(OwnerToken {
+        backlog.push(super::OwnerCleanupItem::Token(OwnerToken {
             deployment_incarnation: "c187".to_owned(),
             tenant_id: Uuid::from_u128(0xC187_0001),
             device_id: Uuid::from_u128(0xC187_1000 + index as u128),
@@ -1162,16 +1409,13 @@ async fn kept_owner_release_is_concurrent_and_bounded() {
             boot_id: "boot".to_owned(),
             session_id: format!("c187-{index}"),
             epoch: 1,
-        });
+        }));
     }
     let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
     let started = tokio::time::Instant::now();
-    let (released, abandoned) = super::release_owner_tokens_until(
-        &shared,
-        &backlog,
-        started + super::CLEANUP_SHUTDOWN_TIMEOUT,
-    )
-    .await;
+    let (released, abandoned) =
+        super::release_backlog_until(&shared, &backlog, started + super::CLEANUP_SHUTDOWN_TIMEOUT)
+            .await;
     assert_eq!(
         (released, abandoned),
         (KEPT, 0),
@@ -1212,6 +1456,9 @@ async fn close_all_logs_the_abandoned_live_session_owner_count() {
         .with_ansi(false)
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
+    // Callsite interest is cached process-wide; another test thread can
+    // cache "never" for a shared callsite just before this subscriber exists.
+    tracing::callsite::rebuild_interest_cache();
 
     cancel.cancel();
     let shutdown = timeout(Duration::from_secs(30), handle.shutdown())
@@ -1226,11 +1473,11 @@ async fn close_all_logs_the_abandoned_live_session_owner_count() {
     let text = captured.text();
     let line = text
         .lines()
-        .find(|line| line.contains("session owners beyond the cleanup queue exceeded"))
+        .find(|line| line.contains("owner cleanup beyond the cleanup queue exceeded"))
         .unwrap_or_else(|| panic!("no abandoned-owner log line: {text}"));
     let kept = LIVE - super::CLEANUP_QUEUE_CAPACITY;
     assert!(
-        line.contains(&format!("abandoned={kept}")) && line.contains("released=0"),
+        line.contains(&format!("abandoned={kept}")) && line.contains("attempted=0"),
         "the log did not count all {kept} kept owners as abandoned: {line}"
     );
     drop(registrations);
