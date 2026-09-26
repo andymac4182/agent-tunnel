@@ -894,9 +894,11 @@ class McpSessionPool:
 
     def leaked(self) -> bool:
         """True if a session may still hold an export slot after `close`."""
+        # Only a 404 proves the session is gone; any other DELETE failure, and
+        # an initialize whose session ID never arrived, may hold a slot.
         stats = self.stats()
-        return stats["unaccounted"] != 0 or any(
-            key == "HTTP_503" or key.startswith("CONN_") for key in self.delete_failures)
+        return (stats["unaccounted"] != 0 or self.init_timeouts > 0
+                or any(key != "HTTP_404" for key in self.delete_failures))
 
 
 def report_mcp_pool(stack: "Stack", pool: McpSessionPool, where: str) -> None:
