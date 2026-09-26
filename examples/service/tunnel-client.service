@@ -56,9 +56,11 @@ TimeoutStopSec=60s
 Restart=on-failure
 RestartSec=30s
 # 2 = invalid invocation or configuration, 3 = the credential or the relay's
-# certificate was refused: no restart fixes either. The unit stays failed and
-# `journalctl -u tunnel-client` shows the real error.
-RestartPreventExitStatus=2 3
+# certificate was refused, 9 = another `tunnel-client connect` already holds
+# this profile's lock (or the lock could not be taken; M6-06): no restart
+# fixes any of them. The unit stays failed and `journalctl -u tunnel-client`
+# shows the real error.
+RestartPreventExitStatus=2 3 9
 # Hardening that leaves the exports' files alone. Add ProtectHome=yes and
 # ProtectSystem=strict if your exports need neither.
 NoNewPrivileges=yes

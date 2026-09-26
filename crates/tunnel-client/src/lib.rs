@@ -19,6 +19,9 @@ pub mod cua_export;
 pub mod fs_export;
 pub mod http_forward;
 mod m2_runtime;
+mod rotation_hooks;
+/// Local, read-only supervisor status IPC (M6-06).
+pub mod supervisor_ipc;
 
 pub use config::FsExportSettings;
 use config::{ExportConfig, ExportKind, RuntimeConfig};
@@ -63,8 +66,9 @@ use uuid::Uuid;
 
 pub use config::{
     CUA_OPT_IN_ENV, CUA_PROFILE_ID, CredentialConfig, CuaBackendSettings, CuaExportSettings,
-    ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig, ReconnectConfig,
-    RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    DEFAULT_SUPERVISOR_SOCKET_NAME, ExportConfig as LocalExport, ExportKind as LocalExportKind,
+    LimitsConfig, ReconnectConfig, RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    SupervisorConfig,
 };
 pub use credentials::{CsrOutput, ImportedCredential};
 pub use tokio_util::sync::CancellationToken as ConnectCancellation;
@@ -88,7 +92,12 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 /// `docs/runtime.md`. Listing it is safe in the direction that matters: this
 /// is the set a classifier may *accept*, so an unreachable member costs
 /// nothing, while a missing member misclassifies a real exit.
-pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 130];
+///
+/// `8` is `status` finding no supervisor for the profile (`SUPERVISOR_ABSENT`,
+/// M6-06); `connect` never produces it. `9` is `connect` refusing to start
+/// without the profile lock (`SUPERVISOR_RUNNING`, `SUPERVISOR_LOCK_FAILED`;
+/// the M6-06 review).
+pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 130];
 
 /// The M1 failure policy. A later caller can explicitly create a fresh
 /// session; the library never reconnects or replays an operation itself.

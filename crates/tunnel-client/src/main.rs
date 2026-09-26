@@ -46,6 +46,10 @@ enum Command {
         path: PathBuf,
         json: bool,
     },
+    Status {
+        path: PathBuf,
+        json: bool,
+    },
 }
 
 /// Every terminal cause `tunnel-client` can report, as a closed set.
@@ -82,6 +86,15 @@ enum Cause {
     ProtocolError,
     SupervisorFailed,
     SignalError,
+    /// `status`: no supervisor is listening for this profile (M6-06).
+    SupervisorAbsent,
+    /// `connect`: another supervisor already holds this profile (M6-06).
+    SupervisorRunning,
+    /// `connect`: the profile lock could not be taken for another reason
+    /// (M6-06 review); the supervisor fails closed.
+    SupervisorLockFailed,
+    /// The local supervisor IPC failed its same-user check (M6-06).
+    IpcUnauthorized,
 }
 
 impl Cause {
@@ -105,6 +118,10 @@ impl Cause {
             Self::ProtocolError => "PROTOCOL_ERROR",
             Self::SupervisorFailed => "SUPERVISOR_FAILED",
             Self::SignalError => "SIGNAL_ERROR",
+            Self::SupervisorAbsent => "SUPERVISOR_ABSENT",
+            Self::SupervisorRunning => "SUPERVISOR_RUNNING",
+            Self::SupervisorLockFailed => "SUPERVISOR_LOCK_FAILED",
+            Self::IpcUnauthorized => "IPC_UNAUTHORIZED",
         }
     }
 
@@ -140,6 +157,18 @@ impl Cause {
     ///   an orderly stop whose join overran its bound.
     ///   A stop request while the session is live drains and exits `0`
     ///   with a `stopped` event instead (M6-C23, M6-C27).
+    /// * `8` — `status` found no supervisor running for the profile (M6-06).
+    ///   Not a failure of anything: nothing is running. Kept apart from `4`
+    ///   because the action is to start `connect`, not to check a network.
+    ///   A supervisor socket, lock or peer that fails the same-user check is
+    ///   `3` (`IPC_UNAUTHORIZED`, authorization denied).
+    /// * `9` — `connect` did not start because it cannot hold the profile
+    ///   lock: another supervisor holds it (`SUPERVISOR_RUNNING`), or it
+    ///   could not be taken (`SUPERVISOR_LOCK_FAILED`). Its own status, and
+    ///   not `7`, since the M6-06 review: `7` is restarted by the example
+    ///   service unit (a relay's stale `OWNER_BUSY` heals by waiting), while
+    ///   a second supervisor never heals by restarting, so the unit lists `9`
+    ///   in `RestartPreventExitStatus`.
     /// * `1` — genuinely unexpected: a protocol violation, a failed
     ///   supervisor, or a signal subsystem error. After this change `1`
     ///   means what it says.
@@ -152,10 +181,12 @@ impl Cause {
     fn exit_code(self) -> u8 {
         match self {
             Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => 2,
-            Self::CredentialError => 3,
+            Self::CredentialError | Self::IpcUnauthorized => 3,
             Self::TransportError | Self::SessionClosed | Self::AuthorizationStale => 4,
             Self::DeadlineExceeded => 5,
             Self::OwnerBusy | Self::ResourceExhausted => 7,
+            Self::SupervisorRunning | Self::SupervisorLockFailed => 9,
+            Self::SupervisorAbsent => 8,
             Self::Cancelled => 130,
             Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => 1,
         }
@@ -182,6 +213,24 @@ impl Cause {
     }
 }
 
+impl Cause {
+    /// Classify a supervisor IPC failure (M6-06). Exhaustive, no fallback.
+    fn from_ipc(error: tunnel_client::supervisor_ipc::IpcError) -> Self {
+        use tunnel_client::supervisor_ipc::IpcError;
+        match error {
+            IpcError::Absent => Self::SupervisorAbsent,
+            IpcError::Busy => Self::SupervisorRunning,
+            IpcError::Unauthorized(_) => Self::IpcUnauthorized,
+            IpcError::PathTooLong => Self::ConfigError,
+            IpcError::Timeout => Self::DeadlineExceeded,
+            IpcError::Malformed => Self::ProtocolError,
+            IpcError::Io(_) => Self::TransportError,
+            IpcError::LockFailed(_) => Self::SupervisorLockFailed,
+            IpcError::Unsupported => Self::InvalidInvocation,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CliError {
     cause: Cause,
@@ -203,6 +252,18 @@ impl CliError {
             cause: Cause::from_client(&error),
             message: error.to_string(),
             retryable: error.retryable(),
+        }
+    }
+
+    fn from_ipc(error: tunnel_client::supervisor_ipc::IpcError) -> Self {
+        Self {
+            cause: Cause::from_ipc(error),
+            message: error.to_string(),
+            retryable: matches!(
+                error,
+                tunnel_client::supervisor_ipc::IpcError::Absent
+                    | tunnel_client::supervisor_ipc::IpcError::Timeout
+            ),
         }
     }
 
@@ -323,7 +384,7 @@ async fn async_main() -> ExitCode {
         }
     };
     if let Command::Doctor { path, json } = &command {
-        return run_doctor(path.clone(), *json);
+        return run_doctor(path.clone(), *json).await;
     }
     let json_command = diagnostic_command(&command);
     match run(command).await {
@@ -410,11 +471,48 @@ async fn run(command: Command) -> Result<(), CliError> {
             Ok(())
         }
         Command::Doctor { .. } => unreachable!("doctor is handled before the async command runner"),
+        Command::Status { path, json } => run_status(&path, json).await,
     }
 }
 
-fn run_doctor(path: PathBuf, json: bool) -> ExitCode {
-    let inspection = doctor::inspect(&path, SystemTime::now());
+/// `tunnel-client status`: read the running supervisor's redacted snapshot
+/// through the profile's local IPC socket (M6-06). Read-only: it opens no
+/// network connection, starts no tunnel and changes nothing.
+async fn run_status(path: &Path, json: bool) -> Result<(), CliError> {
+    let config = load_runtime_config(path)?;
+    let status = tunnel_client::supervisor_ipc::query_status(&config.supervisor_socket_path())
+        .await
+        .map_err(CliError::from_ipc)?;
+    if json {
+        print_ok_json("status", &status);
+        return Ok(());
+    }
+    println!(
+        "Supervisor: pid={} state={} sessions={}",
+        status.pid, status.state, status.sessions
+    );
+    match &status.session {
+        Some(session) => println!(
+            "Session: {} epoch={} generation={} phase={} rotations={} streams={} queue_bytes={}",
+            session.session_id.as_deref().unwrap_or("-"),
+            session.epoch.unwrap_or_default(),
+            session.active_generation.unwrap_or_default(),
+            session.phase,
+            session.rotations_completed,
+            session.streams,
+            session.queue_bytes
+        ),
+        None => println!("Session: none"),
+    }
+    if let Some(code) = &status.last_error_code {
+        println!("Last session end: {code}");
+    }
+    Ok(())
+}
+
+async fn run_doctor(path: PathBuf, json: bool) -> ExitCode {
+    let supervisor_ipc = doctor_supervisor_ipc(&path).await;
+    let inspection = doctor::inspect(&path, SystemTime::now(), supervisor_ipc);
     if json {
         println!(
             "{}",
@@ -422,13 +520,46 @@ fn run_doctor(path: PathBuf, json: bool) -> ExitCode {
         );
     } else if inspection.output.ok {
         println!("Local configuration, credential key match, permissions, and expiry are healthy.");
-        println!("Supervisor IPC: not implemented in this operations slice.");
+        let ipc = &inspection.output.result.supervisor_ipc;
+        println!("Supervisor IPC: {} ({})", ipc.status, ipc.code);
     } else if let Some(error) = &inspection.output.error {
         eprintln!("tunnel-client doctor: {}", error.message);
     } else {
         eprintln!("tunnel-client doctor: local checks failed");
     }
     ExitCode::from(inspection.exit_code)
+}
+
+/// The doctor's supervisor IPC check (M6-06): read the profile's supervisor
+/// socket the way `status` does and report only a status and a closed code.
+/// A supervisor that is simply not running is `not_running`, not a failure:
+/// `doctor` is also run before the first `connect`.
+async fn doctor_supervisor_ipc(path: &Path) -> doctor::CapabilityCheck {
+    let Ok(config) = ConnectConfig::load(path) else {
+        return doctor::CapabilityCheck {
+            status: "not_run",
+            code: "SUPERVISOR_IPC_NOT_RUN",
+        };
+    };
+    let config = config.resolve_relative_to(path.parent().unwrap_or_else(|| Path::new(".")));
+    match tunnel_client::supervisor_ipc::query_status(&config.supervisor_socket_path()).await {
+        Ok(_) => doctor::CapabilityCheck {
+            status: "ok",
+            code: "SUPERVISOR_IPC_OK",
+        },
+        Err(tunnel_client::supervisor_ipc::IpcError::Absent) => doctor::CapabilityCheck {
+            status: "not_running",
+            code: "SUPERVISOR_ABSENT",
+        },
+        Err(tunnel_client::supervisor_ipc::IpcError::Unsupported) => doctor::CapabilityCheck {
+            status: "unsupported",
+            code: "IPC_UNSUPPORTED",
+        },
+        Err(error) => doctor::CapabilityCheck {
+            status: "failed",
+            code: error.code(),
+        },
+    }
 }
 
 fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
@@ -745,6 +876,12 @@ impl Cause {
             Self::Cancelled | Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => {
                 ReconnectClass::Terminal
             }
+            // Supervisor IPC causes arise before the first attempt (the
+            // profile lock) or in `status`, never from a session.
+            Self::SupervisorAbsent
+            | Self::SupervisorRunning
+            | Self::SupervisorLockFailed
+            | Self::IpcUnauthorized => ReconnectClass::Terminal,
         }
     }
 }
@@ -1023,26 +1160,171 @@ fn interrupted_during_backoff(signal: StopSignal, attempt: u32, last: &CliError)
     }
 }
 
+/// The supervisor's side of the local status IPC (M6-06): the snapshot it
+/// publishes and the server task answering `status` and `doctor`.
+struct SupervisorPublisher {
+    status: tokio::sync::watch::Sender<tunnel_client::supervisor_ipc::SupervisorStatus>,
+    server: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    /// The profile lock, held until the publisher is dropped at the end of
+    /// `run_connect` (and released by the kernel on any exit).
+    _lock: ProfileLockHold,
+}
+
+/// What holds the profile lock: the `flock` on Unix; nothing on other
+/// platforms, which have no supervisor IPC and so no lock yet (documented
+/// in docs/runtime.md, "Supervisor status IPC").
+#[cfg(unix)]
+type ProfileLockHold = Option<tunnel_client::supervisor_ipc::ProfileLock>;
+#[cfg(not(unix))]
+type ProfileLockHold = Option<()>;
+
+type IpcServer = Option<(CancellationToken, tokio::task::JoinHandle<()>)>;
+
+impl SupervisorPublisher {
+    /// Take the profile lock, then bind the profile's supervisor socket.
+    ///
+    /// **The lock fails closed** (M6-06 review, task row M6-C132): another
+    /// supervisor holding it is refused `SUPERVISOR_RUNNING`, exit `9`, and
+    /// a lock that cannot be taken for any other reason -- a missing
+    /// directory, one other users can write, a lock file that is a symlink or
+    /// open to others -- refuses to start as well (`SUPERVISOR_LOCK_FAILED`,
+    /// exit `9`, or `IPC_UNAUTHORIZED`, exit `3`): two connectors on one
+    /// profile would share one credential and fight over one owner slot, and
+    /// a supervisor that cannot prove it is alone must not run. **Only the
+    /// socket is optional:** with the lock held, a socket that cannot be
+    /// bound (a path too long for `sun_path`, say) leaves this supervisor
+    /// running without IPC, with one stderr line naming the code; `status`
+    /// then reports no supervisor.
+    fn start(config: &ConnectConfig) -> Result<Self, CliError> {
+        use tunnel_client::supervisor_ipc::{ExportStatus, RotationPolicyStatus, SupervisorStatus};
+        let initial = SupervisorStatus {
+            pid: std::process::id(),
+            state: "starting".to_owned(),
+            device_id: config.device_id.clone(),
+            certificate_expires_at_unix: device_certificate_window(config)
+                .map(|(_, not_after)| not_after),
+            rotation_policy: RotationPolicyStatus {
+                interval_seconds: config.rotation.interval_seconds,
+                handshake_timeout_seconds: config.rotation.handshake_timeout_seconds,
+                overlap_seconds: config.rotation.overlap_seconds,
+            },
+            exports: config
+                .exports
+                .iter()
+                .map(|(name, export)| ExportStatus {
+                    name: name.clone(),
+                    kind: serde_json::to_value(export.kind)
+                        .ok()
+                        .and_then(|kind| kind.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            ..SupervisorStatus::default()
+        };
+        let (status, receiver) = tokio::sync::watch::channel(initial);
+        let (server, lock) = start_ipc_server(config, receiver)?;
+        Ok(Self {
+            status,
+            server,
+            _lock: lock,
+        })
+    }
+
+    fn update(&self, change: impl FnOnce(&mut tunnel_client::supervisor_ipc::SupervisorStatus)) {
+        self.status.send_modify(change);
+    }
+
+    /// Stop answering and remove the socket, bounded.
+    async fn shutdown(mut self) {
+        if let Some((cancel, task)) = self.server.take() {
+            cancel.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn start_ipc_server(
+    config: &ConnectConfig,
+    receiver: tokio::sync::watch::Receiver<tunnel_client::supervisor_ipc::SupervisorStatus>,
+) -> Result<(IpcServer, ProfileLockHold), CliError> {
+    use tunnel_client::supervisor_ipc::{IpcError, ProfileLock, SupervisorIpc};
+    let socket = config.supervisor_socket_path();
+    let lock = match ProfileLock::acquire(&socket) {
+        Ok(lock) => lock,
+        // Fail closed: never run without the lock.
+        Err(error) => return Err(CliError::from_ipc(error)),
+    };
+    match SupervisorIpc::bind(&socket, &lock) {
+        Ok(ipc) => {
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(ipc.serve(receiver, cancel.clone()));
+            Ok((Some((cancel, task)), Some(lock)))
+        }
+        Err(IpcError::Busy) => Err(CliError::from_ipc(IpcError::Busy)),
+        Err(error) => {
+            eprintln!(
+                "tunnel-client: warning: supervisor status IPC unavailable ({}): {error}; \
+                 `status` will report no supervisor",
+                error.code()
+            );
+            Ok((None, Some(lock)))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn start_ipc_server(
+    _config: &ConnectConfig,
+    _receiver: tokio::sync::watch::Receiver<tunnel_client::supervisor_ipc::SupervisorStatus>,
+) -> Result<(IpcServer, ProfileLockHold), CliError> {
+    Ok((None, None))
+}
+
 async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<(), CliError> {
     // First, before any file is read or socket opened: from here on a stop
     // request in any phase reaches the orderly path below instead of the
     // inherited disposition.
     let mut stop = StopSignals::install()?;
     let config = load_runtime_config(&path)?;
+    let publisher = SupervisorPublisher::start(&config)?;
+    let result = run_supervised(&config, &mut stop, &publisher, json, no_reconnect).await;
+    publisher.update(|status| {
+        status.state = "stopping".to_owned();
+        status.session = None;
+    });
+    publisher.shutdown().await;
+    result
+}
+
+async fn run_supervised(
+    config: &ConnectConfig,
+    stop: &mut StopSignals,
+    publisher: &SupervisorPublisher,
+    json: bool,
+    no_reconnect: bool,
+) -> Result<(), CliError> {
+    let config = config.clone();
     let stop_bound = stop_join_bound(&config);
     let policy = ReconnectPolicy::new(&config.reconnect, no_reconnect);
     let mut state = ReconnectState::default();
     // The retry in progress, if this attempt follows a failure.
     let mut retry: Option<u32> = None;
     loop {
+        publisher.update(|status| {
+            status.state = "connecting".to_owned();
+            status.attempt = retry;
+            status.retry_delay_ms = None;
+            status.session = None;
+        });
         let end = run_one_session(
             &config,
-            &mut stop,
+            stop,
             stop_bound,
             json,
             policy.failure_policy(),
-            retry,
-            &state,
+            (retry, &state),
+            publisher,
         )
         .await?;
         let (error, ready) = match end {
@@ -1069,6 +1351,14 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
             return Err(error);
         };
         let session_id = ready.as_ref().map(|(id, _)| id.as_str());
+        publisher.update(|status| {
+            status.state = "backoff".to_owned();
+            status.attempt = Some(attempt);
+            status.retry_delay_ms = Some(millis(delay));
+            status.last_error_code = Some(error.code().to_owned());
+            status.sessions = state.sessions;
+            status.session = None;
+        });
         if json {
             print_ok_json(
                 "connect",
@@ -1147,8 +1437,10 @@ async fn run_one_session(
     stop_bound: std::time::Duration,
     json: bool,
     failure_policy: &'static str,
-    retry: Option<u32>,
-    state: &ReconnectState,
+    // The retry in progress, if this attempt follows a failure, and the
+    // loop's state.
+    (retry, state): (Option<u32>, &ReconnectState),
+    publisher: &SupervisorPublisher,
 ) -> Result<SessionEnd, CliError> {
     // Configured MCP and ACP exports become in-process http-forward/1
     // handlers; an http-forward export without one is still refused at OPEN.
@@ -1246,9 +1538,16 @@ async fn run_one_session(
                     },
                 );
             }
-            run_session(&handle, stop, stop_bound, json, failure_policy).await
+            publisher.update(|status| {
+                status.state = "ready".to_owned();
+                status.sessions = state.sessions + 1;
+            });
+            run_session(&handle, stop, stop_bound, json, failure_policy, publisher).await
         }
     };
+    publisher.update(|status| {
+        status.state = "stopping".to_owned();
+    });
     match outcome {
         Ok(first) => {
             cancellation.cancel();
@@ -1421,6 +1720,7 @@ async fn run_session(
     bound: std::time::Duration,
     json: bool,
     failure_policy: &'static str,
+    publisher: &SupervisorPublisher,
 ) -> Result<StopSignal, CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
@@ -1453,6 +1753,9 @@ async fn run_session(
 
     let mut status = handle.status();
     let mut last_status = status.borrow().clone();
+    publisher.update(|published| {
+        published.session = Some((&last_status).into());
+    });
     if json {
         // Publish the already-ready snapshot once.  A watch receiver cloned
         // after connect observes the current value, so waiting only for
@@ -1483,6 +1786,9 @@ async fn run_session(
                     return Err(stopped_connector_error(&mut readiness, handle, stop, bound, "connector status publisher stopped").await?);
                 }
                 let current = status.borrow_and_update().clone();
+                publisher.update(|published| {
+                    published.session = Some((&current).into());
+                });
                 if json && should_emit_connect_status(&last_status, &current) {
                     print_connect_status(&current);
                 }
@@ -1613,6 +1919,7 @@ fn diagnostic_command(command: &Command) -> Option<&'static str> {
     match command {
         Command::CheckRuntimeConfig { json: true, .. } => Some("config check"),
         Command::Connect { json: true, .. } => Some("connect"),
+        Command::Status { json: true, .. } => Some("status"),
         _ => None,
     }
 }
@@ -1676,6 +1983,10 @@ fn parse_command(args: &[OsString]) -> Result<Command, CliError> {
         "doctor" => {
             let (path, json) = parse_path_and_json(&args[1..], "doctor")?;
             Ok(Command::Doctor { path, json })
+        }
+        "status" => {
+            let (path, json) = parse_path_and_json(&args[1..], "status")?;
+            Ok(Command::Status { path, json })
         }
         _ => Err(CliError::usage("unknown command")),
     }
@@ -1858,6 +2169,7 @@ Usage:\n\
   tunnel-client check-config [PATH]\n\
   tunnel-client config check --config PATH [--json]\n\
   tunnel-client doctor --config PATH [--json]\n\
+  tunnel-client status --config PATH [--json]\n\
   tunnel-client connect --config PATH [--json] [--no-reconnect]\n\
   tunnel-client credentials create --config PATH --csr-out PATH\n\
   tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\n\
@@ -2241,24 +2553,75 @@ mod tests {
     /// not a link. The copy is gone, and this is the assertion that keeps
     /// the remaining one honest in the other direction — a cause mapped to
     /// an unpublished status fails here rather than at a release gate.
+    /// Every `Cause`, in declaration order.
+    ///
+    /// **This list used to be able to fall behind the enum silently, and
+    /// did** (task row M6-C131): its comment said a new variant "breaks the
+    /// build" in `Cause::code` first, which is true and irrelevant -- the
+    /// author then adds the arm there and nothing touches this list. Adding
+    /// `SUPERVISOR_ABSENT` with exit `8` left the test green while `8` was
+    /// missing from `CLI_DIAGNOSTIC_EXIT_CODES`. `cause_index` is an
+    /// exhaustive match with no fallback arm into this array, and the test
+    /// below requires the two to agree, so a new variant now fails to build
+    /// until it is listed here.
+    const ALL_CAUSES: [Cause; 18] = [
+        Cause::InvalidInvocation,
+        Cause::ConfigError,
+        Cause::InvalidConfig,
+        Cause::CredentialError,
+        Cause::AuthorizationStale,
+        Cause::TransportError,
+        Cause::SessionClosed,
+        Cause::DeadlineExceeded,
+        Cause::OwnerBusy,
+        Cause::ResourceExhausted,
+        Cause::Cancelled,
+        Cause::ProtocolError,
+        Cause::SupervisorFailed,
+        Cause::SignalError,
+        Cause::SupervisorAbsent,
+        Cause::SupervisorRunning,
+        Cause::IpcUnauthorized,
+        Cause::SupervisorLockFailed,
+    ];
+
+    fn cause_index(cause: Cause) -> usize {
+        match cause {
+            Cause::InvalidInvocation => 0,
+            Cause::ConfigError => 1,
+            Cause::InvalidConfig => 2,
+            Cause::CredentialError => 3,
+            Cause::AuthorizationStale => 4,
+            Cause::TransportError => 5,
+            Cause::SessionClosed => 6,
+            Cause::DeadlineExceeded => 7,
+            Cause::OwnerBusy => 8,
+            Cause::ResourceExhausted => 9,
+            Cause::Cancelled => 10,
+            Cause::ProtocolError => 11,
+            Cause::SupervisorFailed => 12,
+            Cause::SignalError => 13,
+            Cause::SupervisorAbsent => 14,
+            Cause::SupervisorRunning => 15,
+            Cause::IpcUnauthorized => 16,
+            Cause::SupervisorLockFailed => 17,
+        }
+    }
+
+    #[test]
+    fn the_cause_list_is_every_cause_exactly_once() {
+        for (index, cause) in ALL_CAUSES.iter().enumerate() {
+            assert_eq!(
+                cause_index(*cause),
+                index,
+                "{cause:?} is listed out of place"
+            );
+        }
+    }
+
     #[test]
     fn every_exit_status_is_in_the_published_vocabulary() {
-        let causes = [
-            Cause::InvalidInvocation,
-            Cause::ConfigError,
-            Cause::InvalidConfig,
-            Cause::CredentialError,
-            Cause::AuthorizationStale,
-            Cause::TransportError,
-            Cause::SessionClosed,
-            Cause::DeadlineExceeded,
-            Cause::OwnerBusy,
-            Cause::ResourceExhausted,
-            Cause::Cancelled,
-            Cause::ProtocolError,
-            Cause::SupervisorFailed,
-            Cause::SignalError,
-        ];
+        let causes = ALL_CAUSES;
         for cause in causes {
             let status = cause.exit_code();
             assert!(
@@ -2268,15 +2631,13 @@ mod tests {
                  docs/runtime.md, or classify the cause differently"
             );
         }
-        // The list above is a hand-written enumeration and could fall behind
-        // the enum. It cannot fall behind silently: `Cause::code` is an
-        // exhaustive match, so a new variant breaks the build there first,
-        // and the codes below pin this list's size and contents against the
-        // set of published codes.
         let codes: std::collections::BTreeSet<&str> =
             causes.iter().map(|cause| cause.code()).collect();
-        assert_eq!(causes.len(), 14, "one entry per Cause variant");
-        assert_eq!(codes.len(), 14, "every cause publishes a distinct code");
+        assert_eq!(
+            codes.len(),
+            causes.len(),
+            "every cause publishes a distinct code"
+        );
     }
 
     /// One of every `ClientError` variant, for tests that must sweep them.

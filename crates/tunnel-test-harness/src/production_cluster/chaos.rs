@@ -1618,9 +1618,11 @@ mod tests {
             InterruptionClass::Unclassified
         );
         // Still outside the vocabulary, so the classifier is not merely
-        // accepting everything.
+        // accepting everything.  (This was `9` until the M6-06 review made
+        // `9` the published `SUPERVISOR_RUNNING` status.)
+        assert!(!tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES.contains(&10));
         assert_eq!(
-            classify_client_exit(Some(9)),
+            classify_client_exit(Some(10)),
             InterruptionClass::Unclassified
         );
         assert_eq!(
