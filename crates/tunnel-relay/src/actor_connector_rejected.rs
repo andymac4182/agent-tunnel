@@ -351,15 +351,15 @@ mod actor_tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let now = Utc::now();
-        let tenant_id = Uuid::from_u128(0xc160_01);
-        let device_id = Uuid::from_u128(0xc160_02);
-        let principal_id = Uuid::from_u128(0xc160_03);
-        let service_id = Uuid::from_u128(0xc160_04);
+        let tenant_id = Uuid::from_u128(0xc160_0001);
+        let device_id = Uuid::from_u128(0xc160_0002);
+        let principal_id = Uuid::from_u128(0xc160_0003);
+        let service_id = Uuid::from_u128(0xc160_0004);
         let identity = DeviceIdentity {
             tenant_id,
             device_id,
             owner_user_id: principal_id,
-            credential_id: Uuid::from_u128(0xc160_05),
+            credential_id: Uuid::from_u128(0xc160_0005),
             spki_fingerprint: "m7c160-spki".to_owned(),
             credential_not_before: now - Duration::minutes(1),
             expires_at: now + Duration::minutes(1),
