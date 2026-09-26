@@ -381,7 +381,10 @@ EXPECTED_GUARD_ANCHORS = {
     #
     # Then **71** on integration branch `integrate-2026-09-26e`, which
     # merges both (#171 and #173); 72 fails naming m3, then 71.
-    "m3-guard-deletion.py": 71,
+    #
+    # Then **72** on branch `fix-read-gate-join` (M6-C158), which adds the
+    # carrier-close case. 73 fails naming m3, then 72.
+    "m3-guard-deletion.py": 72,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
