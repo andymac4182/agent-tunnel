@@ -573,7 +573,9 @@ class Stack:
         dev["proc"] = spawn(
             ["nice", "-n", "10", str(self.bins / "tunnel-client"), "connect", "--config",
              str(dev["config"]), "--json"], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-            env={**os.environ, "RUST_LOG": "warn"})
+            # M6-C190: each failed HTTP exchange's payload-free state goes to
+            # stderr, and `close` extracts it for the artifact.
+            env={**os.environ, "RUST_LOG": "warn", "AGENT_TUNNEL_HTTP_EXCHANGE_LOG": "1"})
         dev.setdefault("all_procs", []).append(dev["proc"])
         self.event("device-start", device=name, start=dev["starts"], pid=dev["proc"].pid)
 
@@ -596,6 +598,43 @@ class Stack:
         return sessions, rotations, events
 
     # -- teardown
+    def extract_http_failures(self) -> None:
+        """Copy the payload-free failed-exchange lines into the artifact (M6-C190).
+
+        The relay and device logs themselves are never published (M7-C112).
+        Only two line shapes are kept: the device's `http-exchange-failed`
+        JSON object, and the relay's JSON log events whose `phase` is one of
+        the two HTTP-forward failure diagnostics.  Both carry identifiers,
+        counters, flags and elapsed milliseconds only.
+        """
+        out = []
+        for path in sorted(self.run_dir.glob("device-*.stderr.log")):
+            for line in path.read_text(errors="replace").splitlines():
+                _, marker, rest = line.partition("tunnel-client: http-exchange-failed ")
+                if marker:
+                    try:
+                        out.append({"source": path.name, **json.loads(rest)})
+                    except ValueError:
+                        continue
+        for path in sorted(self.run_dir.glob("relay-*.log")):
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                fields = value.get("fields", {}) if isinstance(value, dict) else {}
+                if fields.get("phase") in ("http_forward_exchange_failed",
+                                           "http_forward_exchange_pumps",
+                                           "http_forward_owner_stream_unfinished"):
+                    fields.pop("message", None)
+                    out.append({"source": path.name, "timestamp": value.get("timestamp"),
+                                **fields})
+        with (self.run_dir / "http-failures.jsonl").open("w") as handle:
+            handle.write(json.dumps({"nonce": self.nonce, "head": head_sha(),
+                                     "lines": len(out)}) + "\n")
+            for item in out:
+                handle.write(json.dumps(item) + "\n")
+
     def close(self) -> None:
         # Whole process groups, so a device's MCP children and anything a
         # killed relay left behind go too; each group is signalled even when
@@ -605,6 +644,7 @@ class Stack:
                 stop_group(proc)
         for proc in self.relay_procs + [self.forwarder]:
             stop_group(proc)
+        self.extract_http_failures()
         try:
             removed = delete_namespace(self.redis[0], self.redis[1], self.namespace)
             self.event("namespace-deleted", namespace=self.namespace, keys=removed)

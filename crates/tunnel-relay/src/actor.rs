@@ -2964,6 +2964,67 @@ pub struct RelayHandle {
     claim_handoffs: ClaimHandoffs,
 }
 
+/// What a [`RelayHandle::refusing_http_writes_for_test`] script observed.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScriptedHttpOp {
+    /// An HTTP stream write, refused.
+    Write,
+    /// An HTTP stream RESET with this reason, accepted.
+    Reset(u16),
+}
+
+#[cfg(test)]
+impl RelayHandle {
+    /// M6-C190: a handle whose commands a script answers instead of an
+    /// actor.  Every HTTP stream write is refused with `code` (as a full
+    /// writer queue refuses it) and every HTTP RESET is accepted; both are
+    /// reported, in order, on the returned receiver.  Other commands are
+    /// dropped unanswered.
+    pub(crate) fn refusing_http_writes_for_test(
+        code: &'static str,
+    ) -> (Self, mpsc::UnboundedReceiver<ScriptedHttpOp>) {
+        let jwk = tunnel_catalog::ApprovedJwk::from_ed25519_der("scripted", &[0_u8; 32])
+            .expect("test OIDC key");
+        let config = tunnel_catalog::OidcConfig::new(
+            "https://issuer.example",
+            ["audience".to_owned()],
+            vec![jwk],
+        )
+        .expect("test OIDC config");
+        let options = RelayOptions::new(Arc::new(
+            tunnel_catalog::OidcVerifier::new(config).expect("verifier"),
+        ));
+        let base = Self::spawn(options, Arc::new(tunnel_catalog::MemoryCatalog::new()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let (ops_tx, ops_rx) = mpsc::unbounded_channel();
+        let mut handle = base;
+        handle.tx = tx;
+        handle.actor_completion = ActorCompletion::default();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    Command::WriteEchoStream { response, .. } => {
+                        let _ = ops_tx.send(ScriptedHttpOp::Write);
+                        let _ = response.send(Err(EchoOutcome::Failure {
+                            code,
+                            execution: "not_dispatched",
+                        }));
+                    }
+                    Command::ResetHttpStream {
+                        reason, response, ..
+                    } => {
+                        let _ = ops_tx.send(ScriptedHttpOp::Reset(reason));
+                        let _ = response.send(true);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (handle, ops_rx)
+    }
+}
+
 impl RelayHandle {
     pub(crate) fn spawn(options: RelayOptions, catalog: SharedCatalog) -> Self {
         let capacity = options.limits.max_queue_messages.max(32);
@@ -3974,6 +4035,7 @@ impl RelayActor {
                     let scope = command.http_maintenance_scope();
                     self.handle(command).await;
                     if !shutdown {
+                        self.retry_writer_held_http();
                         self.after_command_http_maintenance(scope).await;
                         // A command can end a freeze, end a session or pass a
                         // hold deadline; settle held OPENs against it.
@@ -7265,13 +7327,18 @@ impl RelayActor {
             }));
             return;
         };
-        if stream.operation_id != operation_id
-            || stream.terminal
-            || stream
-                .http
-                .as_ref()
-                .is_some_and(HttpStreamState::local_terminal)
-        {
+        // A record parked before the owner's FIN (for credit, replay room or
+        // a full writer) was written before it, so it is still sequenced
+        // ahead of that FIN (M6-C190); only a new write after the FIN, or
+        // anything after a local RESET, is refused.
+        let locally_ended = stream.http.as_ref().is_some_and(|http| {
+            if from_pending_credit {
+                http.local_reset_sent()
+            } else {
+                http.local_terminal()
+            }
+        });
+        if stream.operation_id != operation_id || stream.terminal || locally_ended {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "STREAM_NOT_FOUND",
                 execution: "not_dispatched",
@@ -7494,6 +7561,9 @@ impl RelayActor {
                 }
             }
         }
+        // M6-C190: a raw HTTP chunk the writer queue refuses only because
+        // it is momentarily full is backpressure, not a failure.
+        let mut writer_full = false;
         if failure.is_none() {
             let total_queued_bytes = encoded_chunks.iter().map(Vec::len).sum::<usize>();
             if !queue_budget.reserve_data(total_queued_bytes) {
@@ -7515,9 +7585,10 @@ impl RelayActor {
                         }
                         pressure.latch_data_depth(data_occupancy(&data_tx).depth);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         queue_budget.release(total_queued_bytes);
                         queue_budget.pressure().record_data_refusal();
+                        writer_full = raw && matches!(error, mpsc::error::TrySendError::Full(()));
                         failure = Some(EchoOutcome::Failure {
                             code: "REVERSE_CHANNEL_UNAVAILABLE",
                             execution: "not_dispatched",
@@ -7528,6 +7599,36 @@ impl RelayActor {
         }
         if let Some(outcome) = failure {
             release_m2_bytes(&queue_budget, stream, reserved_stream_bytes);
+            // M6-C190: before this, a chunk refused by a momentarily full
+            // writer queue failed the write, the ingress's outbound pump
+            // ended without telling the device, and the device waited out
+            // its 10 s first-HEAD or record budget, or its 30 s operation
+            // deadline, before the consumer learned anything (measured on
+            // hosted load: 6 -- 59 `HTTP_DEADLINE_EXCEEDED` per 30 s MCP
+            // step from 32 workers).  The chunk now parks at the head of the
+            // stream's bounded FIFO, charged to the same budgets as a
+            // credit-held record, and is retried in order after every
+            // command and on the tick until the writer takes it.  Nothing is
+            // sequenced, so there is no gap and nothing to replay.
+            if writer_full
+                && stream.pending_records.len() < max_pending_operations
+                && stream.pending_record_bytes.saturating_add(body.len()) <= max_queue_bytes
+                && reserve_m2_bytes(&queue_budget, stream, body.len())
+            {
+                stream.pending_record_bytes =
+                    stream.pending_record_bytes.saturating_add(body.len());
+                let parked = stream.pending_record_bytes;
+                if let Some(http) = stream.http.as_mut() {
+                    http.note_parked(parked);
+                    http.trace.writer_parks = http.trace.writer_parks.saturating_add(1);
+                }
+                // Either this record came off the head of the FIFO for a
+                // retry, or the FIFO was empty (a later write queues behind
+                // a non-empty one above): the head is its place either way.
+                stream.pending_records.push_front((body, response));
+                self.http_maintenance.note_writer_held(&key, stream_id);
+                return;
+            }
             let _ = response.send(Err(outcome));
             return;
         }
@@ -7638,6 +7739,25 @@ impl RelayActor {
                 response,
                 true,
             );
+            // The writer queue is still full and the record went back to the
+            // head (M6-C190): the next retry is after a later command.
+            if self.http_maintenance.is_writer_held(key, stream_id) {
+                return;
+            }
+        }
+    }
+
+    /// Retry every HTTP stream whose head record a full writer queue parked
+    /// (M6-C190), data first and then any terminal waiting behind it.  A
+    /// no-op when nothing is parked.
+    pub(super) fn retry_writer_held_http(&mut self) {
+        if self.http_maintenance.writer_held.is_empty() {
+            return;
+        }
+        let held = std::mem::take(&mut self.http_maintenance.writer_held);
+        for (key, stream_id) in held {
+            self.retry_pending_echo_records(&key, stream_id);
+            self.flush_pending_terminal(&key, stream_id);
         }
     }
 
@@ -12409,7 +12529,14 @@ impl RelayActor {
             }
         } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
             if stream.authorization_in_flight {
+                if let Some(http) = stream.http.as_mut() {
+                    http.trace.challenges_ignored_in_flight =
+                        http.trace.challenges_ignored_in_flight.saturating_add(1);
+                }
                 return;
+            }
+            if let Some(http) = stream.http.as_mut() {
+                http.trace.challenges_started = http.trace.challenges_started.saturating_add(1);
             }
             let expected_digest =
                 wire::permission_digest(&stream.grant, &stream.service_id.to_string());
@@ -12967,6 +13094,9 @@ impl RelayActor {
             stream.authorization_in_flight = false;
             stream.authorization_started_at_ms = None;
             stream.authorization_deadline_ms = None;
+            if let Some(http) = stream.http.as_mut() {
+                http.trace.note_confirmation();
+            }
             let authorized_until = confirmed_at + Duration::from_millis(remaining_ms);
             stream.authorization_admission_deadline_ms =
                 Some(runtime::monotonic_millis_at(confirmed_at).saturating_add(remaining_ms));
@@ -14641,6 +14771,10 @@ impl RelayActor {
                 // single PREPARING attempt from the actor tick; the phase and
                 // message IDs make this idempotent once QUIESCE is queued.
                 self.begin_rotation_quiesce(&key);
+            }
+            // Parked DATA before the terminals that wait behind it (M6-C190).
+            if self.http_maintenance.is_writer_held_session(&key) {
+                self.retry_writer_held_http();
             }
             self.retry_failed_terminals(&key);
             // Credit a refused WINDOW_UPDATE left owed is otherwise paid only

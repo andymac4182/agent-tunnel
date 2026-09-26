@@ -170,6 +170,51 @@ pub(crate) struct HttpStreamState {
     /// it lives exactly as long as the stream and is bounded by the stream
     /// table.
     recent_observations: VecDeque<HttpRotationObservation>,
+    /// M6-C190: payload-free timing and authorization counters, logged with
+    /// the owner-stream record when the stream does not end with both FINs.
+    pub(crate) trace: HttpStreamTrace,
+}
+
+/// M6-C190: when this owner stream was created and how its connector
+/// authorization challenges were answered.  Counters and elapsed
+/// milliseconds only.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HttpStreamTrace {
+    pub(crate) created_at: std::time::Instant,
+    /// Challenges the relay started answering (sent to the catalog).
+    pub(crate) challenges_started: u32,
+    /// Challenges ignored because another was still in flight.
+    pub(crate) challenges_ignored_in_flight: u32,
+    /// Confirmations queued toward the connector.
+    pub(crate) confirmations_sent: u32,
+    /// Milliseconds from creation to the first confirmation.
+    pub(crate) first_confirmation_ms: Option<u64>,
+    /// Times a full writer queue parked one of this stream's chunks.
+    pub(crate) writer_parks: u32,
+}
+
+impl HttpStreamTrace {
+    fn new() -> Self {
+        Self {
+            created_at: std::time::Instant::now(),
+            challenges_started: 0,
+            challenges_ignored_in_flight: 0,
+            confirmations_sent: 0,
+            first_confirmation_ms: None,
+            writer_parks: 0,
+        }
+    }
+
+    pub(crate) fn age_ms(&self) -> u64 {
+        u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn note_confirmation(&mut self) {
+        self.confirmations_sent = self.confirmations_sent.saturating_add(1);
+        if self.first_confirmation_ms.is_none() {
+            self.first_confirmation_ms = Some(self.age_ms());
+        }
+    }
 }
 
 /// M3-22: rotation observations retained per HTTP stream.
@@ -213,6 +258,28 @@ pub(crate) struct HttpMaintenance {
     /// How many sessions had their HTTP streams visited to re-publish a
     /// freeze transition (a local counter for regression tests).
     pub(crate) freeze_stream_scans: u64,
+    /// M6-C190: HTTP streams whose head record a momentarily full writer
+    /// queue parked, retried after every command and on the tick.  At most
+    /// one entry per stream, so it is bounded by the stream tables.
+    pub(crate) writer_held: Vec<(SessionKey, u64)>,
+}
+
+impl HttpMaintenance {
+    pub(crate) fn note_writer_held(&mut self, key: &SessionKey, stream_id: u64) {
+        if !self.is_writer_held(key, stream_id) {
+            self.writer_held.push((key.clone(), stream_id));
+        }
+    }
+
+    pub(crate) fn is_writer_held(&self, key: &SessionKey, stream_id: u64) -> bool {
+        self.writer_held
+            .iter()
+            .any(|(held, id)| *id == stream_id && held == key)
+    }
+
+    pub(crate) fn is_writer_held_session(&self, key: &SessionKey) -> bool {
+        self.writer_held.iter().any(|(held, _)| held == key)
+    }
 }
 
 impl HttpStreamState {
@@ -250,6 +317,7 @@ impl HttpStreamState {
                 cancel_sent: false,
                 freeze_capture: None,
                 recent_observations: VecDeque::new(),
+                trace: HttpStreamTrace::new(),
             },
             HttpStreamWatchers {
                 peer_reset: reset_rx,
@@ -262,6 +330,11 @@ impl HttpStreamState {
 
     pub(crate) const fn local_terminal(&self) -> bool {
         self.local_fin || self.local_reset.is_some()
+    }
+
+    /// The owner reset this stream locally.
+    pub(crate) const fn local_reset_sent(&self) -> bool {
+        self.local_reset.is_some()
     }
 
     pub(crate) fn mark_local_reset(&mut self, reason: u16) {
@@ -1166,6 +1239,21 @@ impl RelayActor {
     ) {
         let snapshot = stream.sequence.snapshot();
         let sent = snapshot.direction(Direction::RelayToConnector);
+        let send_credit = stream
+            .sequence
+            .direction(Direction::RelayToConnector)
+            .send_credit();
+        let live = OwnerStreamLive {
+            authorization_in_flight: stream.authorization_in_flight,
+            authorized: stream.authorized_until.is_some(),
+            authorization_failure: stream.authorization_failure_code,
+            open_pending: stream.open_pending,
+            credit_held: stream.credit_held,
+            pending_records: stream.pending_records.len(),
+            pending_record_bytes: stream.pending_record_bytes,
+            pending_terminal: stream.pending_terminal.is_some(),
+            send_credit,
+        };
         let Some(http) = stream.http.as_mut() else {
             return;
         };
@@ -1178,7 +1266,7 @@ impl RelayActor {
             (None, None) if http.local_fin && http.peer_fin => ("fin", None),
             _ => ("closed", None),
         };
-        diagnostics.record_owner_stream(HttpOwnerStreamRecord {
+        let record = HttpOwnerStreamRecord {
             stream_id: stream.sequence.stream_id(),
             operation_id: stream.operation_id.clone(),
             request_id: stream.request_id.clone(),
@@ -1196,8 +1284,64 @@ impl RelayActor {
             reset_generation: http.reset_sequence.map(|(_, generation)| generation),
             reset_deferred_by_freeze: http.reset_deferred_by_freeze,
             cancel_sent: http.cancel_sent,
-        });
+        };
+        if record.release != "fin" {
+            log_unfinished_owner_stream(&record, &live, http);
+        }
+        diagnostics.record_owner_stream(record);
     }
+}
+
+/// M6-C190: the owner stream's live state when it was released, beside its
+/// record.  Flags, counts and byte totals only.
+#[derive(Debug)]
+struct OwnerStreamLive {
+    authorization_in_flight: bool,
+    authorized: bool,
+    authorization_failure: Option<&'static str>,
+    open_pending: bool,
+    credit_held: bool,
+    pending_records: usize,
+    pending_record_bytes: usize,
+    pending_terminal: bool,
+    send_credit: u64,
+}
+
+/// M6-C190: one warn line for an owner HTTP stream released without both
+/// FINs, so a stalled exchange can be attributed from the relay log.  The
+/// record and the live state carry identifiers, counters, phases and elapsed
+/// milliseconds only — never a header, path, body or credential.
+fn log_unfinished_owner_stream(
+    record: &HttpOwnerStreamRecord,
+    live: &OwnerStreamLive,
+    http: &HttpStreamState,
+) {
+    let trace = http.trace;
+    tracing::warn!(
+        target: "tunnel_relay::http_forward_stream",
+        phase = "http_forward_owner_stream_unfinished",
+        record = %serde_json::to_string(record).unwrap_or_default(),
+        age_ms = trace.age_ms(),
+        challenges_started = trace.challenges_started,
+        challenges_ignored_in_flight = trace.challenges_ignored_in_flight,
+        confirmations_sent = trace.confirmations_sent,
+        first_confirmation_ms = trace.first_confirmation_ms,
+        writer_parks = trace.writer_parks,
+        authorization_in_flight = live.authorization_in_flight,
+        authorized = live.authorized,
+        authorization_failure = live.authorization_failure,
+        open_pending = live.open_pending,
+        credit_held = live.credit_held,
+        pending_records = live.pending_records,
+        pending_record_bytes = live.pending_record_bytes,
+        pending_terminal = live.pending_terminal,
+        send_credit = live.send_credit,
+        credit_owed = http.credit_owed,
+        receive_buffered = http.buffered,
+        peer_fin = http.peer_fin,
+        local_fin = http.local_fin,
+        request_fin_sequenced = http.request_fin_sequenced,
+    );
 }
 
 #[cfg(test)]

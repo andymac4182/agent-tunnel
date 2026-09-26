@@ -4989,6 +4989,9 @@ impl M2Actor {
                             authority
                                 .confirm(stream.auth.grant_revision, authority.current_grant());
                         }
+                        if let Some(http) = stream.http.as_mut() {
+                            http.note_confirmation();
+                        }
                         (std::mem::take(&mut stream.pending), stream.pending_bytes)
                     }
                     None => (VecDeque::new(), 0),

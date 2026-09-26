@@ -2712,6 +2712,154 @@ async fn m6c151_refused_http_fin_is_retried_and_the_session_survives() {
     assert!(fixture.session_alive());
 }
 
+/// M6-C190: an HTTP DATA chunk that a momentarily full writer queue refuses
+/// parks at the head of the stream's FIFO instead of failing the write, and
+/// is sequenced in order -- with the chunk queued behind it and the FIN
+/// deferred behind both -- once the writer drains.
+///
+/// Measured on hosted `ubuntu-latest` (m6-soak load, 32 -- 128 MCP workers
+/// over 8 sessions) and reproduced locally: the relay's 128-slot data channel
+/// filled for a moment during a burst of new exchanges, the write failed
+/// `REVERSE_CHANNEL_UNAVAILABLE`, the ingress's outbound pump ended without
+/// telling the device, and the device waited out its 10 s first-HEAD or
+/// record budget, or its 30 s operation deadline, so the consumer got
+/// `HTTP_DEADLINE_EXCEEDED` after 10 -- 30 s, some of them `dispatched`.
+#[tokio::test]
+async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_order() {
+    let mut fixture = FreezeFixture::new("http-data-writer-full", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let generation = fixture.attempt.old_generation;
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+
+    let (head_tx, mut head) = oneshot::channel();
+    fixture.actor.write_echo_stream(
+        key.clone(),
+        STREAM_ID,
+        OPERATION_ID.to_owned(),
+        b"synthetic-head".to_vec(),
+        head_tx,
+    );
+    assert!(
+        matches!(head.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "a chunk the full writer refuses is parked, not failed"
+    );
+    let (body_tx, mut body) = oneshot::channel();
+    fixture.actor.write_echo_stream(
+        key.clone(),
+        STREAM_ID,
+        OPERATION_ID.to_owned(),
+        b"synthetic-body".to_vec(),
+        body_tx,
+    );
+    assert!(matches!(
+        body.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        fixture
+            .actor
+            .finish_http_stream(&key, STREAM_ID, OPERATION_ID),
+        "the FIN is accepted behind the parked chunks"
+    );
+    assert_eq!(fixture.stream().pending_records.len(), 2);
+    assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
+
+    // A retry while the writer is still full keeps both parked, in order,
+    // without spinning.
+    fixture.actor.retry_writer_held_http();
+    assert_eq!(fixture.stream().pending_records.len(), 2);
+    assert!(matches!(
+        head.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    // The writer drains; the next command's retry sequences everything in
+    // order.
+    let _ = drain_data(&mut fixture.old_rx);
+    fixture.actor.retry_writer_held_http();
+    assert!(matches!(head.try_recv(), Ok(Ok(_))), "the head chunk was sequenced");
+    assert!(matches!(body.try_recv(), Ok(Ok(_))), "the body chunk was sequenced");
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![
+            (FrameKind::Data, 1, generation),
+            (FrameKind::Data, 2, generation),
+            (FrameKind::Fin, 3, generation),
+        ]
+    );
+    assert!(fixture.stream().pending_records.is_empty());
+    assert!(fixture.stream().pending_terminal.is_none());
+    assert!(fixture.session_alive());
+}
+
+/// M6-C191: an HTTP chunk parked for send credit before the owner's FIN is
+/// still sequenced ahead of that FIN once credit arrives.  Before this the
+/// retry found the stream locally finished and refused the parked chunk as
+/// `STREAM_NOT_FOUND`, so the device received a FIN after a truncated
+/// request.
+#[tokio::test]
+async fn m6c191_a_credit_parked_chunk_is_sequenced_before_the_owners_fin() {
+    let mut fixture = FreezeFixture::new("http-credit-then-fin", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let epoch = key.epoch;
+    let generation = fixture.attempt.old_generation;
+    let chunk = vec![b's'; super::wire::MAX_BODY_BYTES];
+    let mut waiters = Vec::new();
+    // Write until the initial window is spent and one chunk parks.
+    while !fixture.stream().credit_held {
+        assert!(waiters.len() < 64, "the window must run out");
+        let (tx, rx) = oneshot::channel();
+        fixture
+            .actor
+            .write_echo_stream(key.clone(), STREAM_ID, OPERATION_ID.to_owned(), chunk.clone(), tx);
+        waiters.push(rx);
+    }
+    let mut parked = waiters.pop().expect("the parked chunk's waiter");
+    for mut sent in waiters {
+        assert!(matches!(sent.try_recv(), Ok(Ok(_))));
+    }
+    let before = sequenced(&drain_data(&mut fixture.old_rx)).len() as u64;
+    assert!(
+        fixture
+            .actor
+            .finish_http_stream(&key, STREAM_ID, OPERATION_ID),
+        "the FIN waits behind the parked chunk"
+    );
+    assert!(matches!(
+        parked.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    fixture
+        .actor
+        .inbound_data(
+            fixture.old_carrier.clone(),
+            Frame::window_update(epoch, generation, STREAM_ID, 1 << 20)
+                .encode()
+                .expect("window update encodes"),
+        )
+        .await;
+    assert!(
+        matches!(parked.try_recv(), Ok(Ok(_))),
+        "the parked chunk is sequenced, not refused, after the FIN was requested"
+    );
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![
+            (FrameKind::Data, before + 1, generation),
+            (FrameKind::Fin, before + 2, generation),
+        ]
+    );
+    assert!(fixture.session_alive());
+}
+
 /// M6-C151, the other half: a FIN the writer keeps refusing for the whole
 /// failure window still fails the session closed.  The retry narrows the
 /// fence to a writer that is really stuck; it does not remove it.

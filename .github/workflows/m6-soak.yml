@@ -111,7 +111,7 @@ jobs:
           for run in "$RUNNER_TEMP"/logs/*-2*/; do
             [ -d "$run" ] || continue
             name=$(basename "$run"); mkdir -p "$out/$name"
-            for f in requests.csv samples.csv events.jsonl summary.json run.txt; do
+            for f in requests.csv samples.csv events.jsonl summary.json run.txt http-failures.jsonl; do
               [ -f "$run/$f" ] && cp "$run/$f" "$out/$name/"
             done
           done

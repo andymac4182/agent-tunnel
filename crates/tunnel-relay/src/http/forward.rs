@@ -276,13 +276,35 @@ impl CarrierWriter for ActorWriter {
         let stream_id = self.stream_id;
         let operation_id = self.operation_id.clone();
         async move {
-            handle
-                .write_http_stream(key, stream_id, operation_id, data.to_vec())
+            match handle
+                .write_http_stream(key.clone(), stream_id, operation_id.clone(), data.to_vec())
                 .await
-                .map_err(|error| {
-                    tracing::debug!(error = ?error, phase = "http_forward_actor_write");
-                    CarrierClosed
-                })
+            {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    tracing::debug!(stream_id, error = ?error, phase = "http_forward_actor_write");
+                    // M6-C190: a refused chunk leaves the device holding a
+                    // truncated request it would otherwise wait out for its
+                    // 10 s record budget or 30 s operation deadline.  Reset
+                    // the stream so the device stops at once and the
+                    // consumer is answered now, as an explicit interrupted
+                    // exchange whose execution stays `unknown` once any of
+                    // the request may have reached the device.  Nothing is
+                    // retried.
+                    let _ = handle
+                        .reset_http_stream(
+                            key,
+                            stream_id,
+                            operation_id,
+                            reset_reason_for(ResetDetail {
+                                code: HttpErrorCode::StreamInterrupted,
+                                execution: Execution::Unknown,
+                            }),
+                        )
+                        .await;
+                    Err(CarrierClosed)
+                }
+            }
         }
     }
 
@@ -1917,7 +1939,19 @@ pub(crate) async fn http_forward_route(
             let handle = state.handle.clone();
             tokio::spawn(async move {
                 let _permits = (permit, scope_permit);
-                let (report, _, _) = tokio::join!(exchange.report(), outbound, inbound);
+                let (report, outbound_end, inbound_end) =
+                    tokio::join!(exchange.report(), outbound, inbound);
+                if report.error.is_some() {
+                    // M6-C190: how each carrier pump ended, beside the
+                    // exchange record logged by `record_exchange`.
+                    tracing::warn!(
+                        target: "tunnel_relay::http_forward_exchange",
+                        phase = "http_forward_exchange_pumps",
+                        stream_id,
+                        outbound = ?outbound_end.ok(),
+                        inbound = ?inbound_end.ok(),
+                    );
+                }
                 let body_stats: std::sync::Arc<QueueStats> =
                     body_stats_rx.await.unwrap_or_default();
                 signal_task.abort();
@@ -1993,7 +2027,7 @@ fn record_exchange(
     peer: Option<(usize, usize, HopBytePair)>,
     report: ExchangeReport,
 ) {
-    diagnostics.record_exchange(HttpExchangeRecord {
+    let record = HttpExchangeRecord {
         role,
         request_id,
         stream_id,
@@ -2015,7 +2049,17 @@ fn record_exchange(
         progress_expired: report
             .progress_expired
             .map(tunnel_http_bridge::ProgressKind::as_str),
-    });
+    };
+    // M6-C190: a failed exchange is logged once, payload-free, so a stalled
+    // phase can be attributed from the relay log.
+    if record.error_code.is_some() {
+        tracing::warn!(
+            target: "tunnel_relay::http_forward_exchange",
+            phase = "http_forward_exchange_failed",
+            record = %serde_json::to_string(&record).unwrap_or_default(),
+        );
+    }
+    diagnostics.record_exchange(record);
 }
 
 async fn open_remote_http_admission(
@@ -2362,6 +2406,54 @@ pub(crate) async fn handle_peer_http_stream(
 mod tests {
     use super::*;
     use tunnel_cluster::peer_frame::StreamBudget;
+
+    /// M6-C190: a chunk the owner actor refuses must not end the outbound
+    /// pump silently.  Before this, the ingress's pump returned
+    /// `CarrierClosed` with nothing sent to the device, which then held a
+    /// truncated request for its 10 s record budget or 30 s operation
+    /// deadline before the consumer was answered `HTTP_DEADLINE_EXCEEDED`.
+    /// The writer now resets the stream, so both ends stop at once and the
+    /// consumer gets an explicit interrupted outcome.
+    #[tokio::test]
+    async fn m6c190_a_refused_actor_write_resets_the_stream() {
+        use crate::actor::ScriptedHttpOp;
+        let (handle, mut ops) =
+            RelayHandle::refusing_http_writes_for_test("REVERSE_CHANNEL_UNAVAILABLE");
+        let writer = ActorWriter {
+            handle,
+            key: SessionKey {
+                tenant_id: Uuid::from_u128(1),
+                device_id: Uuid::from_u128(2),
+                session_id: "m6c190-session".to_owned(),
+                epoch: 1,
+            },
+            stream_id: 7,
+            operation_id: "m6c190-operation".to_owned(),
+        };
+        let (to_writer, from_bridge, _) = channel(HANDOFF_CAPACITY);
+        let pump = tokio::spawn(pump_outbound(from_bridge, writer));
+        to_writer
+            .send_data(Bytes::from_static(b"synthetic-record"))
+            .await
+            .expect("handoff accepts the chunk");
+        let end = tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the pump ends")
+            .expect("join");
+        assert_eq!(end, OutboundEnd::CarrierClosed);
+        assert_eq!(ops.recv().await, Some(ScriptedHttpOp::Write));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), ops.recv())
+                .await
+                .ok()
+                .flatten(),
+            Some(ScriptedHttpOp::Reset(reset_reason_for(ResetDetail {
+                code: HttpErrorCode::StreamInterrupted,
+                execution: Execution::Unknown,
+            }))),
+            "the refused write is followed by a RESET of the stream"
+        );
+    }
 
     fn export() -> HttpForwardExport {
         let profile = tunnel_mcp::McpProfile::V2026_07_28
