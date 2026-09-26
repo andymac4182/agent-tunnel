@@ -529,7 +529,7 @@ mod unix {
                     Ok(credential) if peer_is_authorized(credential.uid(), self.expected_uid) => {}
                     Ok(_) => {
                         counters.peers_refused = counters.peers_refused.saturating_add(1);
-                        drop(stream);
+                        refuse_unanswered(stream).await;
                         continue;
                     }
                     Err(_) => {
@@ -558,6 +558,44 @@ mod unix {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+
+    const CLOSED_UNANSWERED: &str = "the supervisor closed the connection without answering";
+
+    /// A reset or broken pipe from an authorized supervisor is the same
+    /// refusal as a clean close without an answer: the supervisor dropped
+    /// this reader. The server closes refused peers cleanly
+    /// ([`refuse_unanswered`]); this keeps the answer right if a reset
+    /// arrives anyway.
+    fn closed_unanswered(error: &io::Error) -> Option<IpcError> {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+        )
+        .then_some(IpcError::Unauthorized(CLOSED_UNANSWERED))
+    }
+
+    /// Close a refused peer's connection without answering, so that it reads
+    /// a clean end of stream. Dropping the socket while the peer's request is
+    /// still unread makes Linux send a reset, which the peer would see as an
+    /// I/O error rather than as this refusal (macOS closes cleanly either
+    /// way; M6-C132, hosted run 36209560738). So: shut down the write half
+    /// first -- the peer's read ends now -- then read and discard at most one
+    /// request line, bounded by [`IPC_IO_TIMEOUT`], before dropping. Nothing
+    /// read is interpreted.
+    async fn refuse_unanswered(mut stream: UnixStream) {
+        let _ = stream.shutdown().await;
+        let mut discard = [0_u8; MAX_REQUEST_BYTES + 1];
+        let drain = async {
+            let mut total = 0_usize;
+            while total <= MAX_REQUEST_BYTES {
+                match stream.read(&mut discard).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => total += read,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(IPC_IO_TIMEOUT, drain).await;
     }
 
     async fn answer(
@@ -646,13 +684,16 @@ mod unix {
             stream
                 .write_all(format!("{STATUS_REQUEST}\n").as_bytes())
                 .await
-                .map_err(|_| IpcError::Io("could not send the status request"))?;
+                .map_err(|error| {
+                    closed_unanswered(&error)
+                        .unwrap_or(IpcError::Io("could not send the status request"))
+                })?;
             let mut response = Vec::new();
             let mut limited = (&mut stream).take(MAX_RESPONSE_BYTES as u64 + 1);
-            limited
-                .read_to_end(&mut response)
-                .await
-                .map_err(|_| IpcError::Io("could not read the status answer"))?;
+            limited.read_to_end(&mut response).await.map_err(|error| {
+                closed_unanswered(&error)
+                    .unwrap_or(IpcError::Io("could not read the status answer"))
+            })?;
             if response.len() > MAX_RESPONSE_BYTES {
                 return Err(IpcError::Malformed);
             }
@@ -664,9 +705,7 @@ mod unix {
         // An authorized peer closing without an answer is a supervisor that
         // refused this reader (another UID from its point of view).
         if response.is_empty() {
-            return Err(IpcError::Unauthorized(
-                "the supervisor closed the connection without answering",
-            ));
+            return Err(IpcError::Unauthorized(CLOSED_UNANSWERED));
         }
         let response: IpcResponse =
             serde_json::from_slice(&response).map_err(|_| IpcError::Malformed)?;
@@ -757,6 +796,44 @@ mod tests {
         let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
         let error = query_status(&path).await.expect_err("refused");
         assert_eq!(error.code(), "IPC_UNAUTHORIZED", "{error}");
+        cancel.cancel();
+        server.await.expect("server joins");
+    }
+
+    /// M6-C132, hosted run 36209560738: the server itself must close a
+    /// refused peer cleanly. A raw reader that has sent its request reads an
+    /// empty answer and a clean end of stream -- not a reset, which Linux
+    /// sends when a socket is dropped with the request still unread -- so the
+    /// refusal does not depend on the client mapping a reset.
+    #[tokio::test]
+    async fn a_refused_peer_reads_a_clean_end_of_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = private_dir();
+        let path = dir.path().join("s.sock");
+        let other = effective_uid().wrapping_add(1);
+        let lock = ProfileLock::acquire(&path).expect("lock");
+        let ipc = SupervisorIpc::bind_for_uid(&path, other, &lock).expect("bind");
+        let (_tx, rx) = watch::channel(snapshot());
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(ipc.serve(rx, cancel.clone()));
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        stream
+            .write_all(format!("{STATUS_REQUEST}\n").as_bytes())
+            .await
+            .expect("request written");
+        let mut answer = Vec::new();
+        let read = tokio::time::timeout(IPC_IO_TIMEOUT, stream.read_to_end(&mut answer))
+            .await
+            .expect("answer within the IPC timeout");
+        assert!(
+            read.is_ok(),
+            "a refused peer must see a clean close: {read:?}"
+        );
+        assert!(answer.is_empty(), "a refused peer is not answered");
+        // Closing ends the server's bounded drain of this connection.
+        drop(stream);
         cancel.cancel();
         server.await.expect("server joins");
     }
