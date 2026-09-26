@@ -13,8 +13,9 @@ fairness phase:
 * `cpu_percent`: CPU of the relay, TLS forwarder, devices and driver in
   percent of one CPU. It also has the Redis server's CPU from `INFO`,
   `redis_script_calls_per_s`, `redis_script_usec_per_call`, and
-  `relay_actor`, the single relay actor's busy wall time in percent (from
-  `tunnel_relay_actor_busy_microseconds_total`).
+  `relay_actor`, the single relay actor's timed busy wall time in percent (from
+  `tunnel_relay_actor_busy_microseconds_total`; a lower bound, since only the
+  actor's command branch is timed).
 * `driver_loop_lag_ms`: how late a 10 ms sleep wakes on the driver's own
   asyncio loop. Any request timed on that loop waits about this long as well.
 * Fairness only: `quiet_user_b_off_loop` is the same quiet user B workload,
@@ -45,6 +46,10 @@ python3 scripts/m6-soak.py load --bin-dir /tmp/fair-bins --logs /tmp/fair-logs \
 python3 scripts/m6-soak.py load --bin-dir /tmp/fair-bins --logs /tmp/fair-logs \
   --redis 127.0.0.1:63790 --kinds echo --steps 1,16,32,64,96,128 --generator-processes 4 \
   --honor-retry-after
+
+# M6-C182 for MCP (on the driver loop; --generator-processes applies to echo only).
+python3 scripts/m6-soak.py load --bin-dir /tmp/fair-bins --logs /tmp/fair-logs \
+  --redis 127.0.0.1:63790 --kinds mcp --steps 1,16,32,64,96,128 --honor-retry-after
 ```
 
 Expected output: `summary.json` in each run directory. For fairness, compare
@@ -53,15 +58,26 @@ Expected output: `summary.json` in each run directory. For fairness, compare
 compare `steps[].throughput_ok_per_s` at 64, 96 and 128 workers with and
 without `--honor-retry-after`, beside `cpu_percent`.
 
-On a 4-vCPU hosted runner (runs 36266358041, 36267311313;
-[soak-2026-09-27.md](../soak-2026-09-27.md) section 6), you should see these
-results:
+On a 4-vCPU hosted runner, you should see the results below (runs
+36266358041, 36267864622, 36267862335, 36267311313 and 36269590574;
+[soak-2026-09-27.md](../soak-2026-09-27.md) section 6):
 
-* In the flood phase, in-loop B has a p50 of about 80 ms, off-loop B about
-  19 ms, and the driver loop's lag p50 about 38 ms.
-* Honouring `retry_after_ms`, the echo load holds about 1,360 -- 1,430 OK/s
-  from 64 to 128 workers. Without it, the rate falls to about 670 -- 860 OK/s.
-* The relay actor is at most about 21% busy in every step.
+* **Flood on the driver loop (the old setup).** In-loop B has a p50 of
+  about 80 ms, off-loop B about 19 ms, and the driver loop's lag p50 is about
+  38 ms. The old harness inflated B about 4×. The in-loop flood also
+  throttled itself, at about 440 refusals a second.
+* **`--flood-processes 2`, no back-off.** Off-loop B has a p50 of about
+  90 ms against a baseline of about 5 ms. The full interference reproduces
+  with B timed correctly. How it splits between the relay's refusal cost and
+  host contention is not attributed.
+* **`--flood-processes 2 --honor-retry-after`.** B's p50 is about 29 ms.
+* **Echo load honouring `retry_after_ms`.** It holds about 1,360 -- 1,430
+  OK/s from 64 to 128 workers. Without back-off it falls to about 670 --
+  860 OK/s.
+* **MCP load honouring `retry_after_ms`.** It holds about 1,180 -- 1,240
+  OK/s. The drop needs clients that do not back off.
+* **Relay actor.** Its timed busy fraction, a lower bound, is at most about
+  21% in every step.
 
 **Shared maintainer Mac.** Run each command through
 `/private/tmp/claude-501/throttle/gate.sh` and discard timings from any run
