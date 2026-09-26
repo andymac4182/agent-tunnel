@@ -1735,8 +1735,43 @@ M7_CONNECTOR_RELAY_CASES.append(
                 STRANDED + "a_stranded_stream_close_returns_false",
                 STRANDED + "a_stranded_http_read_reads_nothing",
                 STRANDED + "a_shutdown_stranded_after_its_completion_check_returns_shutdown",
+                STRANDED + "a_stranded_control_registration_returns_shutdown",
+                STRANDED + "a_stranded_forwarded_control_registration_returns_shutdown",
+                STRANDED + "a_stranded_data_attach_returns_shutdown",
+                STRANDED + "a_stranded_forwarded_echo_open_returns_shutdown",
+                STRANDED + "a_stranded_http_open_returns_shutdown",
+                STRANDED + "a_stranded_fs_open_returns_shutdown",
+                STRANDED + "a_stranded_echo_dispatch_returns_shutdown",
             }
         ),
+    )
+)
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M6-C162 review: a reply sent before the actor ended is still taken.
+        "a relay handle reply sent before its actor ended is still returned",
+        [
+            (
+                ACTOR,
+                "            () = self.wait() => receiver.try_recv().ok(),\n",
+                "            () = self.wait() => None,\n",
+            )
+        ],
+        frozenset({STRANDED + "a_reply_sent_before_the_actor_ended_is_still_returned"}),
+    )
+)
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M6-C162 review: every abort route records the task's completion.
+        "an aborted relay actor or maintenance task records its completion",
+        [
+            (
+                ACTOR,
+                "        self.0.mark_aborted();\n",
+                "        let _ = &self.0;\n",
+            )
+        ],
+        frozenset({STRANDED + "aborting_the_actor_and_maintenance_tasks_records_their_completion"}),
     )
 )
 #: M6-C162: the device http-forward writer/reader reply waits.  Their tests
@@ -1773,6 +1808,23 @@ HTTP_FORWARD_REPLY_CASES: list[Case] = [
                 + "a_stranded_finish_behind_an_exited_actor_reports_carrier_closed",
                 HTTP_FORWARD_STRANDED + "a_stranded_reset_behind_an_exited_actor_returns",
                 HTTP_FORWARD_STRANDED + "a_stranded_read_behind_an_exited_actor_reports_closed",
+            }
+        ),
+    ),
+    Case(
+        # M6-C162 review: a reply sent before the receiver closed is taken.
+        "a device http-forward reply sent before the actor's receiver closed is still returned",
+        [
+            (
+                CLIENT / "src" / "http_forward.rs",
+                "        () = sink.closed() => receiver.try_recv().ok(),\n",
+                "        () = sink.closed() => None,\n",
+            )
+        ],
+        frozenset(
+            {
+                HTTP_FORWARD_STRANDED
+                + "a_reply_sent_before_the_actor_receiver_closed_is_still_returned",
             }
         ),
     ),
