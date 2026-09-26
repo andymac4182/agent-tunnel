@@ -925,6 +925,11 @@ class Worker:
         self.mcp_pool = mcp_pool if mcp_pool is not None else McpSessionPool(1)
         self.mcp_slot = mcp_slot % len(self.mcp_pool.sessions)
         self.mcp_calls_ok = 0
+        # M6-C182: with `honor_retry_after`, a closed-loop worker refused
+        # `CONNECTION_LIMIT` waits the refusal's `retry_after_ms` before its
+        # next request instead of reconnecting at once.
+        self.honor_retry_after = False
+        self.retry_after_s = 0.0
 
     def path(self) -> str:
         dev = self.stack.devices[self.device]
@@ -964,6 +969,11 @@ class Worker:
             await self.conn.close()
             status, code, execution, ok = 0, f"CONN_{type(error).__name__}", "", False
         latency = (time.perf_counter() - start) * 1000
+        if code == "CONNECTION_LIMIT":
+            try:
+                self.retry_after_s = float(json.loads(body).get("retry_after_ms", 1000)) / 1000
+            except (ValueError, AttributeError):
+                self.retry_after_s = 1.0
         # An unclassified refusal keeps a short printable prefix of its body
         # (a relay or fixture error text, never a request payload).
         detail = ""
@@ -1073,6 +1083,9 @@ class Worker:
     async def loop_closed(self, until: float) -> None:
         while time.time() < until:
             await self.once()
+            if self.honor_retry_after and self.retry_after_s:
+                await asyncio.sleep(min(self.retry_after_s, max(0.0, until - time.time())))
+            self.retry_after_s = 0.0
 
     async def shutdown(self) -> None:
         if self.owns_pool:
@@ -1216,6 +1229,8 @@ async def client_main_async(cfg: dict) -> dict:
     rec.phase = cfg["phase"]
     workers = [Worker(stack, rec, "echo", "u", "d", f"{cfg['prefix']}-{i}",
                       payload_size=cfg["payload"]) for i in range(cfg["workers"])]
+    for w in workers:
+        w.honor_retry_after = bool(cfg.get("honor_retry_after"))
     if cfg.get("preconnect"):
         # Open (and hold) each keep-alive connection before the caller starts
         # anything else, so this client is measured as an already-connected
@@ -1246,7 +1261,8 @@ def client_main() -> None:
 
 async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, prefix: str,
                         workers: int, processes: int, until: float, rate: float = 0.0,
-                        payload: int = 1024, preconnect: bool = False):
+                        payload: int = 1024, preconnect: bool = False,
+                        honor_retry_after: bool = False):
     """Start `workers` echo workers split across `processes` `client`
     subprocesses, running until `until`, and return once every process is
     ready (with `preconnect`, once its connections are open).  Await the
@@ -1263,7 +1279,8 @@ async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, pre
                "subject": stack.users[user]["subject"], "device_id": dev["id"],
                "echo": dev["echo"], "token": token, "csv": str(csv_path), "nonce": stack.nonce,
                "phase": rec.phase, "prefix": f"{prefix}-p{index}", "workers": share,
-               "rate": rate, "payload": payload, "until": until, "preconnect": preconnect}
+               "rate": rate, "payload": payload, "until": until, "preconnect": preconnect,
+               "honor_retry_after": honor_retry_after}
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(Path(__file__).resolve()), "client",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -1507,16 +1524,20 @@ async def load(args: argparse.Namespace) -> None:
                     Worker(stack, rec, kind, "a", "a", f"{kind}{concurrency}-{i}",
                            payload_size=args.payload, mcp_pool=pool, mcp_slot=i)
                     for i in range(concurrency)]
+                for w in workers:
+                    w.honor_retry_after = args.honor_retry_after
                 until = time.time() + args.step_seconds
                 lag = LoopLag()
                 cpu_before = cpu_snapshot(stack)
                 clients = (await start_clients(stack, rec, "a", "a", f"{kind}{concurrency}",
                                                concurrency, args.generator_processes, until,
-                                               payload=args.payload)
+                                               payload=args.payload,
+                                               honor_retry_after=args.honor_retry_after)
                            if off_loop else asyncio.sleep(0, {}))
                 gathered = await asyncio.gather(clients, lag.run(until),
                                                 *(w.loop_closed(until) for w in workers))
                 attribution = {"generator_processes": args.generator_processes if off_loop else 0,
+                               "honor_retry_after": args.honor_retry_after,
                                "driver_loop_lag_ms": lag.summary(),
                                "cpu_percent": cpu_percent(cpu_before, cpu_snapshot(stack)),
                                "off_loop_clients": gathered[0].get("processes", [])}
@@ -1915,6 +1936,10 @@ def main() -> None:
                            help="run each echo step's workers in this many separate client "
                                 "processes, each with its own event loop (M6-C182); 0 keeps "
                                 "them on the driver's loop.  MCP steps always run on the loop")
+            p.add_argument("--honor-retry-after", action="store_true",
+                           help="a worker refused CONNECTION_LIMIT waits the refusal's "
+                                "retry_after_ms before its next request (M6-C182); by default "
+                                "it retries at once")
             p.add_argument("--mcp-sessions", type=int, default=8,
                            help="MCP sessions shared by a step's workers (the stdio export's "
                                 "default max_children is 8); every session is DELETEd after "
