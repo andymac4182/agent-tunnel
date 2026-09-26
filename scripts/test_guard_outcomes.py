@@ -302,8 +302,11 @@ EXPECTED_GUARD_ANCHORS = {
     # naming acp ("found 149"), then 149.  **151** after feat-acp-demo added
     # the M8-C27 case and gave the lying-202 prompt case a second edit for
     # the ordered path; measured the same way: 152 first, which fails naming
-    # acp ("found 151"), then 151.
-    "acp-guard-deletion.py": 151,
+    # acp ("found 151"), then 151.  **164** after relay-rekey (#183) added its
+    # peer-key rotation cases, measured on integration branch
+    # `integrate-2026-09-26f` and on #183's own tip `5eb1805f`: 165 fails
+    # naming acp ("found 164"), then 164.
+    "acp-guard-deletion.py": 164,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
