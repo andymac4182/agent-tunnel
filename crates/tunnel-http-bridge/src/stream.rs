@@ -234,6 +234,14 @@ impl FrameSender {
         self.state.state.load(Ordering::SeqCst) == FIN
     }
 
+    /// DATA credit available right now: a send no larger than this does not
+    /// wait. Lets a sender size a piece to whatever credit the peer has
+    /// granted, so that any grant at all is progress (task row M4-21).
+    #[must_use]
+    pub fn available_credit(&self) -> usize {
+        self.credit.available_permits()
+    }
+
     /// DATA credit capacity: a send no larger than this is one queue item,
     /// so it is either wholly queued or not queued at all.
     #[must_use]

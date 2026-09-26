@@ -11,6 +11,14 @@ publish.workspace = true
 name = "tunnel-acp-fixture"
 path = "src/main.rs"
 
+# The demo consumer (`docs/demo/acp.md`): the official pinned ACP client
+# running one session through a relay.  It needs the pinned client, so it is
+# built only with `--features interop` and never by a workspace-wide build.
+[[bin]]
+name = "acp-demo-client"
+path = "src/bin/acp-demo-client.rs"
+required-features = ["interop"]
+
 # This fixture deliberately does NOT use the pinned ACP SDK's server.  It
 # hand-writes the newline-delimited v1 JSON-RPC messages `docs/acp.md` records,
 # because its job is to emit the *pathological* lines a real agent library

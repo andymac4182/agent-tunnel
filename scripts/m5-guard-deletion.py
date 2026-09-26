@@ -2205,10 +2205,10 @@ CASES_C20_RELAY: list[tuple[str, list[Edit], bool]] = [
                 RELAY_FORWARD,
                 """    http::HeaderName::from_static("sec-fetch-mode"),
     header::ACCEPT,
-];""",
+""",
                 """    http::HeaderName::from_static("sec-fetch-mode"),
     header::ACCEPT_LANGUAGE,
-];""",
+""",
             )
         ],
         False,
