@@ -4099,12 +4099,14 @@ async fn m6c160_a_streams_own_progress_restarts_the_fin_window() {
     assert!(fixture.session_alive());
 }
 
-/// Review of #199, item 2: an ACK owed on the carrier a rotation retires is
-/// dropped at the commit, so it can neither be sent on the retired
-/// generation nor keep a deadline running that would close the healthy
-/// session.
+/// Second review of #199: an ACK owed on the carrier a rotation retires is
+/// re-addressed at the commit and re-sent on the activated carrier, with the
+/// new generation and the same cumulative sequence.  The rotation's drain
+/// fence does not carry the connector's `peer_acked`, and nothing else
+/// re-sends a relay ACK, so dropping it left the connector's STREAM_FORGET
+/// proof waiting for an ACK that never came.
 #[tokio::test]
-async fn m6c160_an_ack_owed_on_the_retired_carrier_is_dropped_at_commit() {
+async fn m6c160_an_ack_owed_on_the_retired_carrier_is_resent_on_the_new_one_at_commit() {
     let mut fixture = FreezeFixture::new("owed-ack-rotation", false);
     let _reply = fixture.write(b"owed");
     let _ = drain_data(&mut fixture.old_rx);
@@ -4137,9 +4139,23 @@ async fn m6c160_an_ack_owed_on_the_retired_carrier_is_dropped_at_commit() {
     fixture.connector_drained().await;
     fixture.connector_committed().await;
     assert!(fixture.session_alive());
+    let new_generation = fixture.attempt.new_generation;
+    let acks = drain_data(&mut fixture.candidate_rx)
+        .into_iter()
+        .filter_map(|item| match item {
+            Observed::Frame(frame) if frame.kind == FrameKind::Ack => {
+                Some((frame.stream_id, frame.generation, frame.ack))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        acks.contains(&(STREAM_ID, new_generation, 1)),
+        "the owed ACK is re-sent on the activated carrier: {acks:?}"
+    );
     assert!(
         fixture.session().owed_acks.is_empty(),
-        "the ACK owed on the retired generation was dropped at the commit"
+        "nothing is owed once it went out"
     );
     assert_eq!(fixture.session().flow_control_owed_deadline, None);
 }

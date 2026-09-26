@@ -1648,13 +1648,8 @@ struct DataCarrier {
     tx: mpsc::Sender<DataOutbound>,
 }
 
-/// Hard bound on the ACKs one session may owe at once (review of #199).  An
-/// entry needs a stream the session still retains, and one device retains
-/// at most `max_streams_per_device × RETAINED_ECHO_STREAM_FACTOR` (128 at
-/// the defaults); a session asked to owe more is fenced
-/// `FLOW_CONTROL_OWED_LIMIT` rather than grow the table.
-const MAX_OWED_ACKS: usize = 128;
-/// Typed close reason when a session would owe more than `MAX_OWED_ACKS`.
+/// Typed close reason when a session would owe more relay ACKs than
+/// `RelayActor::owed_ack_limit` (review of #199).
 const FLOW_CONTROL_OWED_LIMIT: &str = "FLOW_CONTROL_OWED_LIMIT";
 
 /// One relay ACK a live data carrier refused for backpressure (task row
@@ -5872,12 +5867,11 @@ impl RelayActor {
             }
             Err(QueueRefusal::Closed) => Err(QueueRefusal::Closed.flow_control_close_reason()),
             Err(QueueRefusal::Budget | QueueRefusal::Full) => {
+                let limit = self.owed_ack_limit();
                 let Some(session) = self.session_mut(key) else {
                     return Ok(());
                 };
-                if !session.owed_acks.contains_key(&stream_id)
-                    && session.owed_acks.len() >= MAX_OWED_ACKS
-                {
+                if !session.owed_acks.contains_key(&stream_id) && session.owed_acks.len() >= limit {
                     return Err(FLOW_CONTROL_OWED_LIMIT);
                 }
                 let owed = session.owed_acks.entry(stream_id).or_insert(OwedAck {
@@ -5902,12 +5896,43 @@ impl RelayActor {
         }
     }
 
-    /// Drop owed ACKs whose stream the session no longer retains, or whose
-    /// stream is at or below the forgotten watermark: the connector ignores
-    /// a late ACK for a stream it has forgotten, so owing one is pointless
-    /// and would keep the table and its deadline alive (review of #199).
+    /// Hard bound on the ACKs one session may owe at once (review of #199).
+    ///
+    /// Every owed entry names a stream the session retains (`prune_owed_acks`
+    /// keeps nothing else, and a stream with an owed ACK is not forgotten),
+    /// so the table cannot exceed what one session can retain:
+    ///
+    /// * `streams`: `open_echo_stream_inner` refuses an OPEN once
+    ///   `streams.len() >= max_streams_per_device × RETAINED_ECHO_STREAM_FACTOR`,
+    ///   and that is the only insertion outside tests;
+    /// * `pending` plus `unary_tombstones`: a unary echo is refused once
+    ///   `pending.len() + unary_tombstones.len() >=
+    ///   max(max_streams_per_device, 1) × RETAINED_ECHO_STREAM_FACTOR`, and a
+    ///   tombstone is only ever made from a removed `pending` entry, so the
+    ///   sum never grows past the admission bound (`max_pending_operations`
+    ///   bounds `pending` alone and is already inside it).
+    ///
+    /// The limit is the sum of the two bounds, 256 at the defaults, so a
+    /// healthy session can never reach it; reaching it means the invariant
+    /// broke, and the session is fenced `FLOW_CONTROL_OWED_LIMIT` instead of
+    /// growing the table.
+    fn owed_ack_limit(&self) -> usize {
+        self.options
+            .limits
+            .max_streams_per_device
+            .max(1)
+            .saturating_mul(RETAINED_ECHO_STREAM_FACTOR)
+            .saturating_mul(2)
+    }
+
+    /// Drop owed ACKs whose stream the session no longer retains: the
+    /// connector ignores a late ACK for a stream it has forgotten, so owing
+    /// one is pointless and would keep the table and its deadline alive.
     fn prune_owed_acks(session: &mut DeviceSession) {
-        let forgotten = session.forgotten_stream_through;
+        // Membership only: `forgotten_stream_through` is a high-water mark
+        // and echoes finish out of order, so a stream below it may still be
+        // retained and still need its ACK (second review of #199).
+
         let DeviceSession {
             owed_acks,
             streams,
@@ -5916,27 +5941,30 @@ impl RelayActor {
             ..
         } = session;
         owed_acks.retain(|stream_id, _| {
-            *stream_id > forgotten
-                && (streams.contains_key(stream_id)
-                    || pending.contains_key(stream_id)
-                    || unary_tombstones.contains_key(stream_id))
+            streams.contains_key(stream_id)
+                || pending.contains_key(stream_id)
+                || unary_tombstones.contains_key(stream_id)
         });
         if session.owed_acks.is_empty() {
             session.flow_control_owed_deadline = None;
         }
     }
 
-    /// Drop owed ACKs addressed to a carrier generation the session no longer
-    /// writes to, at a rotation commit (review of #199).  The retired
-    /// carrier is closing; the connector's cursors on the committed carrier
-    /// are carried by the rotation's own fence and the next ACK.
-    fn drop_retired_owed_acks(session: &mut DeviceSession) {
+    /// At a rotation commit, re-address every owed ACK to the activated
+    /// carrier: its new generation and sender, the same cumulative sequence
+    /// (second review of #199).  Dropping them was wrong: the rotation's
+    /// drain fence proves sequence cursors, not the connector's `peer_acked`,
+    /// and nothing else re-sends a relay ACK, so the connector's STREAM_FORGET
+    /// proof for that stream would wait for an ACK that never comes.  The
+    /// caller retries them once the commit is applied.
+    fn readdress_owed_acks_to_active(session: &mut DeviceSession) {
+        let Some(tx) = session.data_tx.clone() else {
+            return;
+        };
         let generation = session.generation;
-        session
-            .owed_acks
-            .retain(|_, owed| owed.generation == generation);
-        if session.owed_acks.is_empty() {
-            session.flow_control_owed_deadline = None;
+        for owed in session.owed_acks.values_mut() {
+            owed.tx = tx.clone();
+            owed.generation = generation;
         }
     }
 
@@ -9206,7 +9234,7 @@ impl RelayActor {
                 .map(|carrier| carrier.tx.clone());
             session.generation = committed.attempt.new_generation;
             session.connection_id = committed.attempt.new_connection_id.clone();
-            Self::drop_retired_owed_acks(session);
+            Self::readdress_owed_acks_to_active(session);
             if let Some(old) = old {
                 let _ = old.tx.try_send(DataOutbound::Close);
             }
@@ -9232,6 +9260,8 @@ impl RelayActor {
         // resumed on the new generation (phase Retiring).  Emit every frame
         // held while the writer was frozen, each with the continuing sequence.
         self.flush_frozen_writes(key);
+        // ACKs owed on the retired carrier now go out on the activated one.
+        self.retry_owed_acks(key);
         // Then admit the OPENs held across the freeze, in arrival order.
         self.service_held_scope(&key.scope(), tokio::time::Instant::now());
     }
@@ -22059,8 +22089,47 @@ mod stream_identity_tests {
         drop(registration);
     }
 
+    /// Second review of #199: `forgotten_stream_through` is a high-water
+    /// mark and echoes finish out of order, so forgetting a higher stream
+    /// must not drop the owed ACK of a lower stream that is still retained
+    /// (the connector's forget proof for it needs that ACK).
+    #[tokio::test]
+    async fn m6c160_forgetting_a_higher_stream_keeps_a_lower_streams_owed_ack() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_389, "m6-c160-out-of-order").await;
+        let data_tx = actor.sessions[&key.scope()]
+            .data_tx
+            .clone()
+            .expect("live carrier");
+        let budget = actor.sessions[&key.scope()].queue_budget.clone();
+        assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
+        let fin = Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 0);
+        actor.inbound_m2_stream_data(carrier, fin, false).await;
+        assert!(
+            actor.sessions[&key.scope()]
+                .owed_acks
+                .contains_key(&registration.stream_id)
+        );
+
+        // A higher stream is forgotten first; this one is still retained.
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.forgotten_stream_through = registration.stream_id + 5;
+            assert!(session.streams.contains_key(&registration.stream_id));
+        }
+        actor.tick().await;
+        assert!(actor.sessions.contains_key(&key.scope()));
+        assert!(
+            actor.sessions[&key.scope()]
+                .owed_acks
+                .contains_key(&registration.stream_id),
+            "the retained lower stream keeps its owed ACK"
+        );
+        let _ = m6c160_drain_kinds(&mut data_rx);
+        drop(registration);
+    }
+
     /// Review of #199, item 1: the table is hard-capped.  A session asked to
-    /// owe more than `MAX_OWED_ACKS` is fenced under its own typed reason.
+    /// owe more than `owed_ack_limit` is fenced under its own typed reason.
     #[tokio::test]
     async fn m6c160_owing_more_than_the_cap_fences_with_a_typed_reason() {
         let (mut actor, _control, mut data_rx, carrier, key, registration) =
@@ -22071,8 +22140,15 @@ mod stream_identity_tests {
             .expect("live carrier");
         let budget = actor.sessions[&key.scope()].queue_budget.clone();
         assert!(m6c160_fill_live_carrier(&data_tx, &budget) > 0);
+        let limit = actor.owed_ack_limit();
+        assert_eq!(
+            limit,
+            actor.options.limits.max_streams_per_device.max(1)
+                * super::RETAINED_ECHO_STREAM_FACTOR
+                * 2
+        );
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            for stream_id in 0..super::MAX_OWED_ACKS as u64 {
+            for stream_id in 0..limit as u64 {
                 session.owed_acks.insert(
                     1_000 + stream_id,
                     super::OwedAck {
