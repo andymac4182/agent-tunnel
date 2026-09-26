@@ -122,8 +122,8 @@ use super::{
 use crate::acceptance::helpers::write_device_profile;
 use crate::oidc::OidcTokenOptions;
 use crate::{
-    ConnectionId, Direction as ProxyDirection, Harness, HarnessError, HarnessOptions, ProxyConfig,
-    ProxyHandle, Result, TcpProxy,
+    Direction as ProxyDirection, Harness, HarnessError, HarnessOptions, ProxyConfig, ProxyHandle,
+    Result, TcpProxy,
 };
 
 /// The subprotocol the server must select.
