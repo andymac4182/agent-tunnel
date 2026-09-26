@@ -1619,14 +1619,42 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 PROVIDER_SRC,
-                """        if self
-            .session
-            .required_primitives(frame)
-            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))
-        {
+                """        if classified || self.is_a_write_the_grant_forbids(frame) {
             self.stats.mutations_refused += 1;
         }""",
-                "        let _ = frame;",
+                "        let _ = (classified, self.is_a_write_the_grant_forbids(frame));",
+            )
+        ],
+    ),
+    (
+        # Task row **M4-20** (applied by default pending owner confirmation,
+        # 2026-09-25).  A `Twrite` under a grant without `write` is refused for
+        # its fid state before gate 3's session decides any primitive, so the
+        # primitives predicate never sees it.  Deleting the grant-decided
+        # clause restores the defect: a read-only consumer's every attempted
+        # write is invisible in `mutations_refused` again.
+        "a Twrite refused under a read-only grant is counted",
+        [
+            (
+                PROVIDER_SRC,
+                "        if classified || self.is_a_write_the_grant_forbids(frame) {",
+                "        if classified {",
+            )
+        ],
+    ),
+    (
+        # The other half of M4-20, and the one a naive fix fails: counting the
+        # `Twrite` opcode whatever the grant says.  Under a grant that holds
+        # `write`, a `Twrite` on a fid opened read-only is the client's own
+        # state error, not a write the grant stopped.  This keeps the clause
+        # compiling and moving while removing the grant test, so only the case
+        # asserting that refusal is **not** counted can catch it.
+        "a Twrite is counted by the grant, never by its opcode",
+        [
+            (
+                PROVIDER_SRC,
+                "            && !self.authority.current().grant.allows(Capability::Write)",
+                "            && Capability::ALL.contains(&Capability::Write)",
             )
         ],
     ),
@@ -1926,6 +1954,62 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
                 CLIENT_FS,
                 """        if left.allows(capability) && right.allows(capability) {""",
                 """        if left.allows(capability) {""",
+            )
+        ],
+    ),
+    (
+        # Task row **M4-21** (applied by default pending owner confirmation,
+        # 2026-09-25; narrowed on review).  A reply that waits with no carrier
+        # credit for `requestTimeoutSeconds` ends the session.  Pushing the
+        # stall clock a day out restores the defect: a consumer that stopped
+        # taking replies holds the session for ever, because queued or unsent
+        # work is never idle.
+        "a reply the consumer never takes is bounded by the stall deadline",
+        [
+            (
+                CLIENT_FS,
+                "        let stall_at = out.progress_at + stall_limit;",
+                "        let stall_at = out.progress_at + stall_limit + std::time::Duration::from_secs(86_400);",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: every credit grant restarts the stall clock, so a
+        # slow but steady consumer keeps its session.  Without it the deadline
+        # measures the whole transfer again.
+        "credit progress restarts the stall clock",
+        [
+            (
+                CLIENT_FS,
+                """    fn advance(&mut self, sent: usize) -> Advanced {
+        self.progress_at = tokio::time::Instant::now();""",
+                """    fn advance(&mut self, sent: usize) -> Advanced {""",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: input -- a `Tflush` above all -- is read while a
+        # reply waits for credit.  Reading only once nothing is waiting is the
+        # first implementation's behaviour, under which a flush for a request
+        # queued behind a parked reply could never be read in time.
+        "input is read while a reply waits for credit",
+        [
+            (
+                CLIENT_FS,
+                "        let reading = !out.terminal && out.bytes < PENDING_CAP;",
+                "        let reading = !out.terminal && out.records.is_empty();",
+            )
+        ],
+    ),
+    (
+        # M4-21's review: a stall after part of a reply is out resets the
+        # stream; a close record there would be spliced into the reply.
+        "a partial reply is reset, never spliced with a close record",
+        [
+            (
+                CLIENT_FS,
+                "                if out.front_sent() == 0 {",
+                "                if out.front_sent() < usize::MAX {",
             )
         ],
     ),
@@ -6420,6 +6504,8 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('gate4', 'a cookie past the end of a directory is refused'): frozenset({'a_cookie_past_the_end_is_refused'}),
     ('gate4', 'a link is decided before the exportable-kind check'): frozenset({'metadata_of_a_symbolic_link_follows_it_when_the_feature_is_on', 'metadata_of_a_symbolic_link_is_refused_without_the_feature'}),
     ('gate4', 'a mutation refused at admission is counted'): frozenset({'a_refused_open_is_counted_from_its_flags_and_never_from_its_opcode', 'every_mutating_opcode_is_refused_under_a_read_only_grant'}),
+    ('gate4', 'a Twrite refused under a read-only grant is counted'): frozenset({'every_mutating_opcode_is_refused_under_a_read_only_grant'}),
+    ('gate4', 'a Twrite is counted by the grant, never by its opcode'): frozenset({'a_twrite_refused_for_fid_state_under_a_write_grant_is_not_counted'}),
     ('gate4', 'a refusal before the host is counted not-started, never dispatched'): frozenset({'a_narrowed_grant_refuses_a_queued_write_before_the_host_is_touched'}),
     ('gate4', 'a special file is left out of a listing'): frozenset({'a_run_of_unservable_entries_is_bounded_rather_than_walked', 'enumeration_leaves_out_a_special_file'}),
     ('gate4', 'a stale grant revision does not match'): frozenset({'http::fs::tests::a_missing_revision_header_matches_and_a_stale_one_does_not'}),
@@ -6440,6 +6526,10 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('gate4', 'return the bytes the invalidation discarded to the session budget'): frozenset({'actor::stream_identity_tests::an_invalidated_fs_stream_challenge_returns_its_discarded_bytes'}),
     ('gate4', 'the case behaviour is parsed and never guessed'): frozenset({'http::fs::tests::the_case_behaviour_is_parsed_and_never_guessed'}),
     ('gate4', "the connector's allowlist narrows the relay's capabilities"): frozenset({'fs_export::tests::the_local_allowlist_narrows_and_never_widens'}),
+    ('gate4', 'a reply the consumer never takes is bounded by the stall deadline'): frozenset({'fs_export::tests::a_consumer_that_stops_taking_replies_is_reset_at_the_stall_deadline'}),
+    ('gate4', 'credit progress restarts the stall clock'): frozenset({'fs_export::tests::a_slow_but_steady_consumer_keeps_its_session'}),
+    ('gate4', 'input is read while a reply waits for credit'): frozenset({'fs_export::tests::a_flush_is_read_while_a_reply_waits_for_credit'}),
+    ('gate4', 'a partial reply is reset, never spliced with a close record'): frozenset({'fs_export::tests::a_consumer_that_stops_taking_replies_is_reset_at_the_stall_deadline'}),
     ('gate4', 'the flush mark is per queue entry, not per tag number'): frozenset({'a_tag_re_issued_and_flushed_again_drops_both_and_keeps_the_session'}),
     ('gate4', 'the record decoder bounds a declared length before allocating'): frozenset({'record::tests::a_declared_length_above_the_ceiling_is_refused_before_any_copy'}),
     ('gate4', 'the record decoder latches its first violation'): frozenset({'record::tests::the_first_violation_is_latched_and_a_valid_record_after_it_is_not_decoded'}),
