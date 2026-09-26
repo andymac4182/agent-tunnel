@@ -282,7 +282,18 @@ impl CarrierWriter for ActorWriter {
             {
                 Ok(()) => Ok(()),
                 Err(error) => {
-                    tracing::debug!(stream_id, error = ?error, phase = "http_forward_actor_write");
+                    // M6-C190: a closed code only, never the outcome's
+                    // bytes.
+                    let code = match error {
+                        crate::actor::EchoOutcome::Failure { code, .. } => code,
+                        crate::actor::EchoOutcome::Success(_) => "UNEXPECTED_SUCCESS",
+                    };
+                    tracing::warn!(
+                        target: "tunnel_relay::http_forward_exchange",
+                        stream_id,
+                        code,
+                        phase = "http_forward_actor_write_refused",
+                    );
                     // M6-C190: a refused chunk leaves the device holding a
                     // truncated request it would otherwise wait out for its
                     // 10 s record budget or 30 s operation deadline.  Reset

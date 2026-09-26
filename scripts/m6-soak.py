@@ -625,6 +625,7 @@ class Stack:
                 fields = value.get("fields", {}) if isinstance(value, dict) else {}
                 if fields.get("phase") in ("http_forward_exchange_failed",
                                            "http_forward_exchange_pumps",
+                                           "http_forward_actor_write_refused",
                                            "http_forward_owner_stream_unfinished"):
                     fields.pop("message", None)
                     out.append({"source": path.name, "timestamp": value.get("timestamp"),
