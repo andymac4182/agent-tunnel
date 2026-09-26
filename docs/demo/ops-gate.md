@@ -11,7 +11,7 @@ What this shows, end to end through a real local relay:
    a canary or payload bytes.
 4. The client and the relay each stop in order on SIGTERM in every data
    rotation phase -- active, preparing, quiescing, draining, committing,
-   aborting -- with the device's owner slot released and an explicit outcome
+   aborting, retiring (recovering is still open, task row M6-C136) -- with the device's owner slot released and an explicit outcome
    for the request in flight.
 
 Everything is synthetic. Run from a checkout of this branch, macOS or Linux.
@@ -113,7 +113,7 @@ docker run -d --name demo-redis -p 127.0.0.1:63790:6379 redis:7   # or any dispo
 TEST_REDIS_URL=redis://127.0.0.1:63790/ scripts/m6-shutdown-phases-verify.sh
 ```
 
-Expected: twelve `m606-shutdown ok case=...` lines, two `m606-shutdown matrix
+Expected: fourteen `m606-shutdown ok case=...` lines, two `m606-shutdown matrix
 ok` lines, `test result: ok. 2 passed`, and `m6-shutdown-phases-verify: ok`.
 Each `ok` line names the hold, both sides' witnessed phases, the exit
 latency, the in-flight echo's outcome and how fast the owner slot was

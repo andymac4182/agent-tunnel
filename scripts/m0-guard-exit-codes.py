@@ -369,7 +369,10 @@ CASES: list[Case] = [
             (
                 MAIN,
                 "            Self::OwnerBusy | Self::ResourceExhausted => 7,",
-                "            Self::OwnerBusy | Self::ResourceExhausted => 9,",
+                # `10`, not `9`: the M6-06 review published `9`
+                # (`SUPERVISOR_RUNNING`), after which this edit stopped
+                # leaving the vocabulary and reported a wrong witness.
+                "            Self::OwnerBusy | Self::ResourceExhausted => 10,",
             )
         ],
         frozenset({"tests::every_exit_status_is_in_the_published_vocabulary"}),
