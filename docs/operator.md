@@ -1505,6 +1505,24 @@ refused` lines come after authentication and are not limited:
   `peer_refused_server_certificate` (with `_unknown_ca` or `_expired` when the
   peer's alert says so). Other handshake failures, such as a bare TCP close,
   stay at `debug`.
+- `connector rejected an OPEN` (`phase="connector_rejected"`, M7-C160), one
+  line per connector `REJECTED` for a live session, which is what a consumer
+  sees as `503 DEVICE_REJECTED` (or `RESOURCE_EXHAUSTED`). Fields:
+  `tenant_id`, `device_id`, `session_id`, `epoch`, `stream_id`,
+  `operation_id` (`unmatched` unless it equals the relay's own record),
+  `rotation_phase` (`none`, `active`, `preparing`, `quiescing`, `draining`,
+  `committing`, `retiring`, `aborting`, `recovering` or `closed`), `matched`
+  (`unary`, `stream` or `none`), `connector_code`, `reason_category`,
+  `connector_code_len`, `reason_len`, `relay_code` (what the consumer was
+  told, `stream_closed` or `none`), `suppressed` and `session_suppressed`.
+  The code and reason come from the device, so neither is written: a code or
+  reason from the connector's fixed refusal table
+  (`tunnel_protocol::open_refusal`) is logged as its code and category, and
+  anything else as `other` with its byte length. **Rate limited twice:** each
+  session may write at most 5 lines in any 10 s, and across the process at
+  most 20 lines per code label in any 10 s, with REJECTEDs that match no relay
+  record counted under their own `unmatched` key so forged ones cannot use up
+  the budget of real ones.
 
 The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay
 writes it when it admits the device's session and at every owner-lease renewal
