@@ -124,7 +124,7 @@ impl Gate<'_> {
                 )));
             }
             let overlap_seen = Instant::now();
-            self.settle_key_rotation_route().await?;
+            self.settle_after_publish().await?;
 
             // ---- 3. live streams across the switch -------------------------
             let held_label = "genuine-rekey-held";
@@ -229,7 +229,7 @@ impl Gate<'_> {
             flooded.consumer.shutdown();
 
             // ---- 5. the rotated cluster serves a whole turn ------------------
-            self.settle_key_rotation_route().await?;
+            self.settle_after_publish().await?;
             let after_conversation = self.open_connection().await?;
             let (after_session, after_stream) = self
                 .open_session(&after_conversation, "genuine-rekey-after", &[])
@@ -297,6 +297,27 @@ impl Gate<'_> {
         self.settle_key_rotation_route().await?;
         evidence.key_rotation_route_probes = self.key_rotation_route_probes;
         Ok(())
+    }
+
+    /// Settle the cluster after a membership publish, before anything is
+    /// measured.
+    ///
+    /// A publish is a record-version bump, which invalidates every live peer
+    /// admission (M7-C80); a relay whose invalidation callback runs while its
+    /// runtime is momentarily not Ready publishes an empty pin set and marks it
+    /// pending (M7-C81).  Measured: without this, the first `initialize` after
+    /// the overlap publish answered `502` in three of five runs at load ~8,
+    /// after a `key-rotation pin publication failed closed` warning.  This is
+    /// the same restore sequence the phantom-successor case ends with, and it
+    /// runs only between publishes and measurements, never across a stream
+    /// under test.
+    async fn settle_after_publish(&mut self) -> Result<()> {
+        self.wait_owner_membership_ready().await?;
+        for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
+            super::publish_verified_pins(&relay.membership, &relay.pins)?;
+        }
+        self.wait_peers_ready().await?;
+        self.settle_key_rotation_route().await
     }
 
     fn successor_chain_pem(&self) -> String {
@@ -391,6 +412,7 @@ impl Gate<'_> {
         {
             return Ok(false);
         }
+        self.settle_after_publish().await?;
         let deadline = Instant::now() + SWITCH_BOUND;
         while rekey.snapshot().serving_spki != original_spki {
             if Instant::now() >= deadline {
@@ -404,6 +426,7 @@ impl Gate<'_> {
         if !self.converge_owner_keys(withdraw, &[original_spki]).await? {
             return Ok(false);
         }
+        self.settle_after_publish().await?;
         let deadline = Instant::now() + SWITCH_BOUND;
         while rekey.phase() != PeerRekeyPhase::Stable {
             if Instant::now() >= deadline {
