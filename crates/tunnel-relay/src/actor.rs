@@ -2942,10 +2942,41 @@ impl ConsumerStreamRegistration {
     }
 }
 
+/// How busy the single relay actor is (task rows M6-C182, M6-C183): the
+/// commands it has handled and the wall time spent handling them, including
+/// the post-command maintenance.  Payload-free counters only.  Every device
+/// and every tenant shares this one actor, so its busy fraction is the share
+/// of relay command capacity in use.
+#[derive(Debug, Default)]
+pub(crate) struct ActorLoad {
+    commands: AtomicU64,
+    busy_micros: AtomicU64,
+}
+
+impl ActorLoad {
+    fn record(&self, busy: Duration) {
+        self.commands.fetch_add(1, Ordering::Relaxed);
+        self.busy_micros.fetch_add(
+            u64::try_from(busy.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// A point-in-time reading of [`ActorLoad`] and the command queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActorLoadSnapshot {
+    pub(crate) commands: u64,
+    pub(crate) busy_micros: u64,
+    pub(crate) queue_depth: u64,
+    pub(crate) queue_capacity: u64,
+}
+
 /// A cloneable, bounded command handle used by HTTP and WebSocket tasks.
 #[derive(Clone)]
 pub struct RelayHandle {
     tx: mpsc::Sender<Command>,
+    actor_load: Arc<ActorLoad>,
     cancel: CancellationToken,
     terminal_cleanup: TerminalCleanupDispatcher,
     consumer_chunk_reads: Arc<AtomicU64>,
@@ -2997,8 +3028,10 @@ impl RelayHandle {
             backlog: owner_backlog.clone(),
             catalog: catalog.clone(),
         };
+        let actor_load = Arc::new(ActorLoad::default());
         let handle = Self {
             tx: tx.clone(),
+            actor_load: actor_load.clone(),
             cancel: options.shutdown.clone(),
             terminal_cleanup: terminal_cleanup.clone(),
             consumer_chunk_reads: consumer_chunk_reads.clone(),
@@ -3055,6 +3088,7 @@ impl RelayHandle {
             background_failure,
             shutting_down: false,
             freeze_hold: freeze_hold::FreezeHold::default(),
+            actor_load,
         };
         // Keep the actor failure boundary attached to the relay-wide
         // cancellation token.  A panic in the actor must not leave listener
@@ -3670,6 +3704,19 @@ impl RelayHandle {
         self.reply(receiver).await.ok_or(RelayError::Shutdown)
     }
 
+    /// The actor's load counters and its command queue's occupancy, read
+    /// without a round trip through the actor.
+    pub(crate) fn actor_load(&self) -> ActorLoadSnapshot {
+        let capacity = self.tx.max_capacity();
+        ActorLoadSnapshot {
+            commands: self.actor_load.commands.load(Ordering::Relaxed),
+            busy_micros: self.actor_load.busy_micros.load(Ordering::Relaxed),
+            queue_depth: u64::try_from(capacity.saturating_sub(self.tx.capacity()))
+                .unwrap_or(u64::MAX),
+            queue_capacity: u64::try_from(capacity).unwrap_or(u64::MAX),
+        }
+    }
+
     pub(crate) async fn dispatch_echo(
         &self,
         consumer: AuthenticatedConsumer,
@@ -3925,6 +3972,7 @@ struct RelayActor {
     shutting_down: bool,
     /// New OPENs held across a data-rotation freeze (task row M3-15).
     freeze_hold: freeze_hold::FreezeHold,
+    actor_load: Arc<ActorLoad>,
 }
 
 impl RelayActor {
@@ -3972,6 +4020,7 @@ impl RelayActor {
                     let Some(command) = command else { break; };
                     let shutdown = matches!(command, Command::Shutdown(_));
                     let scope = command.http_maintenance_scope();
+                    let started = Instant::now();
                     self.handle(command).await;
                     if !shutdown {
                         self.after_command_http_maintenance(scope).await;
@@ -3979,6 +4028,7 @@ impl RelayActor {
                         // hold deadline; settle held OPENs against it.
                         self.service_held_opens(tokio::time::Instant::now());
                     }
+                    self.actor_load.record(started.elapsed());
                     if shutdown || self.shutting_down {
                         break;
                     }
@@ -18248,6 +18298,7 @@ mod stream_identity_tests {
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutting_down: false,
             freeze_hold: super::freeze_hold::FreezeHold::default(),
+            actor_load: Arc::default(),
         };
         (
             actor,

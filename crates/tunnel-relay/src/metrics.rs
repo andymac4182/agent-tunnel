@@ -172,6 +172,8 @@ pub(crate) struct MetricsInput<'a> {
     pub(crate) authority: Option<AuthorityMetrics>,
     pub(crate) snapshot: &'a RelaySnapshot,
     pub(crate) consumer_refusals: BTreeMap<(&'static str, &'static str), u64>,
+    /// The single relay actor's load (M6-C182, M6-C183).
+    pub(crate) actor_load: crate::actor::ActorLoadSnapshot,
 }
 
 /// The authority check's state and counters (M6-C67).
@@ -358,6 +360,32 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         }
     }
 
+    let load = input.actor_load;
+    counter(
+        &mut out,
+        "tunnel_relay_actor_commands_total",
+        "Commands the relay actor has handled (every device and tenant share one actor).",
+        load.commands,
+    );
+    counter(
+        &mut out,
+        "tunnel_relay_actor_busy_microseconds_total",
+        "Wall time the relay actor spent handling commands, in microseconds; its rate is the actor's busy fraction.",
+        load.busy_micros,
+    );
+    gauge(
+        &mut out,
+        "tunnel_relay_actor_queue_depth",
+        "Commands waiting in the relay actor's bounded queue now.",
+        load.queue_depth,
+    );
+    gauge(
+        &mut out,
+        "tunnel_relay_actor_queue_capacity",
+        "The relay actor command queue's bound.",
+        load.queue_capacity,
+    );
+
     let sessions = &snapshot.sessions;
     gauge(
         &mut out,
@@ -530,6 +558,7 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
         authority,
         snapshot: &snapshot,
         consumer_refusals: consumer_refusals(),
+        actor_load: state.handle.actor_load(),
     });
     ([(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
 }

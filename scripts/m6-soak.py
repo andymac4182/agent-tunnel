@@ -637,7 +637,8 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_streams", "tunnel_relay_sessions_rotating",
                  "tunnel_relay_queue_bytes", "tunnel_relay_replay_bytes",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
-                 "tunnel_relay_ready")
+                 "tunnel_relay_ready", "tunnel_relay_actor_commands_total",
+                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth")
 
 
 def scrape_metrics(port: int) -> dict[str, float]:
@@ -1123,6 +1124,10 @@ def cpu_snapshot(stack: Stack) -> tuple[float, dict[str, float]]:
     own = os.times()
     out["driver"] = own.user + own.system
     out.update(redis_counters(stack.redis))
+    metrics = scrape_metrics(stack.metrics_port) if hasattr(stack, "metrics_port") else {}
+    if "tunnel_relay_actor_busy_microseconds_total" in metrics:
+        out["relay_actor"] = metrics["tunnel_relay_actor_busy_microseconds_total"] / 1e6
+        out["relay_actor_commands"] = metrics.get("tunnel_relay_actor_commands_total", 0.0)
     return time.perf_counter(), out
 
 
@@ -1149,15 +1154,17 @@ def redis_counters(redis: tuple[str, int]) -> dict[str, float]:
 
 def cpu_percent(before: tuple[float, dict[str, float]],
                 after: tuple[float, dict[str, float]]) -> dict[str, float]:
-    """CPU use per process over an interval, in percent of one CPU; Redis
-    command and script counts as rates per second, and script time per call."""
+    """CPU use per process over an interval, in percent of one CPU (for
+    `relay_actor`, the single relay actor's busy wall time in percent); Redis
+    and relay actor command counts as rates per second, and script time per
+    call."""
     span = after[0] - before[0]
     if span <= 0:
         return {}
     delta = {name: after[1][name] - before[1][name] for name in after[1] if name in before[1]}
     out = {}
     for name, value in delta.items():
-        if name in ("redis_commands", "redis_script_calls"):
+        if name in ("redis_commands", "redis_script_calls", "relay_actor_commands"):
             out[f"{name}_per_s"] = round(value / span, 1)
         elif name != "redis_script_usec":
             out[name] = round(value / span * 100, 1)

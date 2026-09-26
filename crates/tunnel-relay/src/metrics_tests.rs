@@ -117,6 +117,12 @@ fn rendered() -> String {
             (("echo", "grant"), 1),
             (("stream", "rotation_freeze"), 8),
         ]),
+        actor_load: crate::actor::ActorLoadSnapshot {
+            commands: 41,
+            busy_micros: 9_876,
+            queue_depth: 3,
+            queue_capacity: 64,
+        },
     })
 }
 
@@ -176,6 +182,10 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_rotation_freeze_hold_max_wait_ms 1234",
         "tunnel_relay_peer_faults_total{stage=\"head\"} 4",
         "tunnel_relay_peer_fault_causes_total{cause=\"transport_timeout\"} 4",
+        "tunnel_relay_actor_commands_total 41",
+        "tunnel_relay_actor_busy_microseconds_total 9876",
+        "tunnel_relay_actor_queue_depth 3",
+        "tunnel_relay_actor_queue_capacity 64",
     ] {
         assert!(
             text.lines().any(|candidate| candidate == line),
