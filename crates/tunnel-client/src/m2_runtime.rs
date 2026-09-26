@@ -11549,13 +11549,9 @@ mod tests {
             matches!(carrier_receiver.try_recv(), Ok(CarrierCommand::Barrier)),
             "the converging ACK queues the FORGET barrier at once"
         );
-        assert!(
-            actor
-                .pending_forgets
-                .get(&stream_id)
-                .is_some_and(|pending| !pending.proof_pending
-                    && pending.barriers_queued.contains(&key))
-        );
+        assert!(actor.pending_forgets.get(&stream_id).is_some_and(
+            |pending| !pending.proof_pending && pending.barriers_queued.contains(&key)
+        ));
         actor
             .handle_barrier_complete(&key)
             .expect("the requeued barrier completes the FORGET");
