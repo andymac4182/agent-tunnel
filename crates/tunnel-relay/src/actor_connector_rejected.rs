@@ -1,5 +1,5 @@
 //! Task row M7-C160: one payload-free, rate-bounded diagnostic for every
-//! connector `REJECTED` the relay accepts for a live session.
+//! connector `REJECTED` the relay receives for a live session.
 //!
 //! The relay answers the consumer with its own mapping (M6-C120:
 //! `RESOURCE_EXHAUSTED` stays `RESOURCE_EXHAUSTED`, everything else becomes
@@ -7,105 +7,88 @@
 //! code attributable at the default `info` filter.
 //!
 //! `code` and `reason` arrive from the device and are untrusted.  Neither is
-//! ever written verbatim.  Each is matched against the fixed set the shipped
-//! connector sends; a known value is logged as a fixed label, and anything
-//! else is logged only as `other` plus its byte length.  A device therefore
-//! cannot put payload data, credentials, control characters or unbounded text
-//! into the relay's log through a refusal.
+//! ever written verbatim.  Each is looked up in the refusal table the shipped
+//! connector sends from (`tunnel_protocol::open_refusal`); a table entry is
+//! logged as its fixed code and category, and anything else only as `other`
+//! plus its byte length.  A device therefore cannot put payload data,
+//! credentials, control characters or unbounded text into the relay's log
+//! through a refusal.
+//!
+//! **Rate bounds.**  Each session has its own small budget
+//! ([`SESSION_REJECTED_LOG_BURST`] lines per [`SESSION_REJECTED_LOG_WINDOW`]),
+//! so one device cannot crowd out another.  A process-wide limiter is the
+//! overall cap: matched refusals share a budget per code label, and REJECTEDs
+//! that match no relay record (which a device can forge freely) share a
+//! separate `unmatched` budget, so forged ones cannot spend the budget of real
+//! ones.
 
-use tunnel_protocol::rotation::RotationPhase;
+use std::time::{Duration, Instant};
+
+use tunnel_protocol::{open_refusal, rotation::RotationPhase};
 use tunnel_transport::log_limit::RefusalLogLimiter;
 
-/// The process-wide limit on `connector rejected` lines, keyed by the code
-/// label: a device answering every OPEN with REJECTED cannot set the growth
-/// rate of the relay's log.
+/// The process-wide cap on `connector rejected` lines, keyed by the code label
+/// for matched refusals and by [`UNMATCHED_KEY`] for unmatched ones.
 #[cfg(not(test))]
 static CONNECTOR_REJECTED_LOG: std::sync::LazyLock<RefusalLogLimiter> =
     std::sync::LazyLock::new(RefusalLogLimiter::with_defaults);
 
-// Unit tests share one process, so each test thread gets its own limiter with
-// the same defaults; another test's refusals cannot spend this test's budget.
+// Unit tests share one process, so each test thread gets its own global
+// limiter with the same defaults; another test's refusals cannot spend this
+// test's budget.
 #[cfg(test)]
 thread_local! {
     static CONNECTOR_REJECTED_LOG: RefusalLogLimiter = RefusalLogLimiter::with_defaults();
 }
 
-/// Label for a code or reason outside the known set.
+/// Lines one session may write per window, below the global cap.
+pub(super) const SESSION_REJECTED_LOG_BURST: u32 = 5;
+/// The per-session window.
+pub(super) const SESSION_REJECTED_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// Global limiter key for a REJECTED matching no relay record.
+const UNMATCHED_KEY: &str = "unmatched";
+
+/// Label for a code or reason outside the connector's refusal table.
 pub(super) const OTHER: &str = "other";
 
-/// The connector refusal codes the shipped connector sends
-/// (`crates/tunnel-client/src/lib.rs` and `m2_runtime.rs`).
-const KNOWN_CODES: &[&str] = &[
-    "AUTHORIZATION_EXPIRED",
-    "CANCELLED",
-    "EXPORT_DENIED",
-    "GOAWAY",
-    "OPERATION_DENIED",
-    "RESOURCE_EXHAUSTED",
-    "STALE_REQUEST",
-    "STREAM_EXISTS",
-];
+/// A session's own fixed-window line budget: two counters and a start time,
+/// held in the (bounded) session state.
+#[derive(Debug, Default)]
+pub(super) struct SessionRejectedLog {
+    window_started: Option<Instant>,
+    admitted: u32,
+    suppressed: u64,
+}
 
-/// The connector's fixed reason texts, each mapped to a stable category.
-const KNOWN_REASONS: &[(&str, &str)] = &[
-    ("connector is draining", "connector_draining"),
-    ("stream limit reached", "stream_limit"),
-    ("bounded OPEN admission is full", "open_admission_full"),
-    (
-        "parsed OPEN retention is full; start a fresh session",
-        "open_retention_full",
-    ),
-    (
-        "OPEN idempotency retention is full; start a fresh session",
-        "open_idempotency_full",
-    ),
-    (
-        "service is not locally allowlisted",
-        "export_not_allowlisted",
-    ),
-    (
-        "only the local echo operation is enabled",
-        "operation_not_enabled",
-    ),
-    (
-        "only the local echo operations are enabled",
-        "operation_not_enabled",
-    ),
-    ("stream ID is already active", "stream_active"),
-    (
-        "stream ID is already active or was already forgotten",
-        "stream_active_or_forgotten",
-    ),
-    (
-        "stream ID was already forgotten; start a fresh session",
-        "stream_forgotten",
-    ),
-    (
-        "OPEN was already forgotten; start a fresh session",
-        "open_forgotten",
-    ),
-    (
-        "OPEN authorization window expired before admission",
-        "authorization_window_expired",
-    ),
-    ("local echo cancelled", "cancelled"),
-];
+impl SessionRejectedLog {
+    /// `Some(n)` admits a line and carries the number this session had
+    /// suppressed since its previous admitted line; `None` suppresses it.
+    pub(super) fn admit_at(&mut self, now: Instant) -> Option<u64> {
+        let expired = self.window_started.is_none_or(|started| {
+            now.saturating_duration_since(started) >= SESSION_REJECTED_LOG_WINDOW
+        });
+        if expired {
+            self.window_started = Some(now);
+            self.admitted = 0;
+        }
+        if self.admitted >= SESSION_REJECTED_LOG_BURST {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.admitted += 1;
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
 
 /// The logged form of a connector code: a fixed label, never device text.
 pub(super) fn code_label(code: &str) -> &'static str {
-    KNOWN_CODES
-        .iter()
-        .copied()
-        .find(|known| *known == code)
-        .unwrap_or(OTHER)
+    open_refusal::known_code(code).unwrap_or(OTHER)
 }
 
 /// The logged form of a connector reason: a fixed category, never device text.
 pub(super) fn reason_category(reason: &str) -> &'static str {
-    KNOWN_REASONS
-        .iter()
-        .find(|(text, _)| *text == reason)
-        .map_or(OTHER, |(_, category)| category)
+    open_refusal::reason_category(reason).unwrap_or(OTHER)
 }
 
 pub(super) fn rotation_phase_label(phase: Option<RotationPhase>) -> &'static str {
@@ -134,38 +117,62 @@ pub(super) struct ConnectorRejectedContext<'a> {
     pub rotation_phase: Option<RotationPhase>,
     /// Which relay record the REJECTED matched: `unary`, `stream` or `none`.
     pub matched: &'static str,
-    /// The code the consumer receives, or `none` when no unary waiter was
-    /// answered.
+    /// The code the consumer receives, `stream_closed` for a pending M2 OPEN,
+    /// or `none`.
     pub relay_code: &'static str,
 }
 
 pub(super) fn log_connector_rejected(
+    session_log: Option<&mut SessionRejectedLog>,
     context: &ConnectorRejectedContext<'_>,
     code: &str,
     reason: &str,
 ) -> bool {
     #[cfg(not(test))]
     {
-        log_connector_rejected_with(&CONNECTOR_REJECTED_LOG, context, code, reason)
+        log_connector_rejected_with(
+            &CONNECTOR_REJECTED_LOG,
+            session_log,
+            Instant::now(),
+            context,
+            code,
+            reason,
+        )
     }
     #[cfg(test)]
     {
-        CONNECTOR_REJECTED_LOG
-            .with(|limiter| log_connector_rejected_with(limiter, context, code, reason))
+        CONNECTOR_REJECTED_LOG.with(|limiter| {
+            log_connector_rejected_with(limiter, session_log, Instant::now(), context, code, reason)
+        })
     }
 }
 
-/// [`log_connector_rejected`] against an explicit limiter; returns whether
-/// the line was written.  An admitted line carries `suppressed`, the number
-/// of lines for its code label dropped since the previous one.
+/// [`log_connector_rejected`] against an explicit global limiter and clock;
+/// returns whether the line was written.  The session budget is checked
+/// first, then the global cap.  An admitted line carries `suppressed` (global,
+/// for its key) and `session_suppressed` (this session's own).
 pub(super) fn log_connector_rejected_with(
     limiter: &RefusalLogLimiter,
+    session_log: Option<&mut SessionRejectedLog>,
+    now: Instant,
     context: &ConnectorRejectedContext<'_>,
     code: &str,
     reason: &str,
 ) -> bool {
+    let session_suppressed = match session_log {
+        Some(session_log) => match session_log.admit_at(now) {
+            Some(suppressed) => suppressed,
+            None => return false,
+        },
+        None => 0,
+    };
     let code_label = code_label(code);
-    let Some(suppressed) = limiter.admit(code_label) else {
+    let key = if context.matched == "none" {
+        UNMATCHED_KEY
+    } else {
+        code_label
+    };
+    let Some(suppressed) = limiter.admit_at(key, now) else {
         return false;
     };
     tracing::info!(
@@ -184,6 +191,7 @@ pub(super) fn log_connector_rejected_with(
         reason_len = reason.len(),
         relay_code = context.relay_code,
         suppressed,
+        session_suppressed,
         "connector rejected an OPEN"
     );
     true
@@ -196,82 +204,85 @@ mod tests {
         time::Duration,
     };
 
+    use std::time::Instant;
+
     use tunnel_transport::log_limit::RefusalLogLimiter;
 
     use super::{
-        ConnectorRejectedContext, OTHER, code_label, log_connector_rejected_with, reason_category,
+        ConnectorRejectedContext, OTHER, SESSION_REJECTED_LOG_BURST, SESSION_REJECTED_LOG_WINDOW,
+        SessionRejectedLog, code_label, log_connector_rejected_with, reason_category,
     };
 
-    /// Every code and reason the shipped connector sends must have a label,
-    /// or the diagnostic degrades to `other` for a real refusal.
-    #[test]
-    fn every_shipped_connector_refusal_has_a_label() {
-        for source in [
-            include_str!("../../tunnel-client/src/lib.rs"),
-            include_str!("../../tunnel-client/src/m2_runtime.rs"),
-        ] {
-            // Production code only: the test modules build synthetic refusals.
-            let production = source
-                .split("\n#[cfg(test)]\nmod ")
-                .next()
-                .unwrap_or(source);
-            let lines: Vec<&str> = production.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                let call = line.contains("send_rejected(")
-                    || line.contains("send_open_rejected_journaled(")
-                    || line.contains("Rejected::new(");
-                if !call || line.trim_start().starts_with("fn ") || line.contains("fn send_") {
-                    continue;
-                }
-                // The call's arguments run to the end of its statement.
-                let mut literals = Vec::new();
-                for next in lines.iter().skip(index).take(12) {
-                    literals.extend(next.split('"').skip(1).step_by(2));
-                    let trimmed = next.trim();
-                    if trimmed.ends_with(';') || trimmed == "}" {
-                        break;
-                    }
-                }
-                for literal in literals {
-                    if literal.chars().all(|c| c.is_ascii_uppercase() || c == '_')
-                        && literal.len() > 3
-                    {
-                        assert_ne!(code_label(literal), OTHER, "unlabelled code {literal}");
-                    } else if literal.contains(' ') {
-                        assert_ne!(
-                            reason_category(literal),
-                            OTHER,
-                            "unlabelled reason {literal:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn lines_are_rate_bounded_per_code_label() {
-        let limiter = RefusalLogLimiter::new(2, Duration::from_secs(3600));
-        let tenant_id = uuid::Uuid::nil();
-        let context = ConnectorRejectedContext {
-            tenant_id: &tenant_id,
-            device_id: &tenant_id,
+    fn context(matched: &'static str) -> ConnectorRejectedContext<'static> {
+        static NIL: uuid::Uuid = uuid::Uuid::nil();
+        ConnectorRejectedContext {
+            tenant_id: &NIL,
+            device_id: &NIL,
             session_id: "m7c160-rate",
             epoch: 1,
             stream_id: 1,
             operation_id: "unmatched",
             rotation_phase: None,
-            matched: "none",
+            matched,
             relay_code: "none",
+        }
+    }
+
+    #[test]
+    fn the_global_cap_is_per_code_label_and_unmatched_has_its_own_key() {
+        let limiter = RefusalLogLimiter::new(2, Duration::from_secs(3600));
+        let now = Instant::now();
+        let matched = context("stream");
+        let log = |context: &ConnectorRejectedContext<'_>, code: &str| {
+            log_connector_rejected_with(&limiter, None, now, context, code, "x")
         };
-        let written: Vec<bool> = (0..4)
-            .map(|_| log_connector_rejected_with(&limiter, &context, "GOAWAY", "x"))
-            .collect();
-        assert_eq!(written, [true, true, false, false]);
+        let written: Vec<bool> = (0..3).map(|_| log(&matched, "GOAWAY")).collect();
+        assert_eq!(written, [true, true, false]);
         // Hostile codes share one label, so they share one budget.
-        assert!(log_connector_rejected_with(&limiter, &context, "A", "x"));
-        assert!(log_connector_rejected_with(&limiter, &context, "B", "x"));
-        assert!(!log_connector_rejected_with(&limiter, &context, "C", "x"));
+        assert!(log(&matched, "A"));
+        assert!(log(&matched, "B"));
+        assert!(!log(&matched, "C"));
+        // Unmatched REJECTEDs spend only their own key, whatever their code.
+        let unmatched = context("none");
+        assert!(log(&unmatched, "RESOURCE_EXHAUSTED"));
+        assert!(log(&unmatched, "RESOURCE_EXHAUSTED"));
+        assert!(!log(&unmatched, "RESOURCE_EXHAUSTED"));
+        assert!(log(&matched, "RESOURCE_EXHAUSTED"));
+    }
+
+    #[test]
+    fn each_session_has_its_own_budget_below_the_global_cap() {
+        let limiter = RefusalLogLimiter::with_defaults();
+        let start = Instant::now();
+        let matched = context("stream");
+        let mut noisy = SessionRejectedLog::default();
+        let mut quiet = SessionRejectedLog::default();
+        let burst = SESSION_REJECTED_LOG_BURST as usize;
+        let written = (0..burst * 2)
+            .filter(|_| {
+                log_connector_rejected_with(
+                    &limiter,
+                    Some(&mut noisy),
+                    start,
+                    &matched,
+                    "GOAWAY",
+                    "x",
+                )
+            })
+            .count();
+        assert_eq!(written, burst);
+        assert!(log_connector_rejected_with(
+            &limiter,
+            Some(&mut quiet),
+            start,
+            &matched,
+            "GOAWAY",
+            "x"
+        ));
+        // A new window admits the noisy session again and reports what it
+        // suppressed.
+        let later = start + SESSION_REJECTED_LOG_WINDOW;
+        assert_eq!(noisy.admit_at(later), Some(burst as u64));
     }
 
     #[test]
@@ -317,9 +328,9 @@ mod tests {
 #[cfg(test)]
 pub(super) use tests::Captured;
 
-/// The real actor path: a connector REJECTED for a pending M2 OPEN is logged
-/// at `info` with the connector's code, a reason category and the rotation
-/// phase, and never with the device's reason text.
+/// The real actor path: a connector REJECTED is logged at `info` with the
+/// connector's code, a reason category and the rotation phase, and never with
+/// the device's reason text.
 #[cfg(test)]
 mod actor_tests {
     use std::collections::BTreeSet;
@@ -332,157 +343,204 @@ mod actor_tests {
 
     use super::Captured;
     use crate::actor::{
-        DataCarrier, RuntimeProfile, SessionKey, runtime::CarrierContext,
-        stream_identity_tests::admitted_control_actor,
+        ConsumerStreamRegistration, DataCarrier, RelayActor, RuntimeProfile, SessionKey,
+        runtime::CarrierContext, stream_identity_tests::admitted_control_actor,
     };
 
     /// Synthetic marker standing in for payload bytes or a credential that a
     /// hostile or buggy device might put in a refusal reason.
     const SYNTHETIC_SECRET: &str = "m7c160-synthetic-secret-7f3a";
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn m7c160_connector_rejected_is_logged_with_code_category_and_phase_only() {
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
             .with_env_filter("info")
             .with_ansi(false)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
 
-        let now = Utc::now();
-        let tenant_id = Uuid::from_u128(0xc160_0001);
-        let device_id = Uuid::from_u128(0xc160_0002);
-        let principal_id = Uuid::from_u128(0xc160_0003);
-        let service_id = Uuid::from_u128(0xc160_0004);
-        let identity = DeviceIdentity {
-            tenant_id,
-            device_id,
-            owner_user_id: principal_id,
-            credential_id: Uuid::from_u128(0xc160_0005),
-            spki_fingerprint: "m7c160-spki".to_owned(),
-            credential_not_before: now - Duration::minutes(1),
-            expires_at: now + Duration::minutes(1),
-            credential_revoked_at: None,
-            device_active: true,
-            credential_active: true,
-            device_version: 1,
-            owner_epoch: 1,
-            last_seen_at: Some(now),
-        };
-        let key = SessionKey {
-            tenant_id,
-            device_id,
-            session_id: "m7c160-session".to_owned(),
-            epoch: 1,
-        };
-        let (mut actor, _control) = admitted_control_actor(identity, key.clone());
-        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
-        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
-            session.profile = RuntimeProfile::M2;
-            session.active_carrier = Some(DataCarrier {
-                context: CarrierContext::new(
-                    key.session_id.clone(),
-                    key.epoch,
-                    1,
-                    "m7c160-data".to_owned(),
-                ),
-                tx: data_tx,
-            });
-        }
-        let consumer = AuthenticatedConsumer {
-            tenant_id,
-            principal_id,
-        };
-        let grant = GrantSnapshot {
-            tenant_id,
-            principal_id,
-            device_id,
-            service_id,
-            revision: 1,
-            permissions: PermissionSet {
-                operations: BTreeSet::from(["echo:invoke".to_owned()]),
-            },
-            constraints: serde_json::json!({}),
-            valid_until: now + Duration::minutes(1),
-            read_started_at: now,
-        };
+    struct Device {
+        actor: RelayActor,
+        key: SessionKey,
+        streams: Vec<ConsumerStreamRegistration>,
+        _data_rx: mpsc::Receiver<crate::actor::DataOutbound>,
+        _control: crate::actor::ControlRegistration,
+    }
 
-        let mut streams = Vec::new();
-        for _ in 0..2 {
-            let (tx, rx) = oneshot::channel();
-            actor.open_echo_stream(
-                consumer.clone(),
+    impl Device {
+        /// One admitted M2 session for its own tenant and device, with `opens`
+        /// pending OPENs the relay issued.
+        async fn open(seed: u128, opens: usize) -> Self {
+            let now = Utc::now();
+            let tenant_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 1);
+            let device_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 2);
+            let principal_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 3);
+            let service_id = Uuid::from_u128(0xc160_0000 + seed * 16 + 4);
+            let identity = DeviceIdentity {
+                tenant_id,
+                device_id,
+                owner_user_id: principal_id,
+                credential_id: Uuid::from_u128(0xc160_0000 + seed * 16 + 5),
+                spki_fingerprint: format!("m7c160-spki-{seed}"),
+                credential_not_before: now - Duration::minutes(1),
+                expires_at: now + Duration::minutes(1),
+                credential_revoked_at: None,
+                device_active: true,
+                credential_active: true,
+                device_version: 1,
+                owner_epoch: 1,
+                last_seen_at: Some(now),
+            };
+            let key = SessionKey {
+                tenant_id,
+                device_id,
+                session_id: format!("m7c160-session-{seed}"),
+                epoch: 1,
+            };
+            let (mut actor, control) = admitted_control_actor(identity, key.clone());
+            let (data_tx, data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+            if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+                session.profile = RuntimeProfile::M2;
+                session.active_carrier = Some(DataCarrier {
+                    context: CarrierContext::new(
+                        key.session_id.clone(),
+                        key.epoch,
+                        1,
+                        format!("m7c160-data-{seed}"),
+                    ),
+                    tx: data_tx,
+                });
+            }
+            let consumer = AuthenticatedConsumer {
+                tenant_id,
+                principal_id,
+            };
+            let grant = GrantSnapshot {
+                tenant_id,
+                principal_id,
                 device_id,
                 service_id,
-                grant.clone(),
-                now + Duration::minutes(1),
-                tx,
-            );
-            streams.push(rx.await.expect("registration").expect("M2 admission"));
+                revision: 1,
+                permissions: PermissionSet {
+                    operations: BTreeSet::from(["echo:invoke".to_owned()]),
+                },
+                constraints: serde_json::json!({}),
+                valid_until: now + Duration::minutes(1),
+                read_started_at: now,
+            };
+            let mut streams = Vec::new();
+            for _ in 0..opens {
+                let (tx, rx) = oneshot::channel();
+                actor.open_echo_stream(
+                    consumer.clone(),
+                    device_id,
+                    service_id,
+                    grant.clone(),
+                    now + Duration::minutes(1),
+                    tx,
+                );
+                streams.push(rx.await.expect("registration").expect("M2 admission"));
+            }
+            Self {
+                actor,
+                key,
+                streams,
+                _data_rx: data_rx,
+                _control: control,
+            }
         }
-        let open_message_id = |actor: &crate::actor::RelayActor, stream_id: u64| {
-            actor
+
+        fn open_message_id(&self, stream_id: u64) -> String {
+            self.actor
                 .sessions
-                .get(&key.scope())
+                .get(&self.key.scope())
                 .and_then(|session| session.streams.get(&stream_id))
                 .map(|stream| stream.open_message_id.clone())
                 .expect("OPEN correlation")
-        };
+        }
+
+        /// Send a REJECTED answering this device's `index`th OPEN.
+        async fn reject(&mut self, index: usize, code: &str, reason: &str) {
+            let stream_id = self.streams[index].stream_id;
+            let operation_id = self.streams[index].operation_id.clone();
+            let reply_to = self.open_message_id(stream_id);
+            self.actor
+                .inbound_control(
+                    self.key.clone(),
+                    ControlMessage::Rejected(tunnel_protocol::Rejected::new(
+                        format!("m7c160-rejected-{index}"),
+                        reply_to,
+                        self.key.session_id.clone(),
+                        self.key.epoch,
+                        stream_id,
+                        operation_id,
+                        code,
+                        reason,
+                    )),
+                )
+                .await;
+        }
+
+        /// Send a REJECTED for a stream the relay never opened.
+        async fn reject_invented(&mut self, stream_id: u64) {
+            self.actor
+                .inbound_control(
+                    self.key.clone(),
+                    ControlMessage::Rejected(tunnel_protocol::Rejected::new(
+                        format!("m7c160-forged-{stream_id}"),
+                        "forged-open",
+                        self.key.session_id.clone(),
+                        self.key.epoch,
+                        stream_id,
+                        "forged-operation",
+                        "GOAWAY",
+                        "connector is draining",
+                    )),
+                )
+                .await;
+        }
+    }
+
+    fn rejected_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.contains("connector_rejected"))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn m7c160_connector_rejected_is_logged_with_code_category_and_phase_only() {
+        let (captured, _guard) = capture();
+        let mut device = Device::open(0, 2).await;
+        let device_id = device.key.device_id;
+        let (first, second) = (
+            (
+                device.streams[0].stream_id,
+                device.streams[0].operation_id.clone(),
+            ),
+            device.streams[1].stream_id,
+        );
 
         // A known refusal: the shipped connector's draining GOAWAY.
-        let first = &streams[0];
-        let reply_to = open_message_id(&actor, first.stream_id);
-        actor
-            .inbound_control(
-                key.clone(),
-                ControlMessage::Rejected(tunnel_protocol::Rejected::new(
-                    "m7c160-rejected-known",
-                    reply_to,
-                    key.session_id.clone(),
-                    key.epoch,
-                    first.stream_id,
-                    first.operation_id.clone(),
-                    "GOAWAY",
-                    "connector is draining",
-                )),
-            )
-            .await;
-
+        device.reject(0, "GOAWAY", "connector is draining").await;
         // A hostile refusal: free-form code and reason carrying a synthetic
         // secret and terminal control characters.
-        let second = &streams[1];
-        let reply_to = open_message_id(&actor, second.stream_id);
+        let hostile_code = format!("X_{SYNTHETIC_SECRET}");
         let hostile_reason = format!("\u{1b}[2J\r\nfake log line {SYNTHETIC_SECRET}");
-        actor
-            .inbound_control(
-                key.clone(),
-                ControlMessage::Rejected(tunnel_protocol::Rejected::new(
-                    "m7c160-rejected-hostile",
-                    reply_to,
-                    key.session_id.clone(),
-                    key.epoch,
-                    second.stream_id,
-                    second.operation_id.clone(),
-                    format!("X_{SYNTHETIC_SECRET}"),
-                    hostile_reason.clone(),
-                )),
-            )
-            .await;
+        device.reject(1, &hostile_code, &hostile_reason).await;
 
         let text = captured.text();
-        let lines: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("connector_rejected"))
-            .collect();
+        let lines = rejected_lines(&text);
         assert_eq!(lines.len(), 2, "one line per connector REJECTED: {text}");
         let known = lines[0];
         for field in [
             " INFO ",
-            &format!("stream_id={}", first.stream_id),
-            &format!("operation_id=\"{}\"", first.operation_id),
+            &format!("stream_id={}", first.0),
+            &format!("operation_id=\"{}\"", first.1),
             &format!("device_id={device_id}"),
-            "session_id=\"m7c160-session\"",
+            "session_id=\"m7c160-session-0\"",
             "rotation_phase=\"none\"",
             "matched=\"stream\"",
             "connector_code=\"GOAWAY\"",
@@ -494,9 +552,9 @@ mod actor_tests {
         }
         let hostile = lines[1];
         for field in [
-            &format!("stream_id={}", second.stream_id),
+            &format!("stream_id={second}"),
             "connector_code=\"other\"",
-            &format!("connector_code_len={}", SYNTHETIC_SECRET.len() + 2),
+            &format!("connector_code_len={}", hostile_code.len()),
             "reason_category=\"other\"",
             &format!("reason_len={}", hostile_reason.len()),
         ] {
@@ -509,5 +567,43 @@ mod actor_tests {
                 && !text.contains("connector is draining"),
             "device text reached the log: {text}"
         );
+    }
+
+    /// Review of PR #207: a device flooding REJECTEDs for stream IDs the relay
+    /// never opened must not spend the budget another tenant's genuine
+    /// refusal needs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn m7c160_a_forged_rejected_flood_cannot_silence_another_tenants_refusal() {
+        let (captured, _guard) = capture();
+        let mut flooder = Device::open(1, 0).await;
+        let mut victim = Device::open(2, 1).await;
+        let flood = u64::from(tunnel_transport::log_limit::DEFAULT_REFUSAL_LOG_BURST) * 3;
+        for stream_id in 0..flood {
+            flooder.reject_invented(1_000_000 + stream_id).await;
+        }
+        victim.reject(0, "GOAWAY", "connector is draining").await;
+
+        let text = captured.text();
+        let victim_session = format!("session_id=\"{}\"", victim.key.session_id);
+        let victim_lines: Vec<&str> = rejected_lines(&text)
+            .into_iter()
+            .filter(|line| line.contains(&victim_session))
+            .collect();
+        assert_eq!(
+            victim_lines.len(),
+            1,
+            "the victim's matched GOAWAY must be logged despite the flood: {text}"
+        );
+        assert!(victim_lines[0].contains("matched=\"stream\""));
+        let flooder_session = format!("session_id=\"{}\"", flooder.key.session_id);
+        let flooder_lines = rejected_lines(&text)
+            .into_iter()
+            .filter(|line| line.contains(&flooder_session))
+            .count();
+        assert!(
+            flooder_lines <= super::SESSION_REJECTED_LOG_BURST as usize,
+            "one session is bounded by its own budget: {flooder_lines} lines"
+        );
+        assert!(flooder_lines > 0, "the flood must have been logged at all");
     }
 }

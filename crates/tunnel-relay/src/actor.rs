@@ -2080,6 +2080,8 @@ struct DeviceSession {
     /// (M7-C92).  Bounded with `pending` by the retained-stream factor at
     /// admission; see [`UnaryTombstone`].
     unary_tombstones: HashMap<u64, UnaryTombstone>,
+    /// M7-C160: this session's own budget of `connector rejected` lines.
+    connector_rejected_log: connector_rejected::SessionRejectedLog,
     streams: HashMap<u64, M2Stream>,
     /// Highest stream ID whose authenticated owner FORGET completed. Stream
     /// IDs never reuse, so late frames at or below this watermark are stale
@@ -4457,6 +4459,7 @@ impl RelayActor {
                 next_stream_id: 1,
                 pending: HashMap::new(),
                 unary_tombstones: HashMap::new(),
+                connector_rejected_log: connector_rejected::SessionRejectedLog::default(),
                 streams: HashMap::new(),
                 forgotten_stream_through: 0,
                 owner_forget_deadline: None,
@@ -11078,7 +11081,11 @@ impl RelayActor {
                         let _ = self.flush_owner_stream_forgets(&key);
                     }
                 }
+                let session_log = self
+                    .session_mut(&key)
+                    .map(|session| &mut session.connector_rejected_log);
                 connector_rejected::log_connector_rejected(
+                    session_log,
                     &connector_rejected::ConnectorRejectedContext {
                         tenant_id: &key.tenant_id,
                         device_id: &key.device_id,
@@ -17046,6 +17053,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
@@ -19013,6 +19021,7 @@ mod stream_identity_tests {
                     next_stream_id: 1,
                     pending: HashMap::new(),
                     unary_tombstones: HashMap::new(),
+                    connector_rejected_log: Default::default(),
                     streams: HashMap::new(),
                     forgotten_stream_through: 0,
                     owner_forget_deadline: None,
@@ -22328,6 +22337,7 @@ mod stream_identity_tests {
             next_stream_id: 1,
             pending: HashMap::new(),
             unary_tombstones: HashMap::new(),
+            connector_rejected_log: Default::default(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,

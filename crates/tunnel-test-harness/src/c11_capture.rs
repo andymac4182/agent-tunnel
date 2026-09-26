@@ -526,6 +526,9 @@ mod tests {
     /// process-wide registry once.  So the probe runs in a fresh copy of this
     /// test binary with that variable removed: no other test can have created
     /// the registry there, and the parent's environment cannot leak in.
+    ///
+    /// The re-exec runs the test binary directly, so a custom Cargo target
+    /// runner (`target.<triple>.runner`) is not honoured for the child.
     #[test]
     fn m7c166_outside_a_c11_child_the_real_gate_holds_no_twin() {
         let exe = std::env::current_exe().expect("test binary path");
@@ -543,7 +546,7 @@ mod tests {
             "twin-gate probe failed: {stdout}{stderr}"
         );
         assert!(
-            stdout.contains(TWIN_GATE_WITNESS) && stdout.contains("1 passed"),
+            stdout.contains(TWIN_GATE_WITNESS) && stdout.contains("test result: ok. 1 passed;"),
             "twin-gate probe did not run: {stdout}{stderr}"
         );
     }
@@ -552,11 +555,13 @@ mod tests {
     #[test]
     #[ignore = "run as a subprocess by m7c166_outside_a_c11_child_the_real_gate_holds_no_twin"]
     fn m7c166_twin_gate_child() {
-        assert_eq!(
-            std::env::var_os(TWIN_GATE_PROBE).as_deref(),
-            Some(std::ffi::OsStr::new("1")),
-            "run only by the M7-C166 parent test"
-        );
+        // Only the M7-C166 parent sets the probe.  Under `--include-ignored`
+        // this test runs in the ordinary process, where other tests may have
+        // created the registry; return without the witness, so the parent's
+        // check cannot be satisfied here.
+        if std::env::var_os(TWIN_GATE_PROBE).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return;
+        }
         assert!(capture_dir().is_none(), "the probe must not be a C11 child");
         // The real entry point, not `bind_twinned_loopback_udp_in(None)`.
         let (udp, tcp) = bind_tcp_on_a_live_udp_number(|| {
