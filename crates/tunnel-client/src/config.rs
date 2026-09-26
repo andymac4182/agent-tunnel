@@ -63,6 +63,18 @@ impl<'de> Deserialize<'de> for RuntimeConfig {
     }
 }
 
+/// Warn, once per process, that an ACP export uses the deprecated
+/// `[deadlines] subscribe_ms` alias (task row M8-C12).  Names the key only.
+fn warn_deprecated_acp_subscribe_ms() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "tunnel-client: warning: acp.deadlines.subscribe_ms is deprecated and will be removed \
+             in v0.3.0; set connection_subscribe_ms and session_subscribe_ms instead"
+        );
+    }
+}
+
 impl RuntimeConfig {
     /// Parse and validate TOML without touching the filesystem.
     pub fn parse(input: &str) -> Result<Self, RuntimeConfigError> {
@@ -182,6 +194,9 @@ impl RuntimeConfig {
                 }
                 acp.validate()
                     .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
+                if acp.uses_deprecated_subscribe_ms() {
+                    warn_deprecated_acp_subscribe_ms();
+                }
             }
             if let Some(cua) = &export.cua {
                 if export.kind != ExportKind::HttpForward {
@@ -1137,6 +1152,34 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
     }
 
     const ACP_EXPORT: &str = "[exports.33333333-3333-4333-8333-333333333333]\ntype = \"http-forward\"\n\n[exports.33333333-3333-4333-8333-333333333333.acp]\nprofile = \"acp-http-v1\"\n\n[exports.33333333-3333-4333-8333-333333333333.acp.agent]\ncommand = \"/opt/synthetic/acp-agent\"\nargs = [\"agent\"]\nworkspace = \"/srv/synthetic-workspace\"\n";
+
+    /// M8-C12: a v0.1.0 configuration's `subscribe_ms` still parses, as a
+    /// deprecated alias; combined with a new key it is refused as ambiguous.
+    #[test]
+    fn a_v0_1_acp_subscribe_ms_is_accepted_as_a_deprecated_alias() {
+        let with_deadlines = |deadlines: &str| {
+            host(&valid_toml().replace(
+                "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
+                &format!(
+                    "{ACP_EXPORT}\n[exports.33333333-3333-4333-8333-333333333333.acp.deadlines]\n{deadlines}"
+                ),
+            ))
+        };
+        let config = RuntimeConfig::parse(&with_deadlines("subscribe_ms = 5000\n"))
+            .expect("the alias alone parses");
+        let acp = config.exports["33333333-3333-4333-8333-333333333333"]
+            .acp
+            .as_ref()
+            .expect("acp export");
+        assert!(acp.uses_deprecated_subscribe_ms());
+        assert!(
+            RuntimeConfig::parse(&with_deadlines(
+                "subscribe_ms = 5000\nsession_subscribe_ms = 300\n"
+            ))
+            .is_err(),
+            "the alias beside a new key is ambiguous"
+        );
+    }
 
     #[test]
     fn acp_exports_parse_validate_and_register_handlers() {

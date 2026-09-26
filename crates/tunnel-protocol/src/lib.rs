@@ -8,6 +8,7 @@
 pub mod control;
 pub mod control_journal;
 pub mod frame;
+pub mod open_refusal;
 pub mod owner_fencing;
 pub mod rotation;
 pub mod rotation_control;
