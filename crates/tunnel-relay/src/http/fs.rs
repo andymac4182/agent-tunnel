@@ -155,6 +155,11 @@ fn rotation_freeze_fs_error() -> Response {
 /// which it already treats as a retryable `BACKEND_UNAVAILABLE`.  Every other
 /// refusal keeps that code.
 fn fs_admission_refusal(error: &crate::actor::RelayError) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
+    if matches!(error, crate::actor::RelayError::RotationFreeze) {
+        crate::metrics::count_local_rotation_freeze("fs");
+    }
     if matches!(error, crate::actor::RelayError::RotationFreeze) {
         return rotation_freeze_fs_error();
     }
@@ -1062,7 +1067,18 @@ mod tests {
             .expect("bounded body");
         let other: serde_json::Value = serde_json::from_slice(&other).expect("json");
         assert_eq!(other["error"]["code"], "BACKEND_UNAVAILABLE");
+        let counted = || {
+            crate::metrics::consumer_refusals()
+                .get(&("fs", "rotation_freeze"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = counted();
         let response = super::fs_admission_refusal(&crate::actor::RelayError::RotationFreeze);
+        assert!(
+            counted() > before,
+            "the metrics scrape counts the fs route's freeze refusal"
+        );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
@@ -1080,6 +1096,74 @@ mod tests {
         assert!(
             body.get("execution").is_none(),
             "the fs contract has no execution field"
+        );
+    }
+
+    /// Task row M4-21's review: what the consumer receives when the device
+    /// ends a stalled session, taken through the functions `pump` uses for
+    /// each case -- the record decoder, `session_close_for_reset` and
+    /// `close_frame` -- rather than asserted from the device side alone.
+    ///
+    /// * A RESET after part of a reply (the connector's stall RESET, carried
+    ///   as `reset_reason_for` makes it): **1011 `SESSION_LOST`**, and not a
+    ///   byte of the partial reply is forwarded -- the decoder holds it and
+    ///   yields no record.
+    /// * A close record at a record boundary: **1011 `DEADLINE_EXCEEDED`**.
+    /// * A close record spliced into a partial reply -- what the first M4-21
+    ///   implementation could send -- is read as more of the reply's payload:
+    ///   the consumer would get a corrupted 9P message instead of any close,
+    ///   or never get the close at all. That is why the device resets instead.
+    #[test]
+    fn a_reset_after_a_partial_record_closes_the_consumer_1011_and_forwards_nothing() {
+        use tunnel_fs_core::SessionErrorCode;
+        use tunnel_fs_provider::{Record, RecordDecoder, encode_close, encode_message};
+        let reply = vec![7_u8; 4_096];
+        let mut record = Vec::new();
+        encode_message(&reply, &mut record);
+
+        // 1. Part of a reply, then the stall RESET.
+        let mut decoder = RecordDecoder::new();
+        decoder
+            .push(&record[..1_000])
+            .expect("a partial record is not an error");
+        assert!(
+            decoder.next_record().expect("no framing error").is_none(),
+            "a partial reply is never forwarded"
+        );
+        let detail = tunnel_http_bridge::ResetDetail {
+            code: tunnel_http_bridge::HttpErrorCode::DeadlineExceeded,
+            execution: tunnel_http_bridge::Execution::Unknown,
+        };
+        let code =
+            super::session_close_for_reset(Some(tunnel_http_bridge::reset_reason_for(detail)));
+        let frame = super::close_frame(code).expect("a close code");
+        assert_eq!(frame.code, 1011);
+        assert_eq!(frame.reason.as_str(), "SESSION_LOST");
+
+        // 2. A close record at a record boundary.
+        let mut close = Vec::new();
+        encode_close(SessionErrorCode::DeadlineExceeded, &mut close);
+        let mut decoder = RecordDecoder::new();
+        decoder.push(&close).expect("a close record");
+        match decoder.next_record().expect("no framing error") {
+            Some(Record::Close(code)) => {
+                let frame = super::close_frame(code).expect("a close code");
+                assert_eq!(frame.code, 1011);
+                assert_eq!(frame.reason.as_str(), "DEADLINE_EXCEEDED");
+            }
+            other => panic!("expected the close record, got {other:?}"),
+        }
+
+        // 3. The splice the device must never send.
+        let mut spliced = record[..1_000].to_vec();
+        spliced.extend_from_slice(&close);
+        spliced.extend_from_slice(&[0_u8; 4_096]);
+        let mut decoder = RecordDecoder::new();
+        let refused = decoder.push(&spliced).is_err()
+            || !matches!(decoder.next_record(), Ok(Some(Record::Message(message))) if message.as_slice() == reply.as_slice());
+        assert!(
+            refused,
+            "a close spliced into a reply must not read as that reply"
         );
     }
 

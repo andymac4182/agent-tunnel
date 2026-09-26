@@ -1631,7 +1631,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
+                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} delete_status={} delete_closed={} delete_failed_streams={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1641,6 +1641,9 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.session_id_from_connection_stream,
                         evidence.prompt_accepted_202,
                         evidence.conversation_stop_reason,
+                        evidence.delete_status,
+                        evidence.delete_closed_connection,
+                        evidence.delete_failed_held_streams,
                         evidence.permission_requested_on_wire,
                         evidence.offered_options,
                         evidence.allow_outcome_at_agent,
@@ -3923,6 +3926,46 @@ mod tests {
         assert!(!message.contains(CREDENTIAL_SENTINEL));
         assert!(!message.contains("private-key-pem"));
         assert!(!message.contains("bearer-token"));
+    }
+
+    /// Task row M6-C96: the fault stage's pass line is printed only for
+    /// evidence that every stage ran; each missing or skipped part refuses.
+    #[test]
+    fn m2_fault_gate_requires_every_stage() {
+        let complete = m2_acceptance::M2FaultEvidence {
+            stages: m2_acceptance::M2_FAULT_STAGES.to_vec(),
+            faults_injected: 5,
+            sessions_recovered: 2,
+            sessions_ended: 3,
+            revocation_outcome_ms: 1_200,
+            consumer_rejections: 4,
+        };
+        assert!(m2_acceptance::require_m2_fault_evidence(&complete).is_ok());
+        assert!(
+            m2_acceptance::require_m2_fault_evidence(&m2_acceptance::M2FaultEvidence::default())
+                .is_err()
+        );
+        for skipped in 0..m2_acceptance::M2_FAULT_STAGES.len() {
+            let mut evidence = complete.clone();
+            evidence.stages.remove(skipped);
+            assert!(
+                m2_acceptance::require_m2_fault_evidence(&evidence).is_err(),
+                "stage {skipped} skipped"
+            );
+        }
+        let mut reordered = complete.clone();
+        reordered.stages.swap(0, 1);
+        assert!(m2_acceptance::require_m2_fault_evidence(&reordered).is_err());
+        for mutate in [
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.faults_injected = 4,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.sessions_recovered = 1,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.sessions_ended = 2,
+            |evidence: &mut m2_acceptance::M2FaultEvidence| evidence.consumer_rejections = 3,
+        ] {
+            let mut evidence = complete.clone();
+            mutate(&mut evidence);
+            assert!(m2_acceptance::require_m2_fault_evidence(&evidence).is_err());
+        }
     }
 
     #[test]

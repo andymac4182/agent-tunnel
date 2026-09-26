@@ -1,0 +1,32 @@
+{
+    "screen_points": [
+        1280,
+        800
+    ],
+    "windows": [
+        {
+            "owner": "Python",
+            "pid": 633,
+            "layer": 19,
+            "alpha": 0.0,
+            "bounds": [
+                0,
+                -44,
+                1280,
+                44
+            ]
+        },
+        {
+            "owner": "Python",
+            "pid": 633,
+            "layer": 19,
+            "alpha": 1.0,
+            "bounds": [
+                0,
+                0,
+                1280,
+                800
+            ]
+        }
+    ]
+}

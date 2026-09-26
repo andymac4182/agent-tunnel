@@ -288,12 +288,22 @@ EXPECTED_MODULE_FILTERS = 9
 #: the truth rather than below it.  That is the whole point of it, and the
 #: correction was taken by re-running `--check-anchors`, not by subtracting
 #: one.
+#:
+#: **487** after task row M4-20 added two gate-4 cases (a `Twrite` refused
+#: under a read-only grant is counted; it is counted by the grant, never by
+#: its opcode), measured by `--check-anchors` on `feat-fs-demo`; **488**
+#: after M4-21 added the gate-4 request-deadline case; **491** after M4-21's
+#: review replaced it with four stall-bound cases, measured by
+#: `--check-anchors`.
 EXPECTED_GUARD_ANCHORS = {
-    "fs-guard-deletion.py": 485,
+    "fs-guard-deletion.py": 491,
     # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
     # `availability()`. Re-measured, not incremented: 150 first, which fails
-    # naming acp ("found 149"), then 149.
-    "acp-guard-deletion.py": 149,
+    # naming acp ("found 149"), then 149.  **151** after feat-acp-demo added
+    # the M8-C27 case and gave the lying-202 prompt case a second edit for
+    # the ordered path; measured the same way: 152 first, which fails naming
+    # acp ("found 151"), then 151.
+    "acp-guard-deletion.py": 151,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
@@ -1164,7 +1174,11 @@ def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
     #: be dropped for constants` (renamed from "...for the cursor point"
     #: after M5-C13) with a measured witness; M4-42 had already witnessed
     #: it under the old name, so the merged figure stays 3.
-    PINNED_WITNESS_DEBT = 3
+    #: The last 3 acp cases were then witnessed, each after a test was made
+    #: able to see its guard (two strengthened, one bounded, one added; see
+    #: M4-42 and the note above acp-guard-deletion's `WITNESSES`) -> 0.
+    #: Every drop is a `WITNESSES` entry; none is a reclassification.
+    PINNED_WITNESS_DEBT = 0
 
     directory = Path(__file__).resolve().parent
     ledger = json.loads(WITNESS_DEBT_FILE.read_text())

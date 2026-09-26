@@ -96,7 +96,10 @@ async fn conversation(
             "params": {"protocolVersion": 1, "clientCapabilities": {}},
         })))
         .expect("request");
-    let response = exchange(export, Arc::clone(profile), request).await;
+    // Every exchange is bounded, not only the stream reads (task row M4-42):
+    // an unbounded await on an answer that never comes hangs this test past
+    // the guard-deletion harness's timeout instead of failing it.
+    let response = within(exchange(export, Arc::clone(profile), request)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let connection = response
         .headers()
@@ -106,7 +109,7 @@ async fn conversation(
         .to_owned();
     drop(response);
 
-    let stream = exchange(
+    let stream = within(exchange(
         export,
         Arc::clone(profile),
         Request::builder()
@@ -117,7 +120,7 @@ async fn conversation(
             .header(headers::ACP_CONNECTION_ID, &connection)
             .body(empty())
             .expect("request"),
-    )
+    ))
     .await;
     assert_eq!(stream.status(), StatusCode::OK);
 
@@ -136,7 +139,7 @@ async fn conversation(
         })))
         .expect("request");
     assert_eq!(
-        exchange(export, Arc::clone(profile), request)
+        within(exchange(export, Arc::clone(profile), request))
             .await
             .status(),
         StatusCode::ACCEPTED
@@ -144,7 +147,7 @@ async fn conversation(
 
     let mut connection_body = std::pin::pin!(stream.into_body());
     let session = within(read_session_id(&mut connection_body)).await;
-    let session_stream = exchange(
+    let session_stream = within(exchange(
         export,
         Arc::clone(profile),
         Request::builder()
@@ -156,7 +159,7 @@ async fn conversation(
             .header(headers::ACP_SESSION_ID, &session)
             .body(empty())
             .expect("request"),
-    )
+    ))
     .await;
     assert_eq!(session_stream.status(), StatusCode::OK);
 
@@ -176,7 +179,7 @@ async fn conversation(
         })))
         .expect("request");
     assert_eq!(
-        exchange(export, Arc::clone(profile), request)
+        within(exchange(export, Arc::clone(profile), request))
             .await
             .status(),
         StatusCode::ACCEPTED
@@ -205,7 +208,7 @@ async fn conversation(
         .body(empty())
         .expect("request");
     assert_eq!(
-        exchange(export, Arc::clone(profile), request)
+        within(exchange(export, Arc::clone(profile), request))
             .await
             .status(),
         StatusCode::ACCEPTED

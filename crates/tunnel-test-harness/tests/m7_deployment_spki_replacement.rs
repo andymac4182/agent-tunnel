@@ -2207,6 +2207,7 @@ fn write_client_config(
                 device_canary: Some(CANARY.to_owned()),
                 mcp: None,
                 acp: None,
+                cua: None,
                 fs: None,
             },
         )]),

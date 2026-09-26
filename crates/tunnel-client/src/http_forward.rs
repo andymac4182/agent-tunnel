@@ -229,7 +229,24 @@ pub struct HttpHandlers {
     /// teardown below: an ACP export owns a supervised child per live
     /// connection, so nobody may rely on its `Drop` running.
     acp: BTreeMap<String, tunnel_acp_export::AcpExport>,
+    /// The registered CUA exports (M5 Lane B), kept for their counters. Each
+    /// owns a supervised backend whose process group is killed when the last
+    /// clone of the export is dropped.
+    #[cfg(feature = "cua")]
+    cua: BTreeMap<String, crate::cua_export::CuaExport>,
 }
+
+/// Why a CUA export was not registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CuaRegistrationError(pub &'static str);
+
+impl std::fmt::Display for CuaRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for CuaRegistrationError {}
 
 /// Ending the registry ends the protocol sessions it served.
 ///
@@ -363,6 +380,75 @@ impl HttpHandlers {
             );
         }
         Ok(self)
+    }
+
+    /// Register every `[exports.<service>.cua]` export of a validated runtime
+    /// configuration (M5 Lane B).
+    ///
+    /// **Three gates.** A build without the non-default `cua` feature refuses
+    /// any CUA table; a build with it refuses unless `opted_in` is true, which
+    /// the CLI sets only when [`crate::CUA_OPT_IN_ENV`] is `1`. A
+    /// configuration with no CUA table is unaffected either way. The backend
+    /// is not started here: it is started, probed and negotiated on the
+    /// export's first request, and stopped with the registry.
+    ///
+    /// # Errors
+    /// The first gate or configuration rule refused.
+    pub fn with_cua_exports(
+        mut self,
+        config: &crate::RuntimeConfig,
+        opted_in: bool,
+    ) -> Result<Self, CuaRegistrationError> {
+        for (service_id, export) in &config.exports {
+            let Some(cua) = &export.cua else { continue };
+            if export.kind != crate::ExportKind::HttpForward {
+                return Err(CuaRegistrationError(
+                    "a cua table is only valid on an http-forward export",
+                ));
+            }
+            #[cfg(not(feature = "cua"))]
+            {
+                let _ = (cua, service_id, opted_in, &mut self);
+                return Err(CuaRegistrationError(
+                    "this tunnel-client was built without the `cua` feature, so it cannot serve a cua export",
+                ));
+            }
+            #[cfg(feature = "cua")]
+            {
+                if !opted_in {
+                    return Err(CuaRegistrationError(
+                        "a cua export drives a real pointer and keyboard; set AGENT_TUNNEL_CUA_LANE_B=1, and only on a dedicated disposable machine",
+                    ));
+                }
+                let cua_export = crate::cua_export::CuaExport::from_settings(cua)
+                    .map_err(|error| CuaRegistrationError(error.0))?;
+                let profile = cua_export
+                    .profile_policies()
+                    .map_err(|error| CuaRegistrationError(error.0))?;
+                self.cua.insert(service_id.clone(), cua_export.clone());
+                let handler = move |request: Request<ChannelBody>| -> HttpHandlerFuture {
+                    let export = cua_export.clone();
+                    Box::pin(async move { Ok(export.handle(request).await) })
+                };
+                self.exports.insert(
+                    service_id.clone(),
+                    HttpExport {
+                        profile: Arc::new(profile),
+                        config: BridgeConfig::default(),
+                        handler: Arc::new(handler),
+                    },
+                );
+            }
+        }
+        Ok(self)
+    }
+
+    /// A shareable view of every registered CUA export's payload-free
+    /// counters.
+    #[cfg(feature = "cua")]
+    #[must_use]
+    pub fn cua_diagnostics_source(&self) -> BTreeMap<String, crate::cua_export::CuaExport> {
+        self.cua.clone()
     }
 
     /// A shareable view of every registered ACP export's payload-free

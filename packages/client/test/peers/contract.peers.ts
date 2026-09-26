@@ -34,7 +34,8 @@ import * as workspaceModule from '@mastra/core/workspace';
 import { Workspace } from '@mastra/core/workspace';
 import { Bash } from 'just-bash';
 import type { IFileSystem, SecurityViolationType } from 'just-bash';
-import { uploadFile } from 'ai';
+import { generateText, stepCountIs, uploadFile } from 'ai';
+import { Agent } from '@mastra/core/agent';
 import type { FilesV4 } from '@ai-sdk/provider';
 
 import { createFilesAdapter, type FilesErrorConstructor } from '../../src/adapters/files-sdk.ts';
@@ -43,7 +44,8 @@ import {
   REQUIRED_DEFENSE_EXCLUSIONS,
   TunnelJustBashFilesystem,
 } from '../../src/adapters/just-bash.ts';
-import { createFilesApi, PROVIDER_KEY } from '../../src/adapters/ai-sdk.ts';
+import { createFilesApi, createFilesystemTools, PROVIDER_KEY } from '../../src/adapters/ai-sdk.ts';
+import { scriptedModel } from '../../demo/scripted-model.ts';
 import { FilesystemError } from '../../src/errors.ts';
 import type { RemoteFilesystem } from '../../src/filesystem.ts';
 import { closeAll, waitFor, wire } from '../adapters/wiring.ts';
@@ -452,5 +454,66 @@ describe("AI SDK: the real ai.uploadFile over the real FilesV4", () => {
     await download?.content.cancel();
     const deleted = await files.deleteFile?.({ file: uploaded.providerReference });
     assert.equal(deleted?.deleted, true);
+  });
+});
+
+describe('AI SDK: the real generateText tool loop over the live directory tools', () => {
+  it('lists, reads and writes through tools a scripted model calls', async () => {
+    const { remote, wired } = await remoteOver({ 'docs/a.md': '# A\n', 'b.txt': 'bee' });
+    const tools = createFilesystemTools({ remote });
+    const { model, offered } = scriptedModel([
+      { toolName: 'list_directory', input: { path: '/' } },
+      { toolName: 'read_file', input: { path: '/docs/a.md' } },
+      { toolName: 'write_file', input: { path: '/notes.txt', content: 'written by a tool' } },
+    ]);
+    const result = await generateText({ model, tools, prompt: 'look around', stopWhen: stepCountIs(5) });
+
+    assert.deepEqual(offered[0]?.slice().sort(), ['list_directory', 'read_file', 'stat', 'write_file']);
+    const calls = result.steps.flatMap((step) => step.toolResults);
+    assert.deepEqual(
+      calls.map((call) => call.toolName),
+      ['list_directory', 'read_file', 'write_file'],
+    );
+    const listed = calls[0]?.output as { ok: boolean; entries: { name: string }[] };
+    assert.deepEqual(listed.entries.map((entry) => entry.name), ['b.txt', 'docs']);
+    const read = calls[1]?.output as { content: string };
+    assert.equal(read.content, '# A\n');
+    assert.equal(new TextDecoder().decode(wired.provider.read('/notes.txt')), 'written by a tool');
+    assert.equal(result.text, 'Saw 3 tool results.');
+  });
+
+  it('turns a scripted input the schema refuses into a tool error, without calling execute', async () => {
+    const { remote, wired } = await remoteOver({ 'a.txt': 'a' });
+    const tools = createFilesystemTools({ remote });
+    const before = wired.connection.received.length;
+    const { model } = scriptedModel([{ toolName: 'read_file', input: { path: '/a.txt', token: 'forged' } }]);
+    const result = await generateText({ model, tools, prompt: 'x', stopWhen: stepCountIs(3) });
+    const errors = result.steps.flatMap((step) => step.content).filter((part) => part.type === 'tool-error');
+    assert.equal(errors.length, 1);
+    assert.equal(wired.connection.received.length, before, 'nothing reached the wire');
+  });
+});
+
+describe('Mastra: a real Agent calling workspace tools over the real filesystem provider', () => {
+  it('runs mastra_workspace_list_files and mastra_workspace_read_file for a scripted model', async () => {
+    const { remote } = await remoteOver({ 'docs/a.txt': 'hello mastra', 'b.txt': 'bee' });
+    const filesystem = new TunnelMastraFilesystem({ remote, errors: workspaceModule });
+    const workspace = new Workspace({ filesystem });
+    const { model, offered } = scriptedModel([
+      { toolName: 'mastra_workspace_list_files', input: { path: '/' } },
+      { toolName: 'mastra_workspace_read_file', input: { path: '/docs/a.txt' } },
+    ]);
+    const agent = new Agent({ id: 'peers-agent', name: 'peers-agent', instructions: 'Use the workspace.', model, workspace });
+    const result = await agent.generate('list and read', { maxSteps: 4 });
+
+    assert.ok(offered[0]?.includes('mastra_workspace_list_files'));
+    assert.ok(offered[0]?.includes('mastra_workspace_read_file'));
+    const outputs = result.toolResults.map((part) => part.payload);
+    const names = result.steps.flatMap((step) => step.toolResults.map((part) => part.payload.toolName));
+    assert.deepEqual(names, ['mastra_workspace_list_files', 'mastra_workspace_read_file']);
+    const read = result.steps[1]?.toolResults[0]?.payload.result;
+    assert.match(String(read), /hello mastra/u);
+    assert.ok(outputs !== undefined);
+    assert.equal(result.text, 'Saw 2 tool results.');
   });
 });

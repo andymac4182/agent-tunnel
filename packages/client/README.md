@@ -13,11 +13,18 @@ adapters are here too**, as export subpaths rather than as four published
 packages: `@agent-tunnel/client/files-sdk`, `/mastra`, `/just-bash` and
 `/ai-sdk`. Each depends on its framework **by type only**, so this package still
 has zero runtime dependencies and `npm test` still runs with `node_modules`
-deleted. What remains of implementation gate 6 is the seventh component — the AI
-SDK live directory tools — and every one of these components against a real
-relay and a real device.
+deleted. The seventh component of implementation gate 6 — the AI SDK live
+directory tools, `createFilesystemTools` on the `/ai-sdk` subpath — is here too
+(task row M4-63).
 
-**What has never run against a relay or a device.** Every socket in this
+**All four adapters have now run against a real local relay and device** — once,
+locally, through `scripts/adapters-demo.sh` ([docs/demo/adapters.md](../../docs/demo/adapters.md),
+task row M4-64), which lends one shared client to `Files`, `Bash`, a Mastra
+`Agent` and the AI SDK `generateText` loop and checks every result against the
+exported host directory. That is a demo with a checker, not a harness gate: it
+is not in CI and holds no session across a rotation.
+
+**What the package's own tests do not prove.** Every socket in this
 package's tests is a loopback socket to a harness in `test/harness/`, which
 speaks the wire and is not the Rust provider. Nothing here is evidence of
 interoperability with `crates/tunnel-relay` or `crates/tunnel-fs-provider`, and
@@ -38,6 +45,8 @@ or a fake in-memory adapter is insufficient to claim remote compatibility".
 | `src/adapters/mastra.ts` | `TunnelMastraFilesystem`: `@mastra/core` 1.65.0's `WorkspaceFilesystem`, with both timestamp policies |
 | `src/adapters/just-bash.ts` | `TunnelJustBashFilesystem`: `just-bash` 3.4.2's `IFileSystem`, plus `drainOperationFailures()` |
 | `src/adapters/ai-sdk.ts` | `createFilesApi`: `@ai-sdk/provider` 4.0.11's `FilesV4`, managed references over one upload directory |
+| `src/adapters/ai-sdk-tools.ts` | `createFilesystemTools`: an `ai` 7.0.94 `ToolSet` — `list_directory`, bounded `read_file`, `stat`, and `write_file` only when the grant advertises it — with hand-written Standard Schema inputs, abort propagation and model-visible `outcome`/`retrySafe` (re-exported from `/ai-sdk`) |
+| `demo/` | `adapters-demo.ts`, the consumer of `scripts/adapters-demo.sh`, and `scripted-model.ts`, a deterministic `MockLanguageModelV4` for agent demos with no LLM |
 | `src/adapters/outcomes.ts`, `keys.ts` | What the adapters share: the outcome vocabulary, and object keys |
 
 The outcome classification is the obligation gate 5 named for this side: there
@@ -311,16 +320,32 @@ this client's own socket path would not be.
 * **A rotating device tunnel**, a cross-relay hop, a real grant, a real
   revocation, and every clock the contract names: this client enforces its own
   request deadline, and the device enforces none.
-* **The four native adapters against a relay or a device.** They compile against
-  their pinned published packages' own declarations and run against the real
-  `Files`, `Workspace`, `Bash` and `ai.uploadFile` — but over the same loopback
-  harness, so the same sentence applies: that says they satisfy their
-  frameworks, not that the endpoint behind them interoperates.
-* **The AI SDK live directory tools.** The seventh component does not exist, so
-  nothing is proven about tool schemas, abort propagation, bounded model-visible
-  output or a model-visible outcome field.
-* **One dataset through all four views at once.** Each adapter's suite drives its
-  own connection; no test has two adapters borrowing one client, so aggregate
-  budgets and the "close one while another has live fids" case are unexercised.
+* **The four native adapters against a relay or a device, in a test.** They
+  compile against their pinned published packages' own declarations and run
+  against the real `Files`, `Workspace`, `Agent`, `Bash`, `generateText` and
+  `ai.uploadFile` — but over the same loopback harness, so the same sentence
+  applies. The relay-and-device evidence is the demo above (M4-64), which is
+  run by hand; only the Mastra adapter is inside a harness gate
+  (`verify-m4-fs-client-e2e`, M4-15).
+* **The AI SDK live directory tools against a real model.** `createFilesystemTools`
+  is tested for its schemas, bounds, abort propagation and model-visible
+  outcomes, and driven by the real `generateText` with a scripted model; what a
+  real model does with a `retrySafe: false` result is untested.
+* **Aggregate budgets across borrowers.** The demo lends one client to all four
+  adapters in sequence; no test closes one borrower while another has live fids,
+  or drives two at once against the shared budget.
+
+## Package scripts
+
+| Script | What it does | Needs an install |
+| --- | --- | --- |
+| `npm test` | The offline suite | no |
+| `npm run lint` | The invariants above, mechanically: no `any`, no suppressed error, framework imports type-only (whole-file scan: multi-line imports, `export … from`, bare and dynamic imports, `require`), no `console` in `src/`, zero runtime dependencies, exact pins that the lockfile resolves | no |
+| `npm run lint:dist` | The type-only rule against the compiled `dist/`: any framework import left after `tsc` erased the types is a run-time load. Fails if `dist/` is missing | yes (after `build`) |
+| `npm run typecheck` | `tsc` over `src/`, `test/`, `demo/`, `fuzz/` and `scripts/` | yes |
+| `npm run build` | `tsconfig.build.json`: `src/` to `dist/` as JavaScript plus declarations, relative `.ts` imports rewritten | yes |
+| `npm run test:peers` | Each adapter handed to its real framework over the loopback harness | yes |
+| `npm run check` | lint, typecheck, build, lint:dist, test, test:peers | yes |
+| `npm run demo:adapters` | `scripts/adapters-demo.sh`: the four adapters through a local relay and device | yes, plus cargo, docker, openssl |
 
 All fixture values are synthetic, as `fixtures/README.md` records.

@@ -92,6 +92,20 @@ use tunnel_acp_fixture::{
 /// easier. It can only make a survival claim weaker, never stronger.
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// The bound on every step of a conversation with the child.
+///
+/// A step that can never complete must **fail**, not hang (task row M4-42).
+/// An unbounded `.await` on a reply that is never coming turns a defeated
+/// guard's red into a run that outlives the guard-deletion harness's timeout,
+/// which reports `NOT EVIDENCE (timed out)` and names no test at all.
+const STEP: Duration = Duration::from_secs(30);
+
+async fn within<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(STEP, future)
+        .await
+        .expect("step timed out")
+}
+
 // ------------------------------------------------------------------ helpers
 
 /// The fixture executable. `CARGO_BIN_EXE_*` is set for the integration tests
@@ -516,7 +530,7 @@ async fn the_group_kill_reaches_an_in_group_helper() {
     assert!(alive(&helper), "the helper runs before the kill");
 
     handle.kill();
-    handle.wait_exited().await;
+    within(handle.wait_exited()).await;
     let row = wait_not_alive(&helper).await;
     eprintln!(
         "MEASURED (M8-C07) in-group helper on the orderly path: pid {helper}, \
@@ -564,7 +578,7 @@ async fn an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it() {
     );
 
     handle.kill();
-    handle.wait_exited().await;
+    within(handle.wait_exited()).await;
     assert_eq!(
         counters.deadman_stood_down.load(Ordering::Relaxed),
         1,
@@ -628,9 +642,8 @@ async fn a_setsid_descendant_escapes_even_with_the_sentinel_armed() {
         },
     );
     let (supervisor, _events) = Supervisor::start(config).expect("spawn");
-    supervisor.initialize().await.expect("initialize");
-    let session = supervisor
-        .new_session("/workspace/demo")
+    within(supervisor.initialize()).await.expect("initialize");
+    let session = within(supervisor.new_session("/workspace/demo"))
         .await
         .expect("session");
     supervisor.subscriber_ready(&session).expect("subscriber");
@@ -639,7 +652,7 @@ async fn a_setsid_descendant_escapes_even_with_the_sentinel_armed() {
     let ticket = supervisor
         .prompt(&session, "detach:detached.pid")
         .expect("prompt");
-    ticket.stop_reason().await.expect("turn completed");
+    within(ticket.stop_reason()).await.expect("turn completed");
 
     let pid = read_pid(&pid_path).await;
     // Registered before any assertion, so nothing below can leak it.
@@ -647,7 +660,7 @@ async fn a_setsid_descendant_escapes_even_with_the_sentinel_armed() {
     assert!(!pid.is_empty(), "the agent started a descendant");
     let escaped = std::fs::read_to_string(marker_file(&pid_path)).unwrap_or_default();
 
-    supervisor.drain().await;
+    within(supervisor.drain()).await;
     let diagnostics = supervisor.diagnostics();
     // Give the group kill, and the sentinel, every chance to reach it.
     tokio::time::sleep(SETTLE).await;

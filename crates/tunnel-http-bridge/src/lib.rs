@@ -54,6 +54,9 @@ pub use stream::{
     Frame, FrameReceiver, FrameSender, QueueStats, ResetNotifier, ResetSignal, SendError,
     SignaledReset, channel, reset_signal_pair,
 };
+/// Re-exported so a stream owner outside the HTTP path (the filesystem
+/// export) can name the code of a RESET it raises.
+pub use tunnel_http_forward::HttpErrorCode;
 /// The codec's payload-free record-position tracker, re-exported for carrier
 /// endpoints that record transport diagnostics.
 pub use tunnel_http_forward::{RecordPosition, RecordTracker, TrackerSnapshot};

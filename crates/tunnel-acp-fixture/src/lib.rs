@@ -23,12 +23,12 @@
 //! | `permission:<n>` | the same, but `n` requests at once, so the pending-callback bound is reachable from one turn |
 //! | `oversized:<bytes>` | one stdout line of `<bytes>` filler with no newline in it |
 //! | `malformed` | one stdout line that is not JSON |
-//! | `batch` | one stdout line that is a JSON-RPC **array** (M8-C02) |
+//! | `batch` | one stdout line that is a JSON-RPC **array** (M8-C02); `batch:<ms>` waits that long first (M8-C34) |
 //! | `stderr-flood:<bytes>` | write `<bytes>` to stderr, then finish |
 //! | `detach:<file>` | start a descendant that calls `setsid` and survives its process group, then finish |
 //! | `exit:<code>` | finish the turn, then exit by itself — the one end of life that runs none of the supervisor's kill path |
 //! | `silent` | never answer the prompt |
-//! | `updates:<n>` | emit `n` `session/update` chunks as fast as it can, then finish — enough of them fills a stream's bounded queue, so an unread subscriber stalls output credit |
+//! | `updates:<n>` | emit `n` `session/update` chunks as fast as it can, then finish — enough of them fills a stream's bounded queue, so an unread subscriber stalls output credit; `updates:<n>:v2` ends with a result that has no `stopReason` (M8-C27's error path) |
 //! | `effect-crash:<name>` | append one line to the workspace's own side-effect ledger, flush it to disk, then **die without answering the prompt** |
 //! | `effect:<name>` | append one line to that same ledger, then finish `end_turn` — the non-crashing sibling, so a turn that must survive can still record a durable effect |
 //! | `effect-permission:<name>` | record one effect, then behave as `permission`: the turn stays open on a pending callback and the effect is already on disk |
@@ -321,6 +321,12 @@ async fn run_directive(
         "batch" => {
             // A JSON-RPC batch frame (M8-C02): the pinned SDK preserves these,
             // the pinned RFD revision answers 501, and this profile refuses.
+            // `batch:<ms>` waits that long first, so a test can reproduce a
+            // loaded host's slow refusal on demand (M8-C34) instead of waiting
+            // for one.
+            if let Some(delay) = argument.and_then(|value| value.parse::<u64>().ok()) {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             let _ = out
                 .send(
                     json!([
@@ -373,13 +379,28 @@ async fn run_directive(
         // that took its queue but never reads the body then stalls output
         // credit, which is the bound `docs/acp.md` puts at 30 seconds.
         "updates" => {
-            let count = argument
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(64);
+            // `updates:<n>:v2` ends the turn with a result that carries no
+            // `stopReason`, which the v1 profile refuses by its own rule: the
+            // export then answers the prompt with an error, and that error
+            // must still arrive behind the turn's updates (M8-C27).
+            let (count, v2) = match argument.as_deref().and_then(|value| value.split_once(':')) {
+                Some((count, "v2")) => (count.parse::<usize>().ok(), true),
+                _ => (
+                    argument.and_then(|value| value.parse::<usize>().ok()),
+                    false,
+                ),
+            };
+            let count = count.unwrap_or(64);
             for index in 0..count {
                 update(&out, &session, &format!("chunk-{index}")).await;
             }
-            finish(&out, &id, "end_turn").await;
+            if v2 {
+                let _ = out
+                    .send(json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string())
+                    .await;
+            } else {
+                finish(&out, &id, "end_turn").await;
+            }
         }
         // A synthetic side effect recorded on disk, then a crash before the
         // turn can be answered. The consumer is left with a dispatched request

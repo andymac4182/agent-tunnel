@@ -380,16 +380,17 @@ pub(crate) fn service_capabilities(
                 return Err(ProvisioningError::Records(
                     "an http-forward service requires service.http_forward_profile: \
                      mcp-2025-11-25 or mcp-2026-07-28 for an MCP server, acp-http-v1 for \
-                     an ACP agent; without it the relay answers every request 404"
+                     an ACP agent, computer-v1 for a CUA backend; without it the relay answers every request 404"
                         .into(),
                 ));
             };
             let pinned = tunnel_mcp::McpProfile::parse_id(profile).is_some()
-                || tunnel_acp::AcpProfile::parse_id(profile).is_some();
+                || tunnel_acp::AcpProfile::parse_id(profile).is_some()
+                || tunnel_cua::CuaProfile::parse_id(profile).is_some();
             if !pinned {
                 return Err(ProvisioningError::Records(format!(
                     "service.http_forward_profile {profile:?} is not a pinned profile; \
-                     the relay serves mcp-2025-11-25, mcp-2026-07-28 and acp-http-v1"
+                     the relay serves mcp-2025-11-25, mcp-2026-07-28, acp-http-v1 and computer-v1"
                 )));
             }
             if !served_profiles.iter().any(|served| served == profile) {
@@ -981,9 +982,14 @@ mod tests {
     /// Every pinned `http-forward` profile, as a relay configured to serve
     /// all of them lists it.
     fn served() -> Vec<String> {
-        ["mcp-2025-11-25", "mcp-2026-07-28", "acp-http-v1"]
-            .map(str::to_owned)
-            .to_vec()
+        [
+            "mcp-2025-11-25",
+            "mcp-2026-07-28",
+            "acp-http-v1",
+            "computer-v1",
+        ]
+        .map(str::to_owned)
+        .to_vec()
     }
 
     fn plan_with(
@@ -1040,6 +1046,13 @@ mod tests {
                 "[\"http:invoke\"]",
                 "http_forward_profile",
                 "acp-http-v1",
+            ),
+            (
+                "type = \"http-forward\"\noperations = [\"http:invoke\"]\n\
+                 http_forward_profile = \"computer-v1\"",
+                "[\"http:invoke\"]",
+                "http_forward_profile",
+                "computer-v1",
             ),
             (
                 "type = \"fs\"\noperations = [\"fs:connect\", \"fs:read\", \"fs:list\"]\n\

@@ -20,17 +20,20 @@ Redis client allowed 1 s for the whole connection including the lookup, so
 cold machine with a connection timeout (M6-C72, M6-C73; measured on Fly with a
 diagnostic build). Resolving the name first with `getent hosts` does not help:
 nothing caches the lookup across processes. Since M6-C73 each startup
-connection gets 10 s. **The relay now runs `main-77bfd28`**, built from
-`77bfd28` (M6-C91's entrypoint) with these deploy files. It replaced
-`main-af23c2f` in place on 2026-09-24, which had replaced `main-721ed2a`
-earlier that day, with no re-provisioning; M6-C65 continuity is on
-(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). In that image a lane reconnect inside a running relay still
-has only 2 s (M6-C74), which matters after a Redis restart (section 6.4); a
-build with M6-C74 gives it the full 10 s, outside the lane lock.
-**`main-77bfd28` refuses a relay configuration that names `metrics_bind`**
-(M6-C24, unknown field): do not add the key to `relay.toml` until the
-deployed image has M6-C24, and remove it before rolling back to
-`main-77bfd28` or any older image.
+connection gets 10 s. **The relay now runs `fly-upgrade-b59db9a`**
+(2026-09-26, section 6.3, "Upgrade to `6830ba7` and HTTP forwarding"). Its
+`tunnel-relay` binary is built from `main` at `6830ba7`, the commit of
+pre-release `v0.1.0-main.36139324781.6830ba79bdf6`, and its only difference
+from `main-6830ba7` is the `[http_forward]` table in
+`deploy/fly/relay/relay.toml`. It has M6-C53 (`403` for a missing scope),
+M3-15 (the rotation-freeze hold), M6-C67 (`/readyz` follows Redis) and M6-C74
+(a lane reconnect gets the full 10 s outside the lane lock). It replaced
+`main-77bfd28` in place, which had replaced `main-af23c2f` on 2026-09-24,
+with no re-provisioning; M6-C65 continuity is on (section 6.6 for the day-2
+proof). **Do not add `metrics_bind` to the Fly `relay.toml`.** The deployed
+image accepts it (M6-C24), but `main-77bfd28`, a rollback target, refuses it
+as an unknown field; remove it before rolling back to `main-77bfd28` or any
+older image.
 
 Every `fly` command below is one the owner runs, in
 order, and each one that costs money is marked **Costs money**. The prices are
@@ -99,14 +102,15 @@ The decisions, and what each rests on:
   the private network (`tls_skip_verify`, because the relay's certificate names
   its public host). The device service has a bare TCP check; the local proof
   measured that a bare connect adds no relay log line. **Images built before
-  M6-C67's fix, including the one deployed when this was written, answer
+  M6-C67's fix, including `main-77bfd28`, answer
   `200` on `/readyz` while Redis is down or has restarted**, and every request
   then fails `503` (measured). From that fix on, a non-cluster relay answers
   `503` while its Redis authority is unavailable or refused
   ([operator.md section 3.2](operator.md#32-health-endpoints-and-load-balancers)),
   so this check then fails and Fly Proxy stops routing consumer traffic to
-  it until Redis serves again. That is measured locally only; it has not been
-  deployed or measured on Fly.
+  it until Redis serves again. The fix is deployed on Fly since 2026-09-26
+  (`fly-upgrade-b59db9a`), where `/readyz` answered `200` with Redis up; the
+  `503` with Redis down is measured locally only, not on Fly.
 - **Stopping.** `kill_signal = "SIGTERM"`, `kill_timeout = 60`. Fly's default
   signal is SIGINT and its default timeout 5 s, at most 300 s
   (<https://fly.io/docs/reference/configuration/>). `serve` handles both
@@ -397,23 +401,34 @@ fly deploy . --config deploy/fly/relay/fly.toml \
   --build-only --push --image-label fly-1
 ```
 
-Build from a checkout of `main` at or after `77bfd28`. The live relay's image
-was built that way from `77bfd28`, labelled `main-77bfd28`
-(`registry.fly.io/agentuplink-relay:main-77bfd28@sha256:1ddaa3f9d12779c994d44406a095e05f304448a97fdee9bdbe442a1d98e09ba1`;
-the digest was read with `fly image show -a agentuplink-relay` on 2026-09-25,
-M6-C103). The previous image, and the rollback target, is `main-af23c2f`
+Build from a checkout of `main` at or after `6830ba7`, and prefer a commit
+that has a pre-release, so devices can run the relay's exact version. The
+live relay's image, `fly-upgrade-b59db9a`
+(`registry.fly.io/agentuplink-relay:fly-upgrade-b59db9a@sha256:96e3d9ab6cd058121438f870f5308a7bd8fdbedfee4cee80eb0fb7f9be87e39a`),
+was built on 2026-09-26 from branch `fly-upgrade-2026-09-25` at `b59db9a`,
+which is `main` at `6830ba7` plus the `[http_forward]` table. The same tree
+without that table is `main-6830ba7`
+(`@sha256:1e358240b0c40d3a6ce8ca57f3f899f816054f5f7a80e08603d2e8f956ed6332`),
+the first rollback target: it serves the echo but answers `404` on the HTTP
+forwarding route. Images built from `cb94dc3` had the same two digests; the
+commits between it and `6830ba7` change only `site/`. The image before
+those, `main-77bfd28`
+(`@sha256:1ddaa3f9d12779c994d44406a095e05f304448a97fdee9bdbe442a1d98e09ba1`),
+is the second rollback target; it predates M6-C53, M3-15, M6-C67 and M6-C74.
+The image before it is `main-af23c2f`
 (`@sha256:e6ac84d4bb660f3eec52eeb0730a264f1635a6369545133bee97c9dc1e76723c`,
 32 MB). It has M6-C65 but not M6-C91, so after a rollback the catalog
 commands of section 6.6 are refused. The image before it, `main-721ed2a`
 (`@sha256:decd4e56b8fc8d1fe190428fa2d3ce8f410bd0299cc652fe2921d4fba29d18b7`),
 has no M6-C65 either (section 6.4).
 
-**No release exists for `77bfd28`.** The published pre-releases are built from
-other commits, so a device cannot run exactly the relay's version. The
+**Devices should run `v0.1.0-main.36139324781.6830ba79bdf6`.** Its
+`tunnel-client` is built from the same commit as the relay's binary, so
+device and relay run the same version (demo-smoke defect D12, M6-C103). The
+relay it replaced, `main-77bfd28`, had no release of its own; the
 2026-09-25 smoke check ran clients from the `5c2d907` and `f9f7abf`
-pre-releases against `main-77bfd28` (echo, rotation, reconnect and an orderly
-stop all passed; M6-C103). Tell testers which release to install, and prefer
-deploying an image built from a commit that has a pre-release.
+pre-releases against it (echo, rotation, reconnect and an orderly stop all
+passed). Tell testers which release to install.
 
 ### 6.2 Activate and provision (before any relay serves)
 
@@ -708,6 +723,119 @@ the `721ed2a` relay also worked. On Fly:
   cannot run through `fly machine run`. An image built from a commit with
   M6-C91 accepts them in a one-off machine (section 6.6).
 
+**Upgrade to `6830ba7` and HTTP forwarding (2026-09-26, measured).** Times
+are `+10:00`. Both steps updated the one relay machine, `185e264a927d58`,
+in place (it was running), and the device reconnected by itself each time.
+- Before anything changed: the credentials directory was copied to a dated
+  backup (`cp -Rp`, mode `700`); a read-only `GET` on the Redis machine showed
+  the namespace's provisioning reservation
+  `tunnel-catalog:agentuplink-fly-1:meta:fixture_seeded` is `1`, so the new
+  image's M6-C34 fence (`class=unprovisioned`) does not refuse the namespace,
+  and `appendfsync` is `always`.
+- Images: section 6.1 with `--image-label main-6830ba7` from `main`, and with
+  `--image-label fly-upgrade-b59db9a` from branch `fly-upgrade-2026-09-25`
+  (the `[http_forward]` commit). Digests are in section 6.1.
+- **Step 1, the image (00:41:01 to 00:41:14).** A one-off `check-serve-config`
+  of `main-6830ba7` logged `Relay serving configuration is valid` and exited
+  `0`. `fly deploy . --config deploy/fly/relay/fly.toml --image
+  registry.fly.io/agentuplink-relay:main-6830ba7 --ha=false` logged `stopping`
+  and `stopped: signal=SIGTERM`, then `listening` and `Redis restart
+  continuity: interval_seconds=5`; both checks passed and `/readyz` answered
+  `200`. With `tunnel-client` from `v0.1.0-main.36139324781.6830ba79bdf6`:
+  `ready` and `active`, then 150 of 150 echoes `200` with the canary; a token
+  without `echo:invoke` got `403 FORBIDDEN` "the consumer access token does not
+  grant this route's scope" (M6-C53; `main-77bfd28` answered `401`), and no
+  token got `401`.
+- **Step 2, `[http_forward]` (00:44:11 to 00:44:21).** A one-off
+  `check-serve-config` of `fly-upgrade-b59db9a` exited `0`; the same deploy
+  with that label; `listening`, continuity, checks passing, `/readyz` `200`;
+  the device went `reconnecting`, `reconnected`, `ready`, `active`.
+- **Step 3, the catalog.** With section 6.6's helper and that image, from
+  `~/agentuplink-fly/http-demo/`: `add-service --dry-run` and `set-grant
+  --dry-run` (`Catalog change is valid ... This dry run contacted no Redis
+  authority and wrote nothing.`), then `add-service` (`Added to namespace
+  agentuplink-fly-1: ... service=8f6efd3e-9b7c-4bcd-bba8-4727943bbbd3
+  service_type=http-forward http_forward_profile=mcp-2026-07-28
+  operations=http:invoke.`) and `set-grant` (`Added grant ...
+  grant_operations=http:invoke revision=1.`), each `exit_code=0`, each machine
+  destroyed; `fly machine list` then showed only the relay. The records:
+
+  ```text
+  [service]
+  tenant = "<tenant>"
+  device = "<device>"
+  id = "<new service UUID>"
+  type = "http-forward"
+  display_name = "Demo synthetic page (MCP 2026-07-28)"
+  operations = ["http:invoke"]
+  http_forward_profile = "mcp-2026-07-28"
+  ```
+
+  and a `[grant]` for the existing user on that service with `operations =
+  ["http:invoke"]`.
+- **Step 4, the device.** A synthetic MCP server on the Mac's loopback
+  (`127.0.0.1:8931/mcp`, Streamable HTTP, protocol `2026-07-28`, stateless;
+  it serves one fixed synthetic page as the `demo_page` tool and the
+  `demo://page` resource) and this export appended to the device profile,
+  then `config check` and a restarted `connect`:
+
+  ```toml
+  [exports."<new service UUID>"]
+  type = "http-forward"
+
+  [exports."<new service UUID>".mcp]
+  profile = "mcp-2026-07-28"
+
+  [exports."<new service UUID>".mcp.backend]
+  kind = "streamable-http"
+  url = "http://127.0.0.1:8931/mcp"
+  ```
+
+- **Verification.** `POST .../services/<new service UUID>/http/mcp` with a
+  token whose `scope` is `http:invoke` and the 2026 headers
+  (`content-type: application/json`, `accept: application/json,
+  text/event-stream`, `mcp-protocol-version: 2026-07-28`, `mcp-method:
+  tools/call`, `mcp-name: demo_page`, and the protocol version in
+  `params._meta`) returned `200` with the page; 10 of 10 such calls, plus
+  `tools/list`, `server/discover` and `resources/read`, all `200`. A token
+  with only `echo:invoke` got `403 FORBIDDEN` there too, and no token `401`.
+  150 of 150 echoes `200` on the same session. **A GET cannot fetch the
+  page**: the relay serves only the MCP and ACP profiles, and under
+  `mcp-2026-07-28` a `GET /mcp` is answered `405` by the device.
+- **SIGTERM restart (01:07:46).** `fly machine restart 185e264a927d58 -a
+  agentuplink-relay --signal SIGTERM` logged `stopping` and `stopped:
+  signal=SIGTERM` at 01:07:47 and `listening` at 01:07:49. The device logged
+  `disconnected TRANSPORT_ERROR` and three backoffs (674, 1,253 and 2,804 ms),
+  then `reconnected`, `ready` and `active` without being restarted; the
+  first echo returned `200` 3 s after the restart command returned, and the
+  next HTTP forward call `200` with the page.
+- **Five-minute run across a rotation (02:48:30 to 02:54:00), 0 non-200.**
+  With the Mac's 1-minute load at 21 (15 at the end; the run waited for it to
+  fall below 30, because a CPU-starved local client can time out on its own), a
+  sequential loop alternated an echo and a `tools/call demo_page` about every
+  0.46 s for 330 s: **713 of 713 returned `200`** with the expected body (357
+  echoes with the canary, 356 HTTP forward calls with the page), slowest
+  0.58 s. The relay logged a scheduled rotation (`reason=policy_timer`,
+  `rotation_prepare`, generation 22) at 02:53:14.013 and `data_attached` at
+  02:53:14.115; the echo sent in that window took 0.58 s instead of about
+  0.15 s and returned `200`, the M3-15 hold at work. Before M3-15 the same
+  rotation cost the 2026-09-25 smoke check 3 `503 RESOURCE_EXHAUSTED` echoes
+  (M6-C103 D10), and the dogfood soak `503 PEER_UNAVAILABLE` MCP requests
+  (M6-C64). The device session had completed 28 rotations by 03:32 with no
+  reconnect.
+- **flyctl reports a fast one-off command as a failure.** `fly machine run
+  ... --detach` for `check-serve-config` and for the dry runs printed `Error:
+  machine failed to reach desired start state, and restart policy was set to
+  no restart`, because the command had already exited `0` before flyctl saw
+  the machine start. The log and `exit_code=0` are the outcome; section 6.6's
+  helper now reads them on that path before destroying the machine.
+- **Rollback**, not needed: `fly deploy ... --image
+  registry.fly.io/agentuplink-relay:main-6830ba7 --ha=false` removes HTTP
+  forwarding (the route answers `404`); `main-77bfd28` goes back to the old
+  relay. Deploy either onto a **running** relay (M6-C104). No catalog command
+  removes a service: to withdraw the demo service, `revoke-grant` it (section
+  6.6, "Revocation").
+
 **Restarting the relay.** Use `--signal SIGTERM`, which is the signal Fly
 sends on a deploy or a stop (`kill_signal` in `fly.toml`):
 
@@ -806,8 +934,9 @@ full 10 s connection budget, DNS lookup of `agentuplink-redis.internal`
 included, and runs outside the lane lock, so other callers on that lane
 fail closed after their own 2 s instead of queueing behind it; a reconnect
 that still fails is retried on the next token, every 5 s. The deployed
-`main-77bfd28` predates M6-C74 and gives the whole reconnect only 2 s, so a
-lookup slower than that fails the attempt there. While Redis is down or refused every consumer call gets `503`
+image has M6-C74 (since 2026-09-26); `main-77bfd28`, a rollback target,
+predates it and gives the whole reconnect only 2 s, so a lookup slower than
+that fails the attempt there. While Redis is down or refused every consumer call gets `503`
 `AUTHORIZATION_UNAVAILABLE`; `/readyz` answers `503` with M6-C67's fix and
 still answers ready on an image built before it.
 
@@ -1055,8 +1184,9 @@ rewrite the secrets directory the running relay reads.
 `redis_namespace` and `deployment_incarnation` baked into it are what the
 command writes to; a command run with another image's values is refused
 (`the relay configuration's incarnation is not active`) or goes to another
-namespace. The relay now serves `main-77bfd28`, which has M6-C91; use that
-label here. An image built before M6-C91, such as `main-af23c2f`, refuses these
+namespace. The relay now serves `fly-upgrade-b59db9a`, which has M6-C91
+and the `[http_forward]` profiles an `http-forward` service's dry run checks
+against; use that label here. An image built before M6-C91, such as `main-af23c2f`, refuses these
 commands. The catalog code did not change
 between `af23c2f` and M6-C91; only the entrypoint did.
 
@@ -1094,6 +1224,12 @@ oneoff() {
     echo "STOP: $name did not start"
     ID=$(machine_id "$name")
     if [ -n "$ID" ]; then
+      # A command that exits within flyctl's start wait (check-serve-config,
+      # a dry run) is reported as "failed to reach desired start state";
+      # its log still holds the command's own outcome.
+      fly machine wait "$ID" -a agentuplink-relay --state stopped || true
+      fly logs -a agentuplink-relay --machine "$ID" --no-tail
+      fly machine status "$ID" -a agentuplink-relay
       fly machine stop "$ID" -a agentuplink-relay
       fly machine destroy "$ID" -a agentuplink-relay
     fi

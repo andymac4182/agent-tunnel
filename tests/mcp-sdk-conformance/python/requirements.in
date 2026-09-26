@@ -1,0 +1,4 @@
+# The official MCP Python SDK, pinned for the M3-17 relay interop harness.
+# Regenerate requirements.txt with:
+#   uv pip compile --universal --python-version 3.10 --generate-hashes requirements.in -o requirements.txt
+mcp==2.2.0

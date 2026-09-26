@@ -85,7 +85,13 @@ export interface Limits {
   maxMessageBytes: number;
   maxInflightRequests: number;
   maxFids: number;
-  maxQueuedBytes: number;
+  /**
+   * Advertised by every current provider but **not enforced** by it (task row
+   * M4-21). Accepted when absent, so a later provider can stop advertising it
+   * once no client older than this one (the v0.1.0 tester release requires
+   * it) needs to be served; validated when present.
+   */
+  maxQueuedBytes?: number;
   maxBufferedFileBytes: number;
   maxTotalBufferedBytes: number;
   maxPathBytes: number;
@@ -97,6 +103,13 @@ export interface Limits {
   maxOperationTimeoutSeconds: number;
   sessionIdleSeconds: number;
 }
+
+/**
+ * Limits a descriptor may omit (task row M4-21). Every other one is required.
+ * Providers still send `maxQueuedBytes`; accepting its absence is what lets
+ * one stop, once older clients are no longer served.
+ */
+const OPTIONAL_LIMITS: ReadonlySet<string> = new Set(['maxQueuedBytes']);
 
 /** The ceilings of the initial profile. Negotiation may only reduce them. */
 export const LIMIT_CEILINGS: Limits = {
@@ -272,6 +285,9 @@ export function validateDescriptor(value: unknown): Descriptor {
   refuseExtraKeys(limits, Object.keys(LIMIT_CEILINGS), 'limits');
   for (const [name, ceiling] of Object.entries(LIMIT_CEILINGS)) {
     const limit = limits[name];
+    if (limit === undefined && OPTIONAL_LIMITS.has(name)) {
+      continue;
+    }
     if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {
       // Neither zero nor a fraction, so there is no "0 means unlimited"
       // reading to be had on this side either.
@@ -287,7 +303,7 @@ export function validateDescriptor(value: unknown): Descriptor {
   }
   // The cross-field rules gate 1 enforces, checked here for the same reason:
   // a descriptor whose limits contradict one another cannot be honoured.
-  if (typed.limits.maxQueuedBytes < typed.limits.maxMessageBytes) {
+  if (typed.limits.maxQueuedBytes !== undefined && typed.limits.maxQueuedBytes < typed.limits.maxMessageBytes) {
     malformed('limits.maxQueuedBytes');
   }
   if (typed.limits.maxBufferedFileBytes > typed.limits.maxTotalBufferedBytes) {

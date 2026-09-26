@@ -311,6 +311,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
     match args.as_slice() {
         [] => print_help(),
         [flag] if flag == OsStr::new("--help") || flag == OsStr::new("-h") => print_help(),
+        // `--help`/`-h` after a known subcommand prints the help and exits
+        // 0 rather than falling through to the usage error (demo-readiness
+        // defect D6, found on `tunnel-client connect --help`).
+        [command, rest @ ..]
+            if RELAY_SUBCOMMANDS
+                .iter()
+                .any(|name| command == OsStr::new(name))
+                && rest
+                    .iter()
+                    .any(|arg| arg == OsStr::new("--help") || arg == OsStr::new("-h")) =>
+        {
+            print_help()
+        }
         [command] if command == OsStr::new("check-config") => {
             RelayConfig::default().validate()?;
             println!("Default relay configuration is valid.");
@@ -1682,6 +1695,27 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
     }
     Ok(approved)
 }
+
+/// Every subcommand `run` dispatches, for the subcommand `--help` arm.
+const RELAY_SUBCOMMANDS: [&str; 17] = [
+    "check-config",
+    "check-serve-config",
+    "serve",
+    "initialize",
+    "activate-first-incarnation",
+    "rebind-redis-run",
+    "provision-catalog",
+    "add-user",
+    "add-device",
+    "add-service",
+    "set-grant",
+    "revoke-grant",
+    "revoke-device",
+    "revoke-credential",
+    "recovery-initialize",
+    "recovery-observe",
+    "recover",
+];
 
 fn print_help() {
     println!(

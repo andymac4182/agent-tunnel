@@ -411,3 +411,18 @@ function opaqueId(): string {
   globalThis.crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
+
+// The live directory tools live beside `FilesV4` on the same subpath: one is a
+// file-object API and the other a directory view, and a consumer of either
+// reaches both through `@agent-tunnel/client/ai-sdk`.
+export {
+  createFilesystemTools,
+  DEFAULT_MAX_ENTRIES,
+  DEFAULT_MAX_READ_BYTES,
+  DEFAULT_MAX_WRITE_BYTES,
+  TOOL_NAMES,
+  type FilesystemToolName,
+  type FilesystemTools,
+  type FilesystemToolsOptions,
+  type ToolFailure,
+} from './ai-sdk-tools.ts';

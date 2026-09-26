@@ -54,9 +54,31 @@ the releases page, `https://github.com/andymac4182/agentuplink/releases`, or
 through the [downloads page](https://agentuplink.dev/docs/downloads).
 
 **The checksum proves the download is intact, not who built it.** The
-`.sha256` file comes from the same release page as the archive. No release is
-signed and no build attestation is published, so there is no authenticity
-check beyond trusting that GitHub release (M6-C103).
+`.sha256` file comes from the same release page as the archive, so anyone who
+could replace one could replace both.
+
+**The build attestation says where it was built.** Releases built after the
+release-hardening change (M6-C114) carry a GitHub build-provenance attestation
+for every archive and every `.sha256` file. Check the archive with the GitHub
+CLI, using exactly this command; each flag narrows what passes:
+
+```text
+gh attestation verify agentuplink-*.tar.gz -R andymac4182/agentuplink --signer-workflow andymac4182/agentuplink/.github/workflows/release.yml --source-ref refs/heads/main
+```
+
+A pass means GitHub's Sigstore-backed signing service recorded that a file with
+exactly this SHA-256 was produced by a run of the release workflow
+(`release.yml`) in `andymac4182/agentuplink`, running on `main`. The commit the
+output names is **main's tip when the release ran**. This can be later than the
+commit the archive was built from, because the release starts after CI finishes
+on main. The source identity is `sourceSha` in the archive's `release.json`,
+not the attested commit.
+
+It does **not** mean the source was reviewed or is safe. It is not code signing:
+macOS and Windows still treat the binaries as unsigned. Anyone with write access
+to the repository's workflows can produce an attestation. Older releases have no
+attestation, and the command fails with `HTTP 404` for them; for those, the
+checksum is the only check.
 
 The archive has **no top-level folder**; it unpacks `LICENSE`, `README.txt`,
 `bin/`, `examples/`, `notices/` and `release.json` into the current directory
@@ -70,8 +92,10 @@ cat release.json
 
 `release.json` names the `version`, the `sourceSha` it was built from, the CI
 run and the `target`. `notices/` holds the third-party licence texts.
-`examples/` holds only `m1-client.toml` and `m1-relay.toml`; every other
-example the documentation mentions is in the repository at `sourceSha`:
+Archives built after M6-C102 carry every example the shipped documents name
+(the Windows archive carries the client profile only). Older archives hold only
+`m1-client.toml` and `m1-relay.toml`; for those, every other example is in the
+repository at `sourceSha`:
 `https://github.com/andymac4182/agentuplink/tree/<sourceSha>/examples`.
 Newer archives' `README.txt` says to start with `docs/operator.md`. That guide
 is for running a relay; as a tester joining one, ignore that pointer and follow
@@ -99,9 +123,10 @@ tunnel-client --version
 This prints `tunnel-client 0.1.0`. The heading of `tunnel-client --help` in
 releases up to `f9f7abf` still reads "Agent Tunnel M1 connector" and calls
 rotation and resume future work; that text is stale, and the client rotates its
-data socket and reconnects by itself. A subcommand does not take `--help`
-(`tunnel-client connect --help` prints the usage and exits `2`); use
-`tunnel-client --help`.
+data socket and reconnects by itself. In releases built after the D6 fix,
+`--help` after any subcommand (for example `tunnel-client connect --help`)
+prints the usage and exits `0`; older releases print it and exit `2`, so use
+`tunnel-client --help` there.
 
 ## 2. Write the device profile
 
