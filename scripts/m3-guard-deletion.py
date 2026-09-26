@@ -1548,6 +1548,29 @@ M7_CONNECTOR_RELAY_CASES.append(
 )
 M7_CONNECTOR_CLIENT_CASES: list[Case] = [
     Case(
+        # M6-C158: a carrier close ends once its writer has exited.
+        "a carrier close does not wait for a reply from a writer that has exited",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "                    _ = writer => {\n"
+                "                        writer_finished = true;\n"
+                "                        false\n"
+                "                    }\n",
+                "                    _ = std::future::pending::<()>() => {\n"
+                "                        let _ = writer;\n"
+                "                        false\n"
+                "                    }\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "closing_a_carrier_whose_writer_already_exited_does_not_wait_for_a_reply",
+            }
+        ),
+    ),
+    Case(
         # M6-C148: stopped control reads pause the M7-C95 give-up clock.
         "the retention give-up clock is paused while control reads are stopped",
         [
