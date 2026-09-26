@@ -1747,3 +1747,31 @@ async fn shutdown_drain_flushes_a_racing_stream_fin_before_the_device_close() {
         "the racing close is answered by the shutdown drain"
     );
 }
+
+/// Task rows M6-C182 / M6-C183: every device and tenant share one relay
+/// actor, so its load must be observable without a payload.  Each handled
+/// command is counted and its handling time accumulated; reading the
+/// counters does not go through the actor.
+#[tokio::test]
+async fn m6c183_actor_load_counts_every_handled_command() {
+    let handle = test_handle();
+    let before = handle.actor_load();
+    assert_eq!(before.queue_depth, 0);
+    assert!(before.queue_capacity >= 32, "{before:?}");
+    for _ in 0..3 {
+        handle.snapshot().await.expect("snapshot");
+    }
+    let after = handle.actor_load();
+    // Three snapshots, plus any maintenance ticks handled meanwhile.
+    assert!(
+        after.commands >= before.commands + 3,
+        "commands {before:?} -> {after:?}"
+    );
+    // Handling a command takes a nonzero wall time, so the timed total
+    // must strictly increase (nanosecond resolution).
+    assert!(
+        after.busy_nanos > before.busy_nanos,
+        "busy time {before:?} -> {after:?}"
+    );
+    handle.shutdown().await.expect("shutdown");
+}

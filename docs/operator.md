@@ -1443,7 +1443,14 @@ device's owner, refused `ROTATION_FREEZE` on the `echo`, `stream`,
 `http-forward` or `fs` route, counted without a log line; a freeze refusal for
 a request that reached the owner through a peer hop is a peer fault with cause
 `rotation_freeze` instead), `peer_faults_total{stage}` and
-`peer_fault_causes_total{cause}`. The owner's admission hold across a
+`peer_fault_causes_total{cause}`. The single relay actor, which every device
+and tenant on the relay shares, has `actor_commands_total`,
+`actor_busy_microseconds_total` (wall time spent handling commands; its rate
+over an interval is a **lower bound** on the actor's busy fraction, because
+only the command branch is timed, not terminal-cleanup drains, held-OPEN
+deadline service or owner-backlog offers; a value near 1 means the actor is
+the relay's bottleneck, a low value does not fully rule it out), and the gauges `actor_queue_depth` and
+`actor_queue_capacity` (task rows M6-C182, M6-C183). The owner's admission hold across a
 data-rotation freeze (M3-15; [protocol.md](protocol.md), "Quiesce
 admission") has its own series: `rotation_freeze_hold_held_total` (new OPENs
 held), the gauge `rotation_freeze_hold_current`,

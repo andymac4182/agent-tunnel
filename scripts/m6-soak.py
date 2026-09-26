@@ -305,11 +305,14 @@ class Stack:
             "kty": "RSA", "kid": "m6-03-soak", "alg": "RS256", "use": "sig",
             "n": b64url(bytes.fromhex(modulus)), "e": "AQAB"}]}))
 
-    def token(self, subject: str, scope: str) -> str:
-        """A 300-second access token, re-signed when less than 60 s remain."""
+    def token(self, subject: str, scope: str, min_remaining: float = 60) -> str:
+        """A 300-second access token, re-signed when `min_remaining` seconds
+        or fewer remain."""
+        if min_remaining > 240:
+            raise ValueError("a 300 s token cannot cover more than 240 s with margin")
         with self.token_lock:
             cached = self.tokens.get((subject, scope))
-            if cached and cached[0] - time.time() > 60:
+            if cached and cached[0] - time.time() > min_remaining:
                 return cached[1]
             now = int(time.time())
             header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "m6-03-soak"}).encode())
@@ -637,7 +640,8 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_streams", "tunnel_relay_sessions_rotating",
                  "tunnel_relay_queue_bytes", "tunnel_relay_replay_bytes",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
-                 "tunnel_relay_ready")
+                 "tunnel_relay_ready", "tunnel_relay_actor_commands_total",
+                 "tunnel_relay_actor_busy_microseconds_total", "tunnel_relay_actor_queue_depth")
 
 
 def scrape_metrics(port: int) -> dict[str, float]:
@@ -924,6 +928,11 @@ class Worker:
         self.mcp_pool = mcp_pool if mcp_pool is not None else McpSessionPool(1)
         self.mcp_slot = mcp_slot % len(self.mcp_pool.sessions)
         self.mcp_calls_ok = 0
+        # M6-C182: with `honor_retry_after`, a closed-loop worker refused
+        # `CONNECTION_LIMIT` waits the refusal's `retry_after_ms` before its
+        # next request instead of reconnecting at once.
+        self.honor_retry_after = False
+        self.retry_after_s = 0.0
 
     def path(self) -> str:
         dev = self.stack.devices[self.device]
@@ -963,6 +972,11 @@ class Worker:
             await self.conn.close()
             status, code, execution, ok = 0, f"CONN_{type(error).__name__}", "", False
         latency = (time.perf_counter() - start) * 1000
+        if code == "CONNECTION_LIMIT":
+            try:
+                self.retry_after_s = float(json.loads(body).get("retry_after_ms", 1000)) / 1000
+            except (ValueError, AttributeError):
+                self.retry_after_s = 1.0
         # An unclassified refusal keeps a short printable prefix of its body
         # (a relay or fixture error text, never a request payload).
         detail = ""
@@ -1072,6 +1086,9 @@ class Worker:
     async def loop_closed(self, until: float) -> None:
         while time.time() < until:
             await self.once()
+            if self.honor_retry_after and self.retry_after_s:
+                await asyncio.sleep(min(self.retry_after_s, max(0.0, until - time.time())))
+            self.retry_after_s = 0.0
 
     async def shutdown(self) -> None:
         if self.owns_pool:
@@ -1079,6 +1096,226 @@ class Worker:
             if self.kind == "mcp":
                 report_mcp_pool(self.stack, self.mcp_pool, self.worker_id)
         await self.conn.close()
+
+
+# ------------------------------------ generator attribution (M6-C182, M6-C183)
+#
+# Every in-process worker shares this driver's single asyncio event loop (and
+# its one Python thread).  A request's latency is measured on that loop, so it
+# includes the time the loop spends running every other worker's callbacks.
+# The helpers below separate the generator from the relay: `LoopLag` measures
+# the driver loop's own scheduling delay, `cpu_seconds` accounts each process's
+# CPU, and `start_clients` runs workers in separate `client` subprocesses, each
+# with its own loop, so the same request code is timed off the flooding loop.
+
+def cpu_seconds(pid: int) -> float | None:
+    """Cumulative user + system CPU seconds of one process (no payload)."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():  # Linux: tick resolution
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+        except (OSError, IndexError, ValueError):
+            return None
+    out = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True)
+    text = out.stdout.strip()
+    if not text:
+        return None
+    days, _, clock = text.rpartition("-")
+    total = 0.0
+    for part in clock.split(":"):
+        total = total * 60 + float(part)
+    return total + (int(days) * 86400 if days else 0)
+
+
+def cpu_snapshot(stack: Stack) -> tuple[float, dict[str, float]]:
+    procs = [("relay", stack.relay), ("forwarder", stack.forwarder)]
+    procs += [(f"device-{n}", d.get("proc")) for n, d in stack.devices.items()]
+    out: dict[str, float] = {}
+    for name, proc in procs:
+        if proc is not None and proc.poll() is None:
+            value = cpu_seconds(proc.pid)
+            if value is not None:
+                out[name] = value
+    own = os.times()
+    out["driver"] = own.user + own.system
+    out.update(redis_counters(stack.redis))
+    metrics = scrape_metrics(stack.metrics_port) if hasattr(stack, "metrics_port") else {}
+    if "tunnel_relay_actor_busy_microseconds_total" in metrics:
+        out["relay_actor"] = metrics["tunnel_relay_actor_busy_microseconds_total"] / 1e6
+        out["relay_actor_commands"] = metrics.get("tunnel_relay_actor_commands_total", 0.0)
+    return time.perf_counter(), out
+
+
+def redis_counters(redis: tuple[str, int]) -> dict[str, float]:
+    """The Redis server's CPU seconds and script/command totals (INFO; no
+    keys or values).  On a shared Redis these include other clients' work."""
+    try:
+        text = resp(redis[0], redis[1], ["INFO", "all"]).decode(errors="replace")
+    except OSError:
+        return {}
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        name, _, value = line.partition(":")
+        if name in ("used_cpu_sys", "used_cpu_user"):
+            out["redis"] = out.get("redis", 0.0) + float(value)
+        elif name == "total_commands_processed":
+            out["redis_commands"] = float(value)
+        elif name.startswith("cmdstat_eval"):
+            fields = dict(item.split("=", 1) for item in value.split(",") if "=" in item)
+            out["redis_script_calls"] = out.get("redis_script_calls", 0.0) + float(fields.get("calls", 0))
+            out["redis_script_usec"] = out.get("redis_script_usec", 0.0) + float(fields.get("usec", 0))
+    return out
+
+
+def cpu_percent(before: tuple[float, dict[str, float]],
+                after: tuple[float, dict[str, float]]) -> dict[str, float]:
+    """CPU use per process over an interval, in percent of one CPU (for
+    `relay_actor`, the single relay actor's busy wall time in percent); Redis
+    and relay actor command counts as rates per second, and script time per
+    call."""
+    span = after[0] - before[0]
+    if span <= 0:
+        return {}
+    delta = {name: after[1][name] - before[1][name] for name in after[1] if name in before[1]}
+    out = {}
+    for name, value in delta.items():
+        if name in ("redis_commands", "redis_script_calls", "relay_actor_commands"):
+            out[f"{name}_per_s"] = round(value / span, 1)
+        elif name != "redis_script_usec":
+            out[name] = round(value / span * 100, 1)
+    if delta.get("redis_script_calls"):
+        out["redis_script_usec_per_call"] = round(delta.get("redis_script_usec", 0.0)
+                                                  / delta["redis_script_calls"], 1)
+    return out
+
+
+class LoopLag:
+    """How late a 10 ms sleep wakes on this process's event loop.  With a
+    saturated loop, every request timed on it is delayed by about this much."""
+
+    def __init__(self, interval: float = 0.01):
+        self.interval = interval
+        self.samples: list[float] = []
+
+    async def run(self, until: float) -> None:
+        while time.time() < until:
+            start = time.perf_counter()
+            await asyncio.sleep(self.interval)
+            self.samples.append((time.perf_counter() - start - self.interval) * 1000)
+
+    def summary(self) -> dict:
+        def pct(value: float) -> float | None:
+            found = percentile(self.samples, value)
+            return None if found is None else round(found, 2)
+        return {"samples": len(self.samples), "p50": pct(50), "p99": pct(99),
+                "max": round(max(self.samples), 2) if self.samples else None}
+
+
+class _ClientStack:
+    """The subset of `Stack` a `Worker` uses, for a `client` subprocess."""
+
+    def __init__(self, cfg: dict):
+        self.consumer_port = cfg["port"]
+        self.work = Path(cfg["work"])
+        self.users = {"u": {"subject": cfg["subject"]}}
+        self.devices = {"d": {"id": cfg["device_id"], "echo": cfg["echo"]}}
+        self._token = cfg["token"]
+
+    def token(self, subject: str, scope: str) -> str:
+        return self._token
+
+
+async def client_main_async(cfg: dict) -> dict:
+    stack = _ClientStack(cfg)
+    rec = Recorder(Path(cfg["csv"]), cfg["nonce"])
+    rec.phase = cfg["phase"]
+    workers = [Worker(stack, rec, "echo", "u", "d", f"{cfg['prefix']}-{i}",
+                      payload_size=cfg["payload"]) for i in range(cfg["workers"])]
+    for w in workers:
+        w.honor_retry_after = bool(cfg.get("honor_retry_after"))
+    if cfg.get("preconnect"):
+        # Open (and hold) each keep-alive connection before the caller starts
+        # anything else, so this client is measured as an already-connected
+        # consumer rather than one competing for a listener permit.
+        for w in workers:
+            await asyncio.wait_for(w.conn.ensure(), 30)
+    print(json.dumps({"ready": True}), flush=True)
+    lag = LoopLag()
+    until = cfg["until"]
+    loops = [w.loop_rate(cfg["rate"], until) if cfg["rate"] else w.loop_closed(until)
+             for w in workers]
+    await asyncio.gather(lag.run(until), *loops)
+    for w in workers:
+        await w.shutdown()
+    rec.close()
+    own = os.times()
+    return {"rows": rec.count, "loop_lag_ms": lag.summary(),
+            "cpu_s": round(own.user + own.system, 3)}
+
+
+def client_main() -> None:
+    """`client`: echo workers on this process's own event loop.  The
+    configuration, including the token, arrives on stdin, never in argv; one
+    JSON summary line is printed on stdout."""
+    cfg = json.loads(sys.stdin.read())
+    print(json.dumps(asyncio.run(client_main_async(cfg))), flush=True)
+
+
+async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, prefix: str,
+                        workers: int, processes: int, until: float, rate: float = 0.0,
+                        payload: int = 1024, preconnect: bool = False,
+                        honor_retry_after: bool = False):
+    """Start `workers` echo workers split across `processes` `client`
+    subprocesses, running until `until`, and return once every process is
+    ready (with `preconnect`, once its connections are open).  Await the
+    returned coroutine to merge their rows into `rec` under the current
+    phase; it returns each process's loop lag and CPU seconds."""
+    dev = stack.devices[device]
+    # A client process holds one token for its whole run (it cannot re-sign),
+    # so it must outlive `until` with the usual 60 s margin.
+    token = await asyncio.to_thread(stack.token, stack.users[user]["subject"], "echo:invoke",
+                                    max(0.0, until - time.time()) + 60)
+    shares = [workers // processes + (1 if i < workers % processes else 0)
+              for i in range(processes)]
+    procs = []
+    for index, share in enumerate(s for s in shares if s):
+        csv_path = stack.run_dir / f"client-{prefix}-{index}.csv"
+        cfg = {"port": stack.consumer_port, "work": str(stack.work),
+               "subject": stack.users[user]["subject"], "device_id": dev["id"],
+               "echo": dev["echo"], "token": token, "csv": str(csv_path), "nonce": stack.nonce,
+               "phase": rec.phase, "prefix": f"{prefix}-p{index}", "workers": share,
+               "rate": rate, "payload": payload, "until": until, "preconnect": preconnect,
+               "honor_retry_after": honor_retry_after}
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(Path(__file__).resolve()), "client",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        proc.stdin.write(json.dumps(cfg).encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+        procs.append((proc, csv_path))
+    for proc, _ in procs:
+        await asyncio.wait_for(proc.stdout.readline(), 60)  # {"ready": true}
+    return _finish_clients(rec, procs)
+
+
+async def _finish_clients(rec: Recorder, procs: list) -> dict:
+    results = await asyncio.gather(*(p.communicate() for p, _ in procs))
+    report = []
+    for (proc, csv_path), (stdout, _) in zip(procs, results):
+        lines = [line for line in csv_path.read_text().splitlines() if not line.startswith("#")]
+        for row in list(csv.DictReader(lines)):
+            rec.add(float(row["t"]), row["kind"], row["worker"], float(row["latency_ms"]),
+                    int(row["status"]), row["code"], row["execution"], row["ok"] == "1",
+                    row["detail"])
+        try:
+            summary = json.loads(stdout.decode().strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            summary = {"error": f"client exited {proc.returncode} without a summary"}
+        summary["exit"] = proc.returncode
+        report.append(summary)
+    return {"processes": report}
 
 
 async def wait_serving(stack: Stack, rec: Recorder, device: str = "a", user: str = "a",
@@ -1286,11 +1523,30 @@ async def load(args: argparse.Namespace) -> None:
                 # MCP workers share at most --mcp-sessions sessions (M6-C146).
                 pool = (McpSessionPool(min(concurrency, args.mcp_sessions))
                         if kind == "mcp" else None)
-                workers = [Worker(stack, rec, kind, "a", "a", f"{kind}{concurrency}-{i}",
-                                  payload_size=args.payload, mcp_pool=pool, mcp_slot=i)
-                           for i in range(concurrency)]
+                # M6-C182: `--generator-processes N` runs an echo step's
+                # workers in N `client` subprocesses instead of on this loop.
+                off_loop = kind == "echo" and args.generator_processes > 0
+                workers = [] if off_loop else [
+                    Worker(stack, rec, kind, "a", "a", f"{kind}{concurrency}-{i}",
+                           payload_size=args.payload, mcp_pool=pool, mcp_slot=i)
+                    for i in range(concurrency)]
+                for w in workers:
+                    w.honor_retry_after = args.honor_retry_after
                 until = time.time() + args.step_seconds
-                await asyncio.gather(*(w.loop_closed(until) for w in workers))
+                lag = LoopLag()
+                cpu_before = cpu_snapshot(stack)
+                clients = (await start_clients(stack, rec, "a", "a", f"{kind}{concurrency}",
+                                               concurrency, args.generator_processes, until,
+                                               payload=args.payload,
+                                               honor_retry_after=args.honor_retry_after)
+                           if off_loop else asyncio.sleep(0, {}))
+                gathered = await asyncio.gather(clients, lag.run(until),
+                                                *(w.loop_closed(until) for w in workers))
+                attribution = {"generator_processes": args.generator_processes if off_loop else 0,
+                               "honor_retry_after": args.honor_retry_after,
+                               "driver_loop_lag_ms": lag.summary(),
+                               "cpu_percent": cpu_percent(cpu_before, cpu_snapshot(stack)),
+                               "off_loop_clients": gathered[0].get("processes", [])}
                 if pool is not None:
                     # Release the step's connections first, then DELETE on a
                     # fresh one, so a listener connection limit or a reset
@@ -1302,12 +1558,13 @@ async def load(args: argparse.Namespace) -> None:
                 for w in workers:
                     await w.shutdown()
                 s = summarize_rows(rec.rows, kind, rec.phase)
-                s.update({"kind": kind, "concurrency": concurrency})
+                s.update({"kind": kind, "concurrency": concurrency, **attribution})
                 if pool is not None:
                     s["mcp_sessions"] = pool.stats()
                 results.append(s)
                 stack.event("load-step-done", kind=kind, concurrency=concurrency,
                             ok_per_s=s["throughput_ok_per_s"], p99=s["latency_ms_ok"]["p99"],
+                            cpu_percent=s["cpu_percent"], driver_loop_lag_ms=s["driver_loop_lag_ms"],
                             errors=s["errors_by_code"], mcp_sessions=s.get("mcp_sessions"))
                 await asyncio.sleep(3)
     finally:
@@ -1327,6 +1584,7 @@ async def fairness(args: argparse.Namespace) -> None:
     stack = base_stack(args, run_dir, nonce, "m6-03-fair", mcp=False)
     rec = Recorder(run_dir / "requests.csv", nonce)
     sampler = None
+    attribution: dict[str, dict] = {}
     try:
         stack.add_user("b")
         stack.add_device("b", "b", {"echo": "echo"})
@@ -1347,10 +1605,40 @@ async def fairness(args: argparse.Namespace) -> None:
                 until = time.time() + args.phase_seconds
                 quiet = [Worker(stack, rec, "echo", "b", target, f"quiet-{target}-{phase}-{i}")
                          for i in range(args.quiet_workers)]
-                flooders = [Worker(stack, rec, "echo", "a", "a", f"flood-{target}-{i}")
-                            for i in range(flood)]
-                await asyncio.gather(*(w.loop_rate(args.quiet_rate, until) for w in quiet),
-                                     *(w.loop_closed(until) for w in flooders))
+                # `--flood-processes N` moves A's flood off this loop into N
+                # client processes (M6-C183).
+                off_flood = flood > 0 and args.flood_processes > 0
+                flooders = [] if off_flood else [
+                    Worker(stack, rec, "echo", "a", "a", f"flood-{target}-{i}")
+                    for i in range(flood)]
+                for w in flooders:
+                    w.honor_retry_after = args.honor_retry_after
+                # M6-C183: the same quiet workload again, timed on its own
+                # event loop in a separate process, beside the in-loop one.
+                # Both of B's clients open their keep-alive connections before
+                # the flood starts: a B that connects during the flood competes
+                # with A for the listener's connection permits instead.
+                for w in quiet:
+                    await asyncio.wait_for(w.conn.ensure(), 30)
+                off_loop = await start_clients(stack, rec, "b", target, f"offloop-{target}-{phase}",
+                                               args.quiet_workers, 1, until, rate=args.quiet_rate,
+                                               preconnect=True)
+                flood_clients = (await start_clients(
+                    stack, rec, "a", "a", f"flood-{target}", flood, args.flood_processes, until,
+                    honor_retry_after=args.honor_retry_after)
+                    if off_flood else asyncio.sleep(0, {}))
+                lag = LoopLag()
+                cpu_before = cpu_snapshot(stack)
+                results = await asyncio.gather(
+                    off_loop,
+                    flood_clients,
+                    lag.run(until),
+                    *(w.loop_rate(args.quiet_rate, until) for w in quiet),
+                    *(w.loop_closed(until) for w in flooders))
+                attribution[rec.phase] = {"driver_loop_lag_ms": lag.summary(),
+                                          "cpu_percent": cpu_percent(cpu_before, cpu_snapshot(stack)),
+                                          "off_loop_clients": results[0]["processes"],
+                                          "flood_processes": results[1].get("processes", [])}
                 for w in quiet + flooders:
                     await w.shutdown()
                 await asyncio.sleep(3)
@@ -1364,12 +1652,17 @@ async def fairness(args: argparse.Namespace) -> None:
         for phase, _ in phases:
             name = f"{phase}-quiet-on-{target}"
             quiet_rows = [r for r in rec.rows if r[3] == name and r[2].startswith("quiet")]
+            off_rows = [r for r in rec.rows if r[3] == name and r[2].startswith("offloop")]
             flood_rows = [r for r in rec.rows if r[3] == name and r[2].startswith("flood")]
             report[name] = {"quiet_user_b": summarize_rows(quiet_rows),
-                            "flooding_user_a": summarize_rows(flood_rows)}
+                            "quiet_user_b_off_loop": summarize_rows(off_rows),
+                            "flooding_user_a": summarize_rows(flood_rows),
+                            **attribution.get(name, {})}
     write_summary(run_dir, {"experiment": "fairness", "nonce": nonce, "head": head_sha(),
                             "flood_workers": args.flood_workers, "quiet_workers": args.quiet_workers,
-                            "quiet_rate_per_worker": args.quiet_rate, "phases": report,
+                            "quiet_rate_per_worker": args.quiet_rate,
+                            "flood_processes": args.flood_processes,
+                            "honor_retry_after": args.honor_retry_after, "phases": report,
                             "processes": summarize_samples(run_dir / "samples.csv")})
 
 
@@ -1659,6 +1952,14 @@ def main() -> None:
             p.add_argument("--step-seconds", type=float, default=30)
             p.add_argument("--kinds", default="echo,mcp")
             p.add_argument("--payload", type=int, default=1024)
+            p.add_argument("--generator-processes", type=int, default=0,
+                           help="run each echo step's workers in this many separate client "
+                                "processes, each with its own event loop (M6-C182); 0 keeps "
+                                "them on the driver's loop.  MCP steps always run on the loop")
+            p.add_argument("--honor-retry-after", action="store_true",
+                           help="a worker refused CONNECTION_LIMIT waits the refusal's "
+                                "retry_after_ms before its next request (M6-C182); by default "
+                                "it retries at once")
             p.add_argument("--mcp-sessions", type=int, default=8,
                            help="MCP sessions shared by a step's workers (the stdio export's "
                                 "default max_children is 8); every session is DELETEd after "
@@ -1675,7 +1976,17 @@ def main() -> None:
             p.add_argument("--quiet-workers", type=int, default=2)
             p.add_argument("--quiet-rate", type=float, default=5)
             p.add_argument("--phase-seconds", type=float, default=60)
+            p.add_argument("--flood-processes", type=int, default=0,
+                           help="run user A's flood in this many separate client processes "
+                                "(M6-C183); 0 keeps it on the driver's loop")
+            p.add_argument("--honor-retry-after", action="store_true",
+                           help="flood workers refused CONNECTION_LIMIT wait its retry_after_ms")
+    sub.add_parser("client", help="internal: echo workers on their own event loop; "
+                                  "configuration on stdin")
     args = parser.parse_args()
+    if args.cmd == "client":
+        client_main()
+        return
     if args.cmd == "forwarder":
         forwarder_main(args)
         return
