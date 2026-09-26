@@ -46,8 +46,11 @@ python3 scripts/m6-soak.py load --bin-dir /private/tmp/$USER-bins \
   --logs /private/tmp/$USER-soak-logs --kinds mcp --steps 16 --mcp-sessions 9 --step-seconds 15
 ```
 
-Expected (measured 2026-09-26 on branch `fix-soak-mcp`, debug binaries, nonce
-`663FBF12-B807-4D5C-9CEB-85ADEBD8BA2B`): one line like
+Expected (measured 2026-09-26 on branch `fix-soak-mcp` with **debug**
+binaries, nonce `663FBF12-B807-4D5C-9CEB-85ADEBD8BA2B`, not with the release
+build above): one line like the one below. Only the outcome codes and the
+session counts carry over to a release build; the rates and counts of calls
+will differ.
 
 ```
 load-step-done {"kind": "mcp", "concurrency": 16, "ok_per_s": 386.8, ..., "errors": {"-32050": 451}}
