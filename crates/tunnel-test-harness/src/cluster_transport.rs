@@ -1335,18 +1335,24 @@ impl EchoSource for tunnel_transport::PeerClientRecv {
 /// as unreclaimed budget.  Every chunk read here still takes and releases its
 /// own budget charge, so reclamation is exercised exactly as before.  Stops
 /// early only at the end of the stream, leaving the shortfall to the caller.
+/// Also returns how many chunks carried the echo, so a passing run can report
+/// whether the split this row describes actually occurred.
 async fn recv_echo<S: EchoSource>(
     source: &mut S,
     expected: usize,
-) -> std::result::Result<Vec<u8>, PeerTransportError> {
+) -> std::result::Result<(Vec<u8>, usize), PeerTransportError> {
     let mut received = Vec::with_capacity(expected);
+    let mut chunks = 0;
     while received.len() < expected {
         match source.next_echo_chunk().await? {
-            Some(chunk) => received.extend_from_slice(&chunk),
+            Some(chunk) => {
+                chunks += 1;
+                received.extend_from_slice(&chunk);
+            }
             None => break,
         }
     }
-    Ok(received)
+    Ok((received, chunks))
 }
 
 fn budget_payload(index: usize) -> Bytes {
@@ -1395,6 +1401,10 @@ async fn run_body_budget_reclamation_case(
     let client = make_client(client_material, peer_ca_pem, server_material.pin, limits)?;
 
     let result = match timeout(CASE_TIMEOUT, async {
+        // Echoes that arrived in more than one chunk (task row M7-C120): the
+        // split the old first-chunk comparison misreported.  Printed on a
+        // pass so a loaded-host loop shows whether the mechanism occurs.
+        let mut split_echoes = 0usize;
         let connection = client
             .connect(PeerDestination::new(address, SERVER_NAME))
             .await
@@ -1424,11 +1434,15 @@ async fn run_body_budget_reclamation_case(
                     HarnessError::Http(format!("receiving M7 stream-budget response head: {error}"))
                 })?;
             }
-            let echoed = recv_echo(&mut stream_recv, payload.len())
-                .await
-                .map_err(|error| {
-                    HarnessError::Http(format!("receiving M7 stream-budget chunk: {error}"))
-                })?;
+            let (echoed, chunks) =
+                recv_echo(&mut stream_recv, payload.len())
+                    .await
+                    .map_err(|error| {
+                        HarnessError::Http(format!("receiving M7 stream-budget chunk: {error}"))
+                    })?;
+            if chunks > 1 {
+                split_echoes += 1;
+            }
             if echoed != payload.as_ref() {
                 eprintln!(
                     "M7 body-budget: stream-budget echo {index} of 6 differed: sent {} bytes, \
@@ -1474,9 +1488,12 @@ async fn run_body_budget_reclamation_case(
                     "receiving M7 connection-budget response head: {error}"
                 ))
             })?;
-            let echoed = recv_echo(&mut recv, payload.len()).await.map_err(|error| {
+            let (echoed, chunks) = recv_echo(&mut recv, payload.len()).await.map_err(|error| {
                 HarnessError::Http(format!("receiving M7 connection-budget chunk: {error}"))
             })?;
+            if chunks > 1 {
+                split_echoes += 1;
+            }
             if echoed != payload.as_ref() {
                 eprintln!(
                     "M7 body-budget: connection-budget echo on stream {index} of 5 differed: \
@@ -1502,6 +1519,7 @@ async fn run_body_budget_reclamation_case(
             }
         }
 
+        eprintln!("M7 body-budget: 11 echoes read whole, split_echoes={split_echoes}");
         Ok::<_, HarnessError>(true)
     })
     .await
@@ -2408,10 +2426,12 @@ mod tests {
         );
         // The comparison the case made before: the first chunk alone.
         assert_ne!(first, payload.as_ref());
-        let echoed = recv_echo(&mut source, payload.len())
+        let (echoed, chunks) = recv_echo(&mut source, payload.len())
             .await
             .expect("scripted chunks");
         assert_eq!(echoed, payload.as_ref());
+        // The split is counted, so a passing run can report that it occurred.
+        assert_eq!(chunks, 2);
         // The terminal read after the echo still sees the end of the stream.
         assert!(source.next_echo_chunk().await.expect("end").is_none());
     }
@@ -2420,10 +2440,11 @@ mod tests {
     async fn a_short_echo_stops_at_the_end_of_the_stream() {
         let payload = budget_payload(4);
         let mut source = Scripted([Some(Bytes::copy_from_slice(&payload[..1])), None].into());
-        let echoed = recv_echo(&mut source, payload.len())
+        let (echoed, chunks) = recv_echo(&mut source, payload.len())
             .await
             .expect("scripted chunks");
         assert_eq!(echoed.len(), 1);
+        assert_eq!(chunks, 1);
         assert_ne!(echoed, payload.as_ref());
     }
 }
