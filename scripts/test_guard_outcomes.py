@@ -393,7 +393,14 @@ EXPECTED_GUARD_ANCHORS = {
     # #197 (75), #196 (the `m8c30-route-proof` suite) and #188 (the
     # `m7-membership-resign` and `m7-membership-rebind-unit` suites):
     # `--check-anchors` reports 83 across 21 suites; 84 fails naming m3.
-    "m3-guard-deletion.py": 83,
+    # Then **85** on branch `fix-reply-waits` (M6-C162), which adds the
+    # relay-handle case to `m7-connector-relay` and the new
+    # `m6c162-http-forward-replies` suite: `--check-anchors` reports 85
+    # across 22 suites; 86 fails naming m3.
+    # Then **88** after the review of PR #200 added the try_recv-arm cases
+    # (relay and client) and the abort-completion case: `--check-anchors`
+    # reports 88 across 22 suites; 89 fails naming m3.
+    "m3-guard-deletion.py": 88,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

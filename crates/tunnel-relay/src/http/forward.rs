@@ -432,7 +432,13 @@ impl CarrierReader for ActorReader {
                 let Some(receiver) = self.pending.as_mut() else {
                     return CarrierEvent::Closed;
                 };
-                let read = receiver.await.unwrap_or(HttpRead::Closed);
+                // Bounded by the actor's completion (task row M6-C162): a read
+                // stranded behind an actor that has ended reads as Closed.
+                let read = self
+                    .handle
+                    .http_read_reply(receiver)
+                    .await
+                    .unwrap_or(HttpRead::Closed);
                 self.pending = None;
                 match read {
                     // An empty chunk only wakes a parked reader.
