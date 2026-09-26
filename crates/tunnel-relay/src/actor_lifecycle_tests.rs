@@ -1064,6 +1064,74 @@ async fn close_all_releases_live_session_overflow_within_one_shutdown_deadline()
     drop(registrations);
 }
 
+/// Expire every live session's owner-forget deadline so the actor's next
+/// `tick` closes all of them in one pass (task row M6-C186).
+async fn expire_owner_forget_deadlines(handle: &RelayHandle) {
+    handle
+        .tx
+        .send(Command::TestMutate(Box::new(|actor| {
+            let now = std::time::Instant::now();
+            for session in actor.sessions.values_mut() {
+                session.owner_forget_deadline = Some(now);
+            }
+        })))
+        .await
+        .expect("actor accepts the test mutation");
+    handle
+        .tx
+        .send(Command::Tick)
+        .await
+        .expect("actor accepts a tick");
+}
+
+/// **Task row M6-C186.** The actor's `tick` closes every session whose
+/// deadline has passed in one pass with no await that yields, and each close
+/// queued the session's owner token on the 64-slot cleanup queue with a
+/// synchronous `try_send`.  `tokio::test` runs on one thread, so the worker
+/// cannot drain during the pass: every token past the capacity was refused as
+/// `saturated`, and the refusal also shut the relay down.  The lease is 30 s;
+/// every owner must be released within 5 s while the relay keeps running.
+#[tokio::test]
+async fn tick_releases_more_closed_session_owners_than_the_cleanup_queue_holds() {
+    const LIVE: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) =
+        register_live_sessions(&handle, &catalog, LIVE).await;
+
+    expire_owner_forget_deadlines(&handle).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let claimed = loop {
+        let claimed = still_claimed(&catalog, tenant_id, &device_ids).await;
+        if claimed == 0 || tokio::time::Instant::now() >= deadline {
+            break claimed;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        claimed,
+        0,
+        "{claimed} of {LIVE} session owners closed by one tick were left fenced until lease \
+         expiry (cleanup queue capacity {})",
+        super::CLEANUP_QUEUE_CAPACITY
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "closing more sessions in one tick than the cleanup queue holds shut the relay down"
+    );
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    drop(registrations);
+}
+
 #[tokio::test]
 async fn shutdown_joins_inflight_owner_renewal_before_cleanup_worker() {
     let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;
