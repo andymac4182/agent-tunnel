@@ -152,6 +152,8 @@ struct HeldCatalog {
     release_renew: Arc<Notify>,
     hold_renew: Arc<AtomicBool>,
     release_delay_ms: Arc<AtomicU64>,
+    releases_in_flight: Arc<AtomicUsize>,
+    max_releases_in_flight: Arc<AtomicUsize>,
 }
 
 impl HeldCatalog {
@@ -168,6 +170,8 @@ impl HeldCatalog {
             release_renew: Arc::new(Notify::new()),
             hold_renew: Arc::new(AtomicBool::new(false)),
             release_delay_ms: Arc::new(AtomicU64::new(0)),
+            releases_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_releases_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -317,11 +321,16 @@ impl Catalog for HeldCatalog {
     }
 
     async fn release_owner(&self, token: &OwnerToken) -> Result<bool, CatalogError> {
+        let in_flight = self.releases_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        self.max_releases_in_flight
+            .fetch_max(in_flight, Ordering::AcqRel);
         let delay = self.release_delay_ms.load(Ordering::Acquire);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        self.inner.release_owner(token).await
+        let released = self.inner.release_owner(token).await;
+        self.releases_in_flight.fetch_sub(1, Ordering::AcqRel);
+        released
     }
 
     async fn current_owner(
@@ -1129,6 +1138,101 @@ async fn tick_releases_more_closed_session_owners_than_the_cleanup_queue_holds()
         .await
         .expect("shutdown is bounded");
     assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    drop(registrations);
+}
+
+/// **Task row M6-C187 (b).** Up to `max_devices` (default 1024) session
+/// owners can be kept past the cleanup queue at shutdown, and a release
+/// against a remote Redis takes about 20 ms.  Released one at a time, 960 of
+/// them need 19.2 s against a 5 s budget; released
+/// `OWNER_RELEASE_CONCURRENCY` at a time they fit, and never more than that
+/// many are in flight.
+#[tokio::test(start_paused = true)]
+async fn kept_owner_release_is_concurrent_and_bounded() {
+    const KEPT: usize = 960;
+    let catalog = HeldCatalog::new();
+    catalog.release_delay_ms.store(20, Ordering::Release);
+    let backlog = super::OwnerBacklog::default();
+    for index in 0..KEPT {
+        backlog.push(OwnerToken {
+            deployment_incarnation: "c187".to_owned(),
+            tenant_id: Uuid::from_u128(0xC187_0001),
+            device_id: Uuid::from_u128(0xC187_1000 + index as u128),
+            node_id: "node".to_owned(),
+            boot_id: "boot".to_owned(),
+            session_id: format!("c187-{index}"),
+            epoch: 1,
+        });
+    }
+    let shared: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
+    let started = tokio::time::Instant::now();
+    let (released, abandoned) = super::release_owner_tokens_until(
+        &shared,
+        &backlog,
+        started + super::CLEANUP_SHUTDOWN_TIMEOUT,
+    )
+    .await;
+    assert_eq!(
+        (released, abandoned),
+        (KEPT, 0),
+        "only {released} of {KEPT} kept owners released within {:?} at 20 ms each",
+        super::CLEANUP_SHUTDOWN_TIMEOUT
+    );
+    assert!(backlog.is_empty());
+    let max = catalog.max_releases_in_flight.load(Ordering::Acquire);
+    assert!(
+        (2..=super::OWNER_RELEASE_CONCURRENCY).contains(&max),
+        "{max} releases were in flight at once; the bound is {}",
+        super::OWNER_RELEASE_CONCURRENCY
+    );
+}
+
+/// **Task row M6-C187 (e).** When the kept live-session owners do not fit
+/// the shutdown deadline, `close_all` counts every one it leaves to lease
+/// expiry, those in flight included, in its error log.  Each release here
+/// outlasts `CLEANUP_OPERATION_TIMEOUT`, so the worker's drain uses the whole
+/// 5 s budget and every kept owner is abandoned.
+#[tokio::test(start_paused = true)]
+async fn close_all_logs_the_abandoned_live_session_owner_count() {
+    const LIVE: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) =
+        register_live_sessions(&handle, &catalog, LIVE).await;
+    catalog.release_delay_ms.store(10_000, Ordering::Release);
+    let captured = super::connector_rejected::Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_env_filter("info")
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    drop(guard);
+    // The worker's drain outlasting the deadline is itself reported as a
+    // failed shutdown; only the owner count matters here.
+    drop(shutdown);
+    catalog.release_delay_ms.store(0, Ordering::Release);
+    assert_eq!(still_claimed(&catalog, tenant_id, &device_ids).await, LIVE);
+    let text = captured.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("session owners beyond the cleanup queue exceeded"))
+        .unwrap_or_else(|| panic!("no abandoned-owner log line: {text}"));
+    let kept = LIVE - super::CLEANUP_QUEUE_CAPACITY;
+    assert!(
+        line.contains(&format!("abandoned={kept}")) && line.contains("released=0"),
+        "the log did not count all {kept} kept owners as abandoned: {line}"
+    );
     drop(registrations);
 }
 

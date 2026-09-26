@@ -26664,8 +26664,8 @@ mod cleanup_tests {
         worker.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn repeated_stale_cleanup_cannot_release_a_successor() {
+    /// One tenant, user and device in a fresh catalog, with no owner yet.
+    async fn seeded_cleanup_catalog() -> MemoryCatalog {
         let catalog = MemoryCatalog::new();
         catalog
             .seed_fixture(&CatalogFixture {
@@ -26699,6 +26699,12 @@ mod cleanup_tests {
             })
             .await
             .expect("catalog fixture");
+        catalog
+    }
+
+    #[tokio::test]
+    async fn repeated_stale_cleanup_cannot_release_a_successor() {
+        let catalog = seeded_cleanup_catalog().await;
         let first = catalog
             .claim_owner(&owner_request("first"))
             .await
@@ -26726,5 +26732,127 @@ mod cleanup_tests {
             .expect("current owner")
             .expect("successor remains");
         assert_eq!(current.token, successor.token);
+    }
+
+    /// A first owner released and a successor claimed on the same device:
+    /// the first owner's token is now superseded.
+    async fn superseded_catalog() -> (MemoryCatalog, OwnerToken, OwnerToken) {
+        let catalog = seeded_cleanup_catalog().await;
+        let first = catalog
+            .claim_owner(&owner_request("first"))
+            .await
+            .expect("first owner");
+        assert!(
+            catalog
+                .release_owner(&first.token)
+                .await
+                .expect("release first")
+        );
+        let successor = catalog
+            .claim_owner(&owner_request("successor"))
+            .await
+            .expect("successor owner");
+        (catalog, first.token, successor.token)
+    }
+
+    async fn current_owner(catalog: &MemoryCatalog) -> Option<OwnerToken> {
+        catalog
+            .current_owner(Uuid::from_u128(1), Uuid::from_u128(2), Utc::now())
+            .await
+            .expect("current owner")
+            .map(|claim| claim.token)
+    }
+
+    /// **Task row M6-C187 (e).** A token kept in the owner backlog whose
+    /// session has since been superseded is released fenced: the successor
+    /// that now owns the device is left untouched, and the stale token is
+    /// still counted as handled rather than retried.
+    #[tokio::test]
+    async fn backlog_release_leaves_a_superseded_owner_untouched() {
+        let (catalog, first, successor) = superseded_catalog().await;
+        let backlog = super::OwnerBacklog::default();
+        backlog.push(first.clone());
+        backlog.push(first);
+        let shared: SharedCatalog = Arc::new(catalog.clone());
+        let (released, abandoned) = super::release_owner_tokens_until(
+            &shared,
+            &backlog,
+            tokio::time::Instant::now() + super::CLEANUP_SHUTDOWN_TIMEOUT,
+        )
+        .await;
+        assert_eq!((released, abandoned), (2, 0));
+        assert!(backlog.is_empty());
+        assert_eq!(
+            current_owner(&catalog).await,
+            Some(successor),
+            "releasing a superseded backlog token released the successor"
+        );
+    }
+
+    /// **Task row M6-C187 (a).** Session owners kept in the backlog when the
+    /// actor ends are released by its supervisor, not dropped.
+    #[tokio::test]
+    async fn stranded_release_covers_owners_kept_in_the_backlog() {
+        let catalog = seeded_cleanup_catalog().await;
+        let owner = catalog
+            .claim_owner(&owner_request("kept"))
+            .await
+            .expect("kept owner")
+            .token;
+        let backlog = super::OwnerBacklog::default();
+        backlog.push(owner);
+        let stranded = super::StrandedClaimRelease {
+            handoffs: super::ClaimHandoffs::default(),
+            backlog: backlog.clone(),
+            catalog: Arc::new(catalog.clone()),
+        };
+        assert_eq!(stranded.release().await, (1, 0));
+        assert!(backlog.is_empty());
+        assert_eq!(
+            current_owner(&catalog).await,
+            None,
+            "an owner kept in the backlog when the actor ended was left fenced"
+        );
+    }
+
+    /// **Task row M6-C187 (a, e).** A supervisor aborted before its release
+    /// ran logs how many kept owners it found and releases them on the
+    /// runtime.
+    #[tokio::test]
+    async fn aborted_stranded_release_logs_and_releases_kept_owners() {
+        let catalog = seeded_cleanup_catalog().await;
+        let owner = catalog
+            .claim_owner(&owner_request("kept"))
+            .await
+            .expect("kept owner")
+            .token;
+        let backlog = super::OwnerBacklog::default();
+        backlog.push(owner);
+        let captured = super::connector_rejected::Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_env_filter("info")
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        drop(super::StrandedClaimRelease {
+            handoffs: super::ClaimHandoffs::default(),
+            backlog: backlog.clone(),
+            catalog: Arc::new(catalog.clone()),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while current_owner(&catalog).await.is_some() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(guard);
+        let text = captured.text();
+        assert!(
+            text.contains("owner claims stranded behind an aborted relay actor")
+                && text.contains("count=1")
+                && text.contains("owners=1"),
+            "the dropped kept-owner count was not logged: {text}"
+        );
+        assert!(backlog.is_empty());
+        assert_eq!(current_owner(&catalog).await, None);
     }
 }
