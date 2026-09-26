@@ -797,6 +797,28 @@ where
     (released, abandoned)
 }
 
+/// Release owner tokens one at a time against `catalog`, fenced exactly as
+/// the cleanup worker releases them (a token only while it is still the
+/// current owner), within one overall `deadline`.  Returns `(released,
+/// abandoned)`: the token in flight and any not yet started when the
+/// deadline passed are left to lease expiry and counted (task row M6-C185).
+async fn release_owner_tokens_until(
+    catalog: &SharedCatalog,
+    owners: Vec<OwnerToken>,
+    deadline: tokio::time::Instant,
+) -> (usize, usize) {
+    let total = owners.len();
+    let mut released = 0_usize;
+    let _ = tokio::time::timeout_at(deadline, async {
+        for owner in owners {
+            release_cleanup_item(catalog, &OwnerCleanupItem::Token(owner)).await;
+            released = released.saturating_add(1);
+        }
+    })
+    .await;
+    (released, total.saturating_sub(released))
+}
+
 /// Held by the actor task's supervisor: once the actor has ended, release
 /// every owner claim still parked in [`ClaimHandoffs`] directly against the
 /// catalog (task rows M6-C170 and M6-C178).  The actor's cleanup worker ended
@@ -2807,6 +2829,7 @@ impl RelayHandle {
             http_maintenance: HttpMaintenance::default(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
+            shutdown_owner_overflow: None,
             claim_handoffs: claim_handoffs.clone(),
             background_tasks: JoinSet::new(),
             background_failure,
@@ -3667,6 +3690,12 @@ struct RelayActor {
     http_maintenance: HttpMaintenance,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
+    /// Set only while `close_all` closes the live sessions: owner tokens the
+    /// cleanup worker's bounded queue has no room for are kept here and
+    /// released, fenced, after the worker has shut down, within the same
+    /// shutdown deadline (task row M6-C185).  Bounded by the live sessions
+    /// (`max_devices`).
+    shutdown_owner_overflow: Option<Vec<OwnerToken>>,
     /// Owner-claim guards in transit to this actor (task row M6-C170).
     claim_handoffs: ClaimHandoffs,
     background_tasks: JoinSet<()>,
@@ -4422,7 +4451,22 @@ impl RelayActor {
         });
     }
 
-    async fn enqueue_cleanup(&self, owner: OwnerToken) {
+    async fn enqueue_cleanup(&mut self, owner: OwnerToken) {
+        if let Some(overflow) = self.shutdown_owner_overflow.as_mut() {
+            // `close_all` closes every live session with no await in between,
+            // so a synchronous `try_send` per session refused every token
+            // past the queue's capacity as `saturated` and left it fenced
+            // until lease expiry (task row M6-C185).  Queue only while there
+            // is room; keep the rest for `close_all`'s fenced release.
+            let mut slot = Some(owner);
+            let queued = self.cleanup_dispatcher.as_ref().is_some_and(|dispatcher| {
+                dispatcher.enqueue_if_room(|| slot.take().map(OwnerCleanupItem::Token))
+            });
+            if !queued && let Some(owner) = slot.take() {
+                overflow.push(owner);
+            }
+            return;
+        }
         if let Some(cleanup) = self.cleanup.as_ref() {
             cleanup.enqueue(owner);
         } else {
@@ -15431,6 +15475,13 @@ impl RelayActor {
             .values()
             .map(|session| session.key.clone())
             .collect();
+        // Every live session's owner token is queued on the cleanup worker
+        // only while its bounded queue has room; the rest are kept and
+        // released below, after the worker has shut down, within this same
+        // deadline (task row M6-C185).
+        self.shutdown_owner_overflow = Some(Vec::with_capacity(
+            keys.len().saturating_sub(CLEANUP_QUEUE_CAPACITY),
+        ));
         for key in keys {
             self.close_session(&key, "SHUTDOWN").await;
         }
@@ -15479,7 +15530,31 @@ impl RelayActor {
         // overall bound, instead of adding the supervisor's own fresh
         // deadline after it.  What does not fit is taken out, counted, and
         // left to lease expiry; the supervisor then finds nothing parked.
+        //
+        // Live-session owner tokens the queue had no room for are released
+        // first, the same way and within the same deadline (task row
+        // M6-C185).  Taking the overflow ends the shutdown mode of
+        // `enqueue_cleanup`: a late close now finds no worker and releases
+        // its token directly, as before.
+        let overflow = self.shutdown_owner_overflow.take().unwrap_or_default();
         let catalog = &self.catalog;
+        let (owners_released, owners_abandoned) =
+            release_owner_tokens_until(catalog, overflow, deadline).await;
+        if owners_abandoned > 0 {
+            tracing::error!(
+                released = owners_released,
+                abandoned = owners_abandoned,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
+                "session owners beyond the cleanup queue exceeded the relay shutdown deadline; lease expiry is the fencing fallback"
+            );
+        } else if owners_released > 0 {
+            tracing::info!(
+                released = owners_released,
+                capacity = CLEANUP_QUEUE_CAPACITY,
+                "session owners beyond the cleanup queue were released at relay shutdown"
+            );
+        }
         let (released, abandoned) =
             release_parked_until(&self.claim_handoffs, deadline, |item| async move {
                 release_cleanup_item(catalog, &item).await
@@ -17911,6 +17986,7 @@ mod stream_identity_tests {
             http_maintenance: super::HttpMaintenance::default(),
             cleanup_dispatcher: None,
             cleanup: None,
+            shutdown_owner_overflow: None,
             claim_handoffs: super::ClaimHandoffs::default(),
             background_tasks: tokio::task::JoinSet::new(),
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),

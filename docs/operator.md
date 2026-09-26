@@ -1551,6 +1551,10 @@ refused` lines come after authentication and are not limited:
   for everyone. A line refused by a later budget does not lose an earlier
   budget's `..._suppressed` count; it is reported on the next written line. Within one tenant, a device's
   forged REJECTEDs spend the same budget as its genuine ones.
+  On the device, `connect --json` counts the refusals it sent in each
+  `connect-status` event's `open_refusals_sent`, one counter per fixed code
+  and no reason text (M7-C167; [runtime.md](runtime.md), "Events"), so a
+  `503 DEVICE_REJECTED` can be attributed from the device side as well.
 
 The device listing (`GET /v1/devices`) reports `last_seen_at`: the relay
 writes it when it admits the device's session and at every owner-lease renewal
