@@ -1696,19 +1696,28 @@ const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
 
 /// Install a recording invalidation callback on one relay.
 ///
-/// It **chains the relay's own shared pin publisher** (M7-C90), so installing
-/// it changes what the fixture records and nothing about what it does. A
-/// recorder that replaced the pin publication would have quietly turned this
-/// case into a second hint-drop gate.
+/// It **chains the fixture's own pin publication**, including the failed-closed
+/// handling and the `pin_publication_pending` latch (M7-C81), so installing it
+/// changes what the fixture records and nothing about what it does. A recorder
+/// that replaced the pin publication would have quietly turned this case into
+/// a second hint-drop gate.
 fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
-    let publisher = Arc::clone(&relay.pin_publisher);
+    let membership = Arc::clone(&relay.membership);
+    let pins = relay.pins.clone();
+    let pending = Arc::clone(&relay.pin_publication_pending);
     let ledger = Arc::clone(ledger);
     let observer = relay.node_id.clone();
     relay
         .membership
         .set_invalidation_callback(Some(Arc::new(move |identity, reason| {
             ledger.record(&observer, &identity.node_id, reason);
-            publisher.publish();
+            if let Err(error) = publish_verified_pins(&membership, &pins) {
+                tracing::warn!(?error, "key-rotation pin publication failed closed");
+                let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
+                pending.store(true, Ordering::SeqCst);
+            } else {
+                pending.store(false, Ordering::SeqCst);
+            }
         })));
 }
 
@@ -2411,7 +2420,7 @@ impl Gate<'_> {
         // of uncorrelated refusals.
         self.wait_owner_membership_ready().await?;
         for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
-            publish_verified_pins(&relay.pin_publisher)?;
+            publish_verified_pins(&relay.membership, &relay.pins)?;
         }
         self.wait_peers_ready().await?;
         self.settle_key_rotation_route().await?;
@@ -2748,9 +2757,12 @@ impl Gate<'_> {
         // --- half one: the pin withdrawal, on its own ---
         {
             let relay = self.cluster.relay("relay-c")?;
-            relay.pin_publisher.withdraw_and_hold().map_err(|error| {
-                HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
-            })?;
+            relay
+                .pins
+                .replace(std::iter::empty::<tunnel_transport::SpkiSha256>())
+                .map_err(|error| {
+                    HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
+                })?;
         }
         // Observed for a bounded window rather than asserted either way: the
         // point is to record what a pin withdrawal alone does to a stream that
@@ -2791,7 +2803,7 @@ impl Gate<'_> {
         self.cluster
             .set_peer_path_drop_from("relay-a", "relay-c", false)?;
         let relay = self.cluster.relay("relay-c")?;
-        super::publish_verified_pins(&relay.pin_publisher)?;
+        super::publish_verified_pins(&relay.membership, &relay.pins)?;
         // The route has to be answering again before the next case starts, or
         // that case would be measuring this one's recovery.
         self.wait_peers_ready().await?;
@@ -4171,15 +4183,12 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // no falsification ever exercised.
             // **Since M7-C80 the control arm invalidates nothing.**  A same-key
             // re-sign at a newer version re-binds the admission rather than
-            // replacing it, so the stream survives and no reason is latched.
-            // That is a stronger control than the old `membership_changed`:
-            // whatever the key arm tears down is now attributable to the key
-            // alone, with the version bump shown to be inert beside it.
+            // replacing it, so no reason is latched: whatever the key arm
+            // tears down is attributable to the key alone.
             // `version_bump_interrupted` is recorded but not asserted: the
             // arm watches its stream for up to 45 s, longer than the ACP
-            // exchange itself is bounded, so a stream that later ends on its
-            // own exchange deadline is not a membership event -- and a
-            // membership invalidation would have latched a reason here.
+            // exchange itself is bounded, and a membership invalidation would
+            // have latched a reason here.
             "the same-key control arm invalidated nothing (M7-C80)",
             evidence.version_bump_reasons.is_empty(),
         ),

@@ -721,8 +721,8 @@ READINESS_PINS_CASES: list[Case] = [
     ),
 ]
 
-#: **M7-C80 and M7-C91: membership re-signs and the shared peer-pin wiring.**
-#: (M7-C86's retention split is held on this branch, so it has no case here.)  Each case defeats one fix in `membership_runtime.rs`
+#: **M7-C80: membership re-signs re-bind an admission instead of replacing it.**
+#: (M7-C86 and its wiring rows M7-C90/M7-C91 are held on the draft branch.)  Each case defeats one fix in `membership_runtime.rs`
 #: and names the regression in `tests/m7_membership_resign.rs` that sees it.
 #: The witnesses drive the real `MembershipRuntime` and the library
 #: `PeerPinPublisher` / `peer_trust_tick` that the serving relay and the
@@ -740,20 +740,6 @@ MEMBERSHIP_RESIGN_TEST = [
 ]
 
 MEMBERSHIP_RESIGN_CASES: list[Case] = [
-    Case(
-        # M7-C91.  Defeated, no readiness transition reaches the change
-        # observer, so the reconcile that restores membership leaves the pin
-        # set empty until the next refresh tick.
-        "the reconcile that restores membership republishes the pin set",
-        [
-            (
-                MEMBERSHIP_RUNTIME,
-                "        self.notify_change_observer();\n    }",
-                "    }",
-            )
-        ],
-        frozenset({"readiness_returns_within_the_reconcile_that_restores_membership"}),
-    ),
     Case(
         # M7-C80.  Defeated, any record-version change invalidates the
         # admission again, killing every in-flight peer stream at a routine

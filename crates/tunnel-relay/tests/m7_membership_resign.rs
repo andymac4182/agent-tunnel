@@ -1,15 +1,12 @@
-//! Membership re-sign and peer-trust wiring regressions (M7-C80, M7-C83,
-//! M7-C86, M7-C90, M7-C91).
+//! Membership re-sign regressions (M7-C80, M7-C83). The peer-trust wiring
+//! tests (M7-C86, M7-C90, M7-C91) are held on the draft M7-C86 branch.
 //!
 //! Each test drives the real `MembershipRuntime` through signed checkpoint
-//! and record bytes from an in-memory source, and the real library pin
-//! wiring (`PeerPinPublisher`, `peer_trust_tick`) that both the serving relay
-//! and the production-cluster fixture install. No Redis, no checkpoint
+//! and record bytes from an in-memory source. No Redis, no checkpoint
 //! service and no network: the synthetic endpoint is never dialled.
 
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -19,8 +16,7 @@ use std::{
 
 use chrono::Utc;
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use tunnel_catalog::{MemoryCatalog, SharedCatalog, SignedMembershipRecord};
+use tunnel_catalog::SignedMembershipRecord;
 use tunnel_cluster::membership::{
     MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipIssuer, MembershipRecord,
     PrivateEndpointPolicy, RELAY_PEER_ROLE, RelayKey, TrustedPublisherKey,
@@ -28,14 +24,8 @@ use tunnel_cluster::membership::{
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
     MembershipPeerIdentity, MembershipReadiness, MembershipRecordSource, MembershipRuntime,
-    MembershipRuntimeConfig, MembershipUnreadyReason, PeerInvalidationReason, PeerListenerState,
-    PeerReadiness, PeerRuntime,
+    MembershipRuntimeConfig, MembershipUnreadyReason, PeerInvalidationReason,
     membership_runtime::{MembershipFuture, MembershipSourceError},
-    peer_pins::{PeerPinPublisher, PeerTrustTick, PinPublication, peer_trust_tick},
-    routing::{OwnerRouter, RelayIdentity},
-};
-use tunnel_transport::{
-    ApprovedPeerPins, PeerClient, PeerTransportLimits, SharedPeerPins, SpkiSha256,
 };
 
 const DEPLOYMENT_ID: &str = "m7-resign-deployment";
@@ -213,11 +203,6 @@ impl Fixture {
         *self.source.records.write().await = vec![record, peer];
     }
 
-    /// Replace the peer's record; it is published with the next local one.
-    async fn set_peer_record(&self, record: SignedMembershipRecord) {
-        *self.peer_record.write().await = record;
-    }
-
     /// Publish a re-signed record at `version` for the same node and key.
     async fn resign(&self, version: u64) {
         self.publish(self.record(version, "key-1", SPKI_SHA256, 30))
@@ -287,69 +272,6 @@ fn sign_record(
         bytes: issuer
             .sign_membership_bytes(record)
             .expect("signed membership record"),
-    }
-}
-
-fn pin(digest: &str) -> SpkiSha256 {
-    let mut bytes = [0_u8; 32];
-    for (index, chunk) in digest.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(chunk).expect("ascii digest");
-        bytes[index] = u8::from_str_radix(text, 16).expect("hex digest");
-    }
-    SpkiSha256::from_bytes(bytes)
-}
-
-fn local_pin() -> SpkiSha256 {
-    let mut bytes = [0_u8; 32];
-    for (index, chunk) in SPKI_SHA256.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(chunk).expect("ascii digest");
-        bytes[index] = u8::from_str_radix(text, 16).expect("hex digest");
-    }
-    SpkiSha256::from_bytes(bytes)
-}
-
-/// A cluster-shaped peer runtime with every readiness input other than the
-/// pin set and membership held true: listener bound, a one-node (empty)
-/// required route set, capacity at the floor.
-struct Wired {
-    peer: Arc<PeerRuntime>,
-    readiness: Arc<PeerReadiness>,
-    publisher: Arc<PeerPinPublisher>,
-}
-
-fn wired(runtime: &Arc<MembershipRuntime>) -> Wired {
-    let catalog: SharedCatalog = Arc::new(MemoryCatalog::new());
-    let identity =
-        RelayIdentity::new(DEPLOYMENT_INCARNATION, NODE_ID, BOOT_ID).expect("relay identity");
-    let router: Arc<OwnerRouter<dyn tunnel_catalog::Catalog>> =
-        Arc::new(OwnerRouter::new(catalog, identity).expect("owner router"));
-    let endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .expect("local synthetic QUIC endpoint");
-    let pins = SharedPeerPins::new(ApprovedPeerPins::new([local_pin()]).expect("own pin"))
-        .expect("dynamic pin set");
-    let client =
-        PeerClient::new_with_pin_provider(endpoint, pins.clone(), PeerTransportLimits::default())
-            .expect("peer client");
-    let readiness = Arc::new(PeerReadiness::new(1).expect("capacity floor"));
-    readiness.set_listener_state(PeerListenerState::Bound);
-    readiness
-        .replace_required_routes(std::iter::empty())
-        .expect("one-node route set");
-    readiness.set_available_capacity(1);
-    let peer = Arc::new(PeerRuntime::new_with_readiness(
-        client,
-        router,
-        Arc::clone(runtime) as Arc<dyn tunnel_relay::PeerBindingProvider>,
-        NODE_ID,
-        BOOT_ID,
-        Arc::clone(&readiness),
-    ));
-    let publisher = PeerPinPublisher::new(Arc::clone(runtime), pins);
-    publisher.install();
-    Wired {
-        peer,
-        readiness,
-        publisher,
     }
 }
 
@@ -530,66 +452,6 @@ async fn a_shrunk_checkpoint_window_invalidates_the_admission() {
 
 // ---------------------------------------------------------------- M7-C86
 
-/// **M7-C86, the security half.** Retention may only *shrink* the pin set.
-/// A reconcile that revokes peer X's key and, in the same candidate, makes
-/// this relay locally unready must still unpin X at once: the unready
-/// candidate is installed with its verified records, and a retained pin is
-/// kept only while that verifier approves it.
-#[tokio::test]
-async fn a_peer_revoked_during_a_local_blip_is_unpinned() {
-    let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    assert_eq!(wired.publisher.publish(), PinPublication::Published);
-    assert!(
-        wired
-            .publisher
-            .pins()
-            .snapshot()
-            .contains(pin(PEER_SPKI_SHA256))
-    );
-
-    fixture
-        .set_peer_record(sign_record(
-            &fixture.issuer,
-            PEER_NODE_ID,
-            2,
-            "peer-key-1",
-            PEER_SPKI_SHA256,
-            30,
-            true,
-        ))
-        .await;
-    fixture
-        .publish(fixture.record(2, "key-2", OTHER_SPKI_SHA256, 30))
-        .await;
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("an unapproved local key makes membership unready");
-    assert_eq!(
-        fixture.runtime.readiness(),
-        MembershipReadiness::Unready(MembershipUnreadyReason::MissingLocalKey)
-    );
-    assert!(
-        !wired
-            .publisher
-            .pins()
-            .snapshot()
-            .contains(pin(PEER_SPKI_SHA256)),
-        "M7-C86: a peer key the newest verified record revoked stayed pinned \
-         because this relay was locally unready"
-    );
-    assert!(
-        !wired
-            .publisher
-            .pins()
-            .snapshot()
-            .contains(pin(REPLACEMENT_SPKI_SHA256)),
-        "retention never widens the set: the replacement key waits for Ready"
-    );
-}
-
 /// **M7-C86 is held on this branch.** Every unready reason withdraws the
 /// pin set, as before the split, because the split regresses
 /// `verify-m7-trust-expiry` (base 20/20, split 10/20). Naming every reason
@@ -612,147 +474,19 @@ fn while_the_retention_split_is_held_every_unready_reason_withdraws() {
 
 // ---------------------------------------------------------------- M7-C90
 
-/// **M7-C90.** The refresh tick's behaviour with no admission active, now
-/// that the serving relay and the fixture run the same library tick: a
-/// transient unready state (a failed catalog read) withdraws the pin set at
-/// the readiness transition itself -- no invalidation callback is needed --
-/// and the tick then withdraws peer trust, consistently with it. The
-/// reconcile that restores membership republishes at once (M7-C91), so the
-/// withdrawal lasts exactly as long as the unready state.
-#[tokio::test]
-async fn the_refresh_tick_and_the_transition_agree_with_no_admission_active() {
-    let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    wired.publisher.publish();
-    assert_eq!(fixture.runtime.snapshot().active_peer_count, 0);
-
-    fixture.source.fail_reads.store(true, Ordering::Release);
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("a failed catalog read makes membership unready");
-    assert!(
-        wired.publisher.pins().snapshot().is_empty(),
-        "M7-C90: the unready transition must be published with no admission active"
-    );
-    let tick = peer_trust_tick(
-        &wired.publisher,
-        &wired.peer,
-        NODE_ID,
-        1,
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(tick, PeerTrustTick::TrustWithdrawn);
-    assert!(!wired.peer.is_ready());
-
-    fixture.source.fail_reads.store(false, Ordering::Release);
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect("membership recovers");
-    assert!(
-        !wired.publisher.pins().snapshot().is_empty(),
-        "M7-C91: the recovering reconcile republishes the pin set at once"
-    );
-    // Route and capacity readiness, withdrawn with trust by the tick, come
-    // back through the next authenticated probe pass, as before.
-}
-
-/// The control for M7-C90: rejected trust evidence withdraws the pin set at
-/// the transition itself, with no admission active and no tick.
-#[tokio::test]
-async fn rejected_evidence_withdraws_the_pin_set_with_no_admission_and_no_tick() {
-    let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    wired.publisher.publish();
-    *fixture.source.records.write().await = vec![SignedMembershipRecord {
-        version: 2,
-        bytes: b"not a signed membership record".to_vec(),
-    }];
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("a rejected record makes membership unready");
-    assert!(
-        wired.publisher.pins().snapshot().is_empty(),
-        "the readiness transition alone must withdraw rejected trust"
-    );
-}
-
 // ---------------------------------------------------------------- M7-C91
-
-/// **M7-C91.** The reconcile that returns membership to `Ready` republishes
-/// the verified pin set at once, so readiness returns within that reconcile
-/// rather than on the next refresh tick. No tick runs in this test.
-#[tokio::test]
-async fn readiness_returns_within_the_reconcile_that_restores_membership() {
-    let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    wired.publisher.publish();
-    let _admission = fixture
-        .runtime
-        .admit_peer(Fixture::identity())
-        .expect("an active admission for the invalidation to reach");
-    assert!(wired.peer.is_ready(), "control: ready before the blip");
-
-    *fixture.source.records.write().await = vec![SignedMembershipRecord {
-        version: 2,
-        bytes: b"not a signed membership record".to_vec(),
-    }];
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect_err("a rejected record makes membership unready");
-    assert!(wired.publisher.pins().snapshot().is_empty());
-    assert!(!wired.peer.is_ready());
-
-    fixture
-        .publish(fixture.record(3, "key-1", SPKI_SHA256, 30))
-        .await;
-    fixture
-        .runtime
-        .reconcile_once()
-        .await
-        .expect("membership recovers");
-    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
-    assert!(
-        wired.readiness.is_ready(),
-        "precondition: route, listener and capacity readiness were never withdrawn"
-    );
-    assert!(
-        !wired.publisher.pins().snapshot().is_empty(),
-        "M7-C91: the reconcile that restored membership did not republish the pin set"
-    );
-    assert!(
-        wired.peer.is_ready(),
-        "M7-C91: readiness did not return within the reconcile that restored membership"
-    );
-}
 
 // ---------------------------------------------------------------- M7-C83
 
-/// **M7-C83 part 1.** Back-to-back re-signs -- three versions reconciled with
-/// no gap, one of them racing a failed catalog read and one an unapproved
-/// local key -- leave peer trust and readiness back within each re-sign's own
-/// reconcile, without any refresh tick (M7-C91). While M7-C86 is held a
-/// transient blip still withdraws the pin set for its own duration. The admission taken
-/// before the first re-sign survives every one of them (M7-C80).
+/// **M7-C83 part 1, at the membership runtime.** Back-to-back same-key
+/// re-signs reconciled with no gap -- one racing a failed catalog read, one
+/// an unapproved local key -- end with membership `Ready`, and an admission
+/// taken after the last blip survives every later same-key re-sign (M7-C80).
+/// Peer readiness recovery through the pin wiring is held with M7-C86 and
+/// its wiring rows (M7-C90, M7-C91) on the draft branch.
 #[tokio::test]
-async fn back_to_back_resigns_recover_peer_readiness_without_a_tick() {
+async fn back_to_back_resigns_end_ready_and_keep_a_live_admission() {
     let fixture = Fixture::ready().await;
-    let wired = wired(&fixture.runtime);
-    wired.publisher.publish();
-    let admission = fixture
-        .runtime
-        .admit_peer(Fixture::identity())
-        .expect("an active admission");
-    let stream = admission.cancellation();
-
     let mut version = 2;
     for blip in [None, Some("catalog"), None, Some("local-key"), None] {
         match blip {
@@ -772,33 +506,19 @@ async fn back_to_back_resigns_recover_peer_readiness_without_a_tick() {
         }
         fixture.resign(version).await;
         version += 1;
-        assert!(
-            !wired.publisher.pins().snapshot().is_empty() && wired.peer.is_ready(),
-            "M7-C83: peer trust and readiness were not back within the re-sign \
-             that followed a transient unready state"
-        );
+        assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
     }
-    assert_eq!(fixture.runtime.readiness(), MembershipReadiness::Ready);
-    assert!(
-        wired.peer.is_ready(),
-        "M7-C83: peer readiness did not recover after back-to-back re-signs"
-    );
-    // The local-key blip invalidated the admission (this relay stopped being
-    // allowed to serve); the admission retaken after it must survive the
-    // later same-key re-signs.
-    assert!(
-        stream.is_cancelled(),
-        "the local-key blip is a real invalidation"
-    );
-    let retaken = fixture
+    let admission = fixture
         .runtime
         .admit_peer(Fixture::identity())
         .expect("admission after recovery");
-    let retaken_stream = retaken.cancellation();
-    fixture.resign(version).await;
-    fixture.resign(version + 1).await;
+    let stream = admission.cancellation();
+    for _ in 0..3 {
+        fixture.resign(version).await;
+        version += 1;
+    }
     assert!(
-        !retaken_stream.is_cancelled(),
-        "back-to-back same-key re-signs must not cancel a live admission"
+        !stream.is_cancelled(),
+        "M7-C83: back-to-back same-key re-signs cancelled a live admission"
     );
 }

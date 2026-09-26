@@ -24,7 +24,6 @@ pub mod membership_version_state;
 mod metrics;
 mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;
-pub mod peer_pins;
 pub mod peer_runtime;
 mod peer_transport_diagnostics;
 pub mod provisioning;

@@ -545,15 +545,9 @@ async fn readiness_and_admission_withdraw_with_the_transport_pin_set() {
 /// The M7-C89 mechanism end to end, with the real `MembershipRuntime`
 /// dispatching its real invalidation callback.
 ///
-/// The callback installed here applies the serving relay's *pre-M7-C86*
-/// rule -- publish when `Ready`, empty the set otherwise -- and nothing else,
-/// so the window it opens is reachable at all. The product no longer wires
-/// only this: the shared library publisher also republishes on the
-/// reconcile that restores `Ready` (M7-C91) and retains the set for a local
-/// unready state (M7-C86); `tests/m7_membership_resign.rs` drives that real
-/// wiring. This test keeps the readiness check honest for every *other* path
-/// that can still empty the set. It is the scenario's trigger, not the
-/// property under test.
+/// The callback installed here applies the serving relay's rule -- publish
+/// when `Ready`, empty the set otherwise -- because the rule itself lives in
+/// the binary. It is the scenario's trigger, not the property under test.
 /// What is asserted is the part that was relayed and is re-derived here:
 /// an unready transition with an active admission empties the pin set; the
 /// reconcile that returns membership to `Ready` has no admission left to

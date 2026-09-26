@@ -1,7 +1,7 @@
 # Demo: a peer stream survives membership re-signs
 
 This recipe shows the M7 cluster behaviour changed on branch `m7-membership`
-(task rows M7-C80, M7-C83, M7-C86, M7-C90 and M7-C91). Three real relay
+(task rows M7-C80 and M7-C83; M7-C86, M7-C90 and M7-C91 are held on a draft branch). Three real relay
 processes run against a local Redis. One device is owned by `relay-a` and one
 public consumer WebSocket enters at `relay-c`, so every exchange goes
 consumer → relay-c → peer HTTP/3 hop → relay-a → device and back. Nothing
@@ -69,9 +69,6 @@ cargo test -p tunnel-relay --test m7_membership_resign --locked
   invalidated the admission. Look for `membership reconcile failed` warnings
   in the output. A record that changes the key, endpoint or server name, or
   shrinks the signed trust window, is still meant to invalidate.
-- `pins_ever_empty`: a relay withdrew its pins during a same-key re-sign. Only
-  rejected trust evidence may do that: an unknown authority, a record that
-  fails verification, or an expired checkpoint or key window. Look for
-  `membership trust evidence was rejected; withdrawing peer pins`.
+- `pins_ever_empty`: a relay withdrew its pins during a same-key re-sign. On this branch every unready state still withdraws them (the narrowing is held as M7-C86), so this means a re-sign raced a reconcile and left a relay briefly unready. Look for `membership reconcile failed` warnings.
 - A readiness timeout after the burst: rerun with `RUST_LOG=warn` and look for
   `authenticated peer readiness probe failed`.

@@ -876,7 +876,7 @@ async fn run_inner(
         let target = cluster.relay(TARGET_NODE)?;
         wait_until_membership_ready(&target.membership, super::KEY_REVOCATION_RECOVERY_TIMEOUT)
             .await?;
-        publish_verified_pins(&target.pin_publisher)?;
+        publish_verified_pins(&target.membership, &target.pins)?;
         cluster
             .wait_for_peer_readiness(super::KEY_REVOCATION_RECOVERY_TIMEOUT)
             .await?;

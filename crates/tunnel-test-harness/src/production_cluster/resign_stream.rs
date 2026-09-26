@@ -133,7 +133,7 @@ pub async fn verify() -> Result<ResignStreamEvidence> {
 }
 
 /// Counts every admission invalidation the relays' dispatchers deliver while
-/// armed, chaining each relay's own shared pin publisher so recording changes
+/// armed, chaining the fixture's own pin publication so recording changes
 /// nothing about what the fixture does.
 #[derive(Default)]
 struct InvalidationCounter {
@@ -144,7 +144,11 @@ struct InvalidationCounter {
 
 fn install_counter(cluster: &ProductionCluster, counter: &Arc<InvalidationCounter>) {
     for relay in &cluster.relays {
-        let publisher = Arc::clone(&relay.pin_publisher);
+        let publish = super::fixture_pin_callback(
+            &relay.membership,
+            &relay.pins,
+            &relay.pin_publication_pending,
+        );
         let counter = Arc::clone(counter);
         relay
             .membership
@@ -156,14 +160,21 @@ fn install_counter(cluster: &ProductionCluster, counter: &Arc<InvalidationCounte
                         counter.other.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-                publisher.publish();
+                publish();
             })));
     }
 }
 
 fn restore_callbacks(cluster: &ProductionCluster) {
     for relay in &cluster.relays {
-        relay.pin_publisher.install();
+        let publish = super::fixture_pin_callback(
+            &relay.membership,
+            &relay.pins,
+            &relay.pin_publication_pending,
+        );
+        relay
+            .membership
+            .set_invalidation_callback(Some(Arc::new(move |_identity, _reason| publish())));
     }
 }
 

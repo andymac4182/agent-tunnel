@@ -453,11 +453,6 @@ mod c17_validator_tests {
 #[derive(Debug, Default)]
 struct HintDropFilter {
     armed: AtomicBool,
-    /// Every relay's shared pin publisher. The invalidation callback is not
-    /// the only process-local publication hint any more: the change observer
-    /// and the refresh tick publish too (M7-C90, M7-C91), so the window
-    /// suppresses the publisher itself.
-    publishers: std::sync::Mutex<Vec<Arc<tunnel_relay::peer_pins::PeerPinPublisher>>>,
     target_dropped: AtomicU64,
     other_dropped: AtomicU64,
     published_in_window: AtomicU64,
@@ -466,23 +461,10 @@ struct HintDropFilter {
 impl HintDropFilter {
     fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
-        for publisher in self.publishers() {
-            publisher.set_suppressed(true);
-        }
     }
 
     fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
-        for publisher in self.publishers() {
-            publisher.set_suppressed(false);
-        }
-    }
-
-    fn publishers(&self) -> Vec<Arc<tunnel_relay::peer_pins::PeerPinPublisher>> {
-        self.publishers
-            .lock()
-            .map(|publishers| publishers.clone())
-            .unwrap_or_default()
     }
 
     /// Return true when the hint must be dropped instead of republishing pins.
@@ -509,10 +491,8 @@ impl HintDropFilter {
 /// publishes nothing while armed.  This is the whole injection: no product code
 /// changes, and the runtime keeps dispatching hints exactly as before.
 fn install_hint_drop_callback(relay: &ProductionRelay, filter: &Arc<HintDropFilter>) {
-    let publisher = Arc::clone(&relay.pin_publisher);
-    if let Ok(mut publishers) = filter.publishers.lock() {
-        publishers.push(Arc::clone(&publisher));
-    }
+    let membership = Arc::clone(&relay.membership);
+    let pins = relay.pins.clone();
     let filter = Arc::clone(filter);
     relay
         .membership
@@ -521,7 +501,10 @@ fn install_hint_drop_callback(relay: &ProductionRelay, filter: &Arc<HintDropFilt
                 return;
             }
             filter.record_publication();
-            publisher.publish();
+            if let Err(error) = publish_verified_pins(&membership, &pins) {
+                tracing::warn!(?error, "hint-drop pin publication failed closed");
+                let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
+            }
         })));
 }
 
@@ -1115,7 +1098,7 @@ async fn run_inner(
     wait_for_record_version(cluster, recovery_record_version).await?;
     for relay in &cluster.relays {
         wait_until_membership_ready(&relay.membership, RECOVERY_BOUND).await?;
-        publish_verified_pins(&relay.pin_publisher)?;
+        publish_verified_pins(&relay.membership, &relay.pins)?;
     }
     cluster.wait_for_peer_readiness(RECOVERY_BOUND).await?;
     cluster

@@ -74,7 +74,7 @@ gate "relay binary startup tests" \
   cargo test -p tunnel-relay --test m7_startup --locked -- --test-threads=1
 gate "relay health endpoint tests" \
   cargo test -p tunnel-relay --test m7_health_endpoints --locked -- --test-threads=1
-gate "membership re-sign and peer-trust wiring tests (M7-C80/C83/C86/C90/C91)" \
+gate "membership re-sign re-binding tests (M7-C80/C83)" \
   cargo test -p tunnel-relay --test m7_membership_resign --locked -- --test-threads=1
 gate "relay membership persistence tests" \
   cargo test -p tunnel-relay --test m7_membership_persistence --locked -- --test-threads=1

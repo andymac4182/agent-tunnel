@@ -488,7 +488,7 @@ pin set, and only a local or transient unready state retains it. Red-then-green
 in both directions at the fix revision: with the retention widened back the gate
 fails at this phase in 65 s, and with the split in place it passes in 68 s.
 
-The retention split is **held** as M7-C86 because it regresses this gate. Measured interleaved through the gate limiter against `origin/main` `6830ba79`: base 20 of 20, split branch 10 of 20, every failure `ingress_last_receive=(IngressReceive, Closed)`. The shared pin wiring (M7-C90), the Ready republication (M7-C91) and the re-sign re-binding (M7-C80) landed without it; see M7-C86 for this gate's measurement on that branch. Attributing a peer reset to trust expiry was not changed. Every transition
+The retention split is **held** as M7-C86 because it regresses this gate. Measured interleaved through the gate limiter against `origin/main` `6830ba79`: base 20 of 20, split branch 10 of 20, every failure `ingress_last_receive=(IngressReceive, Closed)`. Only the re-sign re-binding (M7-C80) landed without it: the shared pin wiring (M7-C90) and the Ready republication (M7-C91) also regressed this gate on their own and are held with M7-C86. With only M7-C80's runtime change, the gate passed 10 of 10. Attributing a peer reset to trust expiry was not changed. Every transition
 asserts payload-free, credential-free process diagnostics, and cleanup joins
 both relay processes, the impostor, the checkpoint authority, both Redis
 forwarders and the catalog namespace. The deterministic statement of the same
