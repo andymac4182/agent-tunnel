@@ -359,6 +359,24 @@ impl ActorCompletion {
     fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
+
+    /// Wait for the reply to a command this actor was sent, or for the actor
+    /// to end, whichever comes first (task row M6-C162).
+    ///
+    /// Dropping a tokio mpsc receiver drains its queue, but a `send` that
+    /// reserved its slot before the drop and stores its value after the drain
+    /// leaves the command -- and the reply sender inside it -- in the channel
+    /// until the last sender is dropped. Every relay handle clones that
+    /// sender, so an unbounded `receiver.await` would wait forever after an
+    /// actor panic or abort. A finished actor answers nothing more; a reply
+    /// it sent before it finished is still returned. `None` means no reply.
+    async fn reply<T>(&self, receiver: &mut oneshot::Receiver<T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            reply = &mut *receiver => reply.ok(),
+            () = self.wait() => receiver.try_recv().ok(),
+        }
+    }
 }
 
 /// Owns a join handle while it is being awaited.  If the surrounding
@@ -2442,6 +2460,22 @@ impl RelayHandle {
         handle
     }
 
+    /// Wait for one command's reply, bounded by the actor's own completion
+    /// (task row M6-C162; see [`ActorCompletion::reply`]).
+    async fn reply<T>(&self, mut receiver: oneshot::Receiver<T>) -> Option<T> {
+        self.actor_completion.reply(&mut receiver).await
+    }
+
+    /// Wait for an outstanding HTTP stream read submitted by
+    /// [`Self::begin_read_http_stream`], bounded by the actor's completion.
+    /// The receiver is borrowed so a dropped wait keeps the read outstanding.
+    pub(crate) async fn http_read_reply(
+        &self,
+        receiver: &mut oneshot::Receiver<HttpRead>,
+    ) -> Option<HttpRead> {
+        self.actor_completion.reply(receiver).await
+    }
+
     pub(crate) fn control_cleanup_guard(&self, key: SessionKey) -> TerminalCleanupGuard {
         self.terminal_cleanup.guard(TerminalCleanup::Control(key))
     }
@@ -2485,7 +2519,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     /// Register a device control stream that arrived through an authenticated
@@ -2508,7 +2542,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     pub(crate) async fn attach_data(
@@ -2525,7 +2559,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     /// Attach a data carrier whose device TLS session terminated at another
@@ -2547,7 +2581,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     pub(crate) async fn inbound_control(
@@ -2641,7 +2675,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     pub(crate) async fn write_echo_stream(
@@ -2665,7 +2699,7 @@ impl RelayHandle {
                 code: "REVERSE_CHANNEL_UNAVAILABLE",
                 execution: "not_dispatched",
             })?;
-        receiver.await.map_err(|_| EchoOutcome::Failure {
+        self.reply(receiver).await.ok_or(EchoOutcome::Failure {
             code: "REVERSE_CHANNEL_INTERRUPTED",
             execution: "unknown",
         })?
@@ -2716,7 +2750,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     /// Admit one filesystem 9P logical stream.
@@ -2756,7 +2790,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)?
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)?
     }
 
     /// Send one raw DATA chunk on an HTTP stream.  Resolves once the chunk is
@@ -2818,7 +2852,7 @@ impl RelayHandle {
         {
             return false;
         }
-        receiver.await.unwrap_or(false)
+        self.reply(receiver).await.unwrap_or(false)
     }
 
     /// Queue the owner's RESET on an HTTP stream.
@@ -2844,7 +2878,7 @@ impl RelayHandle {
         {
             return false;
         }
-        receiver.await.unwrap_or(false)
+        self.reply(receiver).await.unwrap_or(false)
     }
 
     /// The bounded HTTP forwarding diagnostics shared by every hop on this
@@ -2883,7 +2917,7 @@ impl RelayHandle {
         {
             return false;
         }
-        receiver.await.unwrap_or(false)
+        self.reply(receiver).await.unwrap_or(false)
     }
 
     /// Record a bounded timeout from an exact public consumer response-write
@@ -2976,7 +3010,7 @@ impl RelayHandle {
             .send(Command::Snapshot { response })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)
     }
 
     pub(crate) async fn dispatch_echo(
@@ -3001,7 +3035,7 @@ impl RelayHandle {
             })
             .await
             .map_err(|_| RelayError::Shutdown)?;
-        receiver.await.map_err(|_| RelayError::Shutdown)
+        self.reply(receiver).await.ok_or(RelayError::Shutdown)
     }
 
     pub async fn shutdown(&self) -> Result<(), RelayError> {
@@ -3023,7 +3057,7 @@ impl RelayHandle {
             self.join_maintenance_task().await;
             return self.shutdown_result(false);
         }
-        if receiver.await.is_err() {
+        if self.reply(receiver).await.is_none() {
             self.actor_completion.wait().await;
             self.maintenance_completion.wait().await;
             self.join_actor_task().await;
@@ -24121,6 +24155,10 @@ mod cancel_tests;
 #[cfg(test)]
 #[path = "actor_owner_write_tests.rs"]
 mod owner_write_tests;
+
+#[cfg(test)]
+#[path = "actor_stranded_reply_tests.rs"]
+mod stranded_reply_tests;
 
 #[cfg(test)]
 mod cleanup_tests {
