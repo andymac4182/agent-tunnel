@@ -59,7 +59,10 @@ const KNOWN_REASONS: &[(&str, &str)] = &[
         "OPEN idempotency retention is full; start a fresh session",
         "open_idempotency_full",
     ),
-    ("service is not locally allowlisted", "export_not_allowlisted"),
+    (
+        "service is not locally allowlisted",
+        "export_not_allowlisted",
+    ),
     (
         "only the local echo operation is enabled",
         "operation_not_enabled",
@@ -208,7 +211,10 @@ mod tests {
             include_str!("../../tunnel-client/src/m2_runtime.rs"),
         ] {
             // Production code only: the test modules build synthetic refusals.
-            let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap_or(source);
+            let production = source
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .unwrap_or(source);
             let lines: Vec<&str> = production.lines().collect();
             for (index, line) in lines.iter().enumerate() {
                 let call = line.contains("send_rejected(")
@@ -273,7 +279,10 @@ mod tests {
         assert_eq!(code_label("GOAWAY"), "GOAWAY");
         assert_eq!(code_label("goaway"), OTHER);
         assert_eq!(code_label("SECRET_TOKEN_abc"), OTHER);
-        assert_eq!(reason_category("connector is draining"), "connector_draining");
+        assert_eq!(
+            reason_category("connector is draining"),
+            "connector_draining"
+        );
         assert_eq!(reason_category("connector is draining\n"), OTHER);
         assert_eq!(reason_category("\u{1b}[31mpayload"), OTHER);
     }
