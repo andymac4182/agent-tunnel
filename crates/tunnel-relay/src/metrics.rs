@@ -370,8 +370,8 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
     counter(
         &mut out,
         "tunnel_relay_actor_busy_microseconds_total",
-        "Wall time the relay actor spent handling commands, in microseconds; its rate is the actor's busy fraction.",
-        load.busy_micros,
+        "Wall time the relay actor spent handling commands, in microseconds; its rate is a lower bound on the actor's busy fraction (only the command branch is timed).",
+        load.busy_nanos / 1_000,
     );
     gauge(
         &mut out,

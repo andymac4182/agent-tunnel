@@ -119,7 +119,7 @@ fn rendered() -> String {
         ]),
         actor_load: crate::actor::ActorLoadSnapshot {
             commands: 41,
-            busy_micros: 9_876,
+            busy_nanos: 9_876_543,
             queue_depth: 3,
             queue_capacity: 64,
         },

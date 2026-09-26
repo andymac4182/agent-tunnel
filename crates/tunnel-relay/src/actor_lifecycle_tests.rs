@@ -1767,6 +1767,11 @@ async fn m6c183_actor_load_counts_every_handled_command() {
         after.commands >= before.commands + 3,
         "commands {before:?} -> {after:?}"
     );
-    assert!(after.busy_micros >= before.busy_micros, "{after:?}");
+    // Handling a command takes a nonzero wall time, so the timed total
+    // must strictly increase (nanosecond resolution).
+    assert!(
+        after.busy_nanos > before.busy_nanos,
+        "busy time {before:?} -> {after:?}"
+    );
     handle.shutdown().await.expect("shutdown");
 }

@@ -2945,19 +2945,23 @@ impl ConsumerStreamRegistration {
 /// How busy the single relay actor is (task rows M6-C182, M6-C183): the
 /// commands it has handled and the wall time spent handling them, including
 /// the post-command maintenance.  Payload-free counters only.  Every device
-/// and every tenant shares this one actor, so its busy fraction is the share
-/// of relay command capacity in use.
+/// and every tenant shares this one actor.
+///
+/// **A lower bound on the actor's busy time.** Only the command branch of
+/// the actor loop is timed; terminal-cleanup drains, held-OPEN deadline
+/// service, owner-backlog offers and background-task joins run on the same
+/// task and are not counted.
 #[derive(Debug, Default)]
 pub(crate) struct ActorLoad {
     commands: AtomicU64,
-    busy_micros: AtomicU64,
+    busy_nanos: AtomicU64,
 }
 
 impl ActorLoad {
     fn record(&self, busy: Duration) {
         self.commands.fetch_add(1, Ordering::Relaxed);
-        self.busy_micros.fetch_add(
-            u64::try_from(busy.as_micros()).unwrap_or(u64::MAX),
+        self.busy_nanos.fetch_add(
+            u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
     }
@@ -2967,7 +2971,9 @@ impl ActorLoad {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ActorLoadSnapshot {
     pub(crate) commands: u64,
-    pub(crate) busy_micros: u64,
+    /// Timed command handling in nanoseconds (a lower bound; see
+    /// [`ActorLoad`]).  The metric reports it in microseconds.
+    pub(crate) busy_nanos: u64,
     pub(crate) queue_depth: u64,
     pub(crate) queue_capacity: u64,
 }
@@ -3710,7 +3716,7 @@ impl RelayHandle {
         let capacity = self.tx.max_capacity();
         ActorLoadSnapshot {
             commands: self.actor_load.commands.load(Ordering::Relaxed),
-            busy_micros: self.actor_load.busy_micros.load(Ordering::Relaxed),
+            busy_nanos: self.actor_load.busy_nanos.load(Ordering::Relaxed),
             queue_depth: u64::try_from(capacity.saturating_sub(self.tx.capacity()))
                 .unwrap_or(u64::MAX),
             queue_capacity: u64::try_from(capacity).unwrap_or(u64::MAX),

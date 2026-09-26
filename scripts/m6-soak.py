@@ -305,11 +305,14 @@ class Stack:
             "kty": "RSA", "kid": "m6-03-soak", "alg": "RS256", "use": "sig",
             "n": b64url(bytes.fromhex(modulus)), "e": "AQAB"}]}))
 
-    def token(self, subject: str, scope: str) -> str:
-        """A 300-second access token, re-signed when less than 60 s remain."""
+    def token(self, subject: str, scope: str, min_remaining: float = 60) -> str:
+        """A 300-second access token, re-signed when `min_remaining` seconds
+        or fewer remain."""
+        if min_remaining > 240:
+            raise ValueError("a 300 s token cannot cover more than 240 s with margin")
         with self.token_lock:
             cached = self.tokens.get((subject, scope))
-            if cached and cached[0] - time.time() > 60:
+            if cached and cached[0] - time.time() > min_remaining:
                 return cached[1]
             now = int(time.time())
             header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "m6-03-soak"}).encode())
@@ -1269,7 +1272,10 @@ async def start_clients(stack: Stack, rec: Recorder, user: str, device: str, pre
     returned coroutine to merge their rows into `rec` under the current
     phase; it returns each process's loop lag and CPU seconds."""
     dev = stack.devices[device]
-    token = await asyncio.to_thread(stack.token, stack.users[user]["subject"], "echo:invoke")
+    # A client process holds one token for its whole run (it cannot re-sign),
+    # so it must outlive `until` with the usual 60 s margin.
+    token = await asyncio.to_thread(stack.token, stack.users[user]["subject"], "echo:invoke",
+                                    max(0.0, until - time.time()) + 60)
     shares = [workers // processes + (1 if i < workers % processes else 0)
               for i in range(processes)]
     procs = []
