@@ -522,6 +522,8 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "STREAM_CLOSED",
         "CANCEL_UNDELIVERABLE",
         "FLOW_CONTROL_UNDELIVERABLE",
+        // An abandoned unary echo outlived its bound (task row M7-C94).
+        "UNARY_ABANDON_TIMEOUT",
     ];
     ALLOWED
         .iter()

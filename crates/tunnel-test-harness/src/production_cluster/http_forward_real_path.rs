@@ -85,6 +85,11 @@ pub const OPEN_JOURNAL_TRACKED_ENTRIES: usize =
 /// Sequential small requests driven through one device session, comfortably
 /// past that former ceiling.
 pub const SEQUENTIAL_REQUESTS: usize = 160;
+/// Consumer-cancelled `/events` exchanges driven through the same device
+/// session after the sequential phase (task row M7-C85): more than the
+/// connector's 128 tracked OPEN journal entries, so a cancelled exchange
+/// whose entry was never reclaimed would wedge the session before the end.
+pub const CANCELLED_EXCHANGES: usize = 140;
 /// A fresh consumer connection every this many sequential requests, so the
 /// loop does not depend on one HTTP/1.1 connection surviving all of them.
 const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
@@ -217,6 +222,17 @@ pub struct HttpForwardRealPathEvidence {
     pub open_streams_retired_before_sequential: u64,
     pub open_streams_retired: u64,
     pub open_retired_ranges_coalesced: u64,
+    /// M7-C85: consumer-cancelled `/events` exchanges driven after the
+    /// sequential phase, how many handlers observed their cancellation, the
+    /// journal and retired counts around them, and whether the one device
+    /// session survived all of them.
+    pub cancelled_exchanges: usize,
+    pub cancelled_handlers_observed: u64,
+    pub open_journal_entries_after_cancelled: usize,
+    pub open_journal_stream_ids_after_cancelled: Vec<u64>,
+    pub open_streams_retired_after_cancelled: u64,
+    pub cancelled_session_id_stable: bool,
+    pub cancelled_ready_after: bool,
 }
 
 /// The documented bound every hop must respect.  Returns the first violated
@@ -228,7 +244,7 @@ pub fn validate_http_forward_real_path_evidence(
     evidence: &HttpForwardRealPathEvidence,
 ) -> Result<()> {
     let body_queue_bound = BODY_QUEUE_CHUNKS * MAX_BODY_PAYLOAD_LEN;
-    let checks: [(&str, bool); 54] = [
+    let checks: [(&str, bool); 58] = [
         (
             "owner-local ingress answers the permission request",
             evidence.owner_local_permission_exact,
@@ -463,6 +479,30 @@ pub fn validate_http_forward_real_path_evidence(
                     .open_streams_retired_before_sequential
                     .saturating_add(SEQUENTIAL_REQUESTS as u64),
         ),
+        (
+            // M7-C85: more cancelled exchanges than the journal holds, each
+            // one's handler cancelled, on the one session.
+            "every consumer-cancelled exchange cancelled its handler",
+            evidence.cancelled_exchanges == CANCELLED_EXCHANGES
+                && CANCELLED_EXCHANGES > OPEN_JOURNAL_TRACKED_ENTRIES
+                && evidence.cancelled_handlers_observed >= CANCELLED_EXCHANGES as u64,
+        ),
+        (
+            "every consumer-cancelled exchange was reclaimed at the OPEN retry horizon",
+            evidence.open_streams_retired_after_cancelled
+                == evidence
+                    .open_streams_retired
+                    .saturating_add(CANCELLED_EXCHANGES as u64),
+        ),
+        (
+            "the OPEN journal returned to its starting size after the cancelled exchanges",
+            evidence.open_journal_entries_after_cancelled
+                == evidence.open_journal_entries_before_sequential,
+        ),
+        (
+            "the device session survived more cancelled exchanges than its journal holds",
+            evidence.cancelled_session_id_stable && evidence.cancelled_ready_after,
+        ),
     ];
     for (rule, passed) in checks {
         if !passed {
@@ -536,6 +576,8 @@ struct HandlerState {
     events_started_flag: AtomicBool,
     cancellation: Mutex<Option<Instant>>,
     cancelled: Notify,
+    /// Every `/events` handler cancellation observed, for M7-C85's loop.
+    cancellations: AtomicU64,
 }
 
 pub(super) fn handler_body(receiver: mpsc::Receiver<Bytes>) -> HttpBody {
@@ -615,11 +657,12 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
                             state.events_started.notify_waiters();
                             if let Some(HandlerCancellation(token)) = cancellation {
                                 token.cancelled().await;
-                                *state
+                                state
                                     .cancellation
                                     .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(Instant::now());
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get_or_insert_with(Instant::now);
+                                state.cancellations.fetch_add(1, Ordering::SeqCst);
                                 state.cancelled.notify_waiters();
                             }
                             drop(tx);
@@ -1514,7 +1557,123 @@ async fn exercise(
         session_id,
         evidence,
     )
+    .await?;
+    cancelled_exchanges(
+        ingress_addr,
+        &ca,
+        &token,
+        &base,
+        state,
+        client,
+        session_id,
+        evidence,
+    )
     .await
+}
+
+/// Task row M7-C85: cancel `CANCELLED_EXCHANGES` `/events` exchanges one at a
+/// time by disconnecting the consumer after the first event, on the same
+/// device session, and require every one to be reclaimed at the OPEN retry
+/// horizon.  The owner forgets an exchange only once both terminals are
+/// proved after its `RESET(CANCELLED)`; one it never forgot would permanently
+/// spend a connector journal entry, and more cancellations than the journal
+/// holds would then wedge the session at `RESOURCE_EXHAUSTED`.
+#[allow(clippy::too_many_arguments)]
+async fn cancelled_exchanges(
+    ingress_addr: SocketAddr,
+    ca: &[u8],
+    token: &str,
+    base: &str,
+    state: &Arc<HandlerState>,
+    client: &tunnel_client::ConnectionHandle,
+    session_id: &str,
+    evidence: &mut HttpForwardRealPathEvidence,
+) -> Result<()> {
+    let retired_before = evidence.open_streams_retired;
+    for index in 0..CANCELLED_EXCHANGES {
+        let observed_before = state.cancellations.load(Ordering::SeqCst);
+        let (mut sender, task) = connect_consumer(ingress_addr, ca).await?;
+        let response = timeout(
+            SEQUENTIAL_REQUEST_TIMEOUT,
+            sender.send_request(request(
+                "GET",
+                &format!("{base}/events"),
+                Some(token),
+                &[("accept", "text/event-stream")],
+                empty_stream(),
+            )?),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout(format!("cancelled exchange {index} head timed out")))?
+        .map_err(|error| {
+            HarnessError::Http(format!(
+                "cancelled exchange {index}: {}",
+                error_chain(&error)
+            ))
+        })?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(HarnessError::Process(format!(
+                "cancelled exchange {index} answered {status}"
+            )));
+        }
+        let mut body = response.into_body();
+        timeout(SEQUENTIAL_REQUEST_TIMEOUT, body.frame())
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout(format!("cancelled exchange {index} first event timed out"))
+            })?;
+        drop(body);
+        drop(sender);
+        task.abort();
+        let _ = task.await;
+        timeout(SEQUENTIAL_REQUEST_TIMEOUT, async {
+            loop {
+                let notified = state.cancelled.notified();
+                if state.cancellations.load(Ordering::SeqCst) > observed_before {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout(format!(
+                "cancelled exchange {index}: the handler never observed its cancellation"
+            ))
+        })?;
+        evidence.cancelled_exchanges += 1;
+    }
+    evidence.cancelled_handlers_observed = state.cancellations.load(Ordering::SeqCst);
+    let target_retired = retired_before.saturating_add(CANCELLED_EXCHANGES as u64);
+    let final_status = wait_for_records("cancelled exchanges' journal", async || {
+        let snapshot = client.status_snapshot();
+        Ok((snapshot.open_streams_retired >= target_retired
+            && snapshot.open_journal_entries <= evidence.open_journal_entries_before_sequential)
+            .then_some(snapshot))
+    })
+    .await;
+    let final_status = match final_status {
+        Ok(status) => status,
+        Err(error) => {
+            // Record what was retained so the failure names it.
+            let snapshot = client.status_snapshot();
+            evidence.open_journal_entries_after_cancelled = snapshot.open_journal_entries;
+            evidence.open_journal_stream_ids_after_cancelled =
+                snapshot.open_journal_stream_ids.clone();
+            evidence.open_streams_retired_after_cancelled = snapshot.open_streams_retired;
+            return Err(error);
+        }
+    };
+    evidence.open_journal_entries_after_cancelled = final_status.open_journal_entries;
+    evidence.open_journal_stream_ids_after_cancelled = final_status.open_journal_stream_ids.clone();
+    evidence.open_streams_retired_after_cancelled = final_status.open_streams_retired;
+    evidence.cancelled_session_id_stable = final_status.session_id.as_deref() == Some(session_id);
+    evidence.cancelled_ready_after = matches!(
+        &*client.readiness().borrow(),
+        tunnel_client::Readiness::Ready(session) if session.session_id == session_id
+    );
+    Ok(())
 }
 
 /// Drive `SEQUENTIAL_REQUESTS` small requests through one device session, one
@@ -1749,6 +1908,15 @@ mod tests {
             open_streams_retired_before_sequential: 3,
             open_streams_retired: SEQUENTIAL_REQUESTS as u64 + 3,
             open_retired_ranges_coalesced: 0,
+            cancelled_exchanges: CANCELLED_EXCHANGES,
+            cancelled_handlers_observed: CANCELLED_EXCHANGES as u64 + 1,
+            open_journal_entries_after_cancelled: 0,
+            open_journal_stream_ids_after_cancelled: Vec::new(),
+            open_streams_retired_after_cancelled: (SEQUENTIAL_REQUESTS + CANCELLED_EXCHANGES)
+                as u64
+                + 3,
+            cancelled_session_id_stable: true,
+            cancelled_ready_after: true,
         }
     }
 
@@ -1829,6 +1997,24 @@ mod tests {
                 e.max_owner_replay = STREAM_WINDOW_BYTES + 1
             }),
             ("owner budget", |e| e.owner_data_bytes_high_water = 3),
+            ("cancelled exchanges short", |e| {
+                e.cancelled_exchanges = CANCELLED_EXCHANGES - 1;
+            }),
+            ("cancelled handler missed", |e| {
+                e.cancelled_handlers_observed = CANCELLED_EXCHANGES as u64 - 1;
+            }),
+            ("cancelled exchange never reclaimed", |e| {
+                e.open_streams_retired_after_cancelled -= 1;
+            }),
+            ("cancelled journal leak", |e| {
+                e.open_journal_entries_after_cancelled = 1;
+            }),
+            ("cancelled session replaced", |e| {
+                e.cancelled_session_id_stable = false;
+            }),
+            ("cancelled session not ready", |e| {
+                e.cancelled_ready_after = false;
+            }),
             ("device receive buffer", |e| {
                 e.max_device_receive_buffer = STREAM_WINDOW_BYTES + 1;
             }),

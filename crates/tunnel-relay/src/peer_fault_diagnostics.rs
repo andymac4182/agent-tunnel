@@ -219,6 +219,8 @@ pub enum PeerFaultCause {
     RotationFreeze,
     /// The owner's bounded stream limit is full.
     Capacity,
+    /// The peer does not hold the owner token the request named (M7-C110).
+    OwnerChanged,
     /// The peer membership admission expired.
     MembershipExpired,
     /// The peer stream was already closed.
@@ -236,7 +238,7 @@ impl PeerFaultCause {
     /// `tunnel-test-harness` compares them, and the exhaustive match in
     /// `every_cause_is_enumerated` below fails to compile if a variant is
     /// added without being listed here.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::NoLiveOwner,
         Self::Catalog,
         Self::Membership,
@@ -261,6 +263,7 @@ impl PeerFaultCause {
         Self::OwnerNotReady,
         Self::RotationFreeze,
         Self::Capacity,
+        Self::OwnerChanged,
         Self::MembershipExpired,
         Self::Closed,
         Self::Deadline,
@@ -293,6 +296,7 @@ impl PeerFaultCause {
             Self::OwnerNotReady => "owner_not_ready",
             Self::RotationFreeze => "rotation_freeze",
             Self::Capacity => "capacity",
+            Self::OwnerChanged => "owner_changed",
             Self::MembershipExpired => "membership_expired",
             Self::Closed => "closed",
             Self::Deadline => "deadline",
@@ -340,6 +344,7 @@ impl PeerFaultCause {
             PeerRuntimeError::OwnerNotReady { .. } => Self::OwnerNotReady,
             PeerRuntimeError::RotationFreeze { .. } => Self::RotationFreeze,
             PeerRuntimeError::Capacity { .. } => Self::Capacity,
+            PeerRuntimeError::OwnerChanged { .. } => Self::OwnerChanged,
             PeerRuntimeError::MembershipExpired => Self::MembershipExpired,
             PeerRuntimeError::Closed => Self::Closed,
         }
@@ -357,6 +362,7 @@ impl PeerFaultCause {
                 | Self::OwnerNotReady
                 | Self::RotationFreeze
                 | Self::Capacity
+                | Self::OwnerChanged
         )
     }
 }
@@ -794,6 +800,7 @@ mod tests {
                 | PeerFaultCause::OwnerNotReady
                 | PeerFaultCause::RotationFreeze
                 | PeerFaultCause::Capacity
+                | PeerFaultCause::OwnerChanged
                 | PeerFaultCause::MembershipExpired
                 | PeerFaultCause::Closed
                 | PeerFaultCause::Deadline => {}

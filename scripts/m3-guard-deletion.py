@@ -834,12 +834,10 @@ UNARY_ECHO_CASES: list[Case] = [
         [
             (
                 ACTOR,
-                "                let last_emitted = if pending.dispatched {\n"
-                "                    pending.send_sequence.saturating_add(1)\n"
-                "                } else {\n"
-                "                    0\n"
-                "                };",
-                "                let last_emitted = pending.send_sequence;",
+                "                let last_emitted = pending.relay_last_emitted();\n"
+                "                entries.push(StreamFence::new(*stream_id, direction, last_emitted));",
+                "                let last_emitted = pending.send_sequence;\n"
+                "                entries.push(StreamFence::new(*stream_id, direction, last_emitted));",
             )
         ],
         frozenset(
@@ -908,11 +906,8 @@ RETIRING_ADMISSION_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "        self.accepting = matches!(\n"
-                "            self.rotation.phase(),\n"
-                "            RotationPhase::Active | RotationPhase::Retiring\n"
-                "        );",
-                "        self.accepting = can_resume;",
+                "        self.accepting = resumed;\n",
+                "        self.accepting = self.rotation.phase() == RotationPhase::Active;\n",
             )
         ],
         frozenset(
@@ -930,9 +925,11 @@ RETIRING_ADMISSION_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n"
-                "            self.accepting = false;\n",
-                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n",
+                "            self.accepting = false;\n"
+                "            self.writes_frozen = true;\n"
+                "            if !self.recovery_requested",
+                "            self.writes_frozen = true;\n"
+                "            if !self.recovery_requested",
             )
         ],
         frozenset(
@@ -1360,6 +1357,271 @@ RELEASE_RACE_CASES: list[Case] = [
     ),
 ]
 
+#: **The M7 connector, journal and echo rows** (branch `m7-connector`, task
+#: rows M7-C84, M7-C94, M7-C95, M7-C98, M7-C109 and M7-C110).  Each case
+#: defeats one rule and names the tests that must notice it; each was also
+#: shown red by hand before its fix (docs/tasks.md, the row's evidence).
+M7_CONNECTOR_RELAY_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::",
+    "http::peer_cleanup_tests::peer_cleanup_h3_tests::",
+]
+PEER_H3 = "http::peer_cleanup_tests::peer_cleanup_h3_tests::"
+PEER_RUNTIME = RELAY / "src" / "peer_runtime.rs"
+RELAY_HTTP = RELAY / "src" / "http.rs"
+M7_CONNECTOR_RELAY_CASES: list[Case] = [
+    Case(
+        # M7-C109: count a closed stream until the connector's own terminal.
+        "a closed stream keeps its connector slot until the connector's terminal",
+        [
+            (
+                ACTOR,
+                "        if !stream.terminal || stream.open_pending {\n"
+                "            return true;\n"
+                "        }\n",
+                "        if true {\n"
+                "            return !stream.terminal;\n"
+                "        }\n",
+            )
+        ],
+        frozenset(
+            {
+                "actor::stream_identity_tests::"
+                "a_closed_stream_holds_its_connector_slot_until_the_connector_terminal_arrives"
+            }
+        ),
+    ),
+    Case(
+        # M7-C110, the owner: a superseded owner token is answered on its own
+        # stream.  Defeated, quinn finishes the stream bare and the ingress's
+        # HTTP/3 client fails the whole peer connection.
+        "a superseded owner token is answered OWNER_CHANGED on its own stream",
+        [
+            (
+                RELAY_HTTP,
+                "        let _ = request.reject_owner_changed().await;\n"
+                "        return Err(PeerRuntimeError::Membership(\n"
+                "            \"peer request is not for this owner\".to_owned(),\n"
+                "        ));\n"
+                "    }\n"
+                "    if owner.lease_expires_at",
+                "        drop(request);\n"
+                "        return Err(PeerRuntimeError::Membership(\n"
+                "            \"peer request is not for this owner\".to_owned(),\n"
+                "        ));\n"
+                "    }\n"
+                "    if owner.lease_expires_at",
+            )
+        ],
+        frozenset(
+            {
+                PEER_H3 + "a_superseded_owner_token_is_refused_owner_changed_on_its_own_stream",
+                PEER_H3 + "the_ingress_drops_a_stale_route_on_owner_changed_and_answers_typed",
+            }
+        ),
+    ),
+    Case(
+        # M7-C110, the ingress: OWNER_CHANGED drops the cached route.
+        "the ingress drops its cached route on OWNER_CHANGED",
+        [
+            (
+                PEER_RUNTIME,
+                "                if let Some(hook) = self.route_hook.as_ref() {\n"
+                "                    hook.invalidate_owner_route().await;\n"
+                "                }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {PEER_H3 + "the_ingress_drops_a_stale_route_on_owner_changed_and_answers_typed"}
+        ),
+    ),
+    Case(
+        # M7-C94: an exit other than completion abandons the entry instead of
+        # dropping it.  Defeated, the pre-fix removal returns.
+        "a unary echo that fails is abandoned and driven to its forget, not dropped",
+        [
+            (
+                ACTOR,
+                "        if forgets_unary {\n"
+                "            self.abandon_pending(key, stream_id, code, execution);\n"
+                "            return;\n"
+                "        }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "a_unary_echo_whose_consumer_left_is_still_forgotten_and_keeps_the_session",
+                UNARY_FREEZE + "a_unary_echo_invalidated_before_dispatch_is_reset_and_forgotten",
+                UNARY_FREEZE
+                + "a_unary_echo_abandoned_during_a_freeze_keeps_the_roster_and_resets_after_commit",
+            }
+        ),
+    ),
+    Case(
+        # M7-C94: the connector's own RESET is recorded as its terminal.
+        "a connector RESET on a unary echo is recorded as its terminal",
+        [
+            (
+                ACTOR,
+                "                        pending.abandon.connector_terminal = true;\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE + "a_unary_echo_reset_by_the_connector_is_acknowledged_and_forgotten",
+                UNARY_FREEZE + "a_unary_echo_invalidated_before_dispatch_is_reset_and_forgotten",
+            }
+        ),
+    ),
+    Case(
+        # M7-C94: an undispatched abandoned echo is ended by the relay's RESET.
+        "an abandoned undispatched unary echo is ended with the relay's RESET",
+        [
+            (
+                ACTOR,
+                "            let owes_reset =\n"
+                "                !pending.dispatched && !pending.abandon.relay_reset && pending.abandon.admitted;",
+                "            let owes_reset = false;",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE + "a_unary_echo_invalidated_before_dispatch_is_reset_and_forgotten",
+                UNARY_FREEZE
+                + "a_unary_echo_abandoned_during_a_freeze_keeps_the_roster_and_resets_after_commit",
+            }
+        ),
+    ),
+]
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M7-C98, the relay half: the old carrier's FROZEN fence does not bind
+        # the attempt's new carrier while `Retiring`.
+        "the frozen fence binds the old carrier, not the new one while retiring",
+        [
+            (
+                ACTOR,
+                "                && !on_new_carrier\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "a_connector_frame_on_the_new_carrier_while_retiring_is_not_a_fence_violation"
+            }
+        ),
+    )
+)
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # Review of PR #171: an unreadable owner catalog is retryable.
+        "an owner that cannot read its catalog refuses as owner-not-ready, not 403",
+        [
+            (
+                RELAY_HTTP,
+                "    if is_transient_owner_refusal(error) {\n"
+                "        let _ = request.reject_owner_not_ready().await;\n",
+                "    if false {\n"
+                "        let _ = request.reject_owner_not_ready().await;\n",
+            )
+        ],
+        frozenset(
+            {
+                PEER_H3
+                + "an_unreadable_device_catalog_refuses_control_and_data_attachments_as_retryable",
+                PEER_H3 + "an_unreadable_grant_catalog_refuses_echo_and_http_streams_as_retryable",
+            }
+        ),
+    )
+)
+M7_CONNECTOR_CLIENT_CASES: list[Case] = [
+    Case(
+        # Review of PR #171: a session at its live limit is busy, not wedged.
+        "a busy session at its live limit is never given up for retention",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        if self.active_stream_count() >= self.config.limits.max_streams {\n"
+                "            self.open_retention_exhausted_since = None;\n"
+                "        }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "a_busy_session_at_its_live_limit_is_not_given_up_for_retention",
+            }
+        ),
+    ),
+    Case(
+        # M7-C84: an error raised after the stop's own cancellation is a stop.
+        "an orderly stop that lands inside a tick is reported as stopped",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        Err(error) => super::session_failure_result(cancellation_requested, error),",
+                "        Err(error) => Err(error),",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "a_stop_inside_the_forget_barrier_tick_is_reported_as_stopped_by_the_real_loop",
+                "m2_runtime::tests::"
+                "a_stop_during_a_pending_forget_barrier_ends_the_session_as_stopped",
+            }
+        ),
+    ),
+    Case(
+        # M7-C98: the writer resumes at COMMITTED on the activated carrier.
+        "the connector writer resumes after ROTATE_COMMITTED",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        self.writes_frozen = !resumed;",
+                "        self.writes_frozen = true;",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::the_writer_resumes_on_the_activated_carrier_after_committed",
+            }
+        ),
+    ),
+    Case(
+        # M7-C95: exhausted retention that never recovers gives the session up.
+        "a session whose OPEN retention stays exhausted gives up with a typed cause",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "                if let Err(error) = actor.check_open_retention_exhaustion() {\n"
+                "                    break Err(error);\n"
+                "                }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "an_owner_that_never_forgets_makes_the_session_give_up_with_a_typed_cause",
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -1378,6 +1640,18 @@ SUITES: list[Suite] = [
     Suite("m3c33-m3c15-freeze-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
     Suite("m3c15-freeze-hold", [RELAY], FREEZE_HOLD_TEST, FREEZE_HOLD_CASES),
     Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
+    Suite(
+        "m7-connector-relay",
+        [RELAY],
+        M7_CONNECTOR_RELAY_TEST,
+        M7_CONNECTOR_RELAY_CASES,
+    ),
+    Suite(
+        "m7-connector-client",
+        [CLIENT],
+        RETIRING_ADMISSION_TEST,
+        M7_CONNECTOR_CLIENT_CASES,
+    ),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

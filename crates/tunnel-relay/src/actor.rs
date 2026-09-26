@@ -1313,6 +1313,58 @@ struct PendingEcho {
     /// frozen fence; the result is re-applied, with every freshness check,
     /// once the writer resumes (task row M7-C93).
     deferred_authorization: Option<(DeviceChallenge, ChallengeAuthorizationResult)>,
+    /// Where an exchange whose consumer was already answered stands on its
+    /// way to a provable terminal (task row M7-C94).
+    abandon: UnaryAbandon,
+}
+
+/// The state of a unary echo whose consumer has been answered by an exit
+/// other than completion -- a connector RESET, a CANCEL, an authorization
+/// invalidation, a failed dispatch, a consumer that went away or the
+/// operation timeout (task row M7-C94).
+///
+/// Before M7-C94 each of those exits removed the entry from `pending` while
+/// the connector still held its OPEN journal entry and, once admitted, a
+/// stream: nothing ever forgot either, so each exit permanently spent one of
+/// the connector's 128 retention slots, a late connector frame for the
+/// removed stream failed the whole session (`UNKNOWN_STREAM`,
+/// `INVALID_RESET`), and an exit taken during a rotation freeze dropped a
+/// roster member and lost the session ("rotation fence rosters differ").
+/// Instead the entry stays in `pending` -- a roster member like any other --
+/// and is driven to the same two proofs a completed exchange has: the
+/// relay's own direction ended and acknowledged, the connector's ended and
+/// acknowledged.  It then becomes a [`UnaryTombstone`] and is forgotten under
+/// the M7-C92 rule.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UnaryAbandon {
+    /// The consumer has its outcome; nothing is delivered any more.
+    abandoned: bool,
+    /// When the exchange was abandoned, for the bound in the maintenance tick.
+    abandoned_at: Option<Instant>,
+    /// The connector admitted the OPEN (its OPENED or its authorization
+    /// challenge was seen), so it holds a stream the relay must end.
+    admitted: bool,
+    /// The relay ended its own direction with RESET at sequence 1 instead of
+    /// dispatching DATA and FIN.
+    relay_reset: bool,
+    /// The connector's own terminal (FIN or RESET) was received in sequence
+    /// and acknowledged.
+    connector_terminal: bool,
+}
+
+impl PendingEcho {
+    /// The relay->connector sequence this exchange has emitted: its FIN once
+    /// DATA and FIN are queued, its RESET when an abandoned exchange was
+    /// ended before dispatch, nothing otherwise.
+    fn relay_last_emitted(&self) -> u64 {
+        if self.dispatched {
+            UNARY_ECHO_FIN_SEQUENCE
+        } else if self.abandon.relay_reset {
+            UNARY_ECHO_RESET_SEQUENCE
+        } else {
+            0
+        }
+    }
 }
 
 /// Owner-side identity of one unary echo OPEN, kept so the relay can issue
@@ -1343,6 +1395,13 @@ struct UnaryForgetIdentity {
 
 const UNARY_ECHO_DATA_SEQUENCE: u64 = 1;
 const UNARY_ECHO_FIN_SEQUENCE: u64 = 2;
+/// The relay's RESET for an abandoned unary echo that was never dispatched
+/// (task row M7-C94): the first and only frame of its direction.
+const UNARY_ECHO_RESET_SEQUENCE: u64 = 1;
+/// The margin above the derived bound an abandoned unary echo may wait for
+/// its terminal proofs (task row M7-C94; see `unary_abandon_bound`).
+const UNARY_ABANDON_MARGIN: Duration = Duration::from_secs(10);
+const UNARY_ABANDON_TIMEOUT_REASON: &str = "UNARY_ABANDON_TIMEOUT";
 
 /// A unary echo that has left `session.pending` but whose connector-side
 /// OPEN journal entry (and, once admitted, its terminal stream) still awaits
@@ -1374,6 +1433,9 @@ enum UnaryTombstoneEvidence {
     /// The connector answered the OPEN with REJECTED; it holds at most a
     /// journal entry and no stream, so the proof is the no-stream state.
     Rejected,
+    /// An abandoned exchange the relay ended with RESET at sequence 1 before
+    /// dispatch; the connector ended its own direction too (task row M7-C94).
+    RelayReset(UnaryForgetIdentity),
 }
 
 impl UnaryTombstone {
@@ -1385,10 +1447,24 @@ impl UnaryTombstone {
             (UnaryTombstoneEvidence::Completed(_), Direction::RelayToConnector) => {
                 UNARY_ECHO_FIN_SEQUENCE
             }
-            (UnaryTombstoneEvidence::Completed(identity), Direction::ConnectorToRelay) => {
+            (UnaryTombstoneEvidence::Completed(identity), Direction::ConnectorToRelay)
+            | (UnaryTombstoneEvidence::RelayReset(identity), Direction::ConnectorToRelay) => {
                 identity.response_sequence
             }
+            (UnaryTombstoneEvidence::RelayReset(_), Direction::RelayToConnector) => {
+                UNARY_ECHO_RESET_SEQUENCE
+            }
             (UnaryTombstoneEvidence::Rejected, _) => 0,
+        }
+    }
+
+    /// The owner sender identity awaiting the connector's cumulative ACK of
+    /// the relay's terminal, if this tombstone has one.
+    fn identity_mut(&mut self) -> Option<&mut UnaryForgetIdentity> {
+        match &mut self.evidence {
+            UnaryTombstoneEvidence::Completed(identity)
+            | UnaryTombstoneEvidence::RelayReset(identity) => Some(identity),
+            UnaryTombstoneEvidence::Rejected => None,
         }
     }
 
@@ -1418,6 +1494,32 @@ impl UnaryTombstone {
                     received_bytes: 0,
                     send_terminal: Some(tunnel_protocol::sequence::Terminal::Fin),
                     send_terminal_sequence: Some(UNARY_ECHO_FIN_SEQUENCE),
+                    receive_terminal: None,
+                    receive_terminal_sequence: None,
+                    replay_floor: None,
+                    replay_bytes: 0,
+                    reorder_frames: 0,
+                    reorder_bytes: 0,
+                };
+                ResumeDirectionState::from_sequence_snapshot(stream_id, &snapshot).ok()
+            }
+            UnaryTombstoneEvidence::RelayReset(identity) => {
+                if identity.peer_acked < UNARY_ECHO_RESET_SEQUENCE {
+                    return None;
+                }
+                let snapshot = tunnel_protocol::sequence::DirectionSnapshot {
+                    last_emitted: UNARY_ECHO_RESET_SEQUENCE,
+                    peer_acked: UNARY_ECHO_RESET_SEQUENCE,
+                    recv_contiguous: 0,
+                    delivered_contiguous: 0,
+                    send_credit: identity.initial_send_window,
+                    sent_bytes: 0,
+                    receive_credit: identity.initial_receive_window,
+                    received_bytes: 0,
+                    send_terminal: Some(tunnel_protocol::sequence::Terminal::Reset(
+                        tunnel_protocol::reset_reason::CANCELLED,
+                    )),
+                    send_terminal_sequence: Some(UNARY_ECHO_RESET_SEQUENCE),
                     receive_terminal: None,
                     receive_terminal_sequence: None,
                     replay_floor: None,
@@ -4878,6 +4980,7 @@ impl RelayActor {
                 dispatched: false,
                 authorization_in_flight: false,
                 deferred_authorization: None,
+                abandon: UnaryAbandon::default(),
             },
         );
         session.queued_bytes = session.queued_bytes.saturating_add(queued_len);
@@ -5090,7 +5193,7 @@ impl RelayActor {
         let active_streams = session
             .streams
             .values()
-            .filter(|stream| !stream.terminal)
+            .filter(|stream| Self::occupies_connector_stream_slot(stream))
             .count();
         let retained_stream_limit = self
             .options
@@ -5412,6 +5515,31 @@ impl RelayActor {
             return None;
         }
         ResumeDirectionState::from_sequence_snapshot(stream.sequence.stream_id(), sent).ok()
+    }
+
+    /// Whether a stream still counts against the connector's active stream
+    /// limit (task row M7-C109).  The connector counts a stream until it has
+    /// ended its own direction, which it does only after it processes the
+    /// owner's terminal frame; that frame travels on the data socket while
+    /// the next OPEN travels on control, so the owner's own terminal latch is
+    /// not evidence that the connector has released the slot.  The owner
+    /// therefore counts a stream until it has received the connector's own
+    /// FIN or RESET, which the connector emitted after releasing its slot,
+    /// and counts an OPEN until OPENED or REJECTED settles it (a REJECTED
+    /// OPEN leaves the table at its promptly queued FORGET).  Counting on
+    /// receipt is conservative: the owner can only over-count relative to
+    /// the connector, so an admitted OPEN is never refused "stream limit
+    /// reached" after the consumer's upgrade.
+    fn occupies_connector_stream_slot(stream: &M2Stream) -> bool {
+        if !stream.terminal || stream.open_pending {
+            return true;
+        }
+        stream
+            .sequence
+            .snapshot()
+            .direction(Direction::ConnectorToRelay)
+            .receive_terminal
+            .is_none()
     }
 
     /// PREPARING is allowed because the caller queues FORGET before it
@@ -5919,6 +6047,25 @@ impl RelayActor {
             .unwrap_or_default();
         for (_, challenge, result) in deferred {
             self.finish_device_challenge(key.clone(), challenge, result);
+        }
+        // Abandoned unary echoes whose RESET was held by the freeze (M7-C94).
+        let abandoned = self
+            .session_for(key)
+            .map(|session| {
+                let mut ids: Vec<u64> = session
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| pending.abandon.abandoned)
+                    .map(|(stream_id, _)| *stream_id)
+                    .collect();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
+        for stream_id in abandoned {
+            if !self.advance_abandoned_unary(key, stream_id) {
+                break;
+            }
         }
     }
 
@@ -8205,11 +8352,9 @@ impl RelayActor {
                 // `send_sequence` is the DATA sequence only; fencing at it
                 // made every dispatched echo's FIN ACK "above fence" and the
                 // connector failed the session (task row M7-C93).
-                let last_emitted = if pending.dispatched {
-                    pending.send_sequence.saturating_add(1)
-                } else {
-                    0
-                };
+                // An abandoned exchange ended before dispatch fences at its
+                // RESET (task row M7-C94).
+                let last_emitted = pending.relay_last_emitted();
                 entries.push(StreamFence::new(*stream_id, direction, last_emitted));
             } else {
                 entries.push(StreamFence::new(
@@ -10578,6 +10723,24 @@ impl RelayActor {
                     {
                         stream.open_pending = false;
                     }
+                    // A unary echo's OPENED: the connector now holds a stream
+                    // an abandoned exchange must end (task row M7-C94).
+                    let unary_abandoned = self.session_mut(&key).is_some_and(|session| {
+                        session
+                            .pending
+                            .get_mut(&opened.stream_id)
+                            .filter(|pending| {
+                                pending.operation_id == opened.operation_id
+                                    && pending.forget.open_message_id == opened.reply_to
+                            })
+                            .is_some_and(|pending| {
+                                pending.abandon.admitted = true;
+                                pending.abandon.abandoned
+                            })
+                    });
+                    if unary_abandoned {
+                        self.advance_abandoned_unary(&key, opened.stream_id);
+                    }
                     if detached {
                         // The OPEN was admitted after the public registration
                         // disappeared. Reconcile it with a real local FIN;
@@ -10697,22 +10860,22 @@ impl RelayActor {
                 if invalidated.session_id != key.session_id || invalidated.epoch != key.epoch {
                     return;
                 }
-                if let Some(session) = self.session_mut(&key)
-                    && session
-                        .pending
-                        .get(&invalidated.stream_id)
-                        .is_some_and(|pending| {
-                            pending.challenge_id.as_deref()
-                                == Some(invalidated.challenge_id.as_str())
-                                && pending.grant.revision == invalidated.grant_revision
-                        })
-                    && let Some(pending) = session.pending.remove(&invalidated.stream_id)
+                if self
+                    .session_for(&key)
+                    .and_then(|session| session.pending.get(&invalidated.stream_id))
+                    .is_some_and(|pending| {
+                        pending.challenge_id.as_deref() == Some(invalidated.challenge_id.as_str())
+                            && pending.grant.revision == invalidated.grant_revision
+                    })
                 {
-                    release_pending_budget(session, &pending);
-                    let _ = pending.response.send(EchoOutcome::Failure {
-                        code: "AUTHORIZATION_REVOKED",
-                        execution: "not_dispatched",
-                    });
+                    // The connector ends its stream with RESET; the entry
+                    // stays until that is proved and forgotten (M7-C94).
+                    self.fail_pending(
+                        &key,
+                        invalidated.stream_id,
+                        "AUTHORIZATION_REVOKED",
+                        "not_dispatched",
+                    );
                 }
             }
             ControlMessage::ResultStatus(status) => {
@@ -10985,6 +11148,22 @@ impl RelayActor {
             TerminalStream,
         }
         let mut mismatched = None;
+        // A challenge proves the connector admitted a unary echo's OPEN.  An
+        // abandoned one is never authorized: the relay ends that stream
+        // itself (task row M7-C94).
+        let abandoned_unary = self.session_mut(&key).is_some_and(|session| {
+            session
+                .pending
+                .get_mut(&message.stream_id)
+                .is_some_and(|pending| {
+                    pending.abandon.admitted = true;
+                    pending.abandon.abandoned
+                })
+        });
+        if abandoned_unary {
+            self.advance_abandoned_unary(&key, message.stream_id);
+            return;
+        }
         let Some(session) = self.session_mut(&key) else {
             return;
         };
@@ -11887,6 +12066,9 @@ impl RelayActor {
                 // for its owner STREAM_FORGET; it is retained only once the
                 // connector's FIN has been acknowledged below (M7-C92).
                 let mut completed_tombstone = None;
+                // An abandoned exchange's consumer already has its outcome
+                // (M7-C94): its response bytes are acknowledged, not kept.
+                let discard_response;
                 let (update, data_tx, queue_budget, tenant_id, operation_id) = {
                     let Some(session) = self.session_mut(&key) else {
                         return;
@@ -11907,11 +12089,14 @@ impl RelayActor {
                     let queue_budget = session.queue_budget.clone();
                     let tenant_id = session.identity.tenant_id;
                     let operation_id = pending.operation_id.clone();
+                    discard_response = pending.abandon.abandoned;
                     let invalid_frame = !pending.dispatched
+                        || pending.abandon.connector_terminal
                         || frame.ack > pending.send_sequence.saturating_add(1)
                         || frame.sequence <= pending.response_sequence
                         || frame.sequence != pending.response_sequence.saturating_add(1)
                         || (frame.kind == FrameKind::Data
+                            && !discard_response
                             && (pending
                                 .response_body
                                 .len()
@@ -11931,7 +12116,9 @@ impl RelayActor {
                         // Validated above as at most the relay's FIN.
                         pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
                         if frame.kind == FrameKind::Data {
-                            pending.response_body.extend_from_slice(&frame.payload);
+                            if !discard_response {
+                                pending.response_body.extend_from_slice(&frame.payload);
+                            }
                             (
                                 ResponseFrameUpdate::Accepted,
                                 data_tx,
@@ -11968,6 +12155,7 @@ impl RelayActor {
                     }
                 };
                 if matches!(&update, ResponseFrameUpdate::Accepted)
+                    && !discard_response
                     && let Some(session) = self.session_mut(&key)
                 {
                     session.queued_bytes = session.queued_bytes.saturating_add(frame.payload.len());
@@ -12045,15 +12233,20 @@ impl RelayActor {
                     .session_for(&key)
                     .and_then(|session| session.pending.get(&stream_id))
                     .is_some_and(|pending| {
-                        !pending.dispatched || frame.ack > pending.send_sequence.saturating_add(1)
+                        pending.relay_last_emitted() == 0
+                            || frame.ack > pending.relay_last_emitted()
                     });
                 // An ACK can overtake the connector's response FIN or trail
                 // it; either way it is the evidence the unary FORGET waits
-                // for.  An ACK beyond the relay's FIN is stale as before.
+                // for.  An ACK beyond the relay's own terminal is stale as
+                // before: its FIN, or its RESET for an exchange abandoned
+                // before dispatch (M7-C94).
                 let stale_tombstone_ack = self
                     .session_for(&key)
                     .and_then(|session| session.unary_tombstones.get(&stream_id))
-                    .is_some_and(|_| frame.ack > UNARY_ECHO_FIN_SEQUENCE);
+                    .is_some_and(|tombstone| {
+                        frame.ack > tombstone.fence_sequence(Direction::RelayToConnector)
+                    });
                 if stale_ack || stale_tombstone_ack {
                     self.protocol_failure(&key, "STALE_ACK").await;
                     return;
@@ -12062,10 +12255,10 @@ impl RelayActor {
                 if let Some(session) = self.session_mut(&key) {
                     if let Some(pending) = session.pending.get_mut(&stream_id) {
                         pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
-                    } else if let Some(UnaryTombstone {
-                        evidence: UnaryTombstoneEvidence::Completed(identity),
-                        ..
-                    }) = session.unary_tombstones.get_mut(&stream_id)
+                    } else if let Some(identity) = session
+                        .unary_tombstones
+                        .get_mut(&stream_id)
+                        .and_then(UnaryTombstone::identity_mut)
                     {
                         identity.peer_acked = identity.peer_acked.max(frame.ack);
                         acked_tombstone = true;
@@ -12080,19 +12273,91 @@ impl RelayActor {
                 // governed by the per-session budget and the frame size limit.
             }
             FrameKind::Reset => {
+                let forgets_unary = self
+                    .session_for(&key)
+                    .is_some_and(|session| session.profile.supports_rotation());
+                // A connector RESET is valid in sequence, acknowledging no
+                // more than the relay has emitted.  On an M2 session it may
+                // also precede dispatch -- the connector's own authorization
+                // or operation deadline, or its answer to an invalidation --
+                // and it may reach an exchange the relay already abandoned
+                // (task row M7-C94).
                 let valid_reset = self
                     .session_for(&key)
                     .and_then(|session| session.pending.get(&stream_id))
                     .is_some_and(|pending| {
-                        pending.dispatched
-                            && frame.ack <= pending.send_sequence.saturating_add(1)
+                        (pending.dispatched || forgets_unary)
+                            && !pending.abandon.connector_terminal
+                            && frame.ack <= pending.relay_last_emitted()
                             && pending.response_sequence.checked_add(1) == Some(frame.sequence)
                     });
-                if valid_reset {
-                    self.fail_pending(&key, stream_id, "DEVICE_RESET", "unknown");
-                } else {
+                if !valid_reset {
                     self.protocol_failure(&key, "INVALID_RESET").await;
+                    return;
                 }
+                if !forgets_unary {
+                    self.fail_pending(&key, stream_id, "DEVICE_RESET", "unknown");
+                    return;
+                }
+                // Record the connector's terminal and acknowledge it on the
+                // carrier it arrived on: the connector's own sender proof for
+                // a later STREAM_FORGET needs that ACK.
+                let (data_tx, queue_budget) = {
+                    let Some(session) = self.session_mut(&key) else {
+                        return;
+                    };
+                    let data_tx = if carrier_is_candidate {
+                        session
+                            .rotation
+                            .as_ref()
+                            .and_then(|rotation| rotation.candidate.as_ref())
+                            .map(|candidate| candidate.tx.clone())
+                    } else {
+                        session.data_tx.clone()
+                    };
+                    let queue_budget = session.queue_budget.clone();
+                    if let Some(pending) = session.pending.get_mut(&stream_id) {
+                        pending.response_sequence = frame.sequence;
+                        pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
+                        pending.abandon.connector_terminal = true;
+                        pending.abandon.admitted = true;
+                    }
+                    (data_tx, queue_budget)
+                };
+                let Some(data_tx) = data_tx else {
+                    self.fail_pending(&key, stream_id, "DEVICE_OFFLINE", "unknown");
+                    self.protocol_failure(&key, "DEVICE_OFFLINE").await;
+                    return;
+                };
+                let Ok(ack) = tunnel_protocol::Frame::ack(
+                    key.epoch,
+                    carrier.generation,
+                    stream_id,
+                    frame.sequence,
+                )
+                .encode() else {
+                    self.protocol_failure(&key, "FRAME_LIMIT").await;
+                    return;
+                };
+                if let Err(refusal) = queue_flow_control(&data_tx, &queue_budget, ack) {
+                    self.fail_pending(&key, stream_id, "DEVICE_RESET", "unknown");
+                    self.protocol_failure(&key, refusal.flow_control_close_reason())
+                        .await;
+                    return;
+                }
+                let execution = if self
+                    .session_for(&key)
+                    .and_then(|session| session.pending.get(&stream_id))
+                    .is_some_and(|pending| pending.dispatched)
+                {
+                    "unknown"
+                } else {
+                    "not_dispatched"
+                };
+                // Answers the consumer unless it already was, then drives
+                // the entry to its tombstone.
+                self.abandon_pending(&key, stream_id, "DEVICE_RESET", execution);
+                self.advance_abandoned_unary(&key, stream_id);
             }
         }
     }
@@ -12144,7 +12409,20 @@ impl RelayActor {
             // proof unprovable (`AckAboveFence`), so it is a protocol
             // violation on the retiring carrier, not a late event
             // (docs/m7-edge-cases.md EC-044 post-drain rejection).
+            //
+            // The fence binds the *old* carrier only.  After COMMITTED the
+            // attempt's new carrier is the relay's active writer and no
+            // longer its candidate, and since M7-C98 the connector resumes
+            // its writer there as soon as it has sent COMMITTED, so its new
+            // sequences legitimately continue above the fence on that
+            // carrier while the attempt is still `Retiring`.
+            let on_new_carrier = session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.attempt.as_ref())
+                .is_some_and(|attempt| carrier.connection_id == attempt.new_connection_id);
             if !carrier_is_candidate
+                && !on_new_carrier
                 && matches!(
                     frame.kind,
                     FrameKind::Data | FrameKind::Fin | FrameKind::Reset
@@ -12856,14 +13134,12 @@ impl RelayActor {
         {
             return;
         }
-        let Some(pending) = session.pending.remove(&stream_id) else {
+        // Answer the consumer; on an M2 session keep the entry until the
+        // connector's state is proved and forgotten (task row M7-C94).
+        self.fail_pending(key, stream_id, "CANCELLED", "unknown");
+        let Some(session) = self.session_mut(key) else {
             return;
         };
-        release_pending_budget(session, &pending);
-        let _ = pending.response.send(EchoOutcome::Failure {
-            code: "CANCELLED",
-            execution: "unknown",
-        });
         let delivered = wire::encode_control_message(&wire::cancel(
             &key.session_id,
             key.epoch,
@@ -13001,23 +13277,24 @@ impl RelayActor {
                 self.close_session(&key, close_reason).await;
                 continue;
             }
-            let expired: Vec<_> = self
-                .session_for(&key)
-                .map(|session| {
-                    session
-                        .pending
-                        .iter()
-                        .filter(|(_, pending)| {
-                            pending.response.is_closed()
-                                || pending.created_at.elapsed()
-                                    > self.options.limits.operation_timeout
-                        })
-                        .map(|(stream_id, _)| *stream_id)
-                        .collect()
+            self.expire_pending_echoes(&key);
+            // An abandoned unary echo is retained only while its terminal
+            // proofs can still arrive (task row M7-C94).  The connector ends
+            // an admitted stream by its own deadlines, so one still waiting
+            // past this bound belongs to a peer that stopped making
+            // progress: close the session rather than retain it.
+            let abandon_overdue = self.session_for(&key).is_some_and(|session| {
+                let bound = self.unary_abandon_bound(session);
+                session.pending.values().any(|pending| {
+                    pending
+                        .abandon
+                        .abandoned_at
+                        .is_some_and(|at| at.elapsed() > bound)
                 })
-                .unwrap_or_default();
-            for stream_id in expired {
-                self.fail_pending(&key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", "unknown");
+            });
+            if abandon_overdue {
+                self.close_session(&key, UNARY_ABANDON_TIMEOUT_REASON).await;
+                continue;
             }
             // An unknown renewal outcome never extends the local lease
             // clock.  If the authority could not be re-read before the last
@@ -14183,8 +14460,8 @@ impl RelayActor {
                 streams.push(RelayStreamSnapshot {
                     stream_id: *stream_id,
                     operation_id: pending.operation_id.clone(),
-                    last_emitted_relay_to_connector: pending.send_sequence,
-                    peer_acked_relay_to_connector: 0,
+                    last_emitted_relay_to_connector: pending.relay_last_emitted(),
+                    peer_acked_relay_to_connector: pending.forget.peer_acked,
                     recv_contiguous_connector_to_relay: pending.response_sequence,
                     delivered_contiguous_connector_to_relay: pending.response_sequence,
                     replay_frames_relay_to_connector: 0,
@@ -14384,6 +14661,66 @@ impl RelayActor {
             .filter(|session| session.key == *key)
     }
 
+    /// How long an abandoned unary echo may wait for its terminal proofs
+    /// before the session is closed rather than retaining it indefinitely
+    /// (task row M7-C94).  The connector ends an admitted stream by its own
+    /// operation deadline, which can run for the whole operation timeout from
+    /// its start, and a rotation can hold the writer for up to its overlap
+    /// deadline plus one handshake budget; the bound is their sum plus a
+    /// margin, so only a peer that has stopped making progress reaches it.
+    /// (A fixed 60 s closed healthy sessions whose operation timeout was
+    /// longer, up to the configured 300 s: review of PR #171.)
+    fn unary_abandon_bound(&self, session: &DeviceSession) -> Duration {
+        let rotation = session
+            .rotation
+            .as_ref()
+            .map_or(Duration::ZERO, |rotation| {
+                let config = rotation.state.config();
+                Duration::from_millis(
+                    config
+                        .overlap_timeout_ms
+                        .saturating_add(config.handshake_timeout_ms),
+                )
+            });
+        self.options
+            .limits
+            .operation_timeout
+            .saturating_add(rotation)
+            .saturating_add(UNARY_ABANDON_MARGIN)
+    }
+
+    /// The maintenance tick's expiry of unary echoes: one whose consumer has
+    /// gone away (its HTTP request closed) or that has outlived the operation
+    /// timeout is answered `REVERSE_CHANNEL_INTERRUPTED`.  An already
+    /// abandoned exchange is not expired again (task row M7-C94).
+    fn expire_pending_echoes(&mut self, key: &SessionKey) {
+        let expired: Vec<_> = self
+            .session_for(key)
+            .map(|session| {
+                session
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| {
+                        !pending.abandon.abandoned
+                            && (pending.response.is_closed()
+                                || pending.created_at.elapsed()
+                                    > self.options.limits.operation_timeout)
+                    })
+                    .map(|(stream_id, _)| *stream_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for stream_id in expired {
+            self.fail_pending(key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", "unknown");
+        }
+    }
+
+    /// Answer a unary echo's consumer with a failure.  On an M1 session the
+    /// entry is removed as before: the M1 connector keeps no journal and
+    /// never takes a `STREAM_FORGET`.  On an M2 session the entry is
+    /// abandoned instead and driven to its terminal proofs (task row
+    /// M7-C94), because the connector may already hold its OPEN journal
+    /// entry and an admitted stream.
     fn fail_pending(
         &mut self,
         key: &SessionKey,
@@ -14391,6 +14728,13 @@ impl RelayActor {
         code: &'static str,
         execution: &'static str,
     ) {
+        let forgets_unary = self
+            .session_for(key)
+            .is_some_and(|session| session.profile.supports_rotation());
+        if forgets_unary {
+            self.abandon_pending(key, stream_id, code, execution);
+            return;
+        }
         if let Some(session) = self.session_mut(key)
             && let Some(pending) = session.pending.remove(&stream_id)
         {
@@ -14399,6 +14743,136 @@ impl RelayActor {
                 .response
                 .send(EchoOutcome::Failure { code, execution });
         }
+    }
+
+    /// Answer the consumer of a unary echo on an M2 session and keep the
+    /// entry, so that its connector state can still be proved and forgotten
+    /// (task row M7-C94).  Idempotent: an abandoned entry is not answered
+    /// twice.
+    fn abandon_pending(
+        &mut self,
+        key: &SessionKey,
+        stream_id: u64,
+        code: &'static str,
+        execution: &'static str,
+    ) {
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let Some(pending) = session.pending.get_mut(&stream_id) else {
+            return;
+        };
+        if pending.abandon.abandoned {
+            return;
+        }
+        let (dummy, _) = oneshot::channel();
+        let response = std::mem::replace(&mut pending.response, dummy);
+        let _ = response.send(EchoOutcome::Failure { code, execution });
+        pending.abandon.abandoned = true;
+        pending.abandon.abandoned_at = Some(Instant::now());
+        pending.deferred_authorization = None;
+        pending.authorization_in_flight = false;
+        // Nothing is delivered any more: return the undispatched body and
+        // any partial response to the session budget now.
+        let released = pending
+            .body
+            .len()
+            .saturating_add(pending.response_body.len());
+        pending.body = Vec::new();
+        pending.response_body = Vec::new();
+        session.queued_bytes = session.queued_bytes.saturating_sub(released);
+        session.queue_budget.release(released);
+        self.advance_abandoned_unary(key, stream_id);
+    }
+
+    /// Move one abandoned unary echo towards its tombstone (task row M7-C94):
+    /// end the relay's own direction with RESET once the connector is known
+    /// to hold a stream and the writer is not frozen, and retire the entry
+    /// into a [`UnaryTombstone`] once both directions have ended.  Returns
+    /// false only when the relay's RESET could not be published, in which
+    /// case the session has been told to close.
+    fn advance_abandoned_unary(&mut self, key: &SessionKey, stream_id: u64) -> bool {
+        let mut publish_failed = None;
+        {
+            let Some(session) = self.session_mut(key) else {
+                return true;
+            };
+            let frozen = Self::rotation_frozen(session);
+            let Some(pending) = session.pending.get(&stream_id) else {
+                return true;
+            };
+            if !pending.abandon.abandoned {
+                return true;
+            }
+            let owes_reset =
+                !pending.dispatched && !pending.abandon.relay_reset && pending.abandon.admitted;
+            // No writable carrier means the session is ending or recovering;
+            // recovery resumes the writer and flushes this again.
+            if owes_reset
+                && !frozen
+                && let Some(data_tx) = session.data_tx.clone()
+            {
+                let frame = Frame::reset(
+                    session.key.epoch,
+                    session.generation,
+                    stream_id,
+                    UNARY_ECHO_RESET_SEQUENCE,
+                    pending.response_sequence,
+                    tunnel_protocol::reset_reason::CANCELLED,
+                );
+                let queued = frame.encode().is_ok_and(|encoded| {
+                    queue_data(&data_tx, &session.queue_budget, encoded).is_ok()
+                });
+                if queued {
+                    if let Some(pending) = session.pending.get_mut(&stream_id) {
+                        pending.abandon.relay_reset = true;
+                    }
+                } else {
+                    publish_failed = Some((data_tx, session.control_tx.clone()));
+                }
+            }
+        }
+        if let Some((data_tx, control_tx)) = publish_failed {
+            // The same fail-closed answer as a failed DATA/FIN dispatch.
+            let _ = data_tx.try_send(DataOutbound::Close);
+            let _ = control_tx.try_send(ControlOutbound::Close);
+            let _ = self
+                .command_tx
+                .try_send(Command::DisconnectControl(key.clone()));
+            return false;
+        }
+        let Some(session) = self.session_mut(key) else {
+            return true;
+        };
+        let Some(pending) = session.pending.get(&stream_id) else {
+            return true;
+        };
+        let relay_ended = pending.dispatched || pending.abandon.relay_reset;
+        if !(relay_ended && pending.abandon.connector_terminal) {
+            return true;
+        }
+        let frozen_snapshot_id = Self::frozen_snapshot_id(session);
+        let Some(pending) = session.pending.remove(&stream_id) else {
+            return true;
+        };
+        release_pending_budget(session, &pending);
+        let mut identity = pending.forget.clone();
+        identity.response_sequence = pending.response_sequence;
+        let evidence = if pending.dispatched {
+            UnaryTombstoneEvidence::Completed(identity)
+        } else {
+            UnaryTombstoneEvidence::RelayReset(identity)
+        };
+        session.unary_tombstones.insert(
+            stream_id,
+            UnaryTombstone {
+                operation_id: pending.operation_id.clone(),
+                evidence,
+                frozen_snapshot_id,
+            },
+        );
+        let _ = self.flush_owner_stream_forgets(key);
+        true
     }
 
     fn invalidate_pending(
@@ -19590,7 +20064,10 @@ mod stream_identity_tests {
         };
 
         let (mut actor, mut registration) = admitted_control_actor(identity.clone(), key.clone());
-        actor.options.limits.max_streams_per_device = 1;
+        // Two slots: the failed-FIN tombstone below keeps one of them,
+        // because the connector never saw a terminal for it and still counts
+        // it against its own active limit (task row M7-C109).
+        actor.options.limits.max_streams_per_device = 2;
         let (carrier_tx, carrier_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
         if let Some(session) = actor.sessions.get_mut(&key.scope()) {
             session.profile = super::RuntimeProfile::M2;
@@ -19709,7 +20186,7 @@ mod stream_identity_tests {
         let next = next_rx
             .await
             .expect("second echo registration response")
-            .expect("terminal tombstone must not consume active stream capacity");
+            .expect("the second slot is free beside the failed-FIN tombstone");
         assert_ne!(next.stream_id, admitted_stream_id);
         let next_open_message_id = actor
             .sessions
@@ -19801,7 +20278,7 @@ mod stream_identity_tests {
                 .streams
                 .len(),
             2,
-            "full retained tombstone table must reject without evicting either identity"
+            "the two streams still holding connector slots must reject without evicting either identity"
         );
         drop(retained);
         drop(next);
@@ -20508,6 +20985,84 @@ mod stream_identity_tests {
             )
             .await;
         (actor, control, data_rx, carrier, key, registration)
+    }
+
+    /// Task row M7-C109.  The consumer closes its stream: the owner queues
+    /// its FIN on the data socket and latches the stream terminal at once,
+    /// but the connector counts the stream against its active limit until it
+    /// has processed that FIN and ended its own direction.  Before the fix
+    /// the owner admitted the next consumer here -- its OPEN overtakes the
+    /// FIN on the independent control socket, the connector refuses it
+    /// `RESOURCE_EXHAUSTED` "stream limit reached", and the consumer that was
+    /// already upgraded sees a bare Close.  The owner must instead answer the
+    /// typed, retryable `StreamLimit` before any upgrade, and admit again as
+    /// soon as the connector's own terminal arrives.
+    #[tokio::test]
+    async fn a_closed_stream_holds_its_connector_slot_until_the_connector_terminal_arrives() {
+        let seed = 1_090_109;
+        let (mut actor, _control, _data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(seed, "m7-c109").await;
+        actor.options.limits.max_streams_per_device = 1;
+        let now = Utc::now();
+        let consumer = AuthenticatedConsumer {
+            tenant_id: key.tenant_id,
+            principal_id: Uuid::from_u128(seed + 2),
+        };
+        let grant = GrantSnapshot {
+            tenant_id: key.tenant_id,
+            principal_id: Uuid::from_u128(seed + 2),
+            device_id: key.device_id,
+            service_id: Uuid::from_u128(seed + 3),
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+
+        assert!(actor.close_echo_stream(&key, registration.stream_id, &registration.operation_id));
+        assert!(
+            actor.sessions[&key.scope()].streams[&registration.stream_id].terminal,
+            "the consumer's close latches the owner's terminal at once"
+        );
+
+        let (refused_tx, refused_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer.clone(),
+            key.device_id,
+            grant.service_id,
+            grant.clone(),
+            now + Duration::minutes(1),
+            refused_tx,
+        );
+        assert!(
+            matches!(
+                refused_rx.await.expect("admission answer"),
+                Err(RelayError::StreamLimit)
+            ),
+            "the connector has not ended its direction yet, so its slot is still taken"
+        );
+
+        // The connector processes the owner's FIN and ends its own direction.
+        let fin = Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 1);
+        actor.inbound_m2_stream_data(carrier, fin, false).await;
+
+        let (admitted_tx, admitted_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            key.device_id,
+            grant.service_id,
+            grant,
+            now + Duration::minutes(1),
+            admitted_tx,
+        );
+        let admitted = admitted_rx
+            .await
+            .expect("admission answer")
+            .expect("the connector's terminal released its slot");
+        assert_ne!(admitted.stream_id, registration.stream_id);
     }
 
     /// The typed close reason a torn-down session sent its device, if any.

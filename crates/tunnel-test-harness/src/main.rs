@@ -1545,7 +1545,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M3 http-forward real path passed: relays={} owner={} ingress={} non_owner_ingress={} upload_bytes={} echoed_bytes={} handler_sha256_match={} echo_sha256_match={} saturated_when_probed={} permission_status={} permission_latency_ms={} owner_local_permission_exact={} cancel_owner_release={} cancel_reset_reason={:?} cancel_ingress_error={:?} cancel_device_response_aborted={} handler_cancellation_latency_ms={} ingress_request_handoff_hw={} ingress_response_handoff_hw={} ingress_response_body_hw={} ingress_peer_in_flight_hw={} ingress_peer_receive_hw={} owner_request_handoff_hw={} owner_response_handoff_hw={} owner_peer_in_flight_hw={} owner_peer_receive_hw={} owner_receive_buffer_hw={}/{} owner_parked_hw={} owner_replay_hw={} owner_data_bytes_hw={}/{} device_receive_buffer_hw={}/{} device_parked_hw={} device_request_handoff_hw={} device_response_handoff_hw={} device_request_body_hw={} handler_headers={:?} handler_forbidden_header={} handler_value_leak={} response_header_leak={} internal_header_probe={} unauthenticated={} rejected_probes_dispatched={} sequential_requests={} sequential_ok={} sequential_dispatches={} sequential_not_dispatched_retries={} sequential_highest_stream_id={} sequential_session_stable={} sequential_phase_after={} sequential_ready_after={} open_journal_entries_peak={} open_journal_entries_before={} open_journal_entries_after={} open_journal_ids_before={:?} open_journal_ids_after={:?} open_journal_settle_ms={} earlier_phase_streams={:?} open_streams_retired={}(+{} before) open_retired_ranges_coalesced={}",
+                        "M3 http-forward real path passed: relays={} owner={} ingress={} non_owner_ingress={} upload_bytes={} echoed_bytes={} handler_sha256_match={} echo_sha256_match={} saturated_when_probed={} permission_status={} permission_latency_ms={} owner_local_permission_exact={} cancel_owner_release={} cancel_reset_reason={:?} cancel_ingress_error={:?} cancel_device_response_aborted={} handler_cancellation_latency_ms={} ingress_request_handoff_hw={} ingress_response_handoff_hw={} ingress_response_body_hw={} ingress_peer_in_flight_hw={} ingress_peer_receive_hw={} owner_request_handoff_hw={} owner_response_handoff_hw={} owner_peer_in_flight_hw={} owner_peer_receive_hw={} owner_receive_buffer_hw={}/{} owner_parked_hw={} owner_replay_hw={} owner_data_bytes_hw={}/{} device_receive_buffer_hw={}/{} device_parked_hw={} device_request_handoff_hw={} device_response_handoff_hw={} device_request_body_hw={} handler_headers={:?} handler_forbidden_header={} handler_value_leak={} response_header_leak={} internal_header_probe={} unauthenticated={} rejected_probes_dispatched={} sequential_requests={} sequential_ok={} sequential_dispatches={} sequential_not_dispatched_retries={} sequential_highest_stream_id={} sequential_session_stable={} sequential_phase_after={} sequential_ready_after={} open_journal_entries_peak={} open_journal_entries_before={} open_journal_entries_after={} open_journal_ids_before={:?} open_journal_ids_after={:?} open_journal_settle_ms={} earlier_phase_streams={:?} open_streams_retired={}(+{} before) open_retired_ranges_coalesced={} cancelled_exchanges={} cancelled_handlers_observed={} open_streams_retired_after_cancelled={} open_journal_entries_after_cancelled={} open_journal_ids_after_cancelled={:?} cancelled_session_stable={} cancelled_ready_after={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1609,6 +1609,13 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.open_streams_retired,
                         evidence.open_streams_retired_before_sequential,
                         evidence.open_retired_ranges_coalesced,
+                        evidence.cancelled_exchanges,
+                        evidence.cancelled_handlers_observed,
+                        evidence.open_streams_retired_after_cancelled,
+                        evidence.open_journal_entries_after_cancelled,
+                        evidence.open_journal_stream_ids_after_cancelled,
+                        evidence.cancelled_session_id_stable,
+                        evidence.cancelled_ready_after,
                     );
                     Ok(())
                 }),

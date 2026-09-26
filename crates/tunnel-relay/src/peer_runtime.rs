@@ -143,6 +143,11 @@ const PEER_ADMISSION_OWNER_NOT_READY: &str = "owner_not_ready";
 /// consumer the distinct `ROTATION_FREEZE` answer, not the fault refusal.
 const PEER_ADMISSION_ROTATION_FREEZE: &str = "rotation_freeze";
 const PEER_ADMISSION_CAPACITY: &str = "capacity";
+/// The authenticated owner does not hold the owner token the request named:
+/// the ingress resolved a superseded or foreign owner (task row M7-C110).
+/// Pre-admission and `not_dispatched`, so the consumer may retry, and the
+/// ingress drops its cached route so that retry performs a fresh lookup.
+const PEER_ADMISSION_OWNER_CHANGED: &str = "owner_changed";
 const PEER_ERROR_EXECUTION_HEADER: &str = "x-agent-tunnel-execution";
 const PEER_ERROR_CODE_HEADER: &str = "x-agent-tunnel-error-code";
 const PEER_RETRYABLE_HEADER: &str = "x-agent-tunnel-retryable";
@@ -374,6 +379,10 @@ pub enum PeerRuntimeError {
     /// application record was dispatched because its bounded stream limit is
     /// full.
     Capacity { retry_after_ms: u64 },
+    /// The authenticated peer does not hold the owner token the request
+    /// named (task row M7-C110).  Pre-admission; the ingress has dropped its
+    /// cached route, so a consumer retry performs a fresh owner lookup.
+    OwnerChanged { retry_after_ms: u64 },
     /// The authenticated peer membership admission expired.
     MembershipExpired,
     /// The peer stream was already completed or cancelled.
@@ -404,6 +413,7 @@ impl fmt::Display for PeerRuntimeError {
                 formatter.write_str("peer owner is in a data-rotation freeze")
             }
             Self::Capacity { .. } => formatter.write_str("peer owner stream capacity is exhausted"),
+            Self::OwnerChanged { .. } => formatter.write_str("peer owner changed"),
             Self::MembershipExpired => formatter.write_str("peer membership trust expired"),
             Self::Closed => formatter.write_str("peer stream is closed"),
         }
@@ -504,7 +514,8 @@ fn peer_transport_error(error: PeerRuntimeError) -> PeerTransportError {
         | PeerRuntimeError::UnexpectedRecord(_)
         | PeerRuntimeError::OwnerNotReady { .. }
         | PeerRuntimeError::RotationFreeze { .. }
-        | PeerRuntimeError::Capacity { .. } => {
+        | PeerRuntimeError::Capacity { .. }
+        | PeerRuntimeError::OwnerChanged { .. } => {
             PeerTransportError::H3("peer ingress rejected".to_owned())
         }
     }
@@ -783,6 +794,10 @@ fn owner_not_ready_retry_after(response: &Response<()>) -> Option<u64> {
 
 fn rotation_freeze_retry_after(response: &Response<()>) -> Option<u64> {
     retryable_admission_marker(response, PEER_ADMISSION_ROTATION_FREEZE)
+}
+
+fn owner_changed_retry_after(response: &Response<()>) -> Option<u64> {
+    retryable_admission_marker(response, PEER_ADMISSION_OWNER_CHANGED)
 }
 
 /// The retry hint of an exact authenticated `503` pre-admission marker, or
@@ -1572,18 +1587,28 @@ impl PeerRuntime {
         // A stream that raced the peer's GOAWAY may still be refused after it
         // was opened; the hook withdraws this route's readiness on that typed
         // outcome exactly as an open-time failure does above.
-        let route_hook = self.readiness.as_ref().map(|readiness| {
-            Arc::new(RouteUnreachableHook {
-                readiness: Arc::clone(readiness),
-                target: readiness_target.clone(),
-            })
-        });
+        let route_hook = Some(Arc::new(RouteUnreachableHook {
+            readiness: self
+                .readiness
+                .as_ref()
+                .map(|readiness| (Arc::clone(readiness), readiness_target.clone())),
+            owner_route: (
+                Arc::clone(&self.router),
+                OwnerScope::new(owner.token.tenant_id, owner.token.device_id),
+            ),
+        }));
         let exchange =
             PeerExchange::new(stream, envelope, budget, admission_cancellation, route_hook).await?;
         if let Some(diagnostic) = diagnostic {
             diagnostic.set_runtime_stage(PeerOpenDiagnosticStage::Complete);
         }
         Ok(exchange)
+    }
+
+    /// The owner router this runtime resolves and caches routes through.
+    #[cfg(test)]
+    pub(crate) fn owner_router(&self) -> &Arc<OwnerRouter<dyn Catalog>> {
+        &self.router
     }
 
     /// Forward one bounded consumer request and collect its bounded response.
@@ -1772,18 +1797,27 @@ impl PeerRuntime {
 /// viable route until it is re-probed.  The hook carries only the bounded route
 /// target already validated for this request.
 struct RouteUnreachableHook {
-    readiness: Arc<PeerReadiness>,
-    target: PeerRouteTarget,
+    readiness: Option<(Arc<PeerReadiness>, PeerRouteTarget)>,
+    /// The owner route cache this exchange was resolved through and the
+    /// scope it cached (task row M7-C110).
+    owner_route: (Arc<OwnerRouter<dyn Catalog>>, OwnerScope),
 }
 
 impl RouteUnreachableHook {
     fn observe(&self, error: &PeerRuntimeError) {
-        if matches!(
-            error,
-            PeerRuntimeError::Transport(PeerTransportError::GoAway)
-        ) {
-            self.readiness.mark_route_unreachable(&self.target);
+        if let Some((readiness, target)) = self.readiness.as_ref()
+            && matches!(
+                error,
+                PeerRuntimeError::Transport(PeerTransportError::GoAway)
+            )
+        {
+            readiness.mark_route_unreachable(target);
         }
+    }
+
+    async fn invalidate_owner_route(&self) {
+        let (router, scope) = &self.owner_route;
+        router.invalidate(*scope).await;
     }
 }
 
@@ -1961,6 +1995,14 @@ impl PeerExchangeRecv {
             if let Some(retry_after_ms) = stream_limit_retry_after(&response) {
                 return Err(PeerRuntimeError::Capacity { retry_after_ms });
             }
+            if let Some(retry_after_ms) = owner_changed_retry_after(&response) {
+                // The route this ingress cached named an owner the peer no
+                // longer is; drop it so the consumer's retry reads afresh.
+                if let Some(hook) = self.route_hook.as_ref() {
+                    hook.invalidate_owner_route().await;
+                }
+                return Err(PeerRuntimeError::OwnerChanged { retry_after_ms });
+            }
             return Err(PeerRuntimeError::RemoteStatus(response.status()));
         }
         self.response_seen = true;
@@ -2115,6 +2157,35 @@ impl InboundPeerRequest {
     pub async fn reject_rotation_freeze(self) -> Result<(), PeerRuntimeError> {
         self.reject_retryable_admission(PEER_ADMISSION_ROTATION_FREEZE)
             .await
+    }
+
+    /// Reject a request whose envelope names an owner token this relay does
+    /// not hold (task row M7-C110).  Answered on the request's own stream,
+    /// before any body is read, so the refusal costs one stream: returning
+    /// without response headers finishes the stream bare, and the ingress's
+    /// HTTP/3 client raises that as a connection error that takes down every
+    /// other request multiplexed on the same peer connection.
+    pub async fn reject_owner_changed(self) -> Result<(), PeerRuntimeError> {
+        self.reject_retryable_admission(PEER_ADMISSION_OWNER_CHANGED)
+            .await
+    }
+
+    /// Refuse a request on its own merits before any body is read (task row
+    /// M7-C110): an invalid envelope, a failed consumer authentication, an
+    /// inactive device credential.  Answered with response headers and a
+    /// finished stream, so the refusal costs one stream rather than the
+    /// whole multiplexed peer connection.  Nothing was dispatched.
+    pub async fn reject_refused(self, status: StatusCode) -> Result<(), PeerRuntimeError> {
+        let (mut send, mut recv) = self.split();
+        recv.cancel();
+        let response = Response::builder()
+            .status(status)
+            .header("content-type", "application/octet-stream")
+            .header(PEER_ERROR_EXECUTION_HEADER, "not_dispatched")
+            .body(())
+            .map_err(|_| PeerRuntimeError::Closed)?;
+        send.respond_with_headers(response).await?;
+        send.finish().await
     }
 
     async fn reject_retryable_admission(self, marker: &str) -> Result<(), PeerRuntimeError> {
