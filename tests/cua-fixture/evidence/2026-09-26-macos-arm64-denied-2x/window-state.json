@@ -1,0 +1,44 @@
+{
+    "screen_points": [
+        1024,
+        768
+    ],
+    "windows": [
+        {
+            "owner": "Python",
+            "pid": 687,
+            "layer": 19,
+            "alpha": 0.0,
+            "bounds": [
+                0,
+                -44,
+                1024,
+                44
+            ]
+        },
+        {
+            "owner": "Python",
+            "pid": 687,
+            "layer": 19,
+            "alpha": 1.0,
+            "bounds": [
+                0,
+                0,
+                1024,
+                768
+            ]
+        },
+        {
+            "owner": "universalAccessAuthWarn",
+            "pid": 904,
+            "layer": 0,
+            "alpha": 1.0,
+            "bounds": [
+                281,
+                152,
+                461,
+                177
+            ]
+        }
+    ]
+}

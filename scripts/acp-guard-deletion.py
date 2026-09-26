@@ -1062,23 +1062,27 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 BRIDGE,
-                """            }
-            .unwrap_or_default();
-            let _ = target.tx.send(Bytes::from(body)).await;
-        });
-        no_body(StatusCode::ACCEPTED)
-    }
-
-    async fn answer_permission(""",
-                """            }
-            .unwrap_or_default();
-            let _ = body;
-        });
-        no_body(StatusCode::ACCEPTED)
-    }
-
-    async fn answer_permission(""",
-            )
+                """                None => body,
+            };
+            let _ = tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(body))).await;
+        });""",
+                """                None => body,
+            };
+            let _ = (stall_deadline, &target, body);
+        });""",
+            ),
+            # Since M8-C27 a turn's answer travels the ordered transport
+            # channel and only falls back to the direct send above when the
+            # dispatcher is gone.  Defeating only the fallback left this case
+            # green, which is how the reroute was noticed; both paths are
+            # defeated so the 202 really does lie.
+            (
+                BRIDGE,
+                """            let body = match ordered {
+                Some(ordered) => match ordered""",
+                """            let body = match None::<mpsc::Sender<OutboundMessage>> {
+                Some(ordered) => match ordered""",
+            ),
         ],
         False,
     ),
@@ -1363,7 +1367,7 @@ C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
                 RELAY_CONFIG,
                 """            } else {
                 return Err(ConfigError::Invalid(
-                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25, acp-http-v1 and computer-v1",
                 ));
             };""",
                 """            } else {
@@ -1647,6 +1651,22 @@ C4_CASES: list[tuple[str, list[Edit], bool]] = [
                 TERMINAL,
                 """            Self::Turn(_) => "outcome_unknown",""",
                 """            Self::Turn(_) => "succeeded",""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------ a turn's result behind its updates
+    (
+        # M8-C27: the prompt's result travels the supervisor's transport
+        # channel, behind every update the agent wrote before it.  Without
+        # the ordered sender it goes straight to the session target and
+        # overtakes updates still queued at the dispatcher.
+        "a turn's result is queued behind its own updates (M8-C27)",
+        [
+            (
+                BRIDGE,
+                """        let ordered = connection.outbound.upgrade();""",
+                """        let ordered: Option<mpsc::Sender<OutboundMessage>> = None;""",
             )
         ],
         False,
@@ -2628,6 +2648,19 @@ def require_clean_tree(suites: list[Suite]) -> None:
 #: `scripts/guard_witness_debt.json`; the ledger can only shrink, and a case may
 #: not appear in both.
 #:
+#: **The last three were paid on branch `m4-42-witnesses-b` (task row
+#: M4-42), each by making a test able to see its guard rather than by
+#: reading a name off the case.**  `[m8c2] only a permission expires on a
+#: permission deadline` timed out because three fixture tests awaited a reply
+#: with no bound; they now fail within 30 s and the lifecycle test that names
+#: the rule is the witness.  `[m8c2] the child handle kills the group
+#: synchronously` was green whenever `tunnel-deadman` sat in the target
+#: directory, because the sentinel kills the group on runtime teardown too;
+#: its witness is a new test that runs the same teardown with the sentinel
+#: unlocatable.  `[m8c4] a stalled event is never dropped and continued past`
+#: was green because the stall test stopped looking at the first stall; it
+#: now requires the stall count to stay at one for three further bounds.
+#:
 #: **One entry predates M4-42's sweep and is not a moved debt (task row
 #: M5-C16).**  `[m8c7] a present ACP sentinel helper cannot be reported as
 #: missing` was added with its witness declared from the start, so it never
@@ -2681,6 +2714,8 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c2', "every end of a child's life signals its process group"): frozenset({'a_descendant_that_calls_setsid_survives_the_process_group_kill', 'a_grandchild_dies_when_the_child_exits_by_itself', 'a_malformed_stdout_line_kills_the_child_for_being_malformed', 'a_prompt_runs_a_turn_and_the_lifecycle_drives_it', 'a_setsid_descendant_escapes_even_with_the_sentinel_armed', 'a_wrapper_grandchild_dies_with_the_process_group', 'an_oversized_stdout_line_kills_the_child_rather_than_being_reassembled'}),
     ('m8c2', 'the cancellation reaches the agent on the wire'): frozenset({'a_permission_timeout_resolves_as_cancelled_never_approved'}),
     ('m8c2', 'the deadline must be exceeded, not merely reached'): frozenset({'lifecycle::tests::a_permission_deadline_resolves_as_cancelled_never_approved'}),
+    ('m8c2', 'only a permission expires on a permission deadline'): frozenset({'lifecycle::tests::only_a_permission_expires_on_the_permission_deadline'}),
+    ('m8c2', 'the child handle kills the group synchronously, not only from a task'): frozenset({'a_runtime_torn_down_with_no_sentinel_still_kills_the_group'}),
     ('m8c2', 'the deadline ticker ends when the child does'): frozenset({'nothing_holds_the_child_handle_once_the_child_is_gone'}),
     ('m8c2', 'the pending bound is reached at the bound, not one past it'): frozenset({'lifecycle::tests::the_pending_bound_is_exact_at_sixteen_per_direction'}),
     ('m8c2', 'the session bound is reached at the bound, not one past it'): frozenset({'lifecycle::tests::the_session_bound_is_exact_at_eight_per_connection'}),
@@ -2704,12 +2739,14 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c3', 'the host cannot choose a workspace or attach MCP servers'): frozenset({'a_host_cannot_choose_a_workspace_or_attach_mcp_servers'}),
     ('m8c3-relay', 'and admits nothing else'): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
     ('m8c3-relay', "the relay's profile allowlist admits the ACP profile"): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
+    ('m8c4', "a turn's result is queued behind its own updates (M8-C27)"): frozenset({'a_turns_error_is_never_delivered_ahead_of_its_own_updates', 'a_turns_result_is_never_delivered_ahead_of_its_own_updates'}),
     ('m8c4', 'a confirmed cancelled turn is cancelled'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not'}),
     ('m8c4', 'a lost process after dispatch is outcome_unknown, not a success'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not', 'terminal::tests::a_refusal_before_dispatch_is_failed_and_not_unknown'}),
     ('m8c4', 'a permission response must name an offered option (M8-C11)'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered', 'lifecycle::tests::an_agent_that_offered_nothing_admits_no_selection'}),
     ('m8c4', 'a prompt whose child died is classified outcome_unknown by the export'): frozenset({'the_export_classifies_its_terminals_through_the_terminal_rule'}),
     ('m8c4', 'an established required stream that broke is noticed by the watchdog'): frozenset({'a_lost_established_connection_stream_terminates_the_whole_transport', 'a_lost_established_session_stream_terminates_the_whole_transport'}),
     ('m8c4', 'an output-credit stall is bounded'): frozenset({'output_credit_stalls_are_bounded_and_the_event_is_never_skipped'}),
+    ('m8c4', 'a stalled event is never dropped and continued past'): frozenset({'output_credit_stalls_are_bounded_and_the_event_is_never_skipped'}),
     ('m8c4', 'an unoffered option does not consume the outstanding callback'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered'}),
     ('m8c4', 'one principal cannot fill the table and deny the rest'): frozenset({'bridge::capacity_tests::both_caps_are_exact_at_the_boundary_and_refuse_one_beyond', 'bridge::capacity_tests::one_principal_cannot_fill_the_table_and_deny_the_rest'}),
     ('m8c4', 'subscriber loss resolves pending permissions as cancelled'): frozenset({'a_lost_established_session_stream_terminates_the_whole_transport'}),

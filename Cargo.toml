@@ -86,6 +86,18 @@ advertised-targets = [
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
 ]
+# **Built, verified and attested by CI, never published or advertised.**
+# `aarch64-unknown-linux-gnu` is a client-only target (like Windows, it ships
+# `tunnel-client` and `tunnel-deadman` only) that the CUA test VM needs.
+# `.github/workflows/release.yml` builds it on `ubuntu-24.04-arm`, verifies
+# the unpacked archive there and attests it, and `scripts/publish_release.py`
+# publishes only `advertised-targets`, so it is a workflow artifact and never
+# a release asset.  Promoting it to `advertised-targets` changes what the
+# public is offered, which is the owner's decision (M6-C11); it is recorded
+# on docs/tasks.md M6-C115.  `scripts/m6-release-checks.py --check packaging`
+# requires the workflow matrix to equal the union of the two lists, and the
+# two lists to be disjoint.
+ci-only-targets = ["aarch64-unknown-linux-gnu"]
 # The owner explicitly requested publication and the repository is public.
 # `scripts/m6-release-checks.py --check visibility` compares GitHub's live
 # answer against this declared expectation and fails on disagreement **in

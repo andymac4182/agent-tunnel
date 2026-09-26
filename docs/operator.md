@@ -327,7 +327,7 @@ writes anything (section 2.3):
 
 ```console
 $ mkdir -m 700 trial-ca
-$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
+$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
 $ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:33333333-3333-4333-8333-333333333333\n' > trial-ca/device-ext.cnf
 $ openssl x509 -req -in trial/device.csr -CA trial-ca/ca.pem -CAkey trial-ca/ca-key.pem -CAcreateserial -days 1 -extfile trial-ca/device-ext.cnf -out trial/device-cert.pem
 $ openssl x509 -in trial/device-cert.pem -noout -subject
@@ -1341,8 +1341,36 @@ sessions this relay owns; the counters `application_dispatches_total`,
 `control_registration_conflicts_total` (devices refused `owner_busy`),
 `consumer_write_timeouts_total`, `consumer_refusals_total{route,stage}` (the
 refusal stages below, counted even when their log line was rate limited, for
-the whole process), `peer_faults_total{stage}` and
-`peer_fault_causes_total{cause}`. Every value is a count, a gauge or a byte
+the whole process, plus stage `rotation_freeze`: a request this relay, as the
+device's owner, refused `ROTATION_FREEZE` on the `echo`, `stream`,
+`http-forward` or `fs` route, counted without a log line; a freeze refusal for
+a request that reached the owner through a peer hop is a peer fault with cause
+`rotation_freeze` instead), `peer_faults_total{stage}` and
+`peer_fault_causes_total{cause}`. The owner's admission hold across a
+data-rotation freeze (M3-15; [protocol.md](protocol.md), "Quiesce
+admission") has its own series: `rotation_freeze_hold_held_total` (new OPENs
+held), the gauge `rotation_freeze_hold_current`,
+`rotation_freeze_hold_admitted_total` (held OPENs admitted once the hold
+ended), `rotation_freeze_hold_released_total{outcome}` (`commit`, `abort`,
+`recovery`, `session_loss`),
+`rotation_freeze_hold_released_with_deferred_writes_total`,
+`rotation_freeze_hold_refused_total{reason}` (`after_bound`: held past the
+bound; `hold_full`: never held because the hold was full),
+`rotation_freeze_hold_cancelled_total` (the consumer went away while held) and
+the gauge `rotation_freeze_hold_max_wait_ms`. **Do not add
+`consumer_refusals_total{stage="rotation_freeze"}` to
+`rotation_freeze_hold_refused_total`:** the two overlap without either containing the
+other. A request this relay refuses as owner because the hold's bound passed or
+the hold was full is counted in both, so their sum counts it twice. Only the
+hold counts such a refusal for a request that reached the owner through a peer
+hop (the ingress relay counts it as a peer fault), and only
+`consumer_refusals_total` counts a request released from one hold into a
+freeze that has begun again, which is refused without being held twice. Read
+the first for which local route was refused and the second for why the hold
+refused. Every held OPEN leaves the hold
+exactly once, so `held_total` equals `current` plus every `released_total`,
+`refused_total{reason="after_bound"}` and `cancelled_total`; a scrape where it
+does not is a relay defect worth reporting. Every value is a count, a gauge or a byte
 total, and every label value is a fixed word from a closed set: **no tenant,
 device, session, connection, stream or request identifier, subject, issuer,
 token, URL, path, endpoint, error text or payload is ever in a scrape.** A

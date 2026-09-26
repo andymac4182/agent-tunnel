@@ -2246,6 +2246,155 @@ async fn m6c57_provisioned_acp_service_answers_initialize() {
     );
 }
 
+/// The ACP demo (`docs/demo/acp.md`): the **official pinned ACP client** runs
+/// one whole session through a real relay to the device's ACP export.
+///
+/// Same bring-up as [`m6c57_provisioned_acp_service_answers_initialize`] --
+/// shipped `tunnel-relay` and `tunnel-client` processes, the shipped ACP
+/// records example, the repository's synthetic ACP agent on the device -- but
+/// the consumer is `acp-demo-client`, built from `agent-client-protocol` /
+/// `agent-client-protocol-http` `=2.1.0`, run as its own process with a bearer
+/// token and the relay's CA.  It is a separate binary because the pinned
+/// client's `reqwest` carries a second `rustls` provider that must stay out of
+/// this crate's build graph (M8-C09).
+///
+/// What each step proves is read from what arrived, never from a status:
+/// the client prints `demo: ok <step>` only when the message it received says
+/// so (`stopReason` off the session stream, the streamed chunks through its
+/// notification handler, the permission request through its callback), and
+/// the **agent's own marker file** must record the cancellation it received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL, TUNNEL_CLIENT_BIN, TUNNEL_ACP_FIXTURE_BIN and TUNNEL_ACP_DEMO_CLIENT_BIN; run by scripts/demo-acp.sh"]
+async fn m8_acp_demo_official_client_runs_a_session_through_the_relay() {
+    let demo_client = PathBuf::from(env::var_os("TUNNEL_ACP_DEMO_CLIENT_BIN").expect(
+        "TUNNEL_ACP_DEMO_CLIENT_BIN must name acp-demo-client \
+         (cargo build -p tunnel-acp-fixture --features interop --bin acp-demo-client)",
+    ));
+    let (fixture, device, client_log, client_stderr) =
+        serve_kind("m8-acp-demo", ServiceKind::Acp).await;
+    let context = || device_log(&client_log, &client_stderr);
+    let token = access_token_with_scope(&fixture.issuer_key, &fixture.subject, "http:invoke");
+    let path = format!(
+        "/v1/devices/{}/services/{}/http/acp",
+        fixture.device, fixture.service
+    );
+
+    // Wait for the device session with one raw `initialize`, exactly as the
+    // M6-C57 gate does; the demo client should not have to race the device's
+    // first connect.  That connection is never subscribed, so the export ends
+    // it at its subscription deadline.
+    let probe = serde_json::json!({
+        "jsonrpc": "2.0", "id": "demo-ready", "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {}},
+    })
+    .to_string();
+    until_served(
+        "acp demo readiness",
+        || {
+            consumer_request_h2(
+                fixture.consumer,
+                &fixture.pki.ca_pem,
+                "POST",
+                &path,
+                &token,
+                &[
+                    ("content-type", "application/json"),
+                    ("accept", "application/json"),
+                ],
+                probe.as_bytes(),
+            )
+        },
+        context,
+    )
+    .await;
+
+    // The client's inputs, as a person running the demo would hand them over:
+    // the CA as a file, the token in a file only this user can read.
+    let ca = fixture.work.join("demo-server-ca.pem");
+    fs::write(&ca, &fixture.pki.ca_pem).expect("write the demo CA");
+    let token_file = fixture.work.join("demo-token.jwt");
+    fs::write(&token_file, &token).expect("write the demo token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600))
+            .expect("token file mode");
+    }
+    let workspace = fixture.work.join("device").join("acp-workspace");
+    let marker = workspace.join("permission-outcome.txt");
+    let url = format!("https://127.0.0.1:{}{path}", fixture.consumer.port());
+
+    let started = Instant::now();
+    let output = tokio::task::spawn_blocking({
+        let (demo_client, url, ca, token_file, workspace) = (
+            demo_client.clone(),
+            url.clone(),
+            ca.clone(),
+            token_file.clone(),
+            workspace.clone(),
+        );
+        move || {
+            Command::new(demo_client)
+                .args(["--url", &url, "--ca"])
+                .arg(&ca)
+                .arg("--token-file")
+                .arg(&token_file)
+                .arg("--cwd")
+                .arg(&workspace)
+                .output()
+                .expect("run acp-demo-client")
+        }
+    })
+    .await
+    .expect("demo client task");
+    let elapsed_ms = started.elapsed().as_millis();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The demo's transcript is the point of the demo; it carries no token.
+    print!("{stdout}");
+    assert!(
+        output.status.success(),
+        "acp-demo-client exited {:?}\nstdout:\n{stdout}\nstderr:\n{}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        context()
+    );
+    for expected in [
+        "demo: ok initialize",
+        "demo: ok session/new",
+        "demo: update chunk-4",
+        "demo: ok prompt-streaming stopReason=end_turn",
+        "demo: permission answered selected=permit-one",
+        "demo: update permission-outcome:selected:permit-one",
+        "demo: ok prompt-permission stopReason=end_turn",
+        "demo: sending session/cancel",
+        "demo: update permission-outcome:cancelled:",
+        "demo: ok prompt-cancel stopReason=cancelled",
+        "demo: PASS",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "the demo transcript lacks {expected:?}:\n{stdout}"
+        );
+    }
+    // The agent's own record of the last permission outcome it received: the
+    // cancellation reached the agent, not only the client's belief about it.
+    let at_agent = fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        at_agent.trim(),
+        "cancelled:",
+        "the agent recorded receiving the cancellation"
+    );
+
+    drop(device);
+    let (nonce, namespace) = (fixture.nonce.clone(), fixture.namespace.clone());
+    drop(fixture);
+    println!(
+        "m8-acp-demo ok nonce={nonce} namespace={namespace} client=agent-client-protocol-http=2.1.0 \
+         streaming=end_turn permission=selected:permit-one cancel=cancelled \
+         cancel_at_agent=cancelled elapsed_ms={elapsed_ms}"
+    );
+}
+
 /// A minimal 9P2000.L consumer over the relay's filesystem WebSocket: every
 /// byte is encoded and decoded by `tunnel_fs_ninep`, as the M4 gates' client
 /// in `tunnel-test-harness` does.
@@ -4399,6 +4548,26 @@ async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
         assert!(value >= least, "{series} = {value}:\n{text}");
     }
     assert_eq!(m6c24_value(&text, "tunnel_relay_device_sessions"), Some(1));
+    // The owner's rotation-freeze admission hold (M3-15) is exported from
+    // the same snapshot; no freeze was held here, so every series is zero
+    // but present, and the hold's partition holds.
+    let freeze_hold_series = [
+        "tunnel_relay_rotation_freeze_hold_held_total",
+        "tunnel_relay_rotation_freeze_hold_current",
+        "tunnel_relay_rotation_freeze_hold_admitted_total",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"commit\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"abort\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"recovery\"}",
+        "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"session_loss\"}",
+        "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"}",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"hold_full\"}",
+        "tunnel_relay_rotation_freeze_hold_cancelled_total",
+        "tunnel_relay_rotation_freeze_hold_max_wait_ms",
+    ];
+    for series in freeze_hold_series {
+        assert!(m6c24_value(&text, series).is_some(), "no {series}:\n{text}");
+    }
     let redis_url = env::var("TEST_REDIS_URL").unwrap_or_default();
     for canary in [
         payload.as_str(),
@@ -4436,9 +4605,10 @@ async fn m6c24_private_metrics_report_aggregates_and_no_identifier() {
     .expect("public /metrics");
     assert_eq!(public.0, 404, "/metrics must stay off the public listener");
     println!(
-        "m6c24-metrics ok nonce={nonce} series={} bytes={} sessions=1 refusal_identity>=1",
+        "m6c24-metrics ok nonce={nonce} series={} bytes={} sessions=1 refusal_identity>=1 freeze_hold_series={}",
         text.lines().filter(|line| !line.starts_with('#')).count(),
-        text.len()
+        text.len(),
+        freeze_hold_series.len()
     );
     drop(device);
     drop(fixture);

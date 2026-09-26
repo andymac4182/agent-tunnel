@@ -801,9 +801,25 @@ impl HttpForwardServeConfig {
                         ConfigError::Invalid("pinned http_forward profile is inconsistent")
                     })?,
                 )
+            } else if let Some(profile) = tunnel_cua::CuaProfile::parse_id(id) {
+                // `computer-v1` (M5) carries its own, much smaller request
+                // ceiling: a `computer.v1` request is an operation name and a
+                // few integers, so the shared MCP/ACP body numbers do not
+                // apply to it and it always uses its own pinned defaults.
+                // The relay routes it and touches no screen or input; the
+                // device's opt-in (a non-default build feature plus an
+                // environment variable) is what gates a real backend.
+                (
+                    profile.id(),
+                    profile
+                        .policies(tunnel_cua::CuaLimits::default())
+                        .map_err(|_| {
+                            ConfigError::Invalid("pinned http_forward profile is inconsistent")
+                        })?,
+                )
             } else {
                 return Err(ConfigError::Invalid(
-                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25, acp-http-v1 and computer-v1",
                 ));
             };
             exports = exports
@@ -1560,6 +1576,54 @@ consumer_tls_private_key = "consumer-key.pem"
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nresponse_body_bytes = 2000000000\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\ndeadline_seconds = 0\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nfixture_hold = true\n",
+        ] {
+            let input = format!("{}\n{broken}", valid_toml());
+            assert!(ServeConfig::parse(&input).is_err(), "{broken}");
+        }
+    }
+
+    /// M5: `computer-v1` is selectable, selects `tunnel-cua`'s own table
+    /// (`POST /computer`, HTTP/2 only), and keeps its own 64 KiB request
+    /// ceiling whatever the shared `request_body_bytes` says.
+    #[test]
+    fn the_computer_v1_profile_is_selectable_with_its_own_limits() {
+        let configured = format!(
+            "{}\n[http_forward]\nprofiles = [\"computer-v1\", \"acp-http-v1\"]\nrequest_body_bytes = 4194304\n",
+            valid_toml()
+        );
+        let config = ServeConfig::parse(&configured).expect("computer-v1 parses");
+        let exports = config
+            .listener_options()
+            .unwrap()
+            .http_forward
+            .expect("exports");
+        assert_eq!(
+            exports.profile_ids().collect::<Vec<_>>(),
+            vec!["acp-http-v1", "computer-v1"]
+        );
+        let cua = exports
+            .select(&serde_json::json!({"http_forward_profile": "computer-v1"}))
+            .expect("the CUA profile is selectable");
+        assert_eq!(
+            cua.profile.request.body_limit(),
+            tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT,
+            "the shared 4 MiB request limit must not widen computer.v1's"
+        );
+        assert!(
+            cua.profile
+                .request
+                .headers
+                .allows(tunnel_cua::headers::TUNNEL_PRINCIPAL_BINDING)
+                && !cua
+                    .profile
+                    .request
+                    .headers
+                    .allows(tunnel_acp::headers::ACP_CONNECTION_ID),
+            "the selected profile is computer.v1's own table"
+        );
+        for broken in [
+            "[http_forward]\nprofiles = [\"computer-v2\"]\n",
+            "[http_forward]\nprofiles = [\"computer-v1\", \"computer-v1\"]\n",
         ] {
             let input = format!("{}\n{broken}", valid_toml());
             assert!(ServeConfig::parse(&input).is_err(), "{broken}");

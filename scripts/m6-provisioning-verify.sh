@@ -51,6 +51,9 @@
 #    touches `TEST_REDIS_URL`); `scripts/m6-redis-restart-verify.sh` runs it
 #    against its own Redis container, and this step skips it by name, as it
 #    skips M6-C67's readiness gate (`m6c67_`), which does the same.
+#    The ACP demo (`m8_acp_demo_`) shares this binary and is skipped too: it
+#    needs the pinned client built with `--features interop`, and
+#    scripts/demo-acp.sh runs it.
 #
 # Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
 # run because it needs Redis: the 8 catalog provisioning tests (M6-C63's
@@ -128,7 +131,7 @@ require "Redis connection stage tests" "$scratch/stage.log" "test result: ok. 3 
 
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  --test-threads=1 --skip m6c65_ --skip m6c67_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 --skip m6c65_ --skip m6c67_ --skip m8_acp_demo > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
 require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-e2e ok nonce=" "last_seen_listed=true" \
   "m6c34-serve-before-provisioning ok exit=1 class=unprovisioned keys=2" \
@@ -147,7 +150,7 @@ require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 8 passed" "m6c21-
   "m6c31-catalog ok nonce=" "serve_restarts=0 grant_pickup_ms=" \
   "grant_pickup_attempts=1" "revoke_grant_attempts=1" \
   "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true" \
-  "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1"
+  "m6c24-metrics ok nonce=" "sessions=1 refusal_identity>=1 freeze_hold_series=12"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi
