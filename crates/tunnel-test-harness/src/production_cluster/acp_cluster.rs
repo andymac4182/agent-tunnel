@@ -118,6 +118,8 @@ use super::acp_real_path::{
     json_stream, process_alive, session_id, stop_reason,
 };
 use super::membership_hint_drop::{INCOMING_SPKI, TARGET_NODE, target_peer_spki};
+
+mod genuine_rekey;
 use super::{
     CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, ProductionRelay,
     ProxyConfig, Result, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT, TcpProxy,
@@ -188,19 +190,23 @@ const ROTATION_EFFECT: &str = "rotation-span";
 /// record key set** and restores it, which every later case depends on, and it
 /// is deliberately not adjacent to `rotation-span` so the two cases that need
 /// the most membership headroom do not share a boundary's re-sign.
-pub const CLUSTER_CASES: [&str; 8] = [
+/// `genuine-peer-key-rotation` (M8-C24) follows it: it re-keys the owner and
+/// rotates it back, so it too must precede the two cases that rewrite pins
+/// and remove relay-a.
+pub const CLUSTER_CASES: [&str; 9] = [
     "rotation-span",
     "two-tenant-ids",
     "forged-heads",
     "saturation",
     "revocation",
     "peer-key-rotation",
+    "genuine-peer-key-rotation",
     "peer-path-loss",
     "owner-loss",
 ];
 
 /// What this gate deliberately does not establish.
-pub const NOT_COVERED: [&str; 13] = [
+pub const NOT_COVERED: [&str; 14] = [
     "an ACP connection surviving a membership re-sign, or outliving its membership record: M7-C80 is open, a peer admission's deadline is never extended, and this gate's rotation case is bounded to finish inside one record rather than escaping that limit",
     "per-OS process-tree cleanup: macOS is the only host any of this has run on, and a descendant that leaves its process group is not reached at all (M8-C07)",
     "any OS sandbox guarantee: until a tested sandbox profile exists this export is trusted-agent execution, and filesystem confinement is not claimed from cwd alone",
@@ -212,7 +218,8 @@ pub const NOT_COVERED: [&str; 13] = [
     "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
     "peer-key rotation as a survivable event: the key-rotation case drives the teardown and attributes the INGRESS's own decision, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
-    "which end's teardown closed the socket first: the withdrawn key is the OWNER's own serving key and the incoming one is a phantom no certificate presents, so the key arm also drives the owner's runtime through MembershipRejected to Unready, invalidating its own admission of the ingress at the same moment. The key arm is three concurrent teardowns -- ingress-side revalidation, owner-side fail-closed, and the version bump -- and the control arm controls for the third only. Both ends' latched reasons are recorded rather than inferred, and a genuine rotation, where the owner presents the incoming key, needs a relay that re-keys. That is NOT a fixture change, which is what M8-C16 and M8-C24 both assumed: a relay binds ONE serving identity for the life of the process. Its peer certificate is read once at startup and MembershipRuntimeConfig::with_local_spki_sha256 stores a single Option<String>, and readiness requires the record to carry exactly that SPKI un-revoked and in-window (membership_runtime.rs, the local_key lookup). There is no second local SPKI, no setter and no reload path anywhere in tunnel-relay. So withdrawing the SPKI the owner presents and unreadying the owner really are the same act, and no fixture can separate them; the product must be able to hold an OVERLAP on the SERVING side, mirroring the overlap it already supports on the VERIFYING side, before a rotation with the owner staying Ready is drivable at all. Recorded on task row M8-C28",
+    "which end's teardown closed the socket first IN THE PHANTOM-SUCCESSOR ARM: the peer-key-rotation case still withdraws the OWNER's own serving key for a phantom no certificate presents, deliberately, so it also drives the owner's runtime through MembershipRejected to Unready and invalidates the owner's own admission of the ingress at the same moment. That arm is three concurrent teardowns -- ingress-side revalidation, owner-side fail-closed, and the version bump -- and the control arm controls for the third only. Both ends' latched reasons are recorded rather than inferred. A relay no longer binds one serving identity for the life of its process (M8-C28, closed by the product change of M8-C45): the genuine-peer-key-rotation case re-keys the owner through its own PeerRekey state machine and shows the owner staying Ready, and that case -- not this arm -- is the peer-key rotation",
+    "an in-flight stream SURVIVING the predecessor's withdrawal in the genuine rotation: the owner keeps serving existing connections under the predecessor through the overlap and the switch, and both live streams are shown serving across the switch, but when the publisher withdraws the predecessor the ingress's connection presenting it is closed and its admission revoked, so the held turn is torn down and the ingress attributes that to the key. The owner does not GOAWAY-drain inbound connections under the predecessor before the withdrawal (M8-C47), and the flooded forwarded stream's survival is shown by one frame read after the switch, not by a saturation threshold -- both forwarding segments saturated at one instant is M8-05's third discriminator and is not claimed here",
     "any of this at the shipped rotation default, or a key rotation reaching the consumer as a typed terminal: the interruption is an explicit stream failure with no stopReason, which is what the consumer sees, and no code on the wire names the key",
 ];
 
@@ -497,6 +504,47 @@ pub struct AcpClusterEvidence {
     /// is never counted as a boundary's.
     pub key_rotation_route_probes: u64,
 
+    // --- the genuine peer-key rotation (M8-C24, M8-C45) ---
+    /// A staged successor was not served while no record approved it: the
+    /// owner's rotation machine was `staged`, still serving the original SPKI,
+    /// and read the successor's approval as `absent`.
+    pub genuine_staged_not_served: bool,
+    /// The owner's record approving both keys reached every relay's verifier.
+    pub genuine_overlap_staged: bool,
+    /// The owner switched to the successor through its own state machine.
+    pub genuine_switched: bool,
+    /// Disclosed: overlap convergence to switch, and live streams to switch.
+    pub genuine_switch_after_overlap_ms: u128,
+    pub genuine_switch_after_streams_ms: u128,
+    /// The held ACP turn was neither errored nor ended two reconcile intervals
+    /// after the switch.
+    pub genuine_switch_left_acp_serving: bool,
+    /// The flooded, unread forwarded stream still yielded a frame after the
+    /// switch.
+    pub genuine_switch_left_forward_serving: bool,
+    /// A fresh handshake to the owner, approving only the successor, was
+    /// admitted and presented it.
+    pub genuine_successor_presented: bool,
+    /// A fresh handshake approving only the predecessor was refused.
+    pub genuine_predecessor_not_presented: bool,
+    /// The withdrawal tore the held turn down explicitly, with no stopReason.
+    pub genuine_interrupted: bool,
+    pub genuine_no_stop_reason: bool,
+    /// What the ingress latched for its admission of the owner, and the owner
+    /// for its admission of the ingress, from the withdrawal on.
+    pub genuine_ingress_reasons: Vec<String>,
+    pub genuine_owner_reasons: Vec<String>,
+    /// The owner's membership runtime was observed not Ready at any sample
+    /// across the whole case.  The discriminator: it must be false.
+    pub genuine_owner_unready: bool,
+    /// The owner retired the predecessor because the record withdrew it.
+    pub genuine_retired_by_withdrawal: bool,
+    /// A whole ACP turn completed across the rotated route afterwards.
+    pub genuine_post_rotation_turn: bool,
+    /// The fixture adopted the successor for the owner and a full re-sign
+    /// left the owner Ready, serving the successor.
+    pub genuine_resigned_on_successor: bool,
+
     // --- saturation ---
     /// The **request** direction of the ingress→owner peer hop: high-water
     /// bytes the ingress had sent that the owner had not consumed, and the
@@ -733,6 +781,9 @@ struct Gate<'h> {
     /// neither number can absorb the other's.
     key_rotation_route_probes: u64,
     ingress_addr: SocketAddr,
+    /// A second peer certificate for the owner's node, issued under the same
+    /// peer CA at startup, for the genuine rotation (M8-C24).
+    rekey_successor: crate::pki::CertificateMaterial,
     ca: Vec<u8>,
     token: String,
     base_uri: String,
@@ -3936,6 +3987,10 @@ async fn run(
         boundary_route_probes: 0,
         key_rotation_route_probes: 0,
         ingress_addr,
+        rekey_successor: harness
+            .pki
+            .issue_peer(TARGET_NODE)
+            .map_err(|error| HarnessError::Pki(error.to_string()))?,
         ca,
         token,
         base_uri,
@@ -3975,6 +4030,9 @@ async fn run(
                 "saturation" => gate.case_saturation(&mut evidence).await?,
                 "revocation" => gate.case_revocation(&mut evidence).await?,
                 "peer-key-rotation" => gate.case_key_rotation(&mut evidence).await?,
+                "genuine-peer-key-rotation" => {
+                    gate.case_genuine_key_rotation(&mut evidence).await?;
+                }
                 "peer-path-loss" => gate.case_peer_path_loss(&mut evidence).await?,
                 "owner-loss" => gate.case_owner_loss(&mut evidence).await?,
                 other => {
@@ -4434,6 +4492,82 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
+    // --- the genuine peer-key rotation (M8-C24, M8-05 discriminator 1) ---
+    //
+    // Each message names this rotation and nothing else, so a falsification
+    // here can only be absorbed by its own rule.
+    let genuine: [(&str, bool); 13] = [
+        (
+            "genuine rotation: a staged successor was not served before any record approved it",
+            evidence.genuine_staged_not_served,
+        ),
+        (
+            "genuine rotation: the overlap approving both keys reached every relay's verifier",
+            evidence.genuine_overlap_staged,
+        ),
+        (
+            "genuine rotation: the owner switched to the approved successor through its own state machine",
+            evidence.genuine_switched,
+        ),
+        (
+            // The switch changes new handshakes only: the held turn rides a
+            // connection negotiated under the predecessor and must keep
+            // serving through it.
+            "genuine rotation: the held ACP turn kept serving across the switch",
+            evidence.genuine_switch_left_acp_serving,
+        ),
+        (
+            "genuine rotation: the flooded forwarded stream kept serving across the switch",
+            evidence.genuine_switch_left_forward_serving,
+        ),
+        (
+            "genuine rotation: a fresh handshake to the owner presented the successor",
+            evidence.genuine_successor_presented,
+        ),
+        (
+            "genuine rotation: a fresh handshake approving only the predecessor was refused",
+            evidence.genuine_predecessor_not_presented,
+        ),
+        (
+            // **The discriminator of M8-C24 and M8-05 (1).**  It is exactly
+            // what separates a rotation from the phantom-successor arm, whose
+            // owner goes Unready by construction.
+            "genuine rotation: the owner stayed Ready throughout and latched no membership_revoked of its own",
+            !evidence.genuine_owner_unready
+                && !evidence
+                    .genuine_owner_reasons
+                    .iter()
+                    .any(|reason| reason == "membership_revoked"),
+        ),
+        (
+            // Exact equality, for the reason the phantom arm's rule gives.
+            "genuine rotation: the ingress attributed the held turn's teardown to the withdrawn key",
+            evidence.genuine_ingress_reasons == vec!["membership_revoked".to_owned()],
+        ),
+        (
+            "genuine rotation: the withdrawal tore the held turn down explicitly, with no fabricated stopReason",
+            evidence.genuine_interrupted && evidence.genuine_no_stop_reason,
+        ),
+        (
+            "genuine rotation: the owner retired the predecessor because the record withdrew it",
+            evidence.genuine_retired_by_withdrawal,
+        ),
+        (
+            "genuine rotation: a whole ACP turn completed across the rotated route",
+            evidence.genuine_post_rotation_turn,
+        ),
+        (
+            "genuine rotation: a full re-sign on the successor alone left the owner Ready and serving it",
+            evidence.genuine_resigned_on_successor,
+        ),
+    ];
+    for (rule, passed) in genuine {
+        if !passed {
+            return Err(HarnessError::Process(format!(
+                "ACP cluster gate failed: {rule}"
+            )));
+        }
+    }
     // Peer-path loss, peer-key rotation and owner loss are checked together,
     // because the property is the same one and stating it three times
     // separately invites one of them to be quietly weakened.  Each message
@@ -4695,6 +4829,23 @@ mod tests {
             version_bump_owner_unready: false,
             key_left_ingress_verifier: true,
             key_rotation_route_probes: 3,
+            genuine_staged_not_served: true,
+            genuine_overlap_staged: true,
+            genuine_switched: true,
+            genuine_switch_after_overlap_ms: 5_000,
+            genuine_switch_after_streams_ms: 3_200,
+            genuine_switch_left_acp_serving: true,
+            genuine_switch_left_forward_serving: true,
+            genuine_successor_presented: true,
+            genuine_predecessor_not_presented: true,
+            genuine_interrupted: true,
+            genuine_no_stop_reason: true,
+            genuine_ingress_reasons: vec!["membership_revoked".to_owned()],
+            genuine_owner_reasons: vec!["membership_changed".to_owned()],
+            genuine_owner_unready: false,
+            genuine_retired_by_withdrawal: true,
+            genuine_post_rotation_turn: true,
+            genuine_resigned_on_successor: true,
             ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
             ingress_request_direction_saturated: true,
@@ -5252,6 +5403,85 @@ mod tests {
                     e.owner_device_loaded_samples = 0;
                 },
                 "sampled while the upload was still in flight",
+            ),
+            (
+                "genuine_staged_not_served",
+                |e| e.genuine_staged_not_served = false,
+                "staged successor was not served",
+            ),
+            (
+                "genuine_overlap_staged",
+                |e| e.genuine_overlap_staged = false,
+                "overlap approving both keys",
+            ),
+            (
+                "genuine_switched",
+                |e| e.genuine_switched = false,
+                "switched to the approved successor",
+            ),
+            (
+                "genuine_switch_left_acp_serving",
+                |e| e.genuine_switch_left_acp_serving = false,
+                "held ACP turn kept serving across the switch",
+            ),
+            (
+                "genuine_switch_left_forward_serving",
+                |e| e.genuine_switch_left_forward_serving = false,
+                "flooded forwarded stream kept serving",
+            ),
+            (
+                "genuine_successor_presented",
+                |e| e.genuine_successor_presented = false,
+                "presented the successor",
+            ),
+            (
+                "genuine_predecessor_not_presented",
+                |e| e.genuine_predecessor_not_presented = false,
+                "approving only the predecessor was refused",
+            ),
+            (
+                "genuine_owner_unready",
+                |e| e.genuine_owner_unready = true,
+                "owner stayed Ready throughout",
+            ),
+            (
+                "genuine_owner_reasons",
+                |e| {
+                    e.genuine_owner_reasons = vec!["membership_revoked".to_owned()];
+                },
+                "owner stayed Ready throughout",
+            ),
+            (
+                "genuine_ingress_reasons",
+                |e| {
+                    e.genuine_ingress_reasons = vec!["membership_changed".to_owned()];
+                },
+                "attributed the held turn's teardown to the withdrawn key",
+            ),
+            (
+                "genuine_interrupted",
+                |e| e.genuine_interrupted = false,
+                "tore the held turn down explicitly",
+            ),
+            (
+                "genuine_no_stop_reason",
+                |e| e.genuine_no_stop_reason = false,
+                "tore the held turn down explicitly",
+            ),
+            (
+                "genuine_retired_by_withdrawal",
+                |e| e.genuine_retired_by_withdrawal = false,
+                "retired the predecessor because the record withdrew it",
+            ),
+            (
+                "genuine_post_rotation_turn",
+                |e| e.genuine_post_rotation_turn = false,
+                "whole ACP turn completed across the rotated route",
+            ),
+            (
+                "genuine_resigned_on_successor",
+                |e| e.genuine_resigned_on_successor = false,
+                "full re-sign on the successor alone",
             ),
             (
                 "leftover_processes",

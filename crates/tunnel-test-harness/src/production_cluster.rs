@@ -64,8 +64,8 @@ use tunnel_relay::{
 };
 use tunnel_transport::{
     AcceptedSocketDiagnostics, AcceptedSocketOptions, PeerClient, PeerServerStats,
-    PeerTransportLimits, SharedPeerPins, SpkiSha256, load_peer_client_config_from_pem,
-    load_peer_server_config_from_pem, load_server_config_from_pem,
+    PeerTransportLimits, RotatingPeerIdentity, SharedPeerPins, SpkiSha256,
+    load_server_config_from_pem,
 };
 use uuid::Uuid;
 
@@ -1573,7 +1573,24 @@ struct ProductionRelay {
     device_socket_diagnostics: Option<AcceptedSocketDiagnostics>,
     peer_refresh_cancel: CancellationToken,
     peer_refresh: Option<JoinHandle<()>>,
+    /// This relay's live peer-key rotation coordinator (M8-C45).  Every
+    /// production fixture relay serves and dials through a replaceable
+    /// identity slot, exactly as `tunnel-relay serve` does, so any of them can
+    /// genuinely re-key; the tick loop is started only by a gate that rotates.
+    rekey: Arc<tunnel_relay::peer_rekey::PeerRekey>,
 }
+
+/// The fixture's rotation timing: the convergence hold at its configuration
+/// floor (twice the fixture's 1 s reconcile interval, plus one) so a gate is
+/// not dominated by the 61 s production default, and the documented
+/// ten-minute overlap, so the predecessor is retired by the publisher's
+/// withdrawal rather than by a timer inside a gate.
+pub(crate) const FIXTURE_PEER_REKEY: tunnel_relay::peer_rekey::PeerRekeyConfig =
+    tunnel_relay::peer_rekey::PeerRekeyConfig {
+        convergence_hold: Duration::from_secs(3),
+        overlap: tunnel_relay::peer_rekey::DEFAULT_PEER_REKEY_OVERLAP,
+        tick: Duration::from_millis(200),
+    };
 
 fn private_fixture_directory() -> Result<TempDir> {
     let files = tempdir().map_err(HarnessError::Io)?;
@@ -5599,6 +5616,10 @@ async fn start_relay(
         peer_drain_timeout_seconds: 5,
         checkpoint_timeout_seconds: 2,
         max_clock_skew_seconds: 1,
+        peer_tls_next_cert_chain: None,
+        peer_tls_next_private_key: None,
+        peer_rekey_convergence_seconds: Some(FIXTURE_PEER_REKEY.convergence_hold.as_secs()),
+        peer_rekey_overlap_seconds: Some(FIXTURE_PEER_REKEY.overlap.as_secs()),
     };
     let membership_config = MembershipRuntimeConfig::from_cluster_config(
         &cluster_config,
@@ -5707,18 +5728,17 @@ async fn start_relay(
     .map_err(|error| HarnessError::Pki(format!("consumer TLS {}: {error}", node.node_id)))?;
     server.private_key_pem.clear();
 
-    let mut peer_server = load_peer_server_config_from_pem(
+    let peer_identity = RotatingPeerIdentity::from_pem_at_startup(
         node.peer_certificate_chain_pem().as_bytes(),
         node.peer_certificate.private_key_pem.as_bytes(),
-        node.peer_ca_pem().as_bytes(),
     )
-    .map_err(|error| HarnessError::Pki(format!("peer server TLS {}: {error}", node.node_id)))?;
-    let mut peer_client = load_peer_client_config_from_pem(
-        node.peer_certificate_chain_pem().as_bytes(),
-        node.peer_certificate.private_key_pem.as_bytes(),
-        node.peer_ca_pem().as_bytes(),
-    )
-    .map_err(|error| HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id)))?;
+    .map_err(|error| HarnessError::Pki(format!("peer identity {}: {error}", node.node_id)))?;
+    let mut peer_server = peer_identity
+        .quinn_server_config(node.peer_ca_pem().as_bytes())
+        .map_err(|error| HarnessError::Pki(format!("peer server TLS {}: {error}", node.node_id)))?;
+    let mut peer_client = peer_identity
+        .quinn_client_config(node.peer_ca_pem().as_bytes())
+        .map_err(|error| HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id)))?;
     let peer_limits = PeerTransportLimits::default()
         .with_timeouts(PRODUCTION_PEER_IDLE_TIMEOUT, Duration::from_secs(5))
         .map_err(|error| HarnessError::Process(format!("peer limits: {error}")))?;
@@ -5756,7 +5776,15 @@ async fn start_relay(
         PeerClient::new_with_pin_provider(client_endpoint, pins.clone(), peer_limits.clone())
             .map_err(|error| {
                 HarnessError::Process(format!("creating peer client {}: {error}", node.node_id))
-            })?;
+            })?
+            .with_local_identity(Arc::clone(&peer_identity));
+    let rekey = tunnel_relay::peer_rekey::PeerRekey::new(
+        Arc::clone(&peer_identity),
+        Arc::clone(&membership),
+        Some(peer_client.clone()),
+        node.peer_ca_pem().as_bytes().to_vec(),
+        FIXTURE_PEER_REKEY,
+    );
     let identity = RelayIdentity::new(
         fixture.deployment_incarnation.clone(),
         node.node_id.clone(),
@@ -5932,6 +5960,7 @@ async fn start_relay(
         device_socket_diagnostics,
         peer_refresh_cancel: CancellationToken::new(),
         peer_refresh: None,
+        rekey,
     })
 }
 

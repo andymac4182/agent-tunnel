@@ -30,6 +30,7 @@ use tunnel_relay::{
     MembershipUnreadyReason, MembershipVersionStateIdentity, MembershipVersionStateStore,
     PeerListenerConfig, PeerListenerState, PeerReadiness, PeerRouteTarget, PeerRuntime,
     RelayOptions, ServeConfig,
+    peer_rekey::{PeerRekey, PeerRekeyConfig},
     recovery::{
         QuiescenceAcknowledgement, RecoverRequest, RecoveryApprovalVersionStore,
         RecoveryFenceIdentity, RecoveryWorkflowConfig,
@@ -38,8 +39,8 @@ use tunnel_relay::{
     routing::{OwnerRouter, RelayIdentity},
 };
 use tunnel_transport::{
-    PeerClient, PeerTransportLimits, SharedPeerPins, SpkiSha256, load_peer_client_config_from_pem,
-    load_peer_server_config_from_pem, load_server_config_from_pem, spki_sha256_from_der,
+    PeerClient, PeerTransportLimits, RotatingPeerIdentity, SharedPeerPins, SpkiSha256,
+    load_server_config_from_pem, spki_sha256_from_der,
 };
 
 /// How long `main` waits, after the command has returned, for work still
@@ -152,8 +153,10 @@ impl StopSignal {
 ///
 /// Installing the handlers replaces an inherited `SIG_IGN` as well, for the
 /// reason `docs/runtime.md` gives under "Stopping `connect` and `serve`": a stop request
-/// is honoured whatever disposition the process inherited. SIGHUP is not
-/// handled.
+/// is honoured whatever disposition the process inherited. SIGHUP is not a
+/// stop request: a cluster relay handles it separately, as its peer-key
+/// rotation trigger ([`RekeyTrigger`], M8-C46), and any other relay leaves it
+/// at the inherited disposition.
 struct StopSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
@@ -1091,16 +1094,29 @@ async fn start_cluster(
         Duration::from_secs(cluster.peer_idle_timeout_seconds),
         Duration::from_secs(cluster.peer_drain_timeout_seconds),
     )?;
-    let mut peer_server_config = load_peer_server_config_from_pem(&peer_cert, &peer_key, &peer_ca)?;
+    // One replaceable identity slot backs both directions, so a live
+    // peer-key rotation (M8-C45) changes what new handshakes present without
+    // a restart.  The private key stays in this process's memory.
+    let peer_identity = RotatingPeerIdentity::from_pem_at_startup(&peer_cert, &peer_key)?;
+    drop(peer_key);
+    let mut peer_server_config = peer_identity.quinn_server_config(&peer_ca)?;
     peer_limits.apply_to_server_config(&mut peer_server_config)?;
-    let mut peer_client_config = load_peer_client_config_from_pem(&peer_cert, &peer_key, &peer_ca)?;
+    let mut peer_client_config = peer_identity.quinn_client_config(&peer_ca)?;
     peer_limits.apply_to_client_config(&mut peer_client_config)?;
     let peer_server_endpoint = quinn::Endpoint::server(peer_server_config, cluster.peer_bind)?;
     let client_bind = std::net::SocketAddr::new(cluster.peer_bind.ip(), 0);
     let mut peer_client_endpoint = quinn::Endpoint::client(client_bind)?;
     peer_client_endpoint.set_default_client_config(peer_client_config);
     let peer_client =
-        PeerClient::new_with_pin_provider(peer_client_endpoint, pins.clone(), peer_limits.clone())?;
+        PeerClient::new_with_pin_provider(peer_client_endpoint, pins.clone(), peer_limits.clone())?
+            .with_local_identity(Arc::clone(&peer_identity));
+    let rekey = PeerRekey::new(
+        Arc::clone(&peer_identity),
+        Arc::clone(&membership),
+        Some(peer_client.clone()),
+        peer_ca.clone(),
+        PeerRekeyConfig::from_cluster_config(cluster),
+    );
 
     let local_identity = RelayIdentity::new(
         options.deployment_incarnation.clone(),
@@ -1202,6 +1218,9 @@ async fn start_cluster(
         shutdown.clone(),
     ));
 
+    let rekey_task = rekey.spawn(shutdown.clone());
+    let rekey_trigger = RekeyTrigger::install(cluster, Arc::clone(&rekey))?;
+
     eprintln!(
         "tunnel-relay listening: consumer={} device={} peer={}",
         running.consumer_addr, running.device_addr, cluster.peer_bind
@@ -1210,9 +1229,98 @@ async fn start_cluster(
         running,
         peer_runtime,
         peer_task,
+        rekey_task,
+        rekey_trigger,
         membership_handle,
         shutdown,
     })
+}
+
+/// The operator's peer-key rotation trigger: `SIGHUP` (task row M8-C46).
+///
+/// Of the three triggers the design left open -- a signal, an admin command,
+/// a file watch -- this is the conservative one, applied by default pending
+/// owner confirmation (2026-09-25): it adds no network surface, it never fires
+/// on its own when a file changes, and it needs the local privilege to signal
+/// the process.  It reads only the configured `peer_tls_next_*` paths and only
+/// stages them; serving them still waits for a signed record approving the
+/// successor's SPKI.  Installed for cluster relays only, so a non-cluster
+/// relay keeps its previous `SIGHUP` disposition.
+struct RekeyTrigger {
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+    next: Option<(PathBuf, PathBuf)>,
+    rekey: Arc<PeerRekey>,
+}
+
+impl RekeyTrigger {
+    fn install(
+        cluster: &tunnel_relay::ClusterConfig,
+        rekey: Arc<PeerRekey>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let next = cluster
+            .peer_tls_next_cert_chain
+            .clone()
+            .zip(cluster.peer_tls_next_private_key.clone());
+        Ok(Self {
+            #[cfg(unix)]
+            hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
+            next,
+            rekey,
+        })
+    }
+
+    /// Wait for the next trigger.  Cancel-safe.  Never resolves off Unix.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            if self.hangup.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    }
+
+    /// Read, validate and stage the configured successor identity.  Prints
+    /// only public facts: the phase and SPKI digests.
+    fn stage(&self) {
+        let Some((chain_path, key_path)) = &self.next else {
+            eprintln!(
+                "tunnel-relay: SIGHUP received; no cluster.peer_tls_next_* identity is configured, nothing staged"
+            );
+            return;
+        };
+        let chain = match fs::read(chain_path) {
+            Ok(chain) => chain,
+            Err(error) => {
+                eprintln!(
+                    "tunnel-relay: peer rekey refused: cannot read cluster.peer_tls_next_cert_chain ({})",
+                    error.kind()
+                );
+                return;
+            }
+        };
+        let mut key = match fs::read(key_path) {
+            Ok(key) => key,
+            Err(error) => {
+                eprintln!(
+                    "tunnel-relay: peer rekey refused: cannot read cluster.peer_tls_next_private_key ({})",
+                    error.kind()
+                );
+                return;
+            }
+        };
+        let result = self.rekey.stage_pem(&chain, &key);
+        key.fill(0);
+        match result {
+            Ok(spki) => eprintln!(
+                "tunnel-relay: peer identity staged: staged_spki_sha256={spki}; it serves once a signed membership record approves it for {}s",
+                self.rekey.config().convergence_hold.as_secs()
+            ),
+            Err(error) => eprintln!("tunnel-relay: peer rekey refused: {error}"),
+        }
+    }
 }
 
 /// A serving cluster relay and everything its orderly shutdown must join.
@@ -1220,6 +1328,8 @@ struct ClusterServing {
     running: tunnel_relay::RunningRelay,
     peer_runtime: Arc<PeerRuntime>,
     peer_task: tokio::task::JoinHandle<()>,
+    rekey_task: tokio::task::JoinHandle<()>,
+    rekey_trigger: RekeyTrigger,
     membership_handle: tunnel_relay::MembershipRuntimeHandle,
     shutdown: CancellationToken,
 }
@@ -1230,14 +1340,19 @@ impl ClusterServing {
             running,
             peer_runtime,
             peer_task,
+            rekey_task,
+            mut rekey_trigger,
             membership_handle,
             shutdown,
         } = self;
         // The relay's own shutdown token takes the same drain as a stop
-        // request, as it did before M6-C23.
-        let requested = tokio::select! {
-            requested = stop.recv() => Some(requested),
-            () = shutdown.cancelled() => None,
+        // request, as it did before M6-C23.  A rekey trigger stages and loops.
+        let requested = loop {
+            tokio::select! {
+                requested = stop.recv() => break Some(requested),
+                () = shutdown.cancelled() => break None,
+                () = rekey_trigger.recv() => rekey_trigger.stage(),
+            }
         };
         let first = match &requested {
             Some(Ok(signal)) => {
@@ -1259,6 +1374,7 @@ impl ClusterServing {
             let peer_result = peer_task
                 .await
                 .map_err(|error| format!("peer readiness task failed: {error}"));
+            let _ = rekey_task.await;
             let membership_result = membership_handle.shutdown().await;
             running_result?;
             peer_result?;
