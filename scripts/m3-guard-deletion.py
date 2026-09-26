@@ -1713,6 +1713,70 @@ M7_CONNECTOR_RELAY_CASES.append(
         ),
     )
 )
+STRANDED = "actor::stranded_reply_tests::"
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M6-C162: a relay handle's reply wait ends when the actor has ended.
+        "a relay handle reply wait ends when its actor has ended",
+        [
+            (
+                ACTOR,
+                "            () = self.wait() => receiver.try_recv().ok(),\n",
+                "            () = std::future::pending::<()>() => receiver.try_recv().ok(),\n",
+            )
+        ],
+        frozenset(
+            {
+                STRANDED + "a_stranded_snapshot_returns_shutdown",
+                STRANDED + "a_stranded_forwarded_attach_returns_shutdown",
+                STRANDED + "a_stranded_echo_write_returns_an_interrupted_outcome",
+                STRANDED + "a_stranded_http_finish_returns_false",
+                STRANDED + "a_stranded_http_reset_returns_false",
+                STRANDED + "a_stranded_stream_close_returns_false",
+                STRANDED + "a_stranded_http_read_reads_nothing",
+                STRANDED + "a_shutdown_stranded_after_its_completion_check_returns_shutdown",
+            }
+        ),
+    )
+)
+#: M6-C162: the device http-forward writer/reader reply waits.  Their tests
+#: live in `http_forward`, outside the `m2_runtime::tests::` filter.
+HTTP_FORWARD_REPLY_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-client",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "http_forward::stranded_reply_tests::",
+]
+HTTP_FORWARD_STRANDED = "http_forward::stranded_reply_tests::"
+HTTP_FORWARD_REPLY_CASES: list[Case] = [
+    Case(
+        # M6-C162: a device writer/reader reply wait ends once the actor's
+        # receiver is gone.
+        "a device http-forward reply wait ends when the actor's receiver is gone",
+        [
+            (
+                CLIENT / "src" / "http_forward.rs",
+                "        () = sink.closed() => receiver.try_recv().ok(),\n",
+                "        () = std::future::pending::<()>() => receiver.try_recv().ok(),\n",
+            )
+        ],
+        frozenset(
+            {
+                HTTP_FORWARD_STRANDED
+                + "a_stranded_write_behind_an_exited_actor_reports_carrier_closed",
+                HTTP_FORWARD_STRANDED
+                + "a_stranded_finish_behind_an_exited_actor_reports_carrier_closed",
+                HTTP_FORWARD_STRANDED + "a_stranded_reset_behind_an_exited_actor_returns",
+                HTTP_FORWARD_STRANDED + "a_stranded_read_behind_an_exited_actor_reports_closed",
+            }
+        ),
+    ),
+]
 M7_CONNECTOR_CLIENT_CASES: list[Case] = [
     Case(
         # M6-C158: a carrier close ends once its writer has exited.
@@ -2126,6 +2190,12 @@ SUITES: list[Suite] = [
         [CLIENT],
         RETIRING_ADMISSION_TEST,
         M7_CONNECTOR_CLIENT_CASES,
+    ),
+    Suite(
+        "m6c162-http-forward-replies",
+        [CLIENT],
+        HTTP_FORWARD_REPLY_TEST,
+        HTTP_FORWARD_REPLY_CASES,
     ),
     Suite("m3c11-authorization", [RELAY], AUTHORIZATION_TEST, AUTHORIZATION_CASES),
     Suite(
