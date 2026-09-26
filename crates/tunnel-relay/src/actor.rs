@@ -580,7 +580,7 @@ fn lock_handoffs(slots: &Mutex<ClaimHandoffSlots>) -> std::sync::MutexGuard<'_, 
 }
 
 /// Owner-claim guards for registrations in flight (task rows M6-C170 and
-/// M6-C177).
+/// M6-C178).
 ///
 /// A registration task used to hold its `OwnerClaimCleanup` itself and then
 /// move it into `Command::RegisterResolved`.  Both places lose the claim when
@@ -770,7 +770,7 @@ where
 
 /// Held by the actor task's supervisor: once the actor has ended, release
 /// every owner claim still parked in [`ClaimHandoffs`] directly against the
-/// catalog (task rows M6-C170 and M6-C177).  The actor's cleanup worker ended
+/// catalog (task rows M6-C170 and M6-C178).  The actor's cleanup worker ended
 /// with it, so a guard dropped now would find no worker.  Bounded overall by
 /// `CLEANUP_SHUTDOWN_TIMEOUT`; what does not fit is left to lease expiry and
 /// counted in the log.
@@ -1141,7 +1141,7 @@ async fn release_claim_bounded(catalog: &SharedCatalog, request: &OwnerClaimRequ
 /// full command queue to strand that task during shutdown.  Dropping the
 /// command leaves its owner-claim guard parked in [`ClaimHandoffs`], where
 /// `close_all` or, after the actor has ended, [`StrandedClaimRelease`] finds it
-/// (task rows M6-C170 and M6-C177).
+/// (task rows M6-C170 and M6-C178).
 async fn send_background_command(
     cancel: &CancellationToken,
     command_tx: &mpsc::Sender<Command>,
@@ -4099,7 +4099,7 @@ impl RelayActor {
         let cancel = self.options.shutdown.clone();
         // Parked before the task exists, so a task aborted mid-claim with the
         // actor leaves its armed guard where the actor's end finds it (task
-        // row M6-C177).
+        // row M6-C178).
         let mut owner_cleanup = self
             .claim_handoffs
             .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
@@ -4265,7 +4265,7 @@ impl RelayActor {
         let cancel = self.options.shutdown.clone();
         // Parked before the task exists, so a task aborted mid-claim with the
         // actor leaves its armed guard where the actor's end finds it (task
-        // row M6-C177).
+        // row M6-C178).
         let mut owner_cleanup = self
             .claim_handoffs
             .deposit(self.cleanup_dispatcher.clone().map(OwnerClaimCleanup::new));
@@ -14950,7 +14950,7 @@ impl RelayActor {
         // Hand every owner-claim guard still parked (a registration whose
         // result was dropped in the drain above, or whose task was aborted) to
         // the cleanup worker while it is still live (task rows M6-C170 and
-        // M6-C177).  This also closes the registry, so a later deposit keeps
+        // M6-C178).  This also closes the registry, so a later deposit keeps
         // its guard with its own handoff.
         if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
             while let Some(item) = self.claim_handoffs.take_next_after_end() {

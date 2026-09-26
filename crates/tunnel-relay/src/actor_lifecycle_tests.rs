@@ -642,7 +642,7 @@ async fn shutdown_releases_claim_committed_before_registration_result_delivery()
     );
 }
 
-/// **Task row M6-C177.** A registration task aborted mid-claim together with
+/// **Task row M6-C178.** A registration task aborted mid-claim together with
 /// its actor must not leave the committed claim fenced until its lease
 /// expires.  The claim commits and is then held inside `claim_owner`, so the
 /// task is still running when the actor is aborted; the actor's `JoinSet`
