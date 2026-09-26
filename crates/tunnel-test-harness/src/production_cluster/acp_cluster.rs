@@ -4169,8 +4169,14 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // a label nobody checked.  Exact equality here too: an earlier
             // version was `!is_empty && !any(revoked)`, whose first conjunct
             // no falsification ever exercised.
-            "the same-key control arm was attributed to the record version, naming no key",
-            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],
+            // **Since M7-C80 the control arm invalidates nothing.**  A same-key
+            // re-sign at a newer version re-binds the admission rather than
+            // replacing it, so the stream survives and no reason is latched.
+            // That is a stronger control than the old `membership_changed`:
+            // whatever the key arm tears down is now attributable to the key
+            // alone, with the version bump shown to be inert beside it.
+            "the same-key control arm invalidated nothing and the stream survived (M7-C80)",
+            evidence.version_bump_reasons.is_empty() && !evidence.version_bump_interrupted,
         ),
         (
             // **The disclosure, made load-bearing.**  The key arm withdraws
@@ -4671,8 +4677,8 @@ mod tests {
             owner_loss_interrupted: true,
             owner_loss_no_stop_reason: true,
             key_overlap_staged: true,
-            version_bump_interrupted: true,
-            version_bump_reasons: vec!["membership_changed".to_owned()],
+            version_bump_interrupted: false,
+            version_bump_reasons: Vec::new(),
             key_rotation_interrupted: true,
             key_rotation_no_stop_reason: true,
             key_rotation_reasons: vec!["membership_revoked".to_owned()],
@@ -5096,18 +5102,27 @@ mod tests {
                     // evidence of nothing.
                     e.version_bump_reasons = vec!["membership_revoked".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
             ),
             (
                 // The other half of that rule.  It used to read
                 // `!is_empty && !any(revoked)` with only the second conjunct
                 // falsified, so a control arm that invalidated *nothing* --
                 // and therefore controlled for nothing -- would have passed.
-                "version_bump_reasons empty",
+                // M7-C80 regressed: a same-key version bump invalidating the
+                // admission again, as it did before the re-bind.
+                "version_bump_reasons membership_changed",
                 |e| {
-                    e.version_bump_reasons = Vec::new();
+                    e.version_bump_reasons = vec!["membership_changed".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
+            ),
+            (
+                "version_bump_interrupted",
+                |e| {
+                    e.version_bump_interrupted = true;
+                },
+                "same-key control arm invalidated nothing",
             ),
             (
                 "key_rotation_owner_unready",
