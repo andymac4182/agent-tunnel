@@ -262,6 +262,8 @@ pub(crate) struct HttpMaintenance {
     /// queue parked, retried after every command and on the tick.  At most
     /// one entry per stream, so it is bounded by the stream tables.
     pub(crate) writer_held: Vec<(SessionKey, u64)>,
+    /// M6-C190: every such park, for the relay snapshot and metrics.
+    pub(crate) writer_parks_total: u64,
 }
 
 impl HttpMaintenance {

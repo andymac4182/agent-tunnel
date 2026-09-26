@@ -678,6 +678,7 @@ METRIC_SERIES = ("tunnel_relay_device_sessions", "tunnel_relay_device_sockets",
                  "tunnel_relay_streams", "tunnel_relay_sessions_rotating",
                  "tunnel_relay_queue_bytes", "tunnel_relay_replay_bytes",
                  "tunnel_relay_consumer_refusals_total", "tunnel_relay_consumer_write_timeouts_total",
+                 "tunnel_relay_http_writer_parks_total",
                  "tunnel_relay_ready")
 
 
@@ -1204,7 +1205,8 @@ def summarize_samples(path: Path) -> dict:
                     entry[f"{series_name}_max"] = max(vals)
                     entry[f"{series_name}_last"] = vals[-1]
             for counter in ("tunnel_relay_consumer_refusals_total",
-                            "tunnel_relay_consumer_write_timeouts_total"):
+                            "tunnel_relay_consumer_write_timeouts_total",
+                            "tunnel_relay_http_writer_parks_total"):
                 vals = [float(r[counter]) for r in items if r.get(counter)]
                 if vals:
                     entry[f"{counter}_last"] = vals[-1]

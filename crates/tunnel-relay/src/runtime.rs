@@ -551,6 +551,9 @@ pub struct RelaySnapshot {
     /// Monotonic count of authoritative duplicate-control/owner-busy
     /// admission rejections.  It contains no identity or error payload.
     pub control_registration_conflicts: u64,
+    /// Monotonic count of `http-forward/1` and `fs_9p` chunks a momentarily
+    /// full device writer queue parked instead of refusing (M6-C190).
+    pub http_writer_parks: u64,
     /// Bounded public consumer response-write timeout diagnostics.  The
     /// scope contains only device/service identifiers and ingress kind.
     pub consumer_write_diagnostics: ConsumerWriteDiagnosticSnapshot,

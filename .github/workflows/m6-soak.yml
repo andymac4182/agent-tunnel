@@ -4,6 +4,9 @@
 # The artifact holds synthetic metrics only (requests.csv, samples.csv,
 # events.jsonl, summary.json, run.txt and the sequence log): no relay or
 # device log, no payload and no token (M7-C112: no public unredacted logs).
+# http-failures.jsonl holds only the payload-free failed-exchange lines the
+# harness extracts from those logs (M6-C190): identifiers, counters, flags
+# and elapsed milliseconds.
 name: m6-soak
 
 on:

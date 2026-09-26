@@ -439,6 +439,12 @@ pub(crate) fn render(input: &MetricsInput<'_>) -> String {
         "Public response writes that timed out.",
         snapshot.consumer_write_diagnostics.timeout_count,
     );
+    counter(
+        &mut out,
+        "tunnel_relay_http_writer_parks_total",
+        "HTTP-forward and filesystem stream chunks parked because the device writer queue was momentarily full.",
+        snapshot.http_writer_parks,
+    );
 
     render_rotation_freeze_hold(&mut out, &snapshot.rotation_freeze_hold);
 

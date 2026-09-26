@@ -2774,6 +2774,11 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     // without spinning.
     fixture.actor.retry_writer_held_http();
     assert_eq!(fixture.stream().pending_records.len(), 2);
+    assert_eq!(
+        fixture.actor.snapshot().http_writer_parks,
+        2,
+        "the first write and its retry each parked the head chunk"
+    );
     assert!(matches!(
         head.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)

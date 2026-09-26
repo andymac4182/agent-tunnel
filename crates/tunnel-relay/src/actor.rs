@@ -7627,6 +7627,8 @@ impl RelayActor {
                 // a non-empty one above): the head is its place either way.
                 stream.pending_records.push_front((body, response));
                 self.http_maintenance.note_writer_held(&key, stream_id);
+                self.http_maintenance.writer_parks_total =
+                    self.http_maintenance.writer_parks_total.saturating_add(1);
                 return;
             }
             let _ = response.send(Err(outcome));
@@ -16273,6 +16275,7 @@ impl RelayActor {
             lifetime_application_dispatches: self.lifetime_application_dispatches,
             lifetime_consumer_chunk_reads: self.consumer_chunk_reads.load(Ordering::Acquire),
             control_registration_conflicts: self.control_registration_conflicts,
+            http_writer_parks: self.http_maintenance.writer_parks_total,
             consumer_write_diagnostics: self.consumer_write_diagnostics.snapshot(),
             peer_transport_diagnostics: self.peer_transport_diagnostics.snapshot(),
             peer_consumer_diagnostics: self.peer_consumer_diagnostics.snapshot(),
