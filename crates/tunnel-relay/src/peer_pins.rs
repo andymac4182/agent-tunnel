@@ -118,7 +118,22 @@ fn derive_pins(membership: &MembershipRuntime) -> Result<PinDecision, PinDerivat
     // bounded historical key metadata, so publishing it could retain an
     // expired/revoked SPKI in the transport trust set until the next full
     // candidate swap.
-    let digests = approved_digests(membership.verified_peer_route_targets())?;
+    let mut digests = approved_digests(membership.verified_peer_route_targets())?;
+    // Keep the key of every still-active admission until this relay's own
+    // monotonic deadline expires it, so an admission latches `TrustExpired`
+    // before its pooled connection is closed for a dropped pin.
+    for spki in membership.active_admission_spkis() {
+        let bytes = decode_hex_digest(&spki).ok_or_else(|| {
+            PinDerivationError(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid admitted SPKI digest",
+            )))
+        })?;
+        let pin = SpkiSha256::from_bytes(bytes);
+        if !digests.contains(&pin) {
+            digests.push(pin);
+        }
+    }
     Ok(PinDecision::Install(digests))
 }
 
