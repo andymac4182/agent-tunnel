@@ -2184,11 +2184,11 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "the same-key control arm must name the version and nothing else",
+        "the same-key control arm must invalidate nothing (M7-C80)",
         [
             (
                 ACP_CLUSTER,
-                '            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],',
+                "            evidence.version_bump_reasons.is_empty(),",
                 "            true,",
             )
         ],
@@ -2775,7 +2775,7 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c5', 'the request direction of the peer hop must reach the enforced saturation threshold of its credit window'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', "the rotation disclosure must carry this run's own measurement"): frozenset({'production_cluster::acp_cluster::tests::the_rotation_disclosure_carries_the_run_it_describes'}),
     ('m8c5', 'the rotation window must finish inside one membership record'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
-    ('m8c5', 'the same-key control arm must name the version and nothing else'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the same-key control arm must invalidate nothing (M7-C80)'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', 'the saturating upload must have completed, read off the wire'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', 'the segment must have been sampled while the upload was in flight'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', "the staged key overlap must have reached every relay's verifier"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
