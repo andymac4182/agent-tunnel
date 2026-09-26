@@ -1548,6 +1548,41 @@ M7_CONNECTOR_RELAY_CASES.append(
 )
 M7_CONNECTOR_CLIENT_CASES: list[Case] = [
     Case(
+        # M6-C148: stopped control reads pause the M7-C95 give-up clock.
+        "the retention give-up clock is paused while control reads are stopped",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        if self.open_retention_paused_at.is_some() {\n"
+                "            return Ok(());\n"
+                "        }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::paused_control_reads_pause_the_open_retention_give_up_clock",
+            }
+        ),
+    ),
+    Case(
+        # M6-C148: the paused time is credited back when reads resume.
+        "paused control reads are credited back to the retention give-up clock",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            self.open_retention_exhausted_since = "
+                "Some(since.checked_add(paused).unwrap_or(now));\n",
+                "            let _ = paused;\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::paused_control_reads_pause_the_open_retention_give_up_clock",
+            }
+        ),
+    ),
+    Case(
         # Review of PR #171: a session at its live limit is busy, not wedged.
         "a busy session at its live limit is never given up for retention",
         [

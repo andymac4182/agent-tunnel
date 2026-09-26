@@ -1724,6 +1724,11 @@ struct M2Actor {
     /// OPEN journal, or the retained stream table full of terminal streams)
     /// was exhausted, reset by the next reclamation (task row M7-C95).
     open_retention_exhausted_since: Option<Instant>,
+    /// When the M6-C120 read gate last stopped control reads, while it still
+    /// holds them stopped.  The M7-C95 give-up clock does not run while reads
+    /// are stopped: the `STREAM_FORGET`s that would reclaim retention arrive
+    /// on control (task row M6-C148).
+    open_retention_paused_at: Option<Instant>,
     /// Highest terminal stream ID whose carrier barriers have completed.
     /// Relay stream IDs are allocated monotonically for a session, so this
     /// scalar keeps late frames from forgotten streams from creating an
@@ -1900,6 +1905,7 @@ async fn run_m2_session(
         pending_pongs: BTreeMap::new(),
         pending_forgets: BTreeMap::new(),
         open_retention_exhausted_since: None,
+        open_retention_paused_at: None,
         forgotten_stream_through: 0,
         retired_streams: RetiredStreamIds::default(),
         peer_fence_message_id: None,
@@ -1917,6 +1923,9 @@ async fn run_m2_session(
     );
     deadline_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
+        // The same gate the control branch below is guarded by: note a pause
+        // or a resume for the M7-C95 give-up clock (task row M6-C148).
+        actor.observe_control_read_gate_at(Instant::now());
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break Ok(()),
@@ -4237,6 +4246,27 @@ impl M2Actor {
         .saturating_add(OPEN_RETENTION_EXHAUSTION_MARGIN)
     }
 
+    /// Pause the M7-C95 give-up clock while the M6-C120 read gate has stopped
+    /// control reads, and credit the paused time back when reads resume
+    /// (task row M6-C148).  Only the part of a pause that fell inside the
+    /// current exhaustion is credited, so the clock counts exactly the
+    /// exhausted time during which the session was reading control and could
+    /// have received a reclaiming `STREAM_FORGET`.  A pause is bounded on its
+    /// own: a spilled critical control whose writer makes no progress for
+    /// [`M2_CRITICAL_CONTROL_TIMEOUT`] ends the session.
+    fn observe_control_read_gate_at(&mut self, now: Instant) {
+        if !self.control_read_ready() {
+            self.open_retention_paused_at.get_or_insert(now);
+            return;
+        }
+        if let Some(paused_at) = self.open_retention_paused_at.take()
+            && let Some(since) = self.open_retention_exhausted_since
+        {
+            let paused = now.saturating_duration_since(paused_at.max(since));
+            self.open_retention_exhausted_since = Some(since.checked_add(paused).unwrap_or(now));
+        }
+    }
+
     /// Give the session up once OPEN retention has been exhausted for longer
     /// than [`Self::open_retention_exhaustion_grace`] with no reclamation
     /// (task row M7-C95).  Before this a connector whose retention was full
@@ -4257,6 +4287,13 @@ impl M2Actor {
         // concurrent work, so the give-up clock restarts.
         if self.active_stream_count() >= self.config.limits.max_streams {
             self.open_retention_exhausted_since = None;
+        }
+        // While control reads are stopped the clock is paused: the session
+        // cannot read the STREAM_FORGETs that would reclaim its retention.
+        // The critical-control deadline bounds such a stall on its own.
+        self.observe_control_read_gate_at(now);
+        if self.open_retention_paused_at.is_some() {
+            return Ok(());
         }
         match self.open_retention_exhausted_since {
             Some(since)
@@ -9531,6 +9568,7 @@ mod tests {
             pending_pongs: BTreeMap::new(),
             pending_forgets: BTreeMap::new(),
             open_retention_exhausted_since: None,
+            open_retention_paused_at: None,
             forgotten_stream_through: 0,
             retired_streams: RetiredStreamIds::default(),
             peer_fence_message_id: None,
@@ -17112,6 +17150,181 @@ mod tests {
             actor.check_open_retention_exhaustion_at(past_grace),
             Err(ClientError::OpenRetentionFull)
         ));
+    }
+
+    /// Task row M6-C148, on the real session loop.  OPEN retention is
+    /// exhausted while control is read normally, so the M7-C95 give-up clock
+    /// starts.  Part-way through its grace the control writer is held and an
+    /// OPEN flood fills the critical spill, so the M6-C120 read gate stops
+    /// control reads.  The hold outlasts the rest of the grace (but not the
+    /// critical-control deadline).  While reads are stopped the session
+    /// cannot read a reclaiming `STREAM_FORGET`, so it must stay up; once
+    /// the writer is released and reads resume, retention that is still not
+    /// reclaimed must give the session up with `OpenRetentionFull` after the
+    /// unpaused remainder of the grace, and not at the moment reads resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_control_reads_pause_the_open_retention_give_up_clock() -> Result<(), String> {
+        let gate = Arc::new(test_hooks::ControlWriterGate {
+            block_once: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+            forget_tick: std::sync::Mutex::new(None),
+        });
+        let _gate_guard = ControlWriterGateGuard(gate.clone());
+        let (control_client, mut control_peer) = test_websocket_pair().await?;
+        let (data_client, mut data_peer) = test_websocket_pair().await?;
+        let (control_sink, control_stream) = control_client.split();
+        let (data_sink, data_stream) = data_client.split();
+        let cancellation = CancellationToken::new();
+        let (readiness, _readiness_receiver) = watch::channel(Readiness::Connecting);
+        let (status, _status_receiver) = watch::channel(ConnectionStatus::default());
+        let mut config = RuntimeConfig::default();
+        // A small live limit keeps the journal and the spill small.
+        config.limits.max_streams = 2;
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        // Grace = 100 + 200 ms + the 5 s margin = 5.3 s.
+        let rotation_config = RotationConfig::new(300_000, 100, 200)
+            .map_err(|error| format!("test rotation config: {error:?}"))?;
+        let grace = Duration::from_millis(300) + OPEN_RETENTION_EXHAUSTION_MARGIN;
+        let mut actor = tokio::spawn(run_m2_session(
+            config,
+            session,
+            runtime_welcome(),
+            "owner".to_owned(),
+            None,
+            rotation_config,
+            control_sink,
+            control_stream,
+            data_sink,
+            data_stream,
+            cancellation.clone(),
+            readiness,
+            status,
+            None,
+            None,
+            Some(gate.clone()),
+            HttpHandlers::default(),
+        ));
+        tokio::spawn(async move { while data_peer.next().await.is_some() {} });
+        // Every OPEN names a service this connector does not export, so each
+        // is refused and journaled, and no stream is live: the retention that
+        // fills is terminal work the owner never forgets.
+        let unexported_open = |stream_id: u64| {
+            let mut open = test_open(stream_id);
+            open.service_id = "not_exported".to_owned();
+            open
+        };
+
+        let proof = async {
+            // 1. Exhaust OPEN retention with the writer free.
+            let mut stream_id = 1;
+            let mut exhausted_at = None;
+            while exhausted_at.is_none() && stream_id <= 200 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(unexported_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN {stream_id} should reach the actor: {error}"))?;
+                stream_id += 1;
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    timeout(Duration::from_millis(50), control_peer.next()).await
+                {
+                    if let Ok(ControlMessage::Rejected(rejected)) = decode_control(text.as_bytes())
+                        && rejected.code == "RESOURCE_EXHAUSTED"
+                        && rejected
+                            .reason
+                            .contains("OPEN idempotency retention is full")
+                    {
+                        exhausted_at = Some(Instant::now());
+                    }
+                }
+            }
+            let exhausted_at = exhausted_at
+                .ok_or_else(|| "the OPEN journal never reported exhaustion".to_owned())?;
+            // 2. Read control, unpaused, for part of the grace.
+            tokio::time::sleep_until((exhausted_at + Duration::from_secs(3)).into()).await;
+            if actor.is_finished() {
+                return Err("the session gave up before the grace elapsed".to_owned());
+            }
+            // 3. Hold the writer and flood, so the read gate stops reads.
+            let held_at = Instant::now();
+            gate.block_once.store(true, Ordering::Release);
+            let entered = gate.entered.notified();
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(unexported_open(
+                    stream_id,
+                ))))
+                .await
+                .map_err(|error| format!("held OPEN should reach the actor: {error}"))?;
+            stream_id += 1;
+            timeout(TEST_SETUP_TIMEOUT, entered)
+                .await
+                .map_err(|_| "control writer did not enter the deterministic hold".to_owned())?;
+            for _ in 0..47 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(unexported_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN flood should reach the socket: {error}"))?;
+                stream_id += 1;
+            }
+            // 4. Hold past the rest of the grace, inside the critical deadline.
+            tokio::time::sleep_until((held_at + Duration::from_millis(3_500)).into()).await;
+            if exhausted_at.elapsed() < grace {
+                return Err("the hold did not outlast the grace".to_owned());
+            }
+            if actor.is_finished() {
+                return Err(format!(
+                    "the session was given up {:?} after its retention was exhausted, while \
+                     control reads were paused",
+                    exhausted_at.elapsed()
+                ));
+            }
+            Ok::<_, String>(control_peer)
+        }
+        .await;
+
+        // 5. Release: reads resume; nothing reclaims, so the rest of the grace
+        // runs out and the session gives up.
+        gate.release.notify_waiters();
+        let released_at = Instant::now();
+        let proof = proof.map(|mut control_peer| {
+            tokio::spawn(async move { while control_peer.next().await.is_some() {} });
+        });
+        let joined = if proof.is_ok() {
+            timeout(Duration::from_secs(15), &mut actor).await.ok()
+        } else {
+            None
+        };
+        let ended_after = released_at.elapsed();
+        cancellation.cancel();
+        let actor_result = match joined {
+            Some(joined) => joined,
+            None => match timeout(TEST_ACTOR_CLEANUP_TIMEOUT, &mut actor).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    actor.abort();
+                    (&mut actor).await
+                }
+            },
+        };
+        proof?;
+        assert!(
+            matches!(&actor_result, Ok(Err(ClientError::OpenRetentionFull))),
+            "unreclaimed retention still gives the session up once reads resume: {actor_result:?}"
+        );
+        assert!(
+            ended_after >= Duration::from_secs(1),
+            "the paused time is credited back, so the give-up waits for the unpaused \
+             remainder of the grace: ended {ended_after:?} after reads resumed"
+        );
+        Ok(())
     }
 
     /// Task row M7-C84, forced end to end on the real session loop.  A
