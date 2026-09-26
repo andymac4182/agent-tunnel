@@ -5434,8 +5434,9 @@ impl M2Actor {
         }
         carriers.sort();
         carriers.dedup();
+        let stream_id = forget.stream_id;
         self.pending_forgets.insert(
-            forget.stream_id,
+            stream_id,
             PendingStreamForget {
                 forget,
                 carriers,
@@ -5446,7 +5447,17 @@ impl M2Actor {
                 defer_reclamation,
             },
         );
-        self.retry_pending_forget_barriers()?;
+        // Queue this FORGET's barriers only.  Re-queuing every retained
+        // FORGET here re-armed each proof-pending one whose barrier had
+        // drained before the owner's final ACK, so under echo load every
+        // FORGET cycled through about 25 barrier/reset rounds (measured
+        // locally at 32 workers: 222,584 barriers queued and 213,865 reset
+        // for 8,719 FORGETs completed in 15 s) and the connector's actor spent
+        // itself on barriers.  A reset barrier is re-queued when its proof
+        // completes (`refresh_pending_forget_proofs`) or by the deadline tick
+        // (task row M6-C159).
+        self.refresh_pending_forget_proofs()?;
+        self.queue_pending_forget_barriers(vec![stream_id])?;
         self.publish_status();
         Ok(())
     }
@@ -5828,7 +5839,18 @@ impl M2Actor {
     /// stream may become fully proven while QUIESCING or DRAINING still owns
     /// the immutable roster; in that case clear only the proof lease and keep
     /// the physical barriers/tombstone until the phase permits removal.
+    ///
+    /// Every proof completed here has its barriers queued here, whichever
+    /// caller's evidence completed it (task row M6-C159).  A barrier
+    /// that drained before the owner's final ACK was reset; before this only
+    /// the frame handler that delivered that ACK re-queued it, so a proof
+    /// completed by any other refresh -- another stream's barrier completion,
+    /// a control message -- waited for the 100 ms deadline tick with its OPEN
+    /// journal entry held, and one device's echo rate stopped near 565/s with
+    /// 110 -- 126 of 128 journal entries held by FORGETs with no barrier
+    /// queued (measured locally and on hosted Linux).
     fn refresh_pending_forget_proofs(&mut self) -> Result<(), ClientError> {
+        let mut converged = Vec::new();
         let stream_ids = self
             .pending_forgets
             .iter()
@@ -5852,6 +5874,7 @@ impl M2Actor {
                     if let Some(pending) = self.pending_forgets.get_mut(&stream_id) {
                         pending.proof_pending = false;
                         pending.proof_deadline = None;
+                        converged.push(stream_id);
                     }
                 }
                 Err(error) if deadline.is_none_or(|deadline| now >= deadline) => {
@@ -5860,6 +5883,9 @@ impl M2Actor {
                 Err(_) if self.stream_forget_proof_may_still_complete(&forget) => {}
                 Err(error) => return Err(error),
             }
+        }
+        if !converged.is_empty() {
+            self.queue_pending_forget_barriers(converged)?;
         }
         Ok(())
     }
@@ -5909,6 +5935,13 @@ impl M2Actor {
     fn retry_pending_forget_barriers(&mut self) -> Result<(), ClientError> {
         self.refresh_pending_forget_proofs()?;
         let stream_ids = self.pending_forgets.keys().copied().collect::<Vec<_>>();
+        self.queue_pending_forget_barriers(stream_ids)
+    }
+
+    /// Queue the physical drain barriers `stream_ids`' pending FORGETs still
+    /// need, on every carrier that has room.  A carrier without room is
+    /// skipped and retried from the deadline tick.
+    fn queue_pending_forget_barriers(&mut self, stream_ids: Vec<u64>) -> Result<(), ClientError> {
         for stream_id in stream_ids {
             let carriers = self
                 .pending_forgets
@@ -6403,6 +6436,21 @@ impl M2Actor {
         }
         if acknowledge_frame {
             self.defer_ack(&key, stream_id, received_cursor)?;
+            // The ACK of the relay's terminal is the last one this stream
+            // needs, and the owner's STREAM_FORGET proof and this connector's
+            // own FORGET validation both wait for it: send it now instead of
+            // coalescing it until the 100 ms deadline tick.  Deferring it held
+            // every finished echo's OPEN journal entry for up to a tick, which
+            // capped one device near 128 entries per tick: about 565 echoes
+            // per second, refused `RESOURCE_EXHAUSTED` beyond that (task row
+            // M6-C159, M6-C149).  Feedback never overtakes this stream's own
+            // retained output on the carrier, so while that FIFO holds frames
+            // the ACK still waits for it.
+            if matches!(frame.kind, FrameKind::Fin | FrameKind::Reset)
+                && !has_pending_output_for_stream(&self.pending_outputs, stream_id)
+            {
+                self.flush_pending_carrier_controls_matching(&key, Some(stream_id))?;
+            }
         }
         if released_receive_bytes > 0 {
             self.defer_window_update(&key, stream_id, released_receive_bytes)?;
@@ -6415,6 +6463,12 @@ impl M2Actor {
         if self.recovery.is_some() {
             self.maybe_finish_recovery().await?;
         }
+        // A FORGET that arrived on control before this data frame's final
+        // ACK had its barrier reset when that barrier completed first.  The
+        // ACK is the missing evidence: queue the barrier now rather than on
+        // the next 100 ms deadline tick, which otherwise holds every such
+        // FORGET's journal entry that long and caps one device near 128
+        // entries per tick (task row M6-C159, measured on hosted Linux).
         self.refresh_pending_forget_proofs()?;
         self.publish_status();
         Ok(())
@@ -6649,6 +6703,16 @@ impl M2Actor {
         &mut self,
         key: &CarrierKey,
     ) -> Result<(), ClientError> {
+        self.flush_pending_carrier_controls_matching(key, None)
+    }
+
+    /// Flush `key`'s deferred ACK/WINDOW_UPDATE debt, for one stream when
+    /// `only` names it.
+    fn flush_pending_carrier_controls_matching(
+        &mut self,
+        key: &CarrierKey,
+        only: Option<u64>,
+    ) -> Result<(), ClientError> {
         // The recovery stand-in has no socket: its sender is closed by
         // construction, so flushing to it is not a transport failure but a
         // category error, and treating the refusal as fatal ended a healthy
@@ -6660,7 +6724,14 @@ impl M2Actor {
         }
         let stream_ids = self
             .carrier_for_key(key)
-            .map(|carrier| carrier.pending_controls.keys().copied().collect::<Vec<_>>())
+            .map(|carrier| {
+                carrier
+                    .pending_controls
+                    .keys()
+                    .copied()
+                    .filter(|stream_id| only.is_none_or(|only| only == *stream_id))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         for stream_id in stream_ids {
             let Some(pending) = self
@@ -10482,6 +10553,54 @@ mod tests {
         while receiver.recv().await.is_some() {}
     }
 
+    /// Task row M6-C159 (the mechanism behind M6-C149): the connector's ACK
+    /// of the relay's terminal is sent at once, not coalesced until the
+    /// 100 ms deadline tick.  Both FORGET proofs wait for it, so deferring it
+    /// held every finished echo's OPEN journal entry for up to a tick and
+    /// capped one device near 565 echoes per second (measured locally and on
+    /// hosted Linux; about 1,140 per second at 64 workers with no refusal once
+    /// it is sent at once, measured locally).  A non-terminal frame's ACK is
+    /// still coalesced.
+    #[tokio::test]
+    async fn m6c159_the_ack_of_a_relay_terminal_is_sent_at_once() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("test stream sequence");
+        stream.auth.confirmed = true;
+        actor.streams.insert(7, stream);
+        let queued_acks = |receiver: &mut mpsc::Receiver<CarrierCommand>| {
+            let mut acks = Vec::new();
+            while let Ok(command) = receiver.try_recv() {
+                if let CarrierCommand::Frame(frame) = command {
+                    let decoded = Frame::decode(&frame.bytes).expect("frame decodes");
+                    if decoded.kind == FrameKind::Ack {
+                        acks.push(decoded.ack);
+                    }
+                }
+            }
+            acks
+        };
+
+        actor
+            .handle_frame(key.clone(), Frame::data(1, 1, 7, 1, 0, vec![0x2a]))
+            .await
+            .expect("relay data is accepted");
+        assert!(
+            queued_acks(&mut receiver).is_empty(),
+            "a data frame's ACK is still coalesced for the tick"
+        );
+        actor
+            .handle_frame(key.clone(), Frame::fin(1, 1, 7, 2, 0))
+            .await
+            .expect("the relay FIN is accepted");
+        assert_eq!(
+            queued_acks(&mut receiver),
+            vec![2],
+            "the terminal's cumulative ACK is on the carrier without waiting for a tick"
+        );
+    }
+
     #[tokio::test]
     async fn saturated_carrier_preserves_data_fifo_and_reserved_feedback() {
         let (mut actor, key, mut receiver, _control_receiver) =
@@ -11554,6 +11673,125 @@ mod tests {
                 if *scope == crate::STREAM_FORGET_PROOF_SCOPE
                     && detail == crate::STREAM_FORGET_PROOF_EXPIRED
         )
+    }
+
+    /// Task row M6-C159: under load the FORGET's barrier usually completes
+    /// before the owner's final data-channel ACK, so the barrier set is reset
+    /// and the FORGET waits.  Another FORGET's arrival must not re-queue it
+    /// (a barrier/reset busy loop), and the ACK that completes the proof must
+    /// queue the barrier again at once; before this only the 100 ms deadline
+    /// tick did,
+    /// so every such FORGET held its OPEN journal entry for a tick and one
+    /// device's echo rate was capped near 128 entries per tick (measured on
+    /// hosted Linux: 127 of 128 journal entries held by FORGETs with no
+    /// barrier queued, `RESOURCE_EXHAUSTED` "OPEN idempotency retention is
+    /// full" from about 555 echoes per second).
+    #[tokio::test]
+    async fn m6c159_the_owner_ack_that_completes_a_forget_proof_queues_its_barrier_at_once() {
+        let stream_id = 43;
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(stream_id);
+        let (mut actor, key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        actor
+            .handle_control(ControlMessage::StreamForget(
+                tunnel_protocol::rotation_control::StreamForget {
+                    message_id: format!("forget-m6c159-{stream_id}"),
+                    reply_to: String::new(),
+                    session_id: "session".to_owned(),
+                    epoch: 1,
+                    stream_id,
+                    operation_id: "operation".to_owned(),
+                    direction: Direction::RelayToConnector,
+                    final_state,
+                },
+            ))
+            .await
+            .expect("a proof awaiting only the owner ACK is retained");
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Ok(CarrierCommand::Barrier)
+        ));
+
+        // The barrier drains before the owner's ACK: the proof still fails,
+        // so the barrier set is reset and nothing is queued.
+        actor
+            .handle_barrier_complete(&key)
+            .expect("a barrier that beats the ACK leaves the FORGET retained");
+        assert!(actor.streams.contains_key(&stream_id));
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| pending.proof_pending
+                    && pending.barriers_queued.is_empty()
+                    && pending.barriers_completed.is_empty())
+        );
+        assert!(carrier_receiver.try_recv().is_err());
+
+        // Another stream's FORGET arriving now queues only its own barrier:
+        // re-queuing this reset one on every arrival was a barrier/reset
+        // busy loop under load.
+        let other = stream_id + 2;
+        let (other_sequence, other_final) = test_owner_forget_before_owner_ack(other);
+        let mut other_stream = test_stream();
+        other_stream.sequence = other_sequence;
+        other_stream.input_fin = true;
+        other_stream.output_fin = true;
+        actor.streams.insert(other, other_stream);
+        actor
+            .handle_control(ControlMessage::StreamForget(
+                tunnel_protocol::rotation_control::StreamForget {
+                    message_id: format!("forget-m6c159-{other}"),
+                    reply_to: String::new(),
+                    session_id: "session".to_owned(),
+                    epoch: 1,
+                    stream_id: other,
+                    operation_id: "operation".to_owned(),
+                    direction: Direction::RelayToConnector,
+                    final_state: other_final,
+                },
+            ))
+            .await
+            .expect("the other FORGET is retained too");
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Ok(CarrierCommand::Barrier)
+        ));
+        assert!(
+            carrier_receiver.try_recv().is_err(),
+            "the reset FORGET's barrier is not re-queued by another arrival"
+        );
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| pending.barriers_queued.is_empty())
+        );
+
+        // The owner's ACK completes the proof and queues the barrier now,
+        // without waiting for a deadline tick.
+        actor
+            .handle_frame(key.clone(), Frame::ack(1, 1, stream_id, 1))
+            .await
+            .expect("the owner ACK converges the proof");
+        assert!(
+            matches!(carrier_receiver.try_recv(), Ok(CarrierCommand::Barrier)),
+            "the converging ACK queues the FORGET barrier at once"
+        );
+        assert!(actor.pending_forgets.get(&stream_id).is_some_and(
+            |pending| !pending.proof_pending && pending.barriers_queued.contains(&key)
+        ));
+        actor
+            .handle_barrier_complete(&key)
+            .expect("the requeued barrier completes the FORGET");
+        assert!(!actor.streams.contains_key(&stream_id));
+        assert!(!actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, stream_id);
     }
 
     /// Retain a proof-pending FORGET for `stream_id`: the owner's control
