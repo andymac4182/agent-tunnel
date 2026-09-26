@@ -50,9 +50,24 @@ A connection that arrives while every permit is held is **refused explicitly, ne
 
 **Why this option.** The owner brief offered three: (a) complete TLS within a small margin and answer `503`; (b) accept into a bounded queue and hold each connection until a permit frees, then `503` on timeout; (c) leave excess connections in the kernel backlog. Option (c) alone gives a client no answer at all: under a keep-alive flood the served connections never close, so a backlogged client waits until its own timeout, which is no more distinguishable from a dead relay than a reset. Option (b) holds a file descriptor and a TLS session per queued connection for the whole wait and still ends in the same `503`, so it costs more than (a) for the same answer. Option (a) is the smallest amount of work that yields a distinguishable, retryable answer, and its cost is bounded by the margin: at most 16 extra TLS handshakes and 16 x 64 KiB of buffered body at any moment, each for at most 5 s. Falling back to (c) when the margin is full removes the remaining reset without adding work. Setting `listener_refusal_margin = 0` selects pure (c). The 64 limit is unchanged: no measurement justifies another value, and keep-alive connections still count against it for as long as they stay open.
 
+**Accept errors (M6-C155).** A transient `accept` error no longer ends the listener. Resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) is logged at `warn` with a fixed `class`, rate limited per class. The listener then releases the slot and waits `ACCEPT_ERROR_BACKOFF` (100 ms), so a connection that cannot be accepted does not spin the loop, and accepts again. A peer that aborted or reset before `accept` (`ECONNABORTED`; on Windows `WSAECONNABORTED` and `WSAECONNRESET`) is retried immediately with no pause and logged only at `debug`, as axum does. A backoff there would let a client that repeatedly connects and resets throttle the listener to about 10 accepts per second. Any other `accept` error still ends the listener with `TransportError::Accept`. Serving startup prints a warning when the soft `RLIMIT_NOFILE` is below `2 x (listener_max_connections + listener_refusal_margin)`. **TLS failures on refused connections (M6-C156)** are logged through the same labelled, rate-limited `TLS handshake refused` path as on served connections.
+
 **Operator signals.** Each listener logs `refusing connection over the listener connection limit` at `info` with `phase=listener_capacity`, `listener`, `max_connections` and a `suppressed` count, rate limited like the TLS refusal lines (20 lines per 10 s per listener). A load-balancer health check that lands while a listener is full also gets `503 CONNECTION_LIMIT`, distinguishable from `/readyz`'s `503 {"status":"unready"}` by its body. The refusal count is not yet a `/metrics` series.
 
 The two steady-state WebSockets belong to each CLI device connection. Peer QUIC connections and consumer connections are separate. Private HTTP/3 forwarding does not add a third steady-state device socket. During data rotation, one control plus old and candidate data sockets remain bounded by the existing overlap deadline.
+
+### TCP_NODELAY
+
+Every TCP socket that carries request/reply traffic has Nagle's algorithm disabled (task row M6-C124):
+
+| Socket | Where it is set | Gate |
+| --- | --- | --- |
+| Relay consumer and device listeners, every accepted socket | `tunnel-transport` `set_accepted_nodelay`, before the TLS handshake; a failure (a peer that already reset) is logged at debug and the connection is still served; it is counted only when `AcceptedSocketDiagnostics` are attached (tests), not in production | `accepted_sockets_have_nodelay_set_by_default` |
+| Device control and data WebSockets (outbound) | `tunnel-client` `open_socket`, tokio-tungstenite `disable_nagle = true` | `open_socket_sets_tcp_nodelay` |
+| Catalog Redis lanes, the recovery scanner and the primary connection | `tunnel-catalog` `catalog_connection_info` (redis-rs defaults it off) | `catalog_clients_disable_nagle_on_every_connection` |
+| Relay membership runtime's checkpoint-authority HTTPS connection (TCP, then TLS and HTTP/1.1; not Redis) | `membership_runtime.rs` (already set before this change) | none added |
+
+Without it, a small write that followed an unacknowledged one waited for the peer's delayed ACK, which is 40 ms on Linux: the hosted load experiment's single echo worker went from p50 42.4 ms to 1.65 ms when it was set, and a 64 KiB echo from 23.8 to 266.6 requests per second. Bulk writes fill whole segments, which Nagle never delayed, so the option costs bulk transfer nothing measurable. Measurements and runs: [soak-2026-09-26.md](soak-2026-09-26.md#update-tcp_nodelay-m6-c124). The private metrics listener and test-only proxies are not on the request path and are left at the platform default.
 
 ## Rust stack and dependency gate
 

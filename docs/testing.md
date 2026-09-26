@@ -2007,6 +2007,50 @@ reissued (**M4-52**). With all four fixed the gate is green on both hosts and
 runs in the `m4-acceptance` CI job. When it fails it prints the connector's
 terminal error and the owner's session terminal reasons, both payload-free.
 
+### Implementation gate 11b: the same failure with the ACK for the held request lost (`verify-m4-fs-data-recovery-lost-ack`)
+
+Gate 11 destroys the data socket once the device has **produced** the held
+`Rread` into the paused direction. That reply is replayed on the successor, and
+its cumulative ACK covers the held `Tread`, so gate 11 never reaches the state
+task row M6-C163 fixed and passes with that fix reverted (measured locally).
+Gate 11b, the same scenario in
+`crates/tunnel-test-harness/src/production_cluster/fs_data_recovery.rs`
+(`FailurePoint::ReplyParkedForCredit`) and registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh), destroys the
+socket after the device has **received** the held `Tread` while its reply is
+parked for send credit. The consumer sends unread `Tread`s with the
+connector-to-relay direction paused; each is classified from the device's own
+status once received: an emit cursor that moves is a filler whose reply was
+sent (and is waited on until emission settles), and an emit cursor that holds
+still for 500 ms is the held request, its reply parked for send credit that
+the unread filler spent. The device's ACK for the held
+`Tread` dies with the socket, and no frame it replays was emitted after that
+`Tread` arrived, so the relay can learn of the receipt only from the device's
+SNAPSHOT. At the instant of failure the gate requires, against the device's
+status taken immediately before the held `Tread` was sent, that its receive
+cursor has moved (it has the request) and its emit cursor has not (nothing it
+emitted since could carry an ACK of it); the validator refuses a gate 11b run
+without at least one filler, that receipt, and that unmoved emit cursor, so a
+slow device whose late reply is replayed cannot pass it. Why one filler is
+enough, derived from the source and matching the measured runs exactly: each
+`Rread` is one full 65,536-byte 9P message (the negotiated msize) in a record
+with a 5-byte header (`RECORD_HEADER_LEN` in `tunnel-fs-provider`), 65,541
+bytes. The relay's initial window is 128 KiB, so the unread filler leaves
+131,072 - 65,541 = 65,531 bytes of send credit, the figure measured in every
+run. The export offers the held reply to the carrier in 64 KiB pieces
+(`next_chunk` in `fs_export.rs`, bounded by the bridge's `HANDOFF_CAPACITY`),
+and the connector's write check (`WriteRoom::fits` in `m2_http.rs`) is
+all-or-nothing, so the first 65,536-byte piece does not fit 65,531 bytes and is
+parked whole (`park_write`): a 5-byte shortfall. Credit grows only as the
+consumer reads, which it does not do until after the recovery, so the reply
+stays parked. Remaining credit is therefore not zero, and the gate does not
+require it to be. The gate then asserts everything gate 11 does, reading the filler replies before
+the held one. The device's cursors are summed over its streams,
+so the gate refuses a run in which the device carries more than this one
+stream. With the M6-C163 fix reverted, gate 11b fails with `retained recovery
+failed` at the recovery deadline; with it, it passes.
+
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.

@@ -10544,6 +10544,50 @@ impl RelayActor {
             if rotation.recovery.is_none() {
                 return;
             }
+            // M6-C163: advance this relay's peer-ACK cursors from the
+            // connector's authenticated SNAPSHOT pair, as the connector does
+            // with the relay's pair once its own reconcile has succeeded
+            // (`reconcile_for_carrier`, then `reconcile_and_apply`, in
+            // tunnel-client's m2_runtime).  The pair reconciled above, so
+            // every cursor is at most what this relay emitted.  A frame the
+            // connector received on the failed carrier had its ACK die with
+            // that carrier; nothing is replayed for it and the connector's
+            // writes stay frozen until READY, so without this no ACK frame
+            // would ever arrive and `send_recovery_ready`, which needs the
+            // emitted fence acknowledged, would wait out the deadline.
+            // Monotonic: a later ACK frame only raises the cursor.
+            let budget = session.queue_budget.clone();
+            if let Some(recovery) = rotation.recovery.as_ref() {
+                for stream_id in plans.keys() {
+                    let (Some(relay_entry), Some(connector_entry), Some(stream)) = (
+                        recovery.remote_snapshots[0].get(stream_id),
+                        recovery.remote_snapshots[1].get(stream_id),
+                        session.streams.get_mut(stream_id),
+                    ) else {
+                        continue;
+                    };
+                    let peer = StreamSnapshot {
+                        stream_id: *stream_id,
+                        directions: [
+                            direction_snapshot_from_resume(relay_entry),
+                            direction_snapshot_from_resume(connector_entry),
+                        ],
+                    };
+                    let before = stream
+                        .sequence
+                        .direction(Direction::RelayToConnector)
+                        .replay_bytes();
+                    if stream.sequence.reconcile_and_apply(&peer).is_ok() {
+                        let after = stream
+                            .sequence
+                            .direction(Direction::RelayToConnector)
+                            .replay_bytes();
+                        if before > after {
+                            release_m2_bytes(&budget, stream, before - after);
+                        }
+                    }
+                }
+            }
             rotation
                 .recovery
                 .as_mut()
@@ -21713,6 +21757,247 @@ mod stream_identity_tests {
                 super::FLOW_CONTROL_UNDELIVERABLE
             );
         }
+    }
+
+    /// M6-C163 fixture: the relay emits one frame on an M2 stream, the data
+    /// carrier is lost with its ACK, a recovery candidate attaches, the relay
+    /// sends its SNAPSHOT pair, and the connector answers with a pair whose
+    /// relay-to-connector receive cursor is the relay's emitted fence plus
+    /// `beyond`.  Returns the actor, its control receiver, the session key,
+    /// the stream id, the emitted fence, the relay-to-connector replay bytes
+    /// before the pair arrived, and the stream registration.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn m6_c163_snapshot_pair_after_lost_ack(
+        seed: u128,
+        label: &str,
+        beyond: u64,
+    ) -> (
+        RelayActor,
+        ControlRegistration,
+        SessionKey,
+        u64,
+        u64,
+        usize,
+        super::ConsumerStreamRegistration,
+    ) {
+        let (mut actor, control, _data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(seed, label).await;
+        let stream_id = registration.stream_id;
+        let now_ms = super::monotonic_millis();
+        // The relay emits one frame; the connector receives it, and its ACK is
+        // lost with the carrier.
+        let emitted = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let stream = session.streams.get_mut(&stream_id).expect("stream");
+            let r2c = stream
+                .sequence
+                .direction(Direction::RelayToConnector)
+                .snapshot();
+            let c2r = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .snapshot();
+            let sequence = r2c.last_emitted + 1;
+            let frame = Frame::data(
+                key.epoch,
+                carrier.generation,
+                stream_id,
+                sequence,
+                c2r.recv_contiguous,
+                b"held-tread".to_vec(),
+            );
+            stream
+                .sequence
+                .send_frame(Direction::RelayToConnector, &frame)
+                .expect("the relay emits the frame");
+            sequence
+        };
+        // The rotation machine names the active carrier; the data socket the
+        // session holds is that carrier.
+        let active = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let owner_id = super::runtime::owner_id(&session.owner);
+            let attempt = session_attempt(&key, &owner_id, label, 1);
+            let old_connection_id = attempt.old_connection_id.clone();
+            let mut rotation =
+                test_rotation_runtime(now_ms, attempt, now_ms.saturating_add(30_000));
+            rotation.attempt = None;
+            rotation.old_connection_id = old_connection_id.clone();
+            session.rotation = Some(rotation);
+            session.connection_id = old_connection_id.clone();
+            let active = CarrierKey {
+                session: key.clone(),
+                generation: carrier.generation,
+                connection_id: old_connection_id,
+            };
+            let data_tx = session.data_tx.clone().expect("active data writer");
+            session.active_carrier = Some(DataCarrier {
+                context: active.context(),
+                tx: data_tx,
+            });
+            active
+        };
+        actor.disconnect_data(active).await;
+        assert_eq!(
+            actor.sessions[&key.scope()]
+                .rotation
+                .as_ref()
+                .map(|rotation| rotation.state.phase()),
+            Some(RotationPhase::Recovering),
+            "the data loss enters recovery"
+        );
+        attach_ready_recovery_candidate(&mut actor, &key);
+        actor.start_recovery_snapshots(&key);
+
+        let (attempt, snapshot_id, resume_ids, r2c, c2r) = {
+            let session = &actor.sessions[&key.scope()];
+            let rotation = session.rotation.as_ref().expect("rotation");
+            let recovery = rotation.recovery.as_ref().expect("recovery");
+            let stream = &session.streams[&stream_id];
+            (
+                rotation.attempt.clone().expect("attempt"),
+                recovery.roster.snapshot_id.clone(),
+                recovery.resume_message_ids.clone(),
+                stream
+                    .sequence
+                    .direction(Direction::RelayToConnector)
+                    .snapshot(),
+                stream
+                    .sequence
+                    .direction(Direction::ConnectorToRelay)
+                    .snapshot(),
+            )
+        };
+        assert!(
+            r2c.peer_acked < emitted,
+            "precondition: the relay never saw the ACK"
+        );
+        let replay_bytes_before = r2c.replay_bytes;
+        // The connector's snapshot pair: it received everything the relay
+        // emitted, and everything it emitted was acknowledged.
+        let connector_r2c = tunnel_protocol::rotation_control::ResumeDirectionState {
+            stream_id,
+            recv_contiguous: emitted + beyond,
+            delivered_contiguous: emitted + beyond,
+            received_bytes: r2c.sent_bytes,
+            receive_credit: r2c.send_credit,
+            ..Default::default()
+        };
+        let connector_c2r = tunnel_protocol::rotation_control::ResumeDirectionState {
+            stream_id,
+            last_emitted: c2r.recv_contiguous,
+            peer_acked: c2r.recv_contiguous,
+            sent_bytes: c2r.received_bytes,
+            send_credit: c2r.receive_credit,
+            ..Default::default()
+        };
+        for (index, direction, entry) in [
+            (0, Direction::RelayToConnector, connector_r2c),
+            (1, Direction::ConnectorToRelay, connector_c2r),
+        ] {
+            actor
+                .handle_recovery_resumed(
+                    &key,
+                    tunnel_protocol::rotation_control::Resumed {
+                        message_id: format!("{label}-resumed-{index}"),
+                        reply_to: resume_ids[index].clone().expect("RESUME sent"),
+                        attempt: attempt.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                        stage: tunnel_protocol::rotation_control::ResumeStage::Snapshot,
+                        direction,
+                        entries: vec![entry],
+                        replay: Vec::new(),
+                    },
+                )
+                .await;
+        }
+        (
+            actor,
+            control,
+            key,
+            stream_id,
+            emitted,
+            replay_bytes_before,
+            registration,
+        )
+    }
+
+    /// Task row M6-C163, measured on hosted Linux once accepted sockets set
+    /// `TCP_NODELAY` (#193): the relay's last frame reached the connector on
+    /// the data socket that then failed, and the connector's ACK for it died
+    /// with that socket.  The connector's SNAPSHOT reports the frame
+    /// received, so nothing is replayed, and its writes stay frozen until
+    /// READY, so no ACK frame follows.  READY needs the relay's emitted fence
+    /// acknowledged; the snapshot's receive cursor must count as that
+    /// acknowledgement, or READY waits out the recovery deadline.  Red before
+    /// the fix: `ready_sent` stayed `[false, false]`.
+    #[tokio::test]
+    async fn a_snapshot_receive_cursor_acknowledges_a_fence_whose_ack_died() {
+        let (actor, mut control, key, stream_id, emitted, _replay_before, registration) =
+            m6_c163_snapshot_pair_after_lost_ack(4_541, "m6-c163-lost-ack", 0).await;
+        let close = m4_37_session_close_code(&mut control);
+        let session = actor
+            .sessions
+            .get(&key.scope())
+            .unwrap_or_else(|| panic!("recovery must not fence the session ({close:?})"));
+        assert_eq!(
+            session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .map(|recovery| recovery.ready_sent),
+            Some([true, true]),
+            "READY is sent without waiting for an ACK frame that cannot come"
+        );
+        let r2c = session.streams[&stream_id]
+            .sequence
+            .direction(Direction::RelayToConnector)
+            .snapshot();
+        assert_eq!(
+            r2c.peer_acked, emitted,
+            "the snapshot's receive cursor acknowledged the fence"
+        );
+        assert_eq!(r2c.replay_bytes, 0, "the acknowledged frame is pruned");
+        drop(registration);
+    }
+
+    /// Review of M6-C163: a connector snapshot claiming to have received one
+    /// frame more than the relay emitted is not an acknowledgement.  It must
+    /// move neither the peer-ACK cursor nor the retained replay, and READY is
+    /// not sent.  (Reconciliation refuses the pair, and the attempt then runs
+    /// to its recovery deadline; that refusal path predates M6-C163.)
+    #[tokio::test]
+    async fn a_snapshot_cursor_beyond_the_emitted_fence_acknowledges_nothing() {
+        let (actor, mut control, key, stream_id, _emitted, replay_before, registration) =
+            m6_c163_snapshot_pair_after_lost_ack(4_551, "m6-c163-beyond-fence", 1).await;
+        let close = m4_37_session_close_code(&mut control);
+        let session = actor
+            .sessions
+            .get(&key.scope())
+            .unwrap_or_else(|| panic!("the refused pair closed the session ({close:?})"));
+        let r2c = session.streams[&stream_id]
+            .sequence
+            .direction(Direction::RelayToConnector)
+            .snapshot();
+        assert!(
+            replay_before > 0,
+            "precondition: the fence frame is retained"
+        );
+        assert_eq!(
+            (r2c.peer_acked, r2c.replay_bytes),
+            (r2c.last_emitted - 1, replay_before),
+            "a cursor beyond the fence must not acknowledge or prune anything"
+        );
+        assert_eq!(
+            session
+                .rotation
+                .as_ref()
+                .and_then(|rotation| rotation.recovery.as_ref())
+                .map(|recovery| recovery.ready_sent),
+            Some([false, false]),
+            "READY is not sent on an unreconciled pair"
+        );
+        drop(registration);
     }
 
     /// Task row M4-48 (M4-29's mode A), measured before it was fixed: the
