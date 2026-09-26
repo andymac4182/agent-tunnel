@@ -1294,7 +1294,7 @@ impl Gate<'_> {
         workspace: &std::path::Path,
     ) -> Result<Conversation> {
         let consumer = AcpConsumer::connect(self.ingress_addr, &self.ca).await?;
-        let (status, headers, _body) = self
+        let (status, headers, init_body) = self
             .post_as(
                 &consumer,
                 base_uri,
@@ -1313,8 +1313,86 @@ impl Gate<'_> {
             )
             .await?;
         if status != http::StatusCode::OK {
+            // M7-C130 forensics: the gateway's typed error code and execution,
+            // plus each relay's pin state and bounded peer fault tuples.
+            // Identifiers and closed labels only; the body of a gateway error
+            // carries no application payload.
+            let code = headers
+                .get("x-agent-tunnel-error-code")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned();
+            let execution = headers
+                .get("x-agent-tunnel-execution")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned();
+            let body_code = serde_json::from_str::<Value>(&init_body)
+                .ok()
+                .map(|value| {
+                    format!(
+                        "code={} execution={}",
+                        value
+                            .pointer("/error/code")
+                            .or_else(|| value.get("code"))
+                            .map_or("-".into(), ToString::to_string),
+                        value
+                            .pointer("/error/execution")
+                            .or_else(|| value.get("execution"))
+                            .map_or("-".into(), ToString::to_string),
+                    )
+                })
+                .unwrap_or_default();
             return Err(HarnessError::Http(format!(
-                "initialize over the real route answered {status}"
+                "initialize over the real route answered {status} (header code={code} \
+                 execution={execution}; body {body_code}); {}",
+                {
+                    let mut text = self.cluster.peer_path_forensics().await;
+                    for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
+                        if let Ok(snapshot) = relay.snapshot().await {
+                            let forward = snapshot.http_forward;
+                            let exchanges = forward
+                                .exchanges
+                                .iter()
+                                .rev()
+                                .take(3)
+                                .map(|e| {
+                                    format!(
+                                        "{}:{}/{}/{:?}/{}",
+                                        e.role,
+                                        e.request_outcome,
+                                        e.response_outcome,
+                                        e.error_code,
+                                        e.execution
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let owners = forward
+                                .owner_streams
+                                .iter()
+                                .rev()
+                                .take(3)
+                                .map(|o| {
+                                    format!(
+                                        "{}:{:?}:rid={}",
+                                        o.release,
+                                        o.reset_reason,
+                                        o.request_id.is_some()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            text.push_str(&format!(
+                                " || {} exchanges={} [{exchanges}] owner_streams={} [{owners}]",
+                                relay.node_id,
+                                forward.exchanges_recorded,
+                                forward.owner_streams_recorded
+                            ));
+                        }
+                    }
+                    text
+                }
             )));
         }
         let connection = headers
@@ -1494,8 +1572,8 @@ const FORGED_BINDING: &str = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
 /// How long an explicit interruption may take to reach the consumer before the
 /// gate reports that it did not arrive.
 const INTERRUPTION_BOUND: Duration = Duration::from_secs(45);
-/// How long the same-key control arm watches its stream (M7-C80).
-const CONTROL_ARM_OBSERVATION: Duration = Duration::from_secs(5);
+/// How long the same-key control arm watches its stream (M7-C80, M7-C130).
+const CONTROL_ARM_OBSERVATION: Duration = Duration::from_millis(300);
 
 /// How long a live stream is watched after its ingress relay's peer pins are
 /// withdrawn, before the gate records that the withdrawal left it serving.
@@ -2501,9 +2579,15 @@ impl Gate<'_> {
         let mut owner_unready = false;
         // The control arm withdraws nothing, and since M7-C80 a same-key
         // re-sign re-binds the admission rather than tearing the stream down,
-        // so there is nothing to wait 45 s for: waiting that long only
-        // pushed the case past the gate's 15 s re-sign boundary. It observes
-        // for a short bound; the key arm keeps the full interruption bound.
+        // so the stream has nothing to show: the evidence is the reason the
+        // ingress's invalidation dispatcher latched (or did not), which it
+        // does synchronously at the reconcile `converge_owner_keys` already
+        // waited for. Watching the stream for seconds only shifts every later
+        // case in phase against the devices' scheduled data rotations, and
+        // M7-C130 measured what that costs: the next case's first request can
+        // land while the owner device's rotation candidate is stalled behind
+        // the key arm's peer-trust teardown. Keep the control arm as short as
+        // it was before the re-bind made the stream survive.
         let bound = if spkis.contains(&old_spki) {
             CONTROL_ARM_OBSERVATION
         } else {
