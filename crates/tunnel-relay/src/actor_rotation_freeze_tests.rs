@@ -2771,8 +2771,18 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
 
     // A retry while the writer is still full keeps both parked, in order,
-    // without spinning.
+    // without spinning -- whether it comes after a command or from a
+    // WINDOW_UPDATE, which retries the stream's held records directly.
     fixture.actor.retry_writer_held_http();
+    fixture
+        .actor
+        .inbound_data(
+            fixture.old_carrier.clone(),
+            Frame::window_update(key.epoch, generation, STREAM_ID, 1 << 20)
+                .encode()
+                .expect("window update encodes"),
+        )
+        .await;
     assert_eq!(fixture.stream().pending_records.len(), 2);
     let snapshot = fixture.actor.snapshot();
     assert_eq!(
