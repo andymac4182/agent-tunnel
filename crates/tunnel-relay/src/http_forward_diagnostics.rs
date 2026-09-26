@@ -359,6 +359,9 @@ pub struct HttpForwardDiagnosticSnapshot {
     /// refused.
     pub principal_sessions_end_sent: u64,
     pub principal_sessions_end_failed: u64,
+    /// Revocations not sent because the connector did not advertise
+    /// `principal-sessions-end-v1`.
+    pub principal_sessions_end_unsupported: u64,
     /// Highest HTTP peer-hop bytes this relay had in flight to (sent) and
     /// queued from (received) any one peer across all its streams, and the
     /// per-direction aggregate bound.
@@ -396,6 +399,7 @@ struct Inner {
     ingress_rejected_before_admission: u64,
     principal_sessions_end_sent: u64,
     principal_sessions_end_failed: u64,
+    principal_sessions_end_unsupported: u64,
     hop_aggregate_send_high_water: usize,
     hop_aggregate_receive_high_water: usize,
     live_hops: Vec<LiveHopEntry>,
@@ -460,6 +464,12 @@ impl HttpForwardDiagnostics {
             inner.principal_sessions_end_failed =
                 inner.principal_sessions_end_failed.saturating_add(1);
         }
+    }
+
+    pub fn record_principal_sessions_end_unsupported(&self) {
+        let mut inner = self.lock();
+        inner.principal_sessions_end_unsupported =
+            inner.principal_sessions_end_unsupported.saturating_add(1);
     }
 
     pub fn record_ingress_rejection(&self) {
@@ -535,6 +545,7 @@ impl HttpForwardDiagnostics {
             ingress_rejected_before_admission: inner.ingress_rejected_before_admission,
             principal_sessions_end_sent: inner.principal_sessions_end_sent,
             principal_sessions_end_failed: inner.principal_sessions_end_failed,
+            principal_sessions_end_unsupported: inner.principal_sessions_end_unsupported,
             hop_aggregate_send_high_water: inner.hop_aggregate_send_high_water,
             hop_aggregate_receive_high_water: inner.hop_aggregate_receive_high_water,
             hop_aggregate_limit: crate::http::forward::HOP_AGGREGATE_BYTES,

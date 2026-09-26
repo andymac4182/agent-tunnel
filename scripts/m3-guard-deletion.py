@@ -1395,6 +1395,25 @@ AUTHORIZATION_CASES: list[Case] = [
             }
         ),
     ),
+    Case(
+        # Review of #173: the challenge names the same scope set the
+        # metadata publishes, including scopes every token must carry.
+        "the challenge scope is the published scope set",
+        [
+            (
+                RELAY / "src" / "http" / "forward" / "authorization.rs",
+                '    parameters.push(format!("scope=\\"{}\\"", scopes.join(" ")));\n',
+                '    let _ = scopes;\n'
+                '    parameters.push(format!("scope=\\"{}\\"", crate::HTTP_FORWARD_OPERATION));\n',
+            )
+        ],
+        frozenset(
+            {
+                "http::mcp_authorization_tests::"
+                "the_challenge_scope_and_scopes_supported_are_the_same_set"
+            }
+        ),
+    ),
 ]
 
 #: **M3-16: a revoked principal's sessions end on the device, and only its
@@ -1434,6 +1453,93 @@ REVOKED_SESSIONS_CASES: list[Case] = [
         ],
         frozenset(
             {"a_revoked_principal_loses_its_streamable_http_sessions_and_only_its_own"}
+        ),
+    ),
+]
+
+#: **M3-16, owner side (review of #173).**  The watch must actually send
+#: `PRINCIPAL_SESSIONS_END`, only to a connector that advertised it, and a
+#: request held across a freeze must be refused when its grant is revoked.
+OWNER_WATCH_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "revoke",
+]
+OWNER_WATCH_CASES: list[Case] = [
+    Case(
+        "a revoked watch sends PRINCIPAL_SESSIONS_END",
+        [
+            (
+                ACTOR,
+                "        let sent = self\n"
+                "            .send_control(\n"
+                "                key,\n"
+                "                wire::principal_sessions_end(\n"
+                "                    &key.session_id,\n"
+                "                    key.epoch,\n"
+                "                    &service_id.to_string(),\n"
+                "                    &binding,\n"
+                "                    PRINCIPAL_SESSIONS_END_REASON,\n"
+                "                ),\n"
+                "            )\n"
+                "            .is_ok();\n",
+                "        let _ = (&binding, PRINCIPAL_SESSIONS_END_REASON);\n"
+                "        let sent = true;\n",
+            )
+        ],
+        frozenset(
+            {
+                "actor::stream_identity_tests::"
+                "a_revoked_watch_sends_principal_sessions_end_once_and_only_when_supported"
+            }
+        ),
+    ),
+    Case(
+        "a connector that did not advertise the feature is never sent it",
+        [
+            (
+                ACTOR,
+                "        if !self\n"
+                "            .session_for(key)\n"
+                "            .is_some_and(|session| session.principal_sessions_end)\n",
+                "        if false\n"
+                "            && !self\n"
+                "            .session_for(key)\n"
+                "            .is_some_and(|session| session.principal_sessions_end)\n",
+            )
+        ],
+        frozenset(
+            {
+                "actor::stream_identity_tests::"
+                "a_revoked_watch_sends_principal_sessions_end_once_and_only_when_supported"
+            }
+        ),
+    ),
+    Case(
+        "a request held across a freeze is refused when its grant is revoked",
+        [
+            (
+                ACTOR,
+                "        let _ = self.freeze_hold.refuse_revoked(\n"
+                "            key,\n"
+                "            service_id,\n"
+                "            principal_id,\n"
+                "            tokio::time::Instant::now(),\n"
+                "        );\n",
+                "",
+            )
+        ],
+        frozenset(
+            {
+                "actor::rotation_freeze_tests::freeze_hold_tests::"
+                "a_request_held_across_a_freeze_is_refused_when_its_grant_is_revoked"
+            }
         ),
     ),
 ]
@@ -1497,6 +1603,7 @@ SUITES: list[Suite] = [
         REVOKED_SESSIONS_TEST,
         REVOKED_SESSIONS_CASES,
     ),
+    Suite("m3c16-owner-watch", [RELAY], OWNER_WATCH_TEST, OWNER_WATCH_CASES),
     Suite(
         "m3c22-stream-observations",
         [RELAY],

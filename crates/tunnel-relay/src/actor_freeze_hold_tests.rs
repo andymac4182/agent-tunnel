@@ -111,7 +111,8 @@ fn assert_partition(hold: RotationFreezeHoldSnapshot) {
             + hold.released_on_recovery
             + hold.refused_after_bound
             + hold.cancelled
-            + hold.released_on_session_loss,
+            + hold.released_on_session_loss
+            + hold.refused_on_revocation,
         "every held OPEN leaves the hold exactly once: {hold:?}"
     );
 }
@@ -723,4 +724,40 @@ async fn the_run_loop_refuses_a_held_open_at_its_deadline_without_a_command() {
     assert_eq!(snapshot.rotation_freeze_hold.refused_after_bound, 1);
     running.abort();
     drop(control_rx);
+}
+
+/// M3-16, review of #173: a consumer whose grant is revoked while its
+/// request is held across a freeze is refused `not_dispatched` at once, and
+/// the request is not admitted after COMMITTED with the stale grant.  Before
+/// the fix the watch ended only device-side sessions and the held OPEN was
+/// admitted on commit.
+#[tokio::test]
+async fn a_request_held_across_a_freeze_is_refused_when_its_grant_is_revoked() {
+    let mut fixture = FreezeFixture::new("hold-revoked", false);
+    fixture.quiesce();
+    let mut receiver = fixture.open();
+    assert_waiting(&mut receiver, "quiescing");
+    let key = fixture.key.clone();
+    fixture.actor.watch_principal(
+        key.clone(),
+        fixture.consumer.clone(),
+        fixture.service_id,
+        fixture.grant.tenant_id,
+    );
+    fixture.actor.finish_principal_watch(
+        &key,
+        fixture.service_id,
+        fixture.consumer.principal_id,
+        Ok(false),
+    );
+    assert!(matches!(
+        refused(&mut receiver, "revoked while held"),
+        RelayError::Forbidden
+    ));
+    fixture.commit_rotation().await;
+    assert_eq!(fixture.opens_sent(), 0, "nothing reaches the device");
+    let hold = fixture.hold();
+    assert_eq!(hold.refused_on_revocation, 1);
+    assert_eq!(hold.admitted_after_hold, 0);
+    assert_partition(hold);
 }

@@ -348,7 +348,11 @@ EXPECTED_GUARD_ANCHORS = {
     # across 15 with the M3-11, M3-16 and M3-22 suites this branch adds.
     # Re-measured the same way: 56 first, which fails naming m3 ("found
     # 55"), then 55.
-    "m3-guard-deletion.py": 55,
+    #
+    # Then **59**, after the review of #173 added the `m3c16-owner-watch`
+    # suite (3 cases) and the scope-set case. Re-measured the same way: 60
+    # first, which fails naming m3 ("found 59"), then 59.
+    "m3-guard-deletion.py": 59,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

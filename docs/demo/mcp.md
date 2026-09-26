@@ -216,9 +216,10 @@ owner relay. The token is never passed on to the device or to the MCP server.
 That metadata names the relay's `oidc_issuer` as the one authorization
 server, and `http:invoke` as the scope. A client that performs MCP
 authorization (2025-11-25) follows it to the issuer and obtains a token
-there. Set `[http_forward] public_url` when the relay sits behind a proxy
-that changes the host name. Otherwise the relay builds these URLs from the
-request's own authority. If the issuer puts the RFC 8707 `resource` value
+there. Set `[http_forward] public_url` (`https://host[:port]`) on any relay
+that serves the internet. Without it, the relay builds these URLs from the
+request's own authority, which is wrong behind a proxy that changes the host
+name. The demo sets it. If the issuer puts the RFC 8707 `resource` value
 (the endpoint URL) into `aud`, add that URL to `oidc_audience`.
 
 **Claude, through the Messages API MCP connector.** Pass the endpoint and a

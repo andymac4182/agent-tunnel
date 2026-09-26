@@ -66,9 +66,19 @@ fn token(key: &KeyPair, scope: &str) -> String {
 async fn start(
     exports: Option<crate::http::forward::HttpForwardExports>,
 ) -> (std::net::SocketAddr, KeyPair) {
+    start_requiring(exports, &[]).await
+}
+
+async fn start_requiring(
+    exports: Option<crate::http::forward::HttpForwardExports>,
+    required_scopes: &[&str],
+) -> (std::net::SocketAddr, KeyPair) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("OIDC signing key");
     let approved = ApprovedJwk::from_ed25519_der(KID, key.public_key_raw()).expect("approved key");
-    let config = OidcConfig::new(ISSUER, [AUDIENCE.to_owned()], vec![approved]).expect("config");
+    let config = OidcConfig::new(ISSUER, [AUDIENCE.to_owned()], vec![approved])
+        .expect("config")
+        .with_required_scopes(required_scopes.iter().map(|scope| (*scope).to_owned()))
+        .expect("required scopes");
     let oidc = Arc::new(OidcVerifier::new(config).expect("verifier"));
     let tenant_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
@@ -292,4 +302,42 @@ async fn the_protected_resource_metadata_names_the_issuer_the_scope_and_the_exac
         .status,
         404
     );
+}
+
+/// Review of #173: the challenge's `scope` and the metadata's
+/// `scopes_supported` are the same set, including any scope the relay
+/// requires of every token, so a client that asks for exactly what the
+/// challenge names gets a token this route accepts.
+#[tokio::test]
+async fn the_challenge_scope_and_scopes_supported_are_the_same_set() {
+    let (address, _key) = start_requiring(
+        Some(crate::http::forward::HttpForwardExports::new()),
+        &["agent:use"],
+    )
+    .await;
+    let (device, service) = (Uuid::new_v4(), Uuid::new_v4());
+    let path = format!("/v1/devices/{device}/services/{service}/http/mcp");
+    let metadata = send(
+        address,
+        &format!("GET /.well-known/oauth-protected-resource{path} HTTP/1.1"),
+        None,
+    )
+    .await;
+    let supported: Vec<String> = metadata.body["scopes_supported"]
+        .as_array()
+        .expect("scopes_supported")
+        .iter()
+        .map(|scope| scope.as_str().expect("string").to_owned())
+        .collect();
+    assert_eq!(supported, ["agent:use", "http:invoke"]);
+    let challenge = send(address, &format!("POST {path} HTTP/1.1"), None)
+        .await
+        .challenge
+        .expect("challenge");
+    let scope = challenge
+        .split("scope=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("scope parameter");
+    assert_eq!(scope.split(' ').collect::<Vec<_>>(), supported);
 }

@@ -360,6 +360,9 @@ fn m2_hello(config: &RuntimeConfig) -> ControlMessage {
         .collect::<Vec<_>>();
     features.push(M2_FEATURE.to_owned());
     features.push(OWNER_FENCING_FEATURE.to_owned());
+    // M3-16: this connector handles `PRINCIPAL_SESSIONS_END`; a relay sends
+    // it only to connectors that say so.
+    features.push("principal-sessions-end-v1".to_owned());
     let hello = Hello {
         message_id: message_id(),
         connector_id: config.device_id.clone(),

@@ -94,6 +94,7 @@ pub(crate) fn bearer_challenge(
     origin: Option<&str>,
     resource_path: &str,
     error: &OidcError,
+    scopes: &[String],
 ) -> Option<HeaderValue> {
     let error_code = match error {
         OidcError::MissingBearer => None,
@@ -115,13 +116,15 @@ pub(crate) fn bearer_challenge(
             "resource_metadata=\"{origin}{PROTECTED_RESOURCE_WELL_KNOWN}{resource_path}\""
         ));
     }
-    parameters.push(format!("scope=\"{}\"", crate::HTTP_FORWARD_OPERATION));
+    // The same set the metadata's `scopes_supported` publishes (review of
+    // #173): a client that requests exactly these gets a usable token.
+    parameters.push(format!("scope=\"{}\"", scopes.join(" ")));
     HeaderValue::from_str(&format!("Bearer {}", parameters.join(", "))).ok()
 }
 
 /// The scopes a token needs on an `http-forward` route: `http:invoke` and
 /// every scope the relay requires of all tokens.
-fn scopes_supported(oidc: &tunnel_catalog::OidcVerifier) -> Vec<String> {
+pub(crate) fn scopes_supported(oidc: &tunnel_catalog::OidcVerifier) -> Vec<String> {
     let mut scopes: std::collections::BTreeSet<String> =
         oidc.config().required_scopes.iter().cloned().collect();
     scopes.insert(crate::HTTP_FORWARD_OPERATION.to_owned());
@@ -201,7 +204,7 @@ mod tests {
         let path = "/v1/devices/d/services/s/http/mcp";
         let origin = Some("https://relay.test");
         let value = |error| {
-            bearer_challenge(origin, path, &error)
+            bearer_challenge(origin, path, &error, &["http:invoke".to_owned()])
                 .map(|value| value.to_str().expect("ASCII").to_owned())
         };
         let metadata = "resource_metadata=\"https://relay.test/.well-known/oauth-protected-resource/v1/devices/d/services/s/http/mcp\"";
@@ -225,9 +228,14 @@ mod tests {
         );
         assert_eq!(value(OidcError::InvalidConfiguration), None);
         assert_eq!(
-            bearer_challenge(None, path, &OidcError::MissingBearer)
-                .map(|value| value.to_str().expect("ASCII").to_owned())
-                .as_deref(),
+            bearer_challenge(
+                None,
+                path,
+                &OidcError::MissingBearer,
+                &["http:invoke".to_owned()]
+            )
+            .map(|value| value.to_str().expect("ASCII").to_owned())
+            .as_deref(),
             Some("Bearer scope=\"http:invoke\"")
         );
     }

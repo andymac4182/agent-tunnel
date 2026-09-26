@@ -37,6 +37,8 @@ pub const M1_PROFILE_FEATURE: &str = "m1-control-data";
 /// remains closed to data admission until the exact OWNER_FENCED reply has
 /// been observed by the owner.
 pub const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
+/// M3-16: the connector understands `PRINCIPAL_SESSIONS_END`.
+pub const PRINCIPAL_SESSIONS_END_FEATURE: &str = "principal-sessions-end-v1";
 
 pub fn random_token() -> String {
     let mut bytes = [0_u8; 32];

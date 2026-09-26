@@ -1385,18 +1385,6 @@ pub(crate) fn principal_binding_header() -> http::HeaderName {
     http::HeaderName::from_static(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
 }
 
-/// The refusal for a consumer request that presents the relay-only principal
-/// binding itself, or `None` when it presents none.
-///
-/// This is the whole basis of the unkeyed design (M3-04): because a consumer
-/// can never supply the header, the value's integrity does not depend on the
-/// digest being secret.  It is refused, not stripped and overwritten, so a
-/// forged binding can never be confused with a derived one, and the refusal
-/// is a plain `400 HTTP_INVALID_HEAD` `not_dispatched` that says nothing
-/// about the header, the profile or the session.
-///
-/// Header names are already lowercased by the HTTP parser, so one predicate
-/// covers every spelling, and `HeaderMap::contains_key` covers repeats.
 /// Task row M3-16: whether the owner watches a consumer's authorization on
 /// this export so the device can end its protocol sessions on revocation.
 /// Exactly the profiles that carry a principal binding hold sessions keyed
@@ -1409,6 +1397,18 @@ fn watches_principal_sessions(export: &HttpForwardExport) -> bool {
         .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
 }
 
+/// The refusal for a consumer request that presents the relay-only principal
+/// binding itself, or `None` when it presents none.
+///
+/// This is the whole basis of the unkeyed design (M3-04): because a consumer
+/// can never supply the header, the value's integrity does not depend on the
+/// digest being secret.  It is refused, not stripped and overwritten, so a
+/// forged binding can never be confused with a derived one, and the refusal
+/// is a plain `400 HTTP_INVALID_HEAD` `not_dispatched` that says nothing
+/// about the header, the profile or the session.
+///
+/// Header names are already lowercased by the HTTP parser, so one predicate
+/// covers every spelling, and `HeaderMap::contains_key` covers repeats.
 pub(crate) fn refuse_consumer_principal_binding(headers: &http::HeaderMap) -> Option<Response> {
     headers.contains_key(principal_binding_header()).then(|| {
         error_response(
@@ -1522,9 +1522,12 @@ pub(crate) async fn http_forward_route(
             // authenticate.  The refusal itself is unchanged.
             let mut response = consumer_authentication_response(&error, "http-forward");
             let origin = authorization::resource_origin(&exports, headers, request.uri());
-            if let Some(challenge) =
-                authorization::bearer_challenge(origin.as_deref(), request.uri().path(), &error)
-            {
+            if let Some(challenge) = authorization::bearer_challenge(
+                origin.as_deref(),
+                request.uri().path(),
+                &error,
+                &authorization::scopes_supported(oidc),
+            ) {
                 response
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, challenge);

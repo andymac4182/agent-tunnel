@@ -427,6 +427,8 @@ The metadata holds:
 - `scopes_supported`: `http:invoke`, plus any scope every token must carry;
 - `bearer_methods_supported`: `["header"]`.
 
+**Set `public_url` in production.** Without it, the resource origin comes from the request's own `Host` or `:authority`. That is correct only when clients reach the relay directly at the name they use. Behind a proxy or load balancer that rewrites the authority, the metadata would name the wrong resource, and clients would refuse it.
+
 The route is unauthenticated. It serves the same document for any
 well-formed device and service, so it does not reveal whether a device,
 service or grant exists. The host in `resource` comes from
@@ -434,8 +436,8 @@ service or grant exists. The host in `resource` comes from
 Otherwise it comes from the request's own authority.
 
 Every credential refusal on an `http-forward` route carries a
-`WWW-Authenticate: Bearer` challenge with `resource_metadata` and
-`scope="http:invoke"`:
+`WWW-Authenticate: Bearer` challenge with `resource_metadata` and `scope`.
+The `scope` is the same set as `scopes_supported`, space-separated:
 
 - A request with no token gets no `error` parameter.
 - A token refused for its signature, claims, key or identity gets
@@ -463,7 +465,10 @@ Evidence:
 This is option (c) from the row, applied by default pending owner
 confirmation (2026-09-25).
 
-The owner relay watches each consumer it admits to a session-keyed export:
+The owner relay watches each consumer it admits to a session-keyed export
+(it sends the message only to connectors that advertised
+`principal-sessions-end-v1`; see [protocol.md](protocol.md#control-messages)
+for that gate, the read cap and jitter, and the refusal of held requests):
 the `mcp-2025-11-25` profile, the only one that carries the principal
 binding. It keeps at most 64 per device session and re-reads each one's grant
 about once a second. When the grant is revoked or expired, or no longer
@@ -492,6 +497,9 @@ Residuals are in M3-41:
 
 - the message is not journaled, so one lost with its control socket leaves
   the sessions to idle expiry;
+- a request already in flight at revocation is withdrawn by the relay with
+  `502 HTTP_STREAM_INTERRUPTED`, `execution: unknown`. That outcome is
+  truthful but not revocation-specific (M3-44);
 - no upstream `DELETE` is sent to a Streamable HTTP backend;
 - M5-C05 does not use the message yet.
 

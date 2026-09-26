@@ -177,6 +177,8 @@ enum HoldRefusal {
     RotationFreeze,
     /// The device session ended or was replaced.
     SessionLost,
+    /// The consumer's grant was revoked while it was held (M3-16).
+    Revoked,
 }
 
 impl HeldOpen {
@@ -194,6 +196,7 @@ impl HeldOpen {
                 let _ = response.send(Err(match refusal {
                     HoldRefusal::RotationFreeze => RelayError::RotationFreeze,
                     HoldRefusal::SessionLost => RelayError::OwnerNotReady,
+                    HoldRefusal::Revoked => RelayError::Forbidden,
                 }));
             }
             HeldKind::Echo(request) => {
@@ -201,6 +204,7 @@ impl HeldOpen {
                     code: match refusal {
                         HoldRefusal::RotationFreeze => ROTATION_FREEZE_ECHO_CODE,
                         HoldRefusal::SessionLost => "DEVICE_OFFLINE",
+                        HoldRefusal::Revoked => "AUTHORIZATION_REVOKED",
                     },
                     execution: "not_dispatched",
                 });
@@ -240,6 +244,48 @@ impl FreezeHold {
             currently_held: self.total as u64,
             ..self.counters
         }
+    }
+
+    /// M3-16 (review of #173): refuse every stream OPEN held on `key` for
+    /// `principal_id` on `service_id`, because that consumer's grant was
+    /// revoked while it waited.  Without this, a request held across a
+    /// freeze would be admitted after the freeze with the grant snapshot it
+    /// was held with.  Returns how many were refused.
+    pub(super) fn refuse_revoked(
+        &mut self,
+        key: &SessionKey,
+        service: Uuid,
+        principal: Uuid,
+        now: Instant,
+    ) -> u64 {
+        let scope = key.scope();
+        let queue = self.take(&scope);
+        if queue.is_empty() {
+            return 0;
+        }
+        let mut keep = VecDeque::with_capacity(queue.len());
+        let mut refused = Vec::new();
+        for held in queue {
+            let revoked = held.key == *key
+                && matches!(
+                    &held.kind,
+                    HeldKind::Stream { consumer, service_id, .. }
+                        if consumer.principal_id == principal && *service_id == service
+                );
+            if revoked {
+                refused.push(held);
+            } else {
+                keep.push_back(held);
+            }
+        }
+        self.restore(scope, keep);
+        let count = refused.len();
+        for held in refused {
+            self.record_wait(&held, now);
+            self.counters.refused_on_revocation += 1;
+            held.refuse(HoldRefusal::Revoked);
+        }
+        count as u64
     }
 
     /// Drop held OPENs whose consumer has gone. Nothing was dispatched for
