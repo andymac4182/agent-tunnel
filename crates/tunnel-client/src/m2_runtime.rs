@@ -1675,6 +1675,11 @@ struct M2Actor {
     /// Every `expire_stream` call, for the M6-C88 regression test.
     #[cfg(test)]
     expire_stream_calls: u64,
+    /// Every snapshot `publish_status` sent, in order, for the M7-C123
+    /// regression test.  The watch channel coalesces snapshots, so a torn
+    /// intermediate one is only deterministically observable here.
+    #[cfg(test)]
+    published_statuses: std::sync::Mutex<Vec<ConnectionStatus>>,
     pending_outputs: VecDeque<PendingOutput>,
     pending_output_bytes: usize,
     peer_fence: Option<FenceSnapshot>,
@@ -1852,6 +1857,8 @@ async fn run_m2_session(
         auth_expired_streams: 0,
         #[cfg(test)]
         expire_stream_calls: 0,
+        #[cfg(test)]
+        published_statuses: std::sync::Mutex::new(Vec::new()),
         pending_outputs: VecDeque::new(),
         pending_output_bytes: 0,
         peer_fence: None,
@@ -2455,22 +2462,29 @@ impl M2Actor {
             .as_ref()
             .and(rotation_status.deadline_ms)
             .or(self.last_recovery_attempt_deadline_ms);
+        // A completed episode is reported only once its verified reset
+        // marker is recorded (M7-C123).  Activation moves the attempt into
+        // `completed_recovery` and then flushes queued output, which
+        // publishes, before it records the marker and the attempt number
+        // alongside it; reporting the completed episode's deadline and
+        // closure roster in that window tore the snapshot into closures
+        // without an attempt.  Gated on the marker, that window publishes no
+        // recovery fields at all, and the next snapshot publishes all of them.
+        let completed_recovery = self
+            .completed_recovery
+            .as_ref()
+            .filter(|_| self.last_recovery_reset_reason.is_some());
         let recovery_episode_deadline_ms = self
             .recovery
             .as_ref()
             .map(|recovery| recovery.deadline_ms)
-            .or_else(|| {
-                self.completed_recovery
-                    .as_ref()
-                    .map(|recovery| recovery.deadline_ms)
-            });
+            .or_else(|| completed_recovery.map(|recovery| recovery.deadline_ms));
         let recovery_closed_connection_ids = self
             .recovery
             .as_ref()
             .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
             .or_else(|| {
-                self.completed_recovery
-                    .as_ref()
+                completed_recovery
                     .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
             })
             .unwrap_or_default();
@@ -2567,6 +2581,11 @@ impl M2Actor {
             active_local_addr: self.active.local_addr,
             candidate_local_addr,
         };
+        #[cfg(test)]
+        self.published_statuses
+            .lock()
+            .expect("test status history lock")
+            .push(status.clone());
         let _ = self.status.send(status);
     }
 
@@ -9306,6 +9325,8 @@ mod tests {
             auth_expired_streams: 0,
             #[cfg(test)]
             expire_stream_calls: 0,
+            #[cfg(test)]
+            published_statuses: std::sync::Mutex::new(Vec::new()),
             pending_outputs: VecDeque::new(),
             pending_output_bytes: 0,
             peer_fence: None,
@@ -13406,6 +13427,175 @@ mod tests {
                 .closed_connection_ids,
             vec![second_candidate]
         );
+    }
+
+    /// M7-C123: recovery activation moves the attempt into
+    /// `completed_recovery` and then flushes queued output, which publishes a
+    /// status snapshot, before it records the verified reset marker and the
+    /// attempt number.  Every snapshot published on the way must describe
+    /// either the attempt or its verified completion, never a torn mix such
+    /// as the completed attempt's closure roster with no attempt number
+    /// (hosted CI run 36128683568: "attempt timing without an attempt").
+    #[tokio::test]
+    async fn recovery_activation_never_publishes_a_torn_attempt_status() {
+        let (mut actor, old_key, _old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, _candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &old_key);
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "recovery-torn",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("recovery-torn-snapshot", vec![]);
+        let now = actor.now_ms();
+        let recovery_timeout_ms = actor.rotation.config().recovery_timeout_ms;
+        let deadline = now
+            .checked_add(recovery_timeout_ms)
+            .expect("test recovery deadline does not overflow");
+        actor
+            .rotation
+            .transport_lost(&attempt, now, RecoveryReason::OldTransportLost)
+            .expect("carrier loss enters recovery");
+        let closed_evidence = ClosureEvidence::closed(old_key.connection_id.clone());
+        actor
+            .rotation
+            .close_for_recovery(old_key.connection_id.clone(), closed_evidence.clone(), now)
+            .expect("carrier closure releases its rotation allocation");
+        actor
+            .rotation
+            .begin_recovery(
+                attempt.clone(),
+                roster.clone(),
+                now,
+                RecoveryReason::OldTransportLost,
+                deadline,
+            )
+            .expect("recovery attempt starts");
+        actor
+            .rotation
+            .reserve_recovery_socket(now)
+            .expect("replacement is reserved");
+        let begin = RecoveryBegin {
+            message_id: "recovery-torn-begin".to_owned(),
+            reply_to: String::new(),
+            attempt,
+            episode_id: "recovery-torn-episode".to_owned(),
+            attempt_no: 1,
+            roster,
+            remaining_ms: recovery_timeout_ms,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "recovery-torn-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: begin.attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![old_key.connection_id.clone()],
+            closure_digest: "recovery-torn-digest".to_owned(),
+        };
+        actor
+            .closed_for_recovery
+            .insert(old_key.connection_id.clone(), closed_evidence);
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: None,
+            peer_closed: None,
+            combined_digest: Some("recovery-torn-combined".to_owned()),
+            deadline_ms: deadline,
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [true, true],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [true, true],
+            ready_replies: [true, true],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: true,
+        });
+        actor
+            .published_statuses
+            .lock()
+            .expect("test status history lock")
+            .clear();
+
+        actor
+            .maybe_finish_recovery()
+            .await
+            .expect("recovery activates its replacement");
+
+        let statuses = actor
+            .published_statuses
+            .lock()
+            .expect("test status history lock")
+            .clone();
+        assert!(
+            !statuses.is_empty(),
+            "activation must publish at least one status snapshot"
+        );
+        for (index, status) in statuses.iter().enumerate() {
+            let identity_present = status.recovery_old_generation.is_some()
+                || status.recovery_old_connection_id.is_some()
+                || status.recovery_successor_generation.is_some()
+                || status.recovery_successor_connection_id.is_some();
+            if status.recovery_attempt.is_some() {
+                assert!(
+                    status.recovery_attempt_started_at_ms.is_some()
+                        && status.recovery_attempt_deadline_ms.is_some()
+                        && status.recovery_episode_deadline_ms.is_some()
+                        && identity_present,
+                    "snapshot {index} named an attempt without its timing/identity: {status:?}"
+                );
+            } else {
+                assert!(
+                    status.recovery_attempt_started_at_ms.is_none()
+                        && status.recovery_attempt_deadline_ms.is_none()
+                        && status.recovery_episode_deadline_ms.is_none()
+                        && status.recovery_closed_connection_ids.is_empty(),
+                    "snapshot {index} reported attempt timing, an episode deadline or closures \
+                     without an attempt: {status:?}"
+                );
+                assert!(
+                    status.recovery_reset_reason.is_some() || !identity_present,
+                    "snapshot {index} carried identity without a reset reason: {status:?}"
+                );
+            }
+        }
+        let last = statuses.last().expect("checked non-empty above");
+        assert_eq!(last.recovery_attempt, Some(1));
+        assert_eq!(
+            last.recovery_reset_reason,
+            Some(M2_RECOVERY_RESET_FENCED_SUCCESSOR)
+        );
+        assert_eq!(
+            last.recovery_closed_connection_ids,
+            vec![old_key.connection_id.clone()]
+        );
+        assert_eq!(last.recovery_episode_deadline_ms, Some(deadline));
     }
 
     #[tokio::test]
