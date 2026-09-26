@@ -114,6 +114,48 @@ pub fn local_error(
     })
 }
 
+/// The `retryAfterMs` hint of a capacity refusal.  A slot frees when a
+/// request completes, a legacy session is deleted or reaches its idle
+/// expiry, or a child exits, so this is a backoff hint rather than a promise.
+pub const CAPACITY_RETRY_AFTER_MS: u64 = 1_000;
+
+/// The documented refusal of an export at its capacity bound (task row
+/// M6-C145): `503`, JSON-RPC [`codes::CAPACITY_EXHAUSTED`], and `error.data`
+/// of `{"retryable": true, "retryAfterMs": ..., "execution":
+/// "not_dispatched"}`.  Nothing was started for the request, so a client may
+/// retry it after the hint whatever its method.
+///
+/// It is not an internal error: before task row M6-C145 this answer was
+/// `-32603`, which the M6-03 soak (M6-C122) recorded as a failure a client
+/// cannot tell from a server bug.  The relay forwards response bodies but not
+/// a `Retry-After` header (the MCP profiles do not allowlist it), so the hint
+/// travels in the body.
+#[must_use]
+pub fn capacity_refusal(
+    message: &'static str,
+    id: Option<serde_json::Value>,
+) -> Response<ExportBody> {
+    let mut body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": codes::CAPACITY_EXHAUSTED,
+            "message": message,
+            "data": {
+                "retryable": true,
+                "retryAfterMs": CAPACITY_RETRY_AFTER_MS,
+                "execution": "not_dispatched",
+            },
+        },
+    });
+    if let Some(id) = id {
+        body["id"] = id;
+    }
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+    )
+}
+
 /// A bodyless response (202 Accepted, 204 No Content).
 #[must_use]
 pub fn no_body(status: StatusCode) -> Response<ExportBody> {

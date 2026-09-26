@@ -509,7 +509,7 @@ pub fn load_quinn_client_config(
     Ok(quinn::ClientConfig::new(Arc::new(crypto)))
 }
 
-fn ring_provider() -> Arc<CryptoProvider> {
+pub(crate) fn ring_provider() -> Arc<CryptoProvider> {
     Arc::new(crypto::ring::default_provider())
 }
 
@@ -592,7 +592,7 @@ pub fn process_provider_is_ring() -> bool {
     format!("{:?}", installed.secure_random).starts_with("Ring")
 }
 
-fn require_client_ca_with_provider(
+pub(crate) fn require_client_ca_with_provider(
     ca_pem: &[u8],
     provider: Arc<CryptoProvider>,
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, TlsConfigError> {
@@ -602,14 +602,14 @@ fn require_client_ca_with_provider(
         .map_err(|error| TlsConfigError::Verifier(error.to_string()))
 }
 
-fn disable_server_resumption(config: &mut ServerConfig) {
+pub(crate) fn disable_server_resumption(config: &mut ServerConfig) {
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     config.send_half_rtt_data = false;
 }
 
-fn parse_certificates(
+pub(crate) fn parse_certificates(
     pem: &[u8],
     description: &'static str,
 ) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
@@ -623,7 +623,7 @@ fn parse_certificates(
     Ok(certificates)
 }
 
-fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
+pub(crate) fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
     let mut reader = Cursor::new(pem);
     rustls_pemfile::private_key(&mut reader)
         .map_err(TlsConfigError::Pem)?

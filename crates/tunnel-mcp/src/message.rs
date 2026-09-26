@@ -38,6 +38,13 @@ pub mod codes {
     pub const INTERNAL_ERROR: i64 = -32603;
     pub const HEADER_MISMATCH: i64 = -32020;
     pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+    /// An export at its `max_children` (stdio) or session-table (HTTP)
+    /// bound refused a new session or request before dispatching it (task
+    /// row M6-C145).  Server-defined, in JSON-RPC's implementation range; the
+    /// error's `data` carries `retryable: true`, a `retryAfterMs` hint and
+    /// `execution: "not_dispatched"`.  It is never `INTERNAL_ERROR`, which
+    /// a client cannot tell from a server bug.
+    pub const CAPACITY_EXHAUSTED: i64 = -32050;
 }
 
 /// The body `_meta` key mirrored by `MCP-Protocol-Version`.

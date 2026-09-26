@@ -3710,6 +3710,18 @@ async fn handle_peer_consumer_stream(
             );
             return request.reject_stream_limit().await;
         }
+        // M6-C144 (review of #187): the owner lost the device's session after
+        // the ingress resolved it here.  Nothing was dispatched, so the
+        // ingress gets the retryable owner-not-ready refusal rather than a
+        // closed exchange it must report as `unknown`, as for http-forward.
+        Err(RelayError::DeviceOffline) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::OwnerNotReady,
+            );
+            return request.reject_owner_not_ready().await;
+        }
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     registration.claim_admission();
@@ -4735,6 +4747,10 @@ fn local_consumer_admission_response(route: &'static str, error: RelayError) -> 
             "device or service was not found",
             "not_dispatched",
         ),
+        // M6-C144: the same answer as the echo route's for the same state.
+        // Only reached after the route authorized the consumer for this
+        // service, so it reveals nothing a grant does not already show.
+        RelayError::DeviceOffline => failure_outcome("DEVICE_OFFLINE", "not_dispatched"),
         _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "REVERSE_CHANNEL_UNAVAILABLE",
@@ -5932,3 +5948,6 @@ mod tenant_admission_tests;
 mod consumer_refusal_tests;
 #[cfg(test)]
 mod mcp_authorization_tests;
+
+#[cfg(test)]
+mod offline_refusal_tests;

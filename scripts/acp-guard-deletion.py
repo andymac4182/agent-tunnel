@@ -2346,6 +2346,149 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    (
+        'the genuine rotation must not serve an unapproved staged successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_staged_not_served,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the genuine rotation's overlap must reach every verifier",
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_overlap_staged,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must switch to the approved successor itself',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switched,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the held ACP turn must survive the switch',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switch_left_acp_serving,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the flooded forwarded stream must survive the switch',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switch_left_forward_serving,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a fresh handshake must present the successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_successor_presented,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a fresh handshake must no longer present the predecessor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_predecessor_not_presented,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must stay Ready through a genuine rotation',
+        [
+            (
+                ACP_CLUSTER,
+                '            !evidence.genuine_owner_unready\n                && !evidence\n                    .genuine_owner_reasons\n                    .iter()\n                    .any(|reason| reason == "membership_revoked"),',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the ingress must attribute the genuine teardown to the withdrawn key',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_ingress_reasons == vec!["membership_revoked".to_owned()],',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the genuine withdrawal must interrupt explicitly with no stopReason',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_interrupted && evidence.genuine_no_stop_reason,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must retire the predecessor because it was withdrawn',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_retired_by_withdrawal,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a whole turn must complete across the rotated route',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_post_rotation_turn,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the cluster must re-sign the owner on its successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_resigned_on_successor,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
 ]
 
 
@@ -2814,6 +2957,19 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ("m8c7", "a present ACP sentinel helper cannot be reported as missing"): frozenset(
         {"the_skip_cannot_hide_a_helper_that_is_on_disk"}
     ),
+    ('m8c5', 'the genuine rotation must not serve an unapproved staged successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the genuine rotation's overlap must reach every verifier"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must switch to the approved successor itself'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the held ACP turn must survive the switch'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the flooded forwarded stream must survive the switch'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a fresh handshake must present the successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a fresh handshake must no longer present the predecessor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must stay Ready through a genuine rotation'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the ingress must attribute the genuine teardown to the withdrawn key'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the genuine withdrawal must interrupt explicitly with no stopReason'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must retire the predecessor because it was withdrawn'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a whole turn must complete across the rotated route'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the cluster must re-sign the owner on its successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
 }
 
 #: The pinned ledger, loaded once.
