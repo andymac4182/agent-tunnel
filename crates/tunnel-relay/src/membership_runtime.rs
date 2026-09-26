@@ -1330,34 +1330,6 @@ impl MembershipRuntime {
         Self::route_targets_at(&state, now)
     }
 
-    /// SPKIs of the admissions still active on this relay's own monotonic
-    /// clock, after expiring any whose deadline has passed.
-    ///
-    /// The pin publisher keeps these in the published set even when the
-    /// wall-clock key window used by [`Self::verified_peer_route_targets`]
-    /// has just closed. Otherwise a publication could drop a peer key -- and
-    /// the transport pin watcher close its pooled connection -- a few
-    /// milliseconds before this relay's own monotonic conversion of the same
-    /// signed boundary expires the admission, leaving the stream closed with
-    /// no `TrustExpired` latched. An admission is active only while it still
-    /// binds (revocation or removal invalidates it at the reconcile that
-    /// sees it) and only until its monotonic deadline, so this keeps no key
-    /// past its own signed boundary.
-    #[must_use]
-    pub fn active_admission_spkis(&self) -> Vec<String> {
-        let _ = self.snapshot();
-        let now = Instant::now();
-        let state = self.state.lock().expect("membership state mutex poisoned");
-        state
-            .active_peers
-            .iter()
-            .filter(|(_, peer)| {
-                !peer.admission.is_invalidated() && peer.admission.deadline.expires_at > now
-            })
-            .map(|(identity, _)| identity.spki_sha256.clone())
-            .collect()
-    }
-
     fn route_targets_at(state: &RuntimeState, now: DateTime<Utc>) -> Vec<PeerRouteTarget> {
         let Ok(checkpoint) = state.verifier.fresh_checkpoint(now) else {
             return Vec::new();
