@@ -413,6 +413,23 @@ struct Connection {
     state: Mutex<ConnectionState>,
     counters: Arc<Counters>,
     shutdown: CancellationToken,
+    /// A **weak** handle on the supervisor's transport channel, so a finished
+    /// turn's result is queued behind every message the agent wrote before it
+    /// (task row M8-C27).
+    ///
+    /// The agent writes its last `session/update` and then the prompt's
+    /// response.  The reader forwards the update into this channel and only
+    /// then resolves the prompt's waiter, so a result sent into the *same*
+    /// channel afterwards is FIFO-ordered behind it.  Sent anywhere else — the
+    /// session target directly, as it once was — it raced the dispatcher and
+    /// could overtake an update still queued here, so a consumer read the turn
+    /// as finished before the update that belonged to it.
+    ///
+    /// Weak, because the dispatcher holds this `Connection` and ends only when
+    /// every strong sender is gone: a strong sender here would keep it alive
+    /// for as long as the connection itself.  A prompt upgrades it while the
+    /// child is alive and holds the strong sender only until its turn ends.
+    outbound: mpsc::WeakSender<OutboundMessage>,
 }
 
 impl Connection {
@@ -789,6 +806,7 @@ impl AcpExport {
         supervisor_config.session_limit = validated.session_limit;
 
         let (forward_tx, forward_rx) = mpsc::channel(STREAM_BACKLOG);
+        let outbound = forward_tx.downgrade();
         let Ok((supervisor, mut events)) =
             Supervisor::start_forwarding(supervisor_config, Some(forward_tx))
         else {
@@ -837,6 +855,7 @@ impl AcpExport {
             }),
             counters: Arc::clone(&self.inner.counters),
             shutdown: CancellationToken::new(),
+            outbound,
         });
         self.inner
             .connections
@@ -993,6 +1012,11 @@ impl AcpExport {
             .fetch_add(1, Ordering::Relaxed);
         let host_id = message.id.clone().unwrap_or(Value::Null);
         let connection = Arc::clone(connection);
+        // Taken now, while the child is alive and the reader still holds its
+        // own sender, so the upgrade succeeds for every prompt that could
+        // still be answered (M8-C27).
+        let ordered = connection.outbound.upgrade();
+        let stall_deadline = self.inner.validated.output_stall_deadline;
         tokio::spawn(async move {
             let Some(target) = connection.session_target(&session) else {
                 return;
@@ -1027,7 +1051,29 @@ impl AcpExport {
                 }
             }
             .unwrap_or_default();
-            let _ = target.tx.send(Bytes::from(body)).await;
+            // **Behind the turn's own updates** (M8-C27), on both paths: the
+            // reader queued every earlier agent message on this channel before
+            // it resolved the waiter this task just woke from, so the
+            // dispatcher delivers them first and applies the same stall and
+            // loss rules to the result or the error.  Only when the dispatcher
+            // is already gone -- the connection closed -- is the body handed
+            // to the target directly, still bounded by the stall deadline, and
+            // the target's own closed state then decides.
+            let body = match ordered {
+                Some(ordered) => match ordered
+                    .send(OutboundMessage {
+                        session: Some(session.clone()),
+                        kind: MessageKind::Response,
+                        compact: body,
+                    })
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(mpsc::error::SendError(unsent)) => unsent.compact,
+                },
+                None => body,
+            };
+            let _ = tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(body))).await;
         });
         no_body(StatusCode::ACCEPTED)
     }
@@ -1748,6 +1794,10 @@ mod ending_tests {
             }),
             counters: Arc::clone(&export.inner.counters),
             shutdown: CancellationToken::new(),
+            // No dispatcher in this fixture: a sender that is already gone.
+            outbound: tokio::sync::mpsc::channel::<crate::OutboundMessage>(1)
+                .0
+                .downgrade(),
         })
     }
 

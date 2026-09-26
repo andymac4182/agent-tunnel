@@ -534,6 +534,16 @@ where
         self.cache.lock().await.remove(&scope);
     }
 
+    /// The owner epoch this router currently caches for `scope`, if any.
+    #[cfg(test)]
+    pub(crate) async fn cached_owner_epoch(&self, scope: OwnerScope) -> Option<u64> {
+        self.cache
+            .lock()
+            .await
+            .get(&scope)
+            .map(|entry| entry.owner.token.epoch)
+    }
+
     /// Drop all cached routes.  This is a local optimisation reset used when
     /// membership trust is invalidated; it does not mutate catalog authority.
     pub async fn invalidate_all(&self) {

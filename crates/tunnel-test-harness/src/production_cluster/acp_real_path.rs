@@ -201,6 +201,17 @@ pub struct AcpRealPathEvidence {
     pub conversation_stop_reason: String,
     /// `session/prompt` was answered 202 and the result arrived separately.
     pub prompt_accepted_202: bool,
+    /// The consumer's DELETE over the real route: its status, and what it
+    /// did, read from the export and from the consumer's own held streams
+    /// rather than from the status (task row M8-02).
+    pub delete_status: u16,
+    /// The export closed exactly that connection while both of its streams
+    /// were still held by the consumer, so nothing but the DELETE ended it.
+    pub delete_closed_connection: bool,
+    /// Both of the consumer's held streams then **errored**: the teardown
+    /// crossed the device WebSocket, the owner and the peer hop back to the
+    /// consumer, and did not look like an orderly end.
+    pub delete_failed_held_streams: bool,
 
     // --- permissions ---
     /// The permission callback was observed on the session stream.
@@ -866,56 +877,88 @@ impl Gate<'_> {
                 .await
                 .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
                 .unwrap_or_default();
-            if status == http::StatusCode::SERVICE_UNAVAILABLE && body.contains("not_dispatched") {
-                let coincides = self.freeze.coincides();
-                self.ledger.refusals.fetch_add(1, Ordering::SeqCst);
-                if coincides {
-                    self.ledger.retries.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    let mut slot = self
-                        .ledger
-                        .unexplained
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        *slot = Some(self.freeze.unexplained());
-                    }
-                }
-                if coincides && retries < NOT_DISPATCHED_RETRIES {
-                    retries += 1;
-                    sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
-                    continue;
-                }
+            if status == http::StatusCode::SERVICE_UNAVAILABLE
+                && body.contains("not_dispatched")
+                && self.note_refusal(&mut retries).await
+            {
+                continue;
             }
             return Ok((status, headers, body));
         }
     }
 
-    /// Open an SSE stream and hold it.
+    /// Count one `503 not_dispatched` refusal, correlate it against an
+    /// **observed** rotation freeze, and say whether to resend.
+    ///
+    /// One discipline for both verbs (task row M8-C15): a GET refused by a
+    /// freeze is the same refusal as a POST refused by one, and it must be
+    /// counted and correlated the same way rather than surfacing as a bare
+    /// non-200 that fails the run as though the route were broken.  The first
+    /// refusal that does not coincide is recorded and fails the run by name;
+    /// it is never resent.
+    async fn note_refusal(&self, retries: &mut u64) -> bool {
+        let coincides = self.freeze.coincides();
+        self.ledger.refusals.fetch_add(1, Ordering::SeqCst);
+        if coincides {
+            self.ledger.retries.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let mut slot = self
+                .ledger
+                .unexplained
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(self.freeze.unexplained());
+            }
+        }
+        if coincides && *retries < NOT_DISPATCHED_RETRIES {
+            *retries += 1;
+            sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
+            return true;
+        }
+        false
+    }
+
+    /// Open an SSE stream and hold it, resending a freeze refusal exactly as
+    /// [`Self::post`] does.
     async fn open_stream(
         &self,
         consumer: &AcpConsumer,
         extra: &[(&str, &str)],
     ) -> Result<(http::StatusCode, http::HeaderMap, Option<HeldStream>)> {
-        let request = acp_request(
-            "GET",
-            &self.base_uri,
-            &self.token,
-            &[&[("accept", "text/event-stream")][..], extra].concat(),
-            empty_stream(),
-        )?;
-        let response = consumer
-            .sender
-            .clone()
-            .send_request(request)
-            .await
-            .map_err(|error| HarnessError::Http(format!("ACP GET: {error}")))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        if status != http::StatusCode::OK {
+        let mut retries = 0u64;
+        loop {
+            let request = acp_request(
+                "GET",
+                &self.base_uri,
+                &self.token,
+                &[&[("accept", "text/event-stream")][..], extra].concat(),
+                empty_stream(),
+            )?;
+            let response = consumer
+                .sender
+                .clone()
+                .send_request(request)
+                .await
+                .map_err(|error| HarnessError::Http(format!("ACP GET: {error}")))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            if status == http::StatusCode::OK {
+                return Ok((status, headers, Some(HeldStream::hold(response))));
+            }
+            if status == http::StatusCode::SERVICE_UNAVAILABLE {
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                    .unwrap_or_default();
+                if body.contains("not_dispatched") && self.note_refusal(&mut retries).await {
+                    continue;
+                }
+            }
             return Ok((status, headers, None));
         }
-        Ok((status, headers, Some(HeldStream::hold(response))))
     }
 
     /// The case boundary, and the **only** place membership is re-signed.
@@ -1126,7 +1169,48 @@ impl Gate<'_> {
         // What the **export** made of that turn, through the terminal rule.
         evidence.export_terminal_succeeded_delta =
             self.export().terminals_succeeded - before.terminals_succeeded;
-        self.close_conversation(conversation).await;
+
+        // **DELETE over the real route, observed rather than trusted.**  The
+        // streams are still held, so the only thing that can end this
+        // connection now is the DELETE itself; a 202 alone would prove only
+        // that the bridge accepted it.
+        let closed_before = self.export().connections_closed;
+        let headers = self.connection_headers(&conversation);
+        let request = acp_request(
+            "DELETE",
+            &self.base_uri,
+            &self.token,
+            &headers,
+            empty_stream(),
+        )?;
+        let response = conversation
+            .consumer
+            .sender
+            .clone()
+            .send_request(request)
+            .await
+            .map_err(|error| HarnessError::Http(format!("ACP DELETE: {error}")))?;
+        evidence.delete_status = response.status().as_u16();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let closed = self.export().connections_closed - closed_before == 1;
+            let failed = conversation.connection_stream.has_errored()
+                && conversation.session_stream.has_errored();
+            if closed && failed {
+                evidence.delete_closed_connection = true;
+                evidence.delete_failed_held_streams = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                evidence.delete_closed_connection = closed;
+                evidence.delete_failed_held_streams = failed;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        conversation.connection_stream.break_now();
+        conversation.session_stream.break_now();
+        conversation.consumer.shutdown();
         Ok(())
     }
 
@@ -1918,7 +2002,7 @@ fn m8c14_attribution(evidence: &AcpRealPathEvidence) -> String {
 
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
-    let checks: [(&str, bool); 32] = [
+    let checks: [(&str, bool); 35] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the device is owned by relay-a and the consumer entered at relay-c",
@@ -1954,6 +2038,18 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         (
             "the turn completed with end_turn, read off the wire",
             evidence.conversation_stop_reason == "end_turn",
+        ),
+        (
+            "DELETE over the real route was accepted 202",
+            evidence.delete_status == 202,
+        ),
+        (
+            "DELETE closed that connection at the export while its streams were still held",
+            evidence.delete_closed_connection,
+        ),
+        (
+            "DELETE failed both held streams at the consumer rather than ending them cleanly",
+            evidence.delete_failed_held_streams,
         ),
         // --- permissions ---
         (
@@ -2160,6 +2256,7 @@ pub async fn verify() -> Result<AcpRealPathEvidence> {
         request_body_bytes: None,
         response_body_bytes: None,
         deadline_seconds: None,
+        public_url: None,
     };
     let exports = match serve.exports() {
         Ok(exports) => exports,

@@ -327,7 +327,7 @@ writes anything (section 2.3):
 
 ```console
 $ mkdir -m 700 trial-ca
-$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
+$ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
 $ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:33333333-3333-4333-8333-333333333333\n' > trial-ca/device-ext.cnf
 $ openssl x509 -req -in trial/device.csr -CA trial-ca/ca.pem -CAkey trial-ca/ca-key.pem -CAcreateserial -days 1 -extfile trial-ca/device-ext.cnf -out trial/device-cert.pem
 $ openssl x509 -in trial/device-cert.pem -noout -subject
@@ -1079,6 +1079,57 @@ relay has accepted, so a restarted relay cannot be fed an older signed snapshot.
 `recovery.fence_path` records the highest recovery approval consumed. Starting
 each relay is the `serve` command from section 3.1.
 
+### 3.4 Rotating a relay's peer key without a restart
+
+A cluster relay can replace its private HTTP/3 peer certificate and key while
+it serves (task rows M8-C45, M8-C46; the design is in
+[cluster.md](cluster.md#certificate-and-key-lifecycle)). Like the rest of
+section 3.3 it needs the membership publisher this alpha does not ship: the
+relay stages and serves a successor, but only your publisher can approve it.
+
+1. Issue the successor certificate for the **same node** under the same relay
+   peer CA, covering the same server names. Put its chain and key where the
+   relay can read them and name them in the relay's `[cluster]` section, then
+   restart once so the configuration is loaded (or set them before the
+   relay's next planned start):
+
+   ```toml
+   peer_tls_next_cert_chain = "/etc/agent-tunnel/peer-next-chain.pem"
+   peer_tls_next_private_key = "/etc/agent-tunnel/peer-next-key.pem"
+   # Optional; these are the defaults.
+   # peer_rekey_convergence_seconds = 61   # record lifetime + clock skew
+   # peer_rekey_overlap_seconds = 600
+   ```
+
+2. Send the relay `SIGHUP`. It reads the two files, validates them, and logs
+   the successor's public digest; nothing is served with it yet:
+
+   ```console
+   $ kill -HUP "$(pgrep -f 'tunnel-relay serve')"
+   tunnel-relay: peer identity staged: staged_spki_sha256=<64 hex>; it serves once a signed membership record approves it for 61s
+   ```
+
+   A refusal names why (`peer rekey refused: ...`) and changes nothing.
+   `SIGHUP` on a relay with no `peer_tls_next_*` configured logs that and
+   changes nothing. A relay without `[cluster]` does not handle `SIGHUP`.
+
+3. Publish the relay's signed record approving **both** keys. After the hold,
+   the relay logs `peer identity switched` and new handshakes in both
+   directions present the successor; connections already open keep serving.
+4. Publish the record approving **only** the successor. The relay logs
+   `previous peer identity retired` with `cause="withdrawn"` and stays Ready;
+   peers close their connections under the old key, so a stream riding one is
+   interrupted and must be retried.
+5. Before the relay's next restart, point `peer_tls_cert_chain` and
+   `peer_tls_private_key` at the successor's files and remove
+   `peer_tls_next_*` (a restarted relay serves what `peer_tls_cert_chain`
+   names, and would fail closed on the retired key).
+
+Do not publish the successor-only record before step 3's switch: a relay whose
+**served** key the record stops approving fails closed, as it always has. The
+trigger, the hold and the overlap are applied by default pending owner
+confirmation (2026-09-25).
+
 ## 4. Service installation, upgrade, backup and recovery
 
 **Example service units are in `examples/service/` of the source tree**
@@ -1120,9 +1171,10 @@ Every setting follows from how the binaries stop and reconnect
   retries relay restarts and network loss inside the process, with backoff
   (section 3.1), so the unit restarts it only for what the process cannot
   handle: a crash, an internal failure (exit `1`), `OWNER_BUSY` (exit `7`), or
-  an attempt limit you set (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3`**
+  an attempt limit you set (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3 9`**
   keeps a configuration or credential error (a certificate refused on either
-  side) from restarting in a loop: the unit stays failed and
+  side), or a second `connect` on a profile another one already holds (exit
+  `9`, M6-06), from restarting in a loop: the unit stays failed and
   `journalctl -u tunnel-client` shows the error. If your supervisor should own
   every restart instead, add `--no-reconnect` to `ExecStart`. The relay does
   not retry its own startup (an unreachable Redis exits `1`), so its unit
@@ -1158,7 +1210,7 @@ Every setting follows from how the binaries stop and reconnect
 
 A non-cluster `serve` stopped while serving, with a device connected,
 printed its `stopping` and `stopped` lines and exited `0` for both SIGTERM
-and SIGINT (dogfood run; M6-C60). SIGHUP is not handled by either binary; neither reloads its configuration.
+and SIGINT (dogfood run; M6-C60). SIGHUP is not handled by `connect` or by a non-cluster `serve`; a cluster `serve` handles it only to stage a configured successor peer identity (section 3.4). Neither binary reloads its configuration.
 runtime.md lists what is measured and what is not; in short, the handshake,
 startup and backoff phases, a live stop and a reconnect across a relay
 restart are measured on the real binaries, the second-signal and bound logic
@@ -1355,7 +1407,9 @@ ended), `rotation_freeze_hold_released_total{outcome}` (`commit`, `abort`,
 `recovery`, `session_loss`),
 `rotation_freeze_hold_released_with_deferred_writes_total`,
 `rotation_freeze_hold_refused_total{reason}` (`after_bound`: held past the
-bound; `hold_full`: never held because the hold was full),
+bound; `hold_full`: never held because the hold was full; both answered
+`ROTATION_FREEZE`; `revocation`: the consumer's grant was revoked while it was
+held (M3-16), answered as a revocation, not a freeze),
 `rotation_freeze_hold_cancelled_total` (the consumer went away while held) and
 the gauge `rotation_freeze_hold_max_wait_ms`. **Do not add
 `consumer_refusals_total{stage="rotation_freeze"}` to
@@ -1369,7 +1423,8 @@ freeze that has begun again, which is refused without being held twice. Read
 the first for which local route was refused and the second for why the hold
 refused. Every held OPEN leaves the hold
 exactly once, so `held_total` equals `current` plus every `released_total`,
-`refused_total{reason="after_bound"}` and `cancelled_total`; a scrape where it
+`refused_total{reason="after_bound"}`, `refused_total{reason="revocation"}`
+and `cancelled_total`; a scrape where it
 does not is a relay defect worth reporting. Every value is a count, a gauge or a byte
 total, and every label value is a fixed word from a closed set: **no tenant,
 device, session, connection, stream or request identifier, subject, issuer,
@@ -1448,7 +1503,10 @@ shipped path handles typed text. Treat logs as sensitive regardless.
 
 `doctor` checks the local profile: the configuration, whether the certificate
 matches the key, owner-only permissions, certificate expiry, and whether
-`tunnel-deadman` is beside the client. It opens no network connection. **It
+`tunnel-deadman` is beside the client. It opens no network connection. Since
+M6-06 it also asks the profile's running `connect`, if any, through the local
+supervisor socket (`supervisor_ipc`: `ok`, `not_running`, or `failed` with a
+code); that never changes its exit status. **It
 always prints its full `result`, even when it fails** (M6-C07), so a
 half-provisioned machine can still see which checks passed. `not_run` means a
 check could not be attempted, which is different from `failed`. Since M6-C44
@@ -1468,13 +1526,23 @@ earlier runs in section 2.1). `PROCESS_CONTAINMENT_SENTINEL_MISSING` or
 `..._UNUSABLE` means `tunnel-deadman` is absent or unusable. That degrades
 cleanup of supervised child processes but does not change the exit status.
 
-**`status` is not implemented in this alpha**, and neither is `doctor
---network`. Both are refused rather than ignored:
+**`status`** (M6-06) reads the running `connect`'s redacted status through
+an owner-only Unix socket beside the client key (`[supervisor] ipc_path`
+moves it): state, session and rotation phase, generations, queue and drain
+counters, certificate expiry, export names. It only reads; it starts nothing.
+With no `connect` running for the profile it exits `8`
+(`SUPERVISOR_ABSENT`); a socket other users could reach is refused with `3`
+(`IPC_UNAUTHORIZED`); and a second `connect` on a profile whose supervisor is
+running exits `9` (`SUPERVISOR_RUNNING`): the profile lock is an exclusive
+`flock` on `supervisor.lock` beside the socket, and a `connect` that cannot
+take it does not start. [runtime.md](runtime.md#supervisor-status-ipc)
+has the fields and the authorization. `doctor --network` is not implemented
+and is refused rather than ignored:
 
 ```console
 $ tunnel-client status --config trial/client.toml; echo "exit=$?"
-tunnel-client: unknown command
-exit=2
+tunnel-client: no supervisor is running for this profile (start `tunnel-client connect`)
+exit=8
 $ tunnel-client doctor --config trial/client.toml --network; echo "exit=$?"
 tunnel-client: usage: tunnel-client doctor --config PATH
 exit=2
@@ -1483,7 +1551,7 @@ exit=2
 **Client exit codes** are in the table in
 [runtime.md](runtime.md#client-exit-codes). That table is checked against the
 code by this guide's check. This guide runs real processes that exit `0`, `2`,
-`3` and `4`. Exit `7` (`OWNER_BUSY`, `RESOURCE_EXHAUSTED`) and `130`
+`3`, `4` and `8`. Exit `7` (`OWNER_BUSY`, `RESOURCE_EXHAUSTED`) and `130`
 (`CANCELLED`) need a live relay, so this guide's check does not run them.
 `OWNER_BUSY`, exit `7`, was measured by hand against a live relay: a second
 `connect` for a device that already has a live session (M6-C60). Exit `6`

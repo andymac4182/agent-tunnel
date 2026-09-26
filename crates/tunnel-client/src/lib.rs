@@ -19,6 +19,9 @@ pub mod cua_export;
 pub mod fs_export;
 pub mod http_forward;
 mod m2_runtime;
+mod rotation_hooks;
+/// Local, read-only supervisor status IPC (M6-06).
+pub mod supervisor_ipc;
 
 pub use config::FsExportSettings;
 use config::{ExportConfig, ExportKind, RuntimeConfig};
@@ -63,8 +66,9 @@ use uuid::Uuid;
 
 pub use config::{
     CUA_OPT_IN_ENV, CUA_PROFILE_ID, CredentialConfig, CuaBackendSettings, CuaExportSettings,
-    ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig, ReconnectConfig,
-    RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    DEFAULT_SUPERVISOR_SOCKET_NAME, ExportConfig as LocalExport, ExportKind as LocalExportKind,
+    LimitsConfig, ReconnectConfig, RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    SupervisorConfig,
 };
 pub use credentials::{CsrOutput, ImportedCredential};
 pub use tokio_util::sync::CancellationToken as ConnectCancellation;
@@ -88,7 +92,12 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 /// `docs/runtime.md`. Listing it is safe in the direction that matters: this
 /// is the set a classifier may *accept*, so an unreachable member costs
 /// nothing, while a missing member misclassifies a real exit.
-pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 130];
+///
+/// `8` is `status` finding no supervisor for the profile (`SUPERVISOR_ABSENT`,
+/// M6-06); `connect` never produces it. `9` is `connect` refusing to start
+/// without the profile lock (`SUPERVISOR_RUNNING`, `SUPERVISOR_LOCK_FAILED`;
+/// the M6-06 review).
+pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 130];
 
 /// The M1 failure policy. A later caller can explicitly create a fresh
 /// session; the library never reconnects or replays an operation itself.
@@ -129,6 +138,22 @@ pub(crate) mod test_hooks {
         pub(crate) block_once: AtomicBool,
         pub(crate) entered: Notify,
         pub(crate) release: Notify,
+        /// An optional one-shot hook the M2 session loop runs inside its
+        /// deadline tick, immediately before it retries pending
+        /// `STREAM_FORGET` barriers (task row M7-C84).  It lets a test force
+        /// a stop to land inside that tick body on the real loop.
+        pub(crate) forget_tick: std::sync::Mutex<Option<ForgetTickHook>>,
+    }
+
+    /// Seeds actor state; the argument is the M2 actor as `dyn Any`.
+    pub(crate) type ForgetTickSeed = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
+
+    /// Runs its seed, then signals `entered` and waits for `release` before
+    /// the tick continues.
+    pub(crate) struct ForgetTickHook {
+        pub(crate) seed: ForgetTickSeed,
+        pub(crate) entered: std::sync::Arc<Notify>,
+        pub(crate) release: std::sync::Arc<Notify>,
     }
 }
 
@@ -1525,7 +1550,10 @@ impl SessionActor {
             | ControlMessage::Rejected(_)
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
-            | ControlMessage::AuthorizationChallenge(_) => Ok(()),
+            | ControlMessage::AuthorizationChallenge(_)
+            // M3-16: the M1 profile serves no MCP export, so there is no
+            // session to end; the message is advisory and ignored.
+            | ControlMessage::PrincipalSessionsEnd(_) => Ok(()),
             ControlMessage::ResultStatus(_)
             | ControlMessage::RotateRequest(_)
             | ControlMessage::RotatePrepare(_)
@@ -2509,7 +2537,12 @@ impl ClientError {
 
     #[must_use]
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::HandshakeTimeout)
+        // An exhausted OPEN retention ends only the session that holds it; a
+        // fresh session starts with an empty journal (task row M7-C95).
+        matches!(
+            self,
+            Self::Transport { .. } | Self::HandshakeTimeout | Self::OpenRetentionFull
+        )
     }
 
     fn safe_message(&self) -> String {

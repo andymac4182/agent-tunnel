@@ -176,6 +176,69 @@ fn a_mount_point_inside_the_export_is_not_crossed() {
     assert_eq!(error.code(), FsErrorCode::Exdev);
 }
 
+/// Task row M4-08's last gap: on Linux the mount boundary is the kernel's
+/// `RESOLVE_NO_XDEV` inside `openat2`, and until this no test had ever put a
+/// real mount inside an export there -- `hdiutil` above is macOS-only.
+///
+/// Mounting needs privilege this test does not have and must not take, so the
+/// mount is prepared **outside** it: CI's M4 job runs `sudo mount -t tmpfs`
+/// at `<export>/mnt`, writes `<export>/mnt/inside.txt` and
+/// `<export>/plain/beside.txt`, and names the export in
+/// `TUNNEL_FS_LINUX_MOUNT_EXPORT`. It is `#[ignore]`d so an ordinary run does
+/// not need that, and it **fails** rather than skips when run without it, so
+/// `--ignored` can never pass vacuously. Its positive controls prove the
+/// mount is real and the export is otherwise served, so the `EXDEV` it
+/// asserts can only come from the boundary.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "needs a tmpfs mounted inside an export by root (CI: TUNNEL_FS_LINUX_MOUNT_EXPORT)"]
+fn a_mount_point_inside_the_export_is_not_crossed_on_linux() {
+    use std::os::unix::fs::MetadataExt as _;
+    let export_path = std::env::var_os("TUNNEL_FS_LINUX_MOUNT_EXPORT")
+        .map(std::path::PathBuf::from)
+        .expect("TUNNEL_FS_LINUX_MOUNT_EXPORT must name an export with a tmpfs mounted at mnt/");
+    let root_dev = std::fs::metadata(&export_path).expect("export").dev();
+    let mount_dev = std::fs::metadata(export_path.join("mnt"))
+        .expect("mnt")
+        .dev();
+    // Positive control 1: `mnt` really is another filesystem.
+    assert_ne!(
+        root_dev, mount_dev,
+        "mnt must be a mount point on another device"
+    );
+    // Positive control 2: the file behind the boundary exists and is readable
+    // by this process directly, so a refusal is not a missing file.
+    assert!(
+        !std::fs::read(export_path.join("mnt/inside.txt"))
+            .expect("the file inside the mount is readable directly")
+            .is_empty()
+    );
+    let export = tunnel_fs_host::ExportRoot::open(
+        &export_path,
+        support::full_grant(),
+        tunnel_fs_core::FeatureSet::NONE,
+        support::bounds(),
+    )
+    .expect("open the prepared export");
+    // Positive control 3: the same export serves a file on its own device.
+    let beside = export
+        .resolve(&vpath("/plain/beside.txt"), Intent::Read)
+        .expect("a file on the export's own device resolves");
+    assert_eq!(beside.kind(), FileKind::RegularFile);
+
+    let error = export
+        .resolve(&vpath("/mnt"), Intent::Inspect)
+        .expect_err("a directory on another device is not crossed");
+    assert_eq!(error.code(), FsErrorCode::Exdev);
+    let error = export
+        .resolve(&vpath("/mnt/inside.txt"), Intent::Read)
+        .expect_err("nor is anything beneath it");
+    assert_eq!(error.code(), FsErrorCode::Exdev);
+    println!(
+        "m4-08-linux-mount ok root_dev={root_dev} mount_dev={mount_dev} mnt=EXDEV inside=EXDEV beside=served"
+    );
+}
+
 #[test]
 fn the_root_itself_resolves_to_a_directory() {
     let fixture = Fixture::new();

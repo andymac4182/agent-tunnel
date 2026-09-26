@@ -1,6 +1,6 @@
 # MCP adapter plan
 
-Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) is **verified local at `fc5dde3`, 2026-09-25**, on branch `m3-reliability`: `verify-m3-mcp-isolation` passed in every one of 10 consecutive `scripts/m3-harness-verify.sh` runs at that revision, 10 of 10 standalone on a hosted Linux runner at the same revision, and 20 of 20 standalone under CPU load at two earlier revisions of the branch. The peer-trust flake that held it back is closed on this gate by M7-C89's re-sign pin wait rather than by the M7-C86 retention, which stays an open M7 row; the suite's other intermittents were diagnosed and fixed there (M3-20, M3-21/M3-24, M3-23, M3-27, M3-29, M3-30). The suite was held off hosted CI by M3-31 (the real-path gate's OPEN-journal peak on hosted Linux); branch `m3-features` explains that row (the retained entry was an earlier-phase entry still in flight, not a leak) and adds an `m3-acceptance` job to `ci.yml`. See the M3-04 and M3-25 rows in [tasks.md](tasks.md). Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. Both profiles are proven only against the pinned rmcp 3.4.0 client and the deterministic fixture server — no conformance suite or non-Rust SDK is pinned (M3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
+Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) is **verified local at `fc5dde3`, 2026-09-25**, on branch `m3-reliability`: `verify-m3-mcp-isolation` passed in every one of 10 consecutive `scripts/m3-harness-verify.sh` runs at that revision, 10 of 10 standalone on a hosted Linux runner at the same revision, and 20 of 20 standalone under CPU load at two earlier revisions of the branch. The peer-trust flake that held it back is closed on this gate by M7-C89's re-sign pin wait rather than by the M7-C86 retention, which stays an open M7 row; the suite's other intermittents were diagnosed and fixed there (M3-20, M3-21/M3-24, M3-23, M3-27, M3-29, M3-30). The suite was held off hosted CI by M3-31 (the real-path gate's OPEN-journal peak on hosted Linux); branch `m3-features` explains that row (the retained entry was an earlier-phase entry still in flight, not a leak) and adds an `m3-acceptance` job to `ci.yml`. See the M3-04 and M3-25 rows in [tasks.md](tasks.md). Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. The M3 gates prove both profiles against the pinned rmcp 3.4.0 client and the deterministic fixture server. **M3-17** adds off-the-shelf evidence for the `mcp-2025-11-25` profile: the official TypeScript SDK (1.30.1), the official Python SDK (2.2.0) and the official conformance suite (0.2.0-alpha.11), each pinned in `tests/mcp-sdk-conformance` and run through real local relays by `scripts/m3-sdk-conformance.sh`. See [Off-the-shelf clients (M3-17)](#off-the-shelf-clients-m3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
 
 ## Two explicit compatibility profiles
 
@@ -53,7 +53,7 @@ Recorded 2026-09-16. Each item is pinned in code and covered by the tests named 
 - **Official Rust SDK: `rmcp = "=3.4.0"`.** It was released on crates.io on 2026-09-15 from `modelcontextprotocol/rust-sdk` commit `fd7811fdaa9fefa1c8034534b4d7a31c97204f89` (path `crates/rmcp`). The `Cargo.lock` checksum is `b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb`, and the crate's rust-version is 1.88. Its `ProtocolVersion` knows `2026-07-28`, `2025-11-25` and `2025-06-18`. Its client offers `ClientLifecycleMode::Discover` (the `server/discover` and per-request `_meta` lifecycle), `Initialize` (legacy) and `Auto`. Its Streamable HTTP server serves 2026-07-28 requests statelessly and optional legacy sessions to older versions. The 2026 profile is therefore served natively, not faked: rmcp is both the pinned client and the pinned fixture server for both profiles.
 - **Where rmcp is used.** Only the `tunnel-mcp-fixture` crate uses it: the synthetic server binary (`server` and `transport-io` features) and the end-to-end tests (`client`, `transport-streamable-http-client-unix-socket`, `transport-streamable-http-server`). The relay and the connector do not link rmcp.
 - **Why the export bridge is not built on rmcp.** An rmcp proxy would re-type every message. Its typed params, for example `CallToolRequestParams` (fields `_meta`, `name`, `arguments`, `inputResponses`, `requestState`, with no flatten), silently drop unknown fields when they are deserialized and serialized again. That would break the rule above that unknown methods and metadata are not discarded, and it would re-encode request IDs. The device bridge therefore forwards raw JSON-RPC bytes, and rmcp proves interoperability from both ends.
-- **Fixtures.** `tunnel-mcp-fixture` is a deterministic synthetic server with the tools `echo` (arguments, `_meta` and an image block), `progress`, `sleep` (records its cancellation), `crash` (writes a stderr marker, exits 3), `stderr_flood` and `big`. It writes only to the test's temporary marker directory. No other official client or server artifact, such as the TypeScript SDK or the MCP conformance suite, is pinned or run. That is M3-03 work.
+- **Fixtures.** `tunnel-mcp-fixture` is a deterministic synthetic server with the tools `echo` (arguments, `_meta` and an image block), `progress`, `sleep` (records its cancellation), `crash` (writes a stderr marker, exits 3), `stderr_flood` and `big`. It writes only to the test's temporary marker directory. The M3 gates run no other official client or server. The TypeScript SDK, the Python SDK and the conformance suite are pinned and run separately, as test-only dependencies, by M3-17 (see [Off-the-shelf clients (M3-17)](#off-the-shelf-clients-m3-17)).
 
 ### Profiles (`tunnel-mcp`)
 
@@ -69,7 +69,7 @@ The two profiles are separate `McpProfile` values with separate tables. There is
 | Query | none | none |
 
 - **Header rules.** Every header is a singleton, and each `mcp-param-*` name is a singleton on its own. The prefix rule is a new codec feature (`HeaderPolicy::allow_prefix`): it cannot overlap a forbidden or unsupported name or prefix. The 2026 page requires intermediaries to forward `Mcp-Param-*` headers they do not recognize, so the whole family is allowlisted.
-- **Dropped headers (M6-C58).** The public ingress removes `user-agent`, `accept-encoding`, `accept-language` and `sec-fetch-mode` before the codec sees the request, as it removes `authorization` and `cookie` once it has verified them, unless a profile allowlists them (neither MCP profile does). They are what stock clients add by default: curl and Python `httpx` send the first two, and Node's built-in `fetch` (undici, measured on the wire) sends all four. Refusing them failed a client's first request. Dropping them changes nothing the export can observe: the device always sends `Accept-Encoding: identity` to its backend and `identity` is acceptable to every client, `accept-language` is a negotiation hint no export acts on, and `sec-fetch-mode` is advisory Fetch Metadata. None of them is forwarded. A browser is still refused, because it also sends `origin`.
+- **Dropped headers (M6-C58).** The public ingress removes `user-agent`, `accept-encoding`, `accept-language` and `sec-fetch-mode` before the codec sees the request, as it removes `authorization` and `cookie` once it has verified them, unless a profile allowlists them (neither MCP profile does). **`cache-control` joined the list in M3-46**: the official Python SDK (mcp 2.2.0) sends `Cache-Control: no-store` on the 2025-11-25 standalone GET stream (httpx2's SSE helper), and refusing it failed that stream for every Python client. A request cache directive has no authority, and nothing on the path caches. Like the rest of the list, it is dropped for every http-forward profile, including `mcp-2026-07-28` and `acp-http-v1`. They are what stock clients add by default: curl and Python `httpx` send the first two, and Node's built-in `fetch` (undici, measured on the wire) sends all four. Refusing them failed a client's first request. Dropping them changes nothing the export can observe: the device always sends `Accept-Encoding: identity` to its backend and `identity` is acceptable to every client, `accept-language` is a negotiation hint no export acts on, and `sec-fetch-mode` is advisory Fetch Metadata. None of them is forwarded. A browser is still refused, because it also sends `origin`.
 - **Refused headers.** Everything else is refused before admission, and the ingress's `400 HTTP_INVALID_HEAD` names the first unlisted header in the error body's `header` field (M6-C58). That includes `origin`, since browser-capable endpoints are deferred and the relay has no CORS or cookie profile, and, in 2026, `mcp-session-id` and `last-event-id`. The 2026 page says a server SHOULD ignore the last two. This profile refuses them instead, because a 2026 client never sends them.
 - **Limits.** Consumer HTTP/1.1 and HTTP/2 are both accepted. The finite body limits are:
 
@@ -124,6 +124,7 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - The command and workspace are absolute paths. Arguments are fixed, up to 64 values of up to 4096 bytes each.
 - The child environment is cleared first; then explicit values and allowlisted inherited names are set. Nothing runs through a shell.
 - `max_children` is 1 to 64, default 8.
+- **At capacity (M6-C145).** A 2026-07-28 request that finds every `max_children` slot busy, a 2025-11-25 `initialize` that finds the session table full (a legacy session holds its slot until `DELETE`, a crash or `session_idle_seconds`), and a Streamable HTTP export whose session table is full are all refused before anything starts, with `503` and the JSON-RPC error `{"code": -32050, "message": ..., "data": {"retryable": true, "retryAfterMs": 1000, "execution": "not_dispatched"}}`. A client may resend the same request after the hint, whatever its method. The hint travels in the body because the MCP profiles do not pass `Retry-After`. Before M6-C145 this refusal was `-32603` (internal error), which the M6-03 soak recorded from 8 concurrent MCP sessions on one device (M6-C122): 8 soak workers plus the warm-up session needed 9 slots, and sessions the harness never deleted held all 8 into the next step. The bound itself is unchanged: raise `max_children` (at most 64) for more concurrent sessions, and have clients `DELETE` sessions they are done with. The Streamable HTTP refusal does not parse the request, so its `id` is `null`. **The TypeScript SDK does not expose the code:** `@modelcontextprotocol/sdk` 1.30.1 (the M3-17 pin) throws `StreamableHTTPError` for any non-2xx POST, with `.code` set to the HTTP status (`503`); `-32050` and `data` appear only inside its message text (`Error POSTing to endpoint: <body>`), so a TS client must match on the status or parse that text.
 - `session_idle_seconds` is 1 to 86400, default 600. It applies to 2025-11-25 sessions only.
 - stdout carries newline-delimited JSON-RPC. Each line must be one strict object within the JSON limit; otherwise the child is killed and its exchanges are interrupted.
 - stderr is drained, and only its byte count is kept.
@@ -160,6 +161,7 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 ### Relay (gate 5)
 
 - **Configuration.** `ServeConfig` gains an `[http_forward]` table: `profiles` (only the two identifiers above), plus optional `request_body_bytes`, `response_body_bytes` and `deadline_seconds`.
+- **Offline device (M6-C144).** An authorized request (authenticated, service found, grant allowing `http:invoke`, profile selected) to a device with no live session at this relay is `503 DEVICE_OFFLINE` `not_dispatched`, the echo route's answer for the same state, and may be retried. Before M6-C144 it was `404 NOT_FOUND`, which an MCP client cannot tell from "no such service" (M6-C123). It is decided after every authorization check, so a caller without a grant still gets the same `403`/`404` for a real service on an offline device as for an invented one. A missing service, or one with no grant, keeps its `404`/`403`. At a cluster owner (the http-forward and the echo-stream peer handlers), the same state reaches the ingress as the retryable `503 PEER_UNAVAILABLE` `not_dispatched` owner-not-ready refusal instead of an `unknown` peer failure; this owner mapping has no test yet (M6-C144).
 - **Profile selection.** A catalog service chooses its profile through its Redis service record capability `{"http_forward_profile": "<id>"}`. Both the ingress and the owner select from their own catalog read, after authorization. A service with no capability, or one naming a profile the relay does not serve, gets 404 before normalization, routing or any stream.
 - **Harness fixture.** The gate-3/4 harness serves its synthetic test profile under the identifier `fixture-http-forward`, which production configuration cannot name.
 - **Fixture hold.** The relay now defines only an `HttpRelayInterposer` hook. The one-shot hold itself lives in `tunnel-test-harness` (`http_relay_hold`), and the `test-fixtures` cargo feature is gone. `serve` builds its exports only from `ServeConfig`, which has no interposer setting, so no relay artifact, workspace-built or not, contains a hold implementation.
@@ -377,9 +379,187 @@ session that never existed.
   but the colliding JSON-RPC IDs and progress tokens of the `correlation` case
   still run on the stdio exports only, where each session has its own child.
   So shared-process *correlation* remains unproven here (M3-13).
-- **Ending a device-side session on revocation.** Revocation makes the session
-  unreachable but does not end it, so its child holds a `max_children` slot
-  for as long as the device session lives, or until `session_idle_seconds`
-  (M3-16 in [tasks.md](tasks.md)). It no longer outlives the device session:
-  the export ends every session it holds when the connector's handler registry
-  goes away.
+- ~~**Ending a device-side session on revocation.**~~ Closed by M3-16 on
+  branch `feat-mcp-demo` (applied by default pending owner confirmation,
+  2026-09-25): see [Revocation ends the session (M3-16)](#revocation-ends-the-session-m3-16).
+  The gate's `revocation` case now also requires the revoked principal's
+  device-side session to end within 5 s.
+
+## Off-the-shelf clients (M3-17)
+
+Recorded 2026-09-26. `scripts/m3-sdk-conformance.sh` runs the MCP clients a demo audience would actually use against device-exported servers, through real local relays. The route is `tunnel-relay serve` and `tunnel-client connect`, configured from the shipped examples, with a bearer token from a synthetic issuer. The recipe is [demo/mcp-sdk-conformance.md](demo/mcp-sdk-conformance.md).
+
+### Pins (test-only)
+
+These pins live in `tests/mcp-sdk-conformance` and are never a runtime dependency.
+
+| Artifact | Version | How it is pinned |
+| --- | --- | --- |
+| Official TypeScript SDK `@modelcontextprotocol/sdk` | 1.30.1 (latest protocol `2025-11-25`) | exact version, `package-lock.json` integrity hashes |
+| Official Python SDK `mcp` | 2.2.0 (handshake revisions through `2025-11-25`, plus `2026-07-28`) | `python/requirements.txt`, compiled with `uv pip compile --universal --generate-hashes`, installed with `--require-hashes` |
+| Official conformance suite `@modelcontextprotocol/conformance` | 0.2.0-alpha.11 (gitHead `c321dd32…`) | exact version, lockfile |
+| The suite's reference server `examples/servers/typescript/everything-server.ts` | at `c321dd32035556e6769d3724a8ee97d87c3faaac` | fetched and checked against its SHA-256 on every run; run under `tsx` 4.23.15 |
+
+The device exports three `mcp-2025-11-25` services, each on its own relay and namespace:
+
+- the **reference server** (Streamable HTTP backend on loopback);
+- **`ts-sdk-server.mjs`**, a plain `McpServer` on the pinned TypeScript SDK that uses the reference server's tool, resource and prompt names;
+- the **rmcp fixture** over stdio.
+
+### What passes through the relay
+
+| Case | TypeScript SDK | Python SDK (`legacy` and `auto`) |
+| --- | --- | --- |
+| `initialize`, `Mcp-Session-Id`, protocol `2025-11-25` | reference, SDK server, fixture | SDK server, fixture (not the reference server: M3-47) |
+| `tools/list`, `tools/call` (text, image, `isError`) | reference, SDK server | SDK server |
+| `tools/call` arguments and `_meta` preserved, image block | fixture | fixture |
+| `resources/list`, `resources/read` (text and blob) | reference, SDK server | SDK server |
+| `prompts/list`, `prompts/get` (with arguments) | reference, SDK server | SDK server |
+| Streamed `notifications/progress`, in order | reference, SDK server, fixture | SDK server, fixture |
+| Streamed `notifications/message` after `logging/setLevel` | reference, SDK server | SDK server |
+| Cancellation: an abort **after** the fixture logged the call reaches the device's server (`cancelled-<label>` marker), and the session stays usable | fixture | fixture (the close after it can meet M3-48) |
+| Session `DELETE` | all | all |
+
+The **conformance suite** (`server --spec-version 2025-11-25`) passes **31 of 31 scenarios (73 checks)** directly against the reference server. Through the relay it passes **30 of 31**. The exception is `dns-rebinding-protection` (M3-49). That scenario covers only unauthenticated plain-HTTP localhost servers. Its raw request path cannot carry the bearer token, and it sends `Host: evil.example.com` as the TLS server name. The relay's own answer to a rebinding request is checked instead: a request that carries `Origin` gets `400 HTTP_INVALID_HEAD` with `header: origin`. The suite carries no credential option, so a Node `--import` preload (`preload.mjs`) adds the bearer to `fetch` calls for the relay's origin only.
+
+### Incompatibilities found
+
+| Row | What | Where |
+| --- | --- | --- |
+| M3-46 | The relay refused the Python SDK's `Cache-Control: no-store` on the standalone GET stream. | relay; **fixed** by dropping `cache-control` at the ingress, for every http-forward profile (`mcp-2025-11-25`, `mcp-2026-07-28`, `acp-http-v1`) |
+| M3-47 | The reference server refuses the Python SDK's `initialize` with `-32020 Missing MCP-Protocol-Version header`. The SDK sends `_meta: {}`, which that server reads as a 2026 request. Reproduced directly, without the relay. | upstream (conformance reference server); the harness checks that the relay forwards the refusal unchanged |
+| M3-48 | After a forwarded `notifications/cancelled`, the stdio export holds the cancelled request's POST open. It answers `502` only when the session is deleted, and the Python SDK then raises `ClosedResourceError` from `Client.__aexit__`. rmcp's own Streamable HTTP server answers such a POST at once with an empty event stream. | device bridge (stdio, 2025-11-25); open |
+| M3-49 | The conformance suite's `dns-rebinding-protection` scenario cannot run through the relay. | suite scope; the relay refuses `Origin` instead |
+
+Also observed, but not recorded as rows:
+
+- In its default `auto` mode, the Python SDK first probes `server/discover` with the 2026 headers. The `mcp-2025-11-25` profile answers `400 HTTP_INVALID_HEAD` (`header: mcp-method`), and the SDK falls back to `initialize`. That costs one extra round trip and works.
+- Python 3.13 and later verify certificates with `VERIFY_X509_STRICT` and refuse a CA without `keyUsage`, which a bare `openssl req -x509` produces. The harness's synthetic CAs carry `keyUsage`.
+
+### Not proven by M3-17
+
+- The `mcp-2026-07-28` profile with a non-Rust SDK. The TypeScript SDK 1.30.1 does not speak it, and the Python SDK's 2026 mode is not run here.
+- Rotation, crash and isolation with these SDKs. Those stay proven with rmcp by the M3 gates.
+- Sampling, elicitation and other server-to-client requests through an SDK client. The conformance suite drives the reference server's `tools-call-sampling` and `tools-call-elicitation` through the relay, and both pass. No SDK client case does.
+- Hosted CI beyond one run. The script runs in the `m3-acceptance` job; hosted run 36197864485 passed it (76 SDK cases, conformance 30/31 through the relay) at `2242b33`.
+
+## The demo path, discovery and revocation (branch `feat-mcp-demo`)
+
+Recorded 2026-09-26. [docs/demo/mcp.md](demo/mcp.md) is the runnable recipe.
+
+### Demo (M3-39)
+
+`scripts/demo-mcp.sh` brings up one relay and one device from the shipped
+binaries and examples. It uses a throwaway PKI and identity issuer and its
+own TLS Redis. It exports `tunnel-mcp-fixture` over stdio, and drives it
+through the relay's public route with the pinned rmcp 3.4.0 client
+(`tunnel-test-harness mcp-demo-client`). The client covers discovery,
+lifecycle, tools (text and image), resources (text and blob), prompts, a
+subscription and its update, and progress and log notifications. Both
+profiles pass. The client is the harness binary, not a shipped one, and no
+hosted agent has been connected (M3-40).
+
+### Fixture additions (part of M3-13)
+
+`tunnel-mcp-fixture` now advertises `resources` (with `subscribe`) and
+`prompts`:
+
+- two resources: `fixture://synthetic/readme.txt` (text) and
+  `fixture://synthetic/pixel.png` (blob);
+- one prompt: `greet`, with a required `name`;
+- a `touch` tool, which sends `notifications/resources/updated` to a
+  2025-11-25 subscriber;
+- a 2026-07-28 `subscriptions/listen` handler, which reports each accepted
+  URI once and then ends the subscription cleanly.
+
+Only the stdio export, driven by the demo client, exercises these. Sampling,
+elicitation and MRTR input requests are still unexercised, and so is the
+Streamable HTTP export (M3-13 stays open).
+
+### Protected-resource discovery (M3-11)
+
+The consumer listener serves RFC 9728 metadata at
+`GET /.well-known/oauth-protected-resource/v1/devices/{device}/services/{service}/http/{path}`.
+The metadata holds:
+
+- `resource`: the endpoint URL;
+- `authorization_servers`: the relay's `oidc_issuer`;
+- `scopes_supported`: `http:invoke`, plus any scope every token must carry;
+- `bearer_methods_supported`: `["header"]`.
+
+**Set `public_url` in production.** Without it, the resource origin comes from the request's own `Host` or `:authority`. That is correct only when clients reach the relay directly at the name they use. Behind a proxy or load balancer that rewrites the authority, the metadata would name the wrong resource, and clients would refuse it.
+
+The route is unauthenticated. It serves the same document for any
+well-formed device and service, so it does not reveal whether a device,
+service or grant exists. The host in `resource` comes from
+`[http_forward] public_url` (`https://host[:port]`) when that is set.
+Otherwise it comes from the request's own authority.
+
+Every credential refusal on an `http-forward` route carries a
+`WWW-Authenticate: Bearer` challenge with `resource_metadata` and `scope`.
+The `scope` is the same set as `scopes_supported`, space-separated:
+
+- A request with no token gets no `error` parameter.
+- A token refused for its signature, claims, key or identity gets
+  `error="invalid_token"`.
+- A token without the route's scope gets `403` with
+  `error="insufficient_scope"`.
+
+A `503` for the relay's own fault, and a refusal for a missing grant, carry
+no challenge.
+
+Token validation itself is unchanged: issuer, audience, signature, expiry,
+scope, catalog identity and grant, on the ingress and again on the owner.
+Audiences are still the configured `oidc_audience` list. An issuer that puts
+the RFC 8707 `resource` value into `aud` therefore needs that URL listed
+there (M3-42). Browser `Origin` is still refused on both profiles.
+
+Evidence:
+
+- `http::mcp_authorization_tests`, over the real consumer router;
+- `http::forward::authorization::tests`;
+- the demo, whose client performs the discovery before any MCP traffic.
+
+### Revocation ends the session (M3-16)
+
+This is option (c) from the row, applied by default pending owner
+confirmation (2026-09-25).
+
+The owner relay watches each consumer it admits to a session-keyed export
+(it sends the message only to connectors that advertised
+`principal-sessions-end-v1`; see [protocol.md](protocol.md#control-messages)
+for that gate, the read cap and jitter, and the refusal of held requests):
+the `mcp-2025-11-25` profile, the only one that carries the principal
+binding. It keeps at most 64 per device session and re-reads each one's grant
+about once a second. When the grant is revoked or expired, or no longer
+allows `http:invoke`, the owner sends the device `PRINCIPAL_SESSIONS_END`
+(see [protocol.md](protocol.md#control-messages)), naming the service and the
+opaque binding.
+
+The connector then ends that binding's sessions on that export:
+
+- a stdio session is removed and its child's process group killed, as a
+  `DELETE` would;
+- a Streamable HTTP export forgets the backend sessions it bound to that
+  binding.
+
+Other principals' sessions are untouched, and the device still learns no
+identity. The export counts these in `sessions_revoked`.
+
+Evidence:
+
+- `principal_binding` tests in `tunnel-mcp-fixture`, for both export kinds;
+- the protocol codec tests;
+- `verify-m3-mcp-isolation`'s `revocation` case, which requires the device
+  session to end within 5 s.
+
+Residuals are in M3-41:
+
+- the message is not journaled, so one lost with its control socket leaves
+  the sessions to idle expiry;
+- a request already in flight at revocation is withdrawn by the relay with
+  `502 HTTP_STREAM_INTERRUPTED`, `execution: unknown`. That outcome is
+  truthful but not revocation-specific (M3-44);
+- no upstream `DELETE` is sent to a Streamable HTTP backend;
+- M5-C05 does not use the message yet.
+

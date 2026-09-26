@@ -180,6 +180,12 @@ pub const REVOCATION_BOUND: Duration = Duration::from_secs(30);
 /// that deadline at about 30 s, and with it the call ends in well under a
 /// second.
 pub const REVOCATION_WITHDRAWAL_BOUND: Duration = Duration::from_secs(5);
+/// Task row M3-16: the revoked principal's device-side protocol session must
+/// end this soon after the revocation.  The owner re-reads a watched grant
+/// every second and ticks every 500 ms, so the expected figure is under two
+/// seconds; before M3-16 the session lived until `session_idle_seconds`
+/// (600 s by default).
+pub const REVOKED_SESSION_END_BOUND: Duration = Duration::from_secs(5);
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 
 /// What this gate does not prove.  Recorded rather than faked.
@@ -366,10 +372,14 @@ pub struct RevocationEvidence {
     /// and the device session itself survived.
     pub sibling_principal_served: bool,
     pub device_session_survived: bool,
-    /// Whether the revoked principal's own legacy session survived the
-    /// revocation as a device object (it does: the device holds sessions,
-    /// the relay holds authorization).
+    /// Whether the revoked principal's own legacy session became
+    /// unreachable through the relay.
     pub revoked_session_unreachable: bool,
+    /// Task row M3-16: protocol sessions the device export ended because the
+    /// owner reported the revocation (`sessions_revoked`, counted from
+    /// before it), and how long after the revocation the first one ended.
+    pub revoked_sessions_ended: u64,
+    pub session_ended_within_ms: u128,
 }
 
 /// `rotation-span`.
@@ -516,7 +526,7 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             && (500..=599).contains(&outcome.status)
     };
     let forgery = &evidence.forgery;
-    let checks: [(&str, bool); 46] = [
+    let checks: [(&str, bool); 47] = [
         ("three relays ran", evidence.relay_count == 3),
         (
             "the ingress was not the owner",
@@ -712,6 +722,12 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
         (
             "the blast radius spared the other principals and the device session",
             revocation.sibling_principal_served && revocation.device_session_survived,
+        ),
+        (
+            // M3-16: applied by default pending owner confirmation.
+            "the revoked principal's device-side session ended promptly",
+            revocation.revoked_sessions_ended >= 1
+                && revocation.session_ended_within_ms <= REVOKED_SESSION_END_BOUND.as_millis(),
         ),
         (
             "one call spanned the required scheduled rotations",
@@ -2422,6 +2438,7 @@ impl Gate<'_> {
         self.wait_hold_started("gaterevoke", "the revocation hold", &mut in_flight)
             .await?;
         let dispatched_before = self.export(SERVICE_2025).dispatched;
+        let sessions_revoked_before = self.export(SERVICE_2025).sessions_revoked;
         let revoked_at = Instant::now();
         self.cluster
             .catalog
@@ -2462,6 +2479,22 @@ impl Gate<'_> {
         evidence.after_code = code;
         evidence.after_execution = execution;
         evidence.revoked_session_unreachable = after.status != 200;
+
+        // M3-16: the device session itself must end, not only become
+        // unreachable.  Polled from the revocation, bounded.
+        let end_deadline = revoked_at + REVOKED_SESSION_END_BOUND;
+        loop {
+            let ended = self
+                .export(SERVICE_2025)
+                .sessions_revoked
+                .saturating_sub(sessions_revoked_before);
+            if ended > 0 || Instant::now() >= end_deadline {
+                evidence.revoked_sessions_ended = ended;
+                evidence.session_ended_within_ms = revoked_at.elapsed().as_millis();
+                break;
+            }
+            sleep(POLL).await;
+        }
 
         // The held exchange is left running, still blocked in the fixture, for
         // the whole revocation bound.  If revocation withdraws an admitted
@@ -2881,6 +2914,7 @@ pub async fn verify() -> Result<McpIsolationEvidence> {
         request_body_bytes: None,
         response_body_bytes: None,
         deadline_seconds: None,
+        public_url: None,
     };
     let exports = match serve.exports() {
         Ok(exports) => exports,
@@ -3429,6 +3463,8 @@ mod tests {
                 sibling_principal_served: true,
                 device_session_survived: true,
                 revoked_session_unreachable: true,
+                revoked_sessions_ended: 1,
+                session_ended_within_ms: 1_500,
             },
             rotation_span: RotationSpanEvidence {
                 rotations_spanned: ROTATION_SPAN,
@@ -3627,6 +3663,12 @@ mod tests {
             }),
             ("blast radius device", |e| {
                 e.revocation.device_session_survived = false;
+            }),
+            ("revoked session not ended", |e| {
+                e.revocation.revoked_sessions_ended = 0;
+            }),
+            ("revoked session ended late", |e| {
+                e.revocation.session_ended_within_ms = REVOKED_SESSION_END_BOUND.as_millis() + 1;
             }),
             ("rotations spanned", |e| {
                 e.rotation_span.rotations_spanned = ROTATION_SPAN - 1;

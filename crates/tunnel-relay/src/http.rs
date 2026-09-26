@@ -44,6 +44,9 @@ const MAX_ECHO_CANARY_BYTES: usize = 256;
 /// existing owner-not-ready and stream-limit hints: admission capacity is
 /// released by an in-flight operation completing, not by a lease or a clock.
 const ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 250;
+/// Retry hint for a unary echo refused by the owner's per-device capacity
+/// before dispatch (task row M6-C120).
+const ECHO_CAPACITY_RETRY_AFTER_MS: u64 = 250;
 const MAX_ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
 // A ConsumerChunk body may use the full protocol-defined 64 KiB bound. The
 // transport fragments its encoded record (including the eight-byte prefix)
@@ -894,6 +897,12 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         .route(
             "/v1/devices/{device}/services/{service}/http/{*path}",
             axum::routing::any(crate::http::forward::http_forward_route),
+        )
+        // M3-11: RFC 9728 protected-resource metadata for every
+        // `http-forward` route, at the path-inserted well-known location.
+        .route(
+            "/.well-known/oauth-protected-resource/v1/devices/{device}/services/{service}/http/{*path}",
+            get(crate::http::forward::authorization::protected_resource_metadata_route),
         )
         // One URL for the descriptor and the upgrade, registered for every
         // method so the 405 is this route's own typed answer rather than the
@@ -3059,15 +3068,38 @@ async fn handle_peer_ingress_inner(
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
     let now = Utc::now();
-    let owner = catalog
+    // Every refusal before the stream is split is answered on this request's
+    // own stream (task row M7-C110); see `reject_owner_changed`.
+    let owner = match catalog
         .current_owner(destination.tenant_id, destination.device_id, now)
         .await
-        .map_err(|_| PeerRuntimeError::Membership("owner catalog unavailable".to_owned()))?
-        .ok_or_else(|| PeerRuntimeError::Membership("owner is unavailable".to_owned()))?;
+    {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            // The owner the request named no longer holds the device.  The
+            // owner-side fault keeps its `membership` classification.
+            let _ = request.reject_owner_changed().await;
+            return Err(PeerRuntimeError::Membership(
+                "owner is unavailable".to_owned(),
+            ));
+        }
+        Err(_) => {
+            let _ = request.reject_owner_not_ready().await;
+            return Err(PeerRuntimeError::Membership(
+                "owner catalog unavailable".to_owned(),
+            ));
+        }
+    };
     if owner.token != destination.owner_token
         || owner.token.node_id != local_node_id
         || owner.token.boot_id != local_boot_id
     {
+        // Task row M7-C110: answer on this request's own stream with the
+        // typed, retryable OWNER_CHANGED before returning.  Returning bare
+        // let quinn finish the stream with no response headers, which the
+        // ingress's HTTP/3 client raises as a connection error, taking down
+        // every other request multiplexed on that peer connection.
+        let _ = request.reject_owner_changed().await;
         return Err(PeerRuntimeError::Membership(
             "peer request is not for this owner".to_owned(),
         ));
@@ -3076,41 +3108,82 @@ async fn handle_peer_ingress_inner(
         // The claim is this relay's, but its Redis lease has lapsed: a
         // distinct bounded stage from an owner mismatch.
         fault.mark(PeerOpenDiagnosticStage::Lease);
+        // The claim is still this relay's; the lease renewal may catch up.
+        let _ = request.reject_owner_not_ready().await;
         return Err(PeerRuntimeError::Membership(
             "peer owner lease has expired".to_owned(),
         ));
     }
-    let verified_peer = VerifiedPeerIdentity::from_verified_peer_binding(request.binding())
-        .map_err(|_| PeerRuntimeError::Membership("peer envelope rejected".to_owned()))?;
+    let Ok(verified_peer) = VerifiedPeerIdentity::from_verified_peer_binding(request.binding())
+    else {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+        return Err(PeerRuntimeError::Membership(
+            "peer envelope rejected".to_owned(),
+        ));
+    };
     let owner_access = match &envelope.request {
         InternalRequest::ConsumerStreams(stream) => {
             let authorization = format!("Bearer {}", stream.bearer.token());
-            Some(
-                oidc.authenticate_for_scope(
+            match oidc
+                .authenticate_for_scope(
                     &*catalog,
                     &authorization,
                     Some(destination.tenant_id),
                     &stream.required_scope,
                 )
                 .await
-                .map_err(|_| {
-                    PeerRuntimeError::Membership("consumer authentication failed".to_owned())
-                })?,
-            )
+            {
+                Ok(access) => Some(access),
+                Err(error) => {
+                    // A catalog the owner could not read never evaluated the
+                    // credential: retryable, as for the public boundary
+                    // (2aefebca).  Only a rejected credential is a 401.
+                    if matches!(error, tunnel_catalog::OidcError::Catalog(_)) {
+                        let _ = request.reject_owner_not_ready().await;
+                        return Err(PeerRuntimeError::Membership(
+                            OWNER_AUTHORIZATION_UNAVAILABLE.to_owned(),
+                        ));
+                    }
+                    let _ = request.reject_refused(StatusCode::UNAUTHORIZED).await;
+                    return Err(PeerRuntimeError::Membership(
+                        "consumer authentication failed".to_owned(),
+                    ));
+                }
+            }
         }
         _ => None,
     };
-    envelope
+    if envelope
         .validate(now, &verified_peer, &destination, owner_access.as_ref())
-        .map_err(|_| PeerRuntimeError::Membership("peer envelope rejected".to_owned()))?;
+        .is_err()
+    {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+        return Err(PeerRuntimeError::Membership(
+            "peer envelope rejected".to_owned(),
+        ));
+    }
 
     match envelope.request.clone() {
         InternalRequest::DeviceControl(request_body) => {
-            let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
+            let device =
+                match resolve_peer_device(&catalog, &request_body.authentication, now).await {
+                    Ok(device) => device,
+                    Err(error) => {
+                        refuse_peer_admission(request, &error).await;
+                        return Err(error);
+                    }
+                };
             handle_peer_device_control(request, handle.clone(), device, fault).await
         }
         InternalRequest::DeviceData(request_body) => {
-            let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
+            let device =
+                match resolve_peer_device(&catalog, &request_body.authentication, now).await {
+                    Ok(device) => device,
+                    Err(error) => {
+                        refuse_peer_admission(request, &error).await;
+                        return Err(error);
+                    }
+                };
             handle_peer_device_data(request, handle.clone(), device, fault).await
         }
         InternalRequest::ConsumerStreams(request_body)
@@ -3122,7 +3195,7 @@ async fn handle_peer_ingress_inner(
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
             })?;
-            let (grant, capabilities) = owner_stream_grant_of_type(
+            let (grant, capabilities) = match owner_stream_grant_of_type(
                 &catalog,
                 &access.consumer,
                 destination.device_id,
@@ -3131,7 +3204,14 @@ async fn handle_peer_ingress_inner(
                 crate::HTTP_FORWARD_SERVICE_TYPE,
                 crate::HTTP_FORWARD_OPERATION,
             )
-            .await?;
+            .await
+            {
+                Ok(granted) => granted,
+                Err(error) => {
+                    refuse_peer_admission(request, &error).await;
+                    return Err(error);
+                }
+            };
             // The owner selects the profile from its own catalog read, never
             // from the forwarding relay's choice.
             let export = http_forward
@@ -3154,14 +3234,21 @@ async fn handle_peer_ingress_inner(
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
             })?;
-            let grant = owner_stream_grant(
+            let grant = match owner_stream_grant(
                 &catalog,
                 &access.consumer,
                 destination.device_id,
                 destination.service_id,
                 access.expires_at,
             )
-            .await?;
+            .await
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    refuse_peer_admission(request, &error).await;
+                    return Err(error);
+                }
+            };
             handle_peer_consumer_stream(
                 request,
                 handle.clone(),
@@ -3183,6 +3270,33 @@ async fn handle_peer_ingress_inner(
     }
 }
 
+/// The owner-side refusals that mean "the owner could not read its
+/// catalog", not "the request was denied" (review of PR #171, the 2aefebca
+/// class): each is answered owner-not-ready (`503`, `not_dispatched`,
+/// retryable) rather than a non-retryable `403`.
+const OWNER_DEVICE_CATALOG_UNAVAILABLE: &str = "device catalog unavailable";
+const OWNER_AUTHORIZATION_UNAVAILABLE: &str = "authorization unavailable";
+
+fn is_transient_owner_refusal(error: &PeerRuntimeError) -> bool {
+    matches!(
+        error,
+        PeerRuntimeError::Membership(reason)
+            if reason == OWNER_DEVICE_CATALOG_UNAVAILABLE
+                || reason == OWNER_AUTHORIZATION_UNAVAILABLE
+    )
+}
+
+/// Answer a device or grant refusal on the request's own stream (task row
+/// M7-C110): a transient catalog failure as owner-not-ready, a real denial
+/// as `403`.
+async fn refuse_peer_admission(request: InboundPeerRequest, error: &PeerRuntimeError) {
+    if is_transient_owner_refusal(error) {
+        let _ = request.reject_owner_not_ready().await;
+    } else {
+        let _ = request.reject_refused(StatusCode::FORBIDDEN).await;
+    }
+}
+
 async fn resolve_peer_device(
     catalog: &SharedCatalog,
     authentication: &tunnel_cluster::envelope::DeviceAuthenticationContext,
@@ -3192,7 +3306,7 @@ async fn resolve_peer_device(
     let device = catalog
         .resolve_device(&certificate.spki_fingerprint, now)
         .await
-        .map_err(|_| PeerRuntimeError::Membership("device catalog unavailable".to_owned()))?
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_DEVICE_CATALOG_UNAVAILABLE.to_owned()))?
         .ok_or_else(|| {
             PeerRuntimeError::Membership("device credential is not active".to_owned())
         })?;
@@ -3243,7 +3357,7 @@ async fn owner_stream_grant_of_type(
     let devices = catalog
         .list_devices_filtered(consumer, &DeviceListFilter::default(), Utc::now())
         .await
-        .map_err(|_| PeerRuntimeError::Membership("device catalog unavailable".to_owned()))?;
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_DEVICE_CATALOG_UNAVAILABLE.to_owned()))?;
     let Some(device) = devices
         .into_iter()
         .find(|device| device.device_id == device_id)
@@ -3272,7 +3386,7 @@ async fn owner_stream_grant_of_type(
     let grant = catalog
         .authorize(consumer, device_id, service_id, Utc::now(), Utc::now())
         .await
-        .map_err(|_| PeerRuntimeError::Membership("authorization unavailable".to_owned()))?
+        .map_err(|_| PeerRuntimeError::Membership(OWNER_AUTHORIZATION_UNAVAILABLE.to_owned()))?
         .ok_or_else(|| PeerRuntimeError::Membership("service is not authorized".to_owned()))?;
     if !grant.permissions.allows(operation) {
         return Err(PeerRuntimeError::Membership(
@@ -3595,6 +3709,18 @@ async fn handle_peer_consumer_stream(
                 PeerFaultCause::Capacity,
             );
             return request.reject_stream_limit().await;
+        }
+        // M6-C144 (review of #187): the owner lost the device's session after
+        // the ingress resolved it here.  Nothing was dispatched, so the
+        // ingress gets the retryable owner-not-ready refusal rather than a
+        // closed exchange it must report as `unknown`, as for http-forward.
+        Err(RelayError::DeviceOffline) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::OwnerNotReady,
+            );
+            return request.reject_owner_not_ready().await;
         }
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
@@ -4469,7 +4595,37 @@ fn echo_failure_response(code: &'static str, execution: &'static str) -> Respons
     if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
         return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
     }
+    // A capacity refusal before dispatch is retryable, and says when (task
+    // row M6-C120): the device's session is untouched, only this request was
+    // refused, so a consumer should back off and retry rather than treat the
+    // device as gone.
+    if code == "RESOURCE_EXHAUSTED" && execution == "not_dispatched" {
+        return echo_capacity_response();
+    }
     failure_outcome(code, execution)
+}
+
+/// The unary echo's answer when the owner's per-device capacity refused the
+/// request before dispatch (task row M6-C120): `503 RESOURCE_EXHAUSTED`,
+/// `not_dispatched`, retryable, with a bounded `Retry-After`.
+fn echo_capacity_response() -> Response {
+    let retry_after_ms = ECHO_CAPACITY_RETRY_AFTER_MS;
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: "RESOURCE_EXHAUSTED",
+            execution: "not_dispatched",
+            message: "reverse channel operation did not complete",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn failure_outcome(code: &'static str, execution: &'static str) -> Response {
@@ -4541,6 +4697,9 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
         PeerRuntimeError::Capacity { retry_after_ms } => {
             return stream_limit_response(retry_after_ms);
         }
+        PeerRuntimeError::OwnerChanged { retry_after_ms } => {
+            return owner_changed_response(retry_after_ms);
+        }
         PeerRuntimeError::RemoteStatus(_)
         | PeerRuntimeError::Transport(_)
         | PeerRuntimeError::Envelope(_)
@@ -4588,6 +4747,10 @@ fn local_consumer_admission_response(route: &'static str, error: RelayError) -> 
             "device or service was not found",
             "not_dispatched",
         ),
+        // M6-C144: the same answer as the echo route's for the same state.
+        // Only reached after the route authorized the consumer for this
+        // service, so it reveals nothing a grant does not already show.
+        RelayError::DeviceOffline => failure_outcome("DEVICE_OFFLINE", "not_dispatched"),
         _ => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "REVERSE_CHANNEL_UNAVAILABLE",
@@ -4640,6 +4803,36 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
             code: "PEER_UNAVAILABLE",
             execution: "not_dispatched",
             message: "selected owner is not ready; retry after the bounded hint",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The answer for a request the selected peer refused because it no longer
+/// holds the owner token this relay resolved (task row M7-C110).  Nothing was
+/// dispatched and this relay has dropped its cached route, so a consumer
+/// retry performs a fresh authoritative owner lookup (docs/cluster.md: the
+/// relay never reselects an owner itself).  `OWNER_CHANGED` exists only as
+/// the internal peer admission marker; consumers never receive it.  The
+/// public answer keeps the consumer vocabulary's retryable
+/// `PEER_UNAVAILABLE` / `not_dispatched`, as for an owner that is not ready.
+/// Only the ingress fault record names `owner_changed`; the owner records
+/// its refusal as `membership`.
+fn owner_changed_response(retry_after_ms: u64) -> Response {
+    let retry_after_ms = retry_after_ms.clamp(1, OWNER_NOT_READY_RETRY_AFTER_MS.max(1));
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: "PEER_UNAVAILABLE",
+            execution: "not_dispatched",
+            message: "the device's owner relay changed; retry after the bounded hint",
             retryable: Some(true),
             retry_after_ms: Some(retry_after_ms),
         }),
@@ -4800,6 +4993,33 @@ fn error_response(
 
 #[cfg(test)]
 mod tests {
+    /// M6-C120: an echo refused by the owner's per-device capacity before
+    /// dispatch is answered as retryable with a bounded `Retry-After`, so a
+    /// flooding consumer backs off instead of seeing the device as gone.
+    #[tokio::test]
+    async fn m6c120_echo_capacity_refusal_is_retryable_with_retry_after() {
+        let response = echo_failure_response("RESOURCE_EXHAUSTED", "not_dispatched");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body reads");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retry_after_ms"], super::ECHO_CAPACITY_RETRY_AFTER_MS);
+        // An outcome that may have executed is never given a retry hint.
+        let unknown = echo_failure_response("RESOURCE_EXHAUSTED", "unknown");
+        assert!(unknown.headers().get(header::RETRY_AFTER).is_none());
+    }
+
     // M6-C68: the device control idle deadline.  Only an inbound frame moves
     // it, it never moves backwards, and a live device's Pong -- due every
     // Ping interval -- keeps it ahead of the next Ping with room for two
@@ -5726,3 +5946,8 @@ mod tenant_admission_tests;
 
 #[cfg(test)]
 mod consumer_refusal_tests;
+#[cfg(test)]
+mod mcp_authorization_tests;
+
+#[cfg(test)]
+mod offline_refusal_tests;

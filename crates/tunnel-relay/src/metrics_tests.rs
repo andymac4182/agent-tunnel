@@ -56,7 +56,7 @@ fn canary_snapshot() -> RelaySnapshot {
     snapshot.consumer_write_diagnostics.timeout_count = 2;
     // Distinct values so a field rendered under the wrong series is caught.
     snapshot.rotation_freeze_hold = crate::RotationFreezeHoldSnapshot {
-        held: 29,
+        held: 35,
         currently_held: 2,
         admitted_after_hold: 17,
         released_on_commit: 13,
@@ -67,6 +67,7 @@ fn canary_snapshot() -> RelaySnapshot {
         refused_hold_full: 7,
         cancelled: 3,
         released_on_session_loss: 2,
+        refused_on_revocation: 6,
         max_hold_wait_ms: 1_234,
     };
     snapshot
@@ -148,6 +149,9 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_device_sockets 4",
         "tunnel_relay_streams 2",
         "tunnel_relay_sessions_rotating 1",
+        "tunnel_relay_sessions_by_rotation_phase{phase=\"active\"} 1",
+        "tunnel_relay_sessions_by_rotation_phase{phase=\"draining\"} 1",
+        "tunnel_relay_sessions_by_rotation_phase{phase=\"closed\"} 0",
         "tunnel_relay_sessions_owner_write_unknown 1",
         "tunnel_relay_queue_bytes 200",
         "tunnel_relay_replay_bytes 80",
@@ -157,7 +161,7 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"identity\"} 6",
         "tunnel_relay_consumer_refusals_total{route=\"echo\",stage=\"grant\"} 1",
         "tunnel_relay_consumer_refusals_total{route=\"stream\",stage=\"rotation_freeze\"} 8",
-        "tunnel_relay_rotation_freeze_hold_held_total 29",
+        "tunnel_relay_rotation_freeze_hold_held_total 35",
         "tunnel_relay_rotation_freeze_hold_current 2",
         "tunnel_relay_rotation_freeze_hold_admitted_total 17",
         "tunnel_relay_rotation_freeze_hold_released_total{outcome=\"commit\"} 13",
@@ -167,6 +171,7 @@ fn m6c24_a_scrape_reports_the_aggregates() {
         "tunnel_relay_rotation_freeze_hold_released_with_deferred_writes_total 4",
         "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"} 5",
         "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"hold_full\"} 7",
+        "tunnel_relay_rotation_freeze_hold_refused_total{reason=\"revocation\"} 6",
         "tunnel_relay_rotation_freeze_hold_cancelled_total 3",
         "tunnel_relay_rotation_freeze_hold_max_wait_ms 1234",
         "tunnel_relay_peer_faults_total{stage=\"head\"} 4",
@@ -205,6 +210,7 @@ fn m3_15_the_freeze_hold_partition_is_checkable_from_a_scrape() {
         value("tunnel_relay_rotation_freeze_hold_current")
             + released
             + value("tunnel_relay_rotation_freeze_hold_refused_total{reason=\"after_bound\"}")
+            + value("tunnel_relay_rotation_freeze_hold_refused_total{reason=\"revocation\"}")
             + value("tunnel_relay_rotation_freeze_hold_cancelled_total"),
     );
 }

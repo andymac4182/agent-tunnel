@@ -1062,23 +1062,27 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 BRIDGE,
-                """            }
-            .unwrap_or_default();
-            let _ = target.tx.send(Bytes::from(body)).await;
-        });
-        no_body(StatusCode::ACCEPTED)
-    }
-
-    async fn answer_permission(""",
-                """            }
-            .unwrap_or_default();
-            let _ = body;
-        });
-        no_body(StatusCode::ACCEPTED)
-    }
-
-    async fn answer_permission(""",
-            )
+                """                None => body,
+            };
+            let _ = tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(body))).await;
+        });""",
+                """                None => body,
+            };
+            let _ = (stall_deadline, &target, body);
+        });""",
+            ),
+            # Since M8-C27 a turn's answer travels the ordered transport
+            # channel and only falls back to the direct send above when the
+            # dispatcher is gone.  Defeating only the fallback left this case
+            # green, which is how the reroute was noticed; both paths are
+            # defeated so the 202 really does lie.
+            (
+                BRIDGE,
+                """            let body = match ordered {
+                Some(ordered) => match ordered""",
+                """            let body = match None::<mpsc::Sender<OutboundMessage>> {
+                Some(ordered) => match ordered""",
+            ),
         ],
         False,
     ),
@@ -1647,6 +1651,22 @@ C4_CASES: list[tuple[str, list[Edit], bool]] = [
                 TERMINAL,
                 """            Self::Turn(_) => "outcome_unknown",""",
                 """            Self::Turn(_) => "succeeded",""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------ a turn's result behind its updates
+    (
+        # M8-C27: the prompt's result travels the supervisor's transport
+        # channel, behind every update the agent wrote before it.  Without
+        # the ordered sender it goes straight to the session target and
+        # overtakes updates still queued at the dispatcher.
+        "a turn's result is queued behind its own updates (M8-C27)",
+        [
+            (
+                BRIDGE,
+                """        let ordered = connection.outbound.upgrade();""",
+                """        let ordered: Option<mpsc::Sender<OutboundMessage>> = None;""",
             )
         ],
         False,
@@ -2326,6 +2346,149 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    (
+        'the genuine rotation must not serve an unapproved staged successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_staged_not_served,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the genuine rotation's overlap must reach every verifier",
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_overlap_staged,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must switch to the approved successor itself',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switched,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the held ACP turn must survive the switch',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switch_left_acp_serving,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the flooded forwarded stream must survive the switch',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_switch_left_forward_serving,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a fresh handshake must present the successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_successor_presented,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a fresh handshake must no longer present the predecessor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_predecessor_not_presented,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must stay Ready through a genuine rotation',
+        [
+            (
+                ACP_CLUSTER,
+                '            !evidence.genuine_owner_unready\n                && !evidence\n                    .genuine_owner_reasons\n                    .iter()\n                    .any(|reason| reason == "membership_revoked"),',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the ingress must attribute the genuine teardown to the withdrawn key',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_ingress_reasons == vec!["membership_revoked".to_owned()],',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the genuine withdrawal must interrupt explicitly with no stopReason',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_interrupted && evidence.genuine_no_stop_reason,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the owner must retire the predecessor because it was withdrawn',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_retired_by_withdrawal,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'a whole turn must complete across the rotated route',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_post_rotation_turn,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        'the cluster must re-sign the owner on its successor',
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.genuine_resigned_on_successor,',
+                "            true,",
+            )
+        ],
+        False,
+    ),
 ]
 
 
@@ -2719,6 +2882,7 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c3', 'the host cannot choose a workspace or attach MCP servers'): frozenset({'a_host_cannot_choose_a_workspace_or_attach_mcp_servers'}),
     ('m8c3-relay', 'and admits nothing else'): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
     ('m8c3-relay', "the relay's profile allowlist admits the ACP profile"): frozenset({'config::tests::http_forward_profiles_are_pinned_configured_and_otherwise_absent'}),
+    ('m8c4', "a turn's result is queued behind its own updates (M8-C27)"): frozenset({'a_turns_error_is_never_delivered_ahead_of_its_own_updates', 'a_turns_result_is_never_delivered_ahead_of_its_own_updates'}),
     ('m8c4', 'a confirmed cancelled turn is cancelled'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not'}),
     ('m8c4', 'a lost process after dispatch is outcome_unknown, not a success'): frozenset({'terminal::tests::a_confirmed_cancelled_turn_is_cancelled_and_a_lost_process_is_not', 'terminal::tests::a_refusal_before_dispatch_is_failed_and_not_unknown'}),
     ('m8c4', 'a permission response must name an offered option (M8-C11)'): frozenset({'lifecycle::tests::a_permission_response_must_name_an_option_the_agent_offered', 'lifecycle::tests::an_agent_that_offered_nothing_admits_no_selection'}),
@@ -2793,6 +2957,19 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ("m8c7", "a present ACP sentinel helper cannot be reported as missing"): frozenset(
         {"the_skip_cannot_hide_a_helper_that_is_on_disk"}
     ),
+    ('m8c5', 'the genuine rotation must not serve an unapproved staged successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', "the genuine rotation's overlap must reach every verifier"): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must switch to the approved successor itself'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the held ACP turn must survive the switch'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the flooded forwarded stream must survive the switch'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a fresh handshake must present the successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a fresh handshake must no longer present the predecessor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must stay Ready through a genuine rotation'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the ingress must attribute the genuine teardown to the withdrawn key'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the genuine withdrawal must interrupt explicitly with no stopReason'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the owner must retire the predecessor because it was withdrawn'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'a whole turn must complete across the rotated route'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the cluster must re-sign the owner on its successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
 }
 
 #: The pinned ledger, loaded once.

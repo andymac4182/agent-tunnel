@@ -37,6 +37,8 @@ pub const M1_PROFILE_FEATURE: &str = "m1-control-data";
 /// remains closed to data admission until the exact OWNER_FENCED reply has
 /// been observed by the owner.
 pub const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
+/// M3-16: the connector understands `PRINCIPAL_SESSIONS_END`.
+pub const PRINCIPAL_SESSIONS_END_FEATURE: &str = "principal-sessions-end-v1";
 
 pub fn random_token() -> String {
     let mut bytes = [0_u8; 32];
@@ -558,6 +560,24 @@ pub fn authorization_invalidated(
         grant_revision,
         reason,
     ))
+}
+
+/// Task row M3-16: tell the device to end one consumer's protocol sessions.
+pub fn principal_sessions_end(
+    session_id: &str,
+    epoch: u64,
+    service_id: &str,
+    principal_binding: &str,
+    reason: &str,
+) -> ControlMessage {
+    ControlMessage::PrincipalSessionsEnd(tunnel_protocol::PrincipalSessionsEnd {
+        message_id: random_token(),
+        session_id: session_id.to_owned(),
+        epoch,
+        service_id: service_id.to_owned(),
+        principal_binding: principal_binding.to_owned(),
+        reason: reason.to_owned(),
+    })
 }
 
 pub fn rejected(

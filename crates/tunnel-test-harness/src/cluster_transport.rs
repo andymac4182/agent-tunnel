@@ -1311,6 +1311,44 @@ fn body_budget_limits() -> Result<PeerTransportLimits> {
     .map_err(|error| HarnessError::Http(format!("building M7 body-budget limits: {error}")))
 }
 
+/// One source of received body chunks (task row M7-C120).
+trait EchoSource {
+    async fn next_echo_chunk(&mut self) -> std::result::Result<Option<Bytes>, PeerTransportError>;
+}
+
+impl EchoSource for tunnel_transport::PeerClientRecv {
+    async fn next_echo_chunk(&mut self) -> std::result::Result<Option<Bytes>, PeerTransportError> {
+        Ok(self
+            .recv_chunk()
+            .await?
+            .map(|chunk| Bytes::copy_from_slice(chunk.as_bytes())))
+    }
+}
+
+/// Read one echoed message of `expected` bytes, however the transport split
+/// it (task row M7-C120).  `recv_chunk` returns whatever HTTP/3 has received
+/// of the current DATA frame: the vendored h3 `FrameStream::poll_data`
+/// returns a partial frame payload when only part of it has arrived (its own
+/// `poll_data_split` test), and these cases run with a 16-byte QUIC
+/// connection window, so a 2-byte echo can arrive as two 1-byte chunks.  The
+/// case compared the first chunk with the whole payload and reported a split
+/// as unreclaimed budget.  Every chunk read here still takes and releases its
+/// own budget charge, so reclamation is exercised exactly as before.  Stops
+/// early only at the end of the stream, leaving the shortfall to the caller.
+async fn recv_echo<S: EchoSource>(
+    source: &mut S,
+    expected: usize,
+) -> std::result::Result<Vec<u8>, PeerTransportError> {
+    let mut received = Vec::with_capacity(expected);
+    while received.len() < expected {
+        match source.next_echo_chunk().await? {
+            Some(chunk) => received.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    Ok(received)
+}
+
 fn budget_payload(index: usize) -> Bytes {
     Bytes::from(vec![index as u8, 0xa5 ^ (index as u8)])
 }
@@ -1386,10 +1424,19 @@ async fn run_body_budget_reclamation_case(
                     HarnessError::Http(format!("receiving M7 stream-budget response head: {error}"))
                 })?;
             }
-            let echoed = stream_recv.recv_chunk().await.map_err(|error| {
-                HarnessError::Http(format!("receiving M7 stream-budget chunk: {error}"))
-            })?;
-            if echoed.as_ref().map(|chunk| chunk.as_bytes()) != Some(payload.as_ref()) {
+            let echoed = recv_echo(&mut stream_recv, payload.len())
+                .await
+                .map_err(|error| {
+                    HarnessError::Http(format!("receiving M7 stream-budget chunk: {error}"))
+                })?;
+            if echoed != payload.as_ref() {
+                eprintln!(
+                    "M7 body-budget: stream-budget echo {index} of 6 differed: sent {} bytes, \
+                     received {} bytes, connection charge {} of 16 bytes",
+                    payload.len(),
+                    echoed.len(),
+                    connection.body_bytes_charged()
+                );
                 return Ok::<_, HarnessError>(false);
             }
         }
@@ -1427,10 +1474,17 @@ async fn run_body_budget_reclamation_case(
                     "receiving M7 connection-budget response head: {error}"
                 ))
             })?;
-            let echoed = recv.recv_chunk().await.map_err(|error| {
+            let echoed = recv_echo(&mut recv, payload.len()).await.map_err(|error| {
                 HarnessError::Http(format!("receiving M7 connection-budget chunk: {error}"))
             })?;
-            if echoed.as_ref().map(|chunk| chunk.as_bytes()) != Some(payload.as_ref()) {
+            if echoed != payload.as_ref() {
+                eprintln!(
+                    "M7 body-budget: connection-budget echo on stream {index} of 5 differed: \
+                     sent {} bytes, received {} bytes, connection charge {} of 16 bytes",
+                    payload.len(),
+                    echoed.len(),
+                    connection.body_bytes_charged()
+                );
                 return Ok(false);
             }
             send.finish().await.map_err(|error| {
@@ -2319,4 +2373,57 @@ async fn finish_client_and_server<T>(
     client_shutdown?;
     server_shutdown?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scripted chunk source: `None` is the end of the stream.
+    struct Scripted(std::collections::VecDeque<Option<Bytes>>);
+
+    impl EchoSource for Scripted {
+        async fn next_echo_chunk(
+            &mut self,
+        ) -> std::result::Result<Option<Bytes>, PeerTransportError> {
+            Ok(self.0.pop_front().flatten())
+        }
+    }
+
+    /// Task row M7-C120.  The transport may deliver one 2-byte echo as two
+    /// 1-byte chunks.  The body-budget case compared the first chunk with the
+    /// whole payload, which reports that split as unreclaimed budget; the
+    /// echo must be read whole.
+    #[tokio::test]
+    async fn a_split_echo_is_read_whole_and_the_old_comparison_would_have_failed() {
+        let payload = budget_payload(3);
+        let (first, second) = payload.split_at(1);
+        let mut source = Scripted(
+            [
+                Some(Bytes::copy_from_slice(first)),
+                Some(Bytes::copy_from_slice(second)),
+                None,
+            ]
+            .into(),
+        );
+        // The comparison the case made before: the first chunk alone.
+        assert_ne!(first, payload.as_ref());
+        let echoed = recv_echo(&mut source, payload.len())
+            .await
+            .expect("scripted chunks");
+        assert_eq!(echoed, payload.as_ref());
+        // The terminal read after the echo still sees the end of the stream.
+        assert!(source.next_echo_chunk().await.expect("end").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_short_echo_stops_at_the_end_of_the_stream() {
+        let payload = budget_payload(4);
+        let mut source = Scripted([Some(Bytes::copy_from_slice(&payload[..1])), None].into());
+        let echoed = recv_echo(&mut source, payload.len())
+            .await
+            .expect("scripted chunks");
+        assert_eq!(echoed.len(), 1);
+        assert_ne!(echoed, payload.as_ref());
+    }
 }

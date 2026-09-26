@@ -48,10 +48,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_bridge::{
     BridgeConfig, CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, ExchangeReport,
-    Execution, HANDOFF_CAPACITY, OutboundEnd, Outcome, PauseController, PauseSignal, Profile,
-    QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset, begin_paused, channel,
-    detail_from_reason, detail_from_status, pump_inbound, pump_outbound, rejection_response,
-    reset_reason_for, reset_signal_pair,
+    Execution, FrameSender, HANDOFF_CAPACITY, InboundEnd, OutboundEnd, Outcome, PauseController,
+    PauseSignal, Profile, QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset,
+    begin_paused, channel, detail_from_reason, detail_from_status, pump_inbound, pump_outbound,
+    rejection_response, reset_reason_for, reset_signal_pair,
 };
 use tunnel_http_forward::HttpErrorCode;
 use tunnel_protocol::{ResultDetail, reset_reason};
@@ -63,6 +63,7 @@ use crate::http_forward_diagnostics::{
 };
 
 mod aggregate;
+pub(crate) mod authorization;
 mod hold;
 mod owner_relay;
 
@@ -150,6 +151,9 @@ pub const MAX_PROFILE_ID_LEN: usize = 64;
 pub struct HttpForwardExports {
     exports: std::collections::BTreeMap<String, HttpForwardExport>,
     interposer: Option<Arc<dyn HttpRelayInterposer>>,
+    /// M3-11: the public origin protected-resource identifiers are built
+    /// from.  Absent, a request's own authority is used.
+    public_url: Option<String>,
 }
 
 impl core::fmt::Debug for HttpForwardExports {
@@ -158,6 +162,7 @@ impl core::fmt::Debug for HttpForwardExports {
             .debug_struct("HttpForwardExports")
             .field("profiles", &self.exports.keys().collect::<Vec<_>>())
             .field("interposer", &self.interposer.is_some())
+            .field("public_url", &self.public_url)
             .finish()
     }
 }
@@ -166,6 +171,22 @@ impl HttpForwardExports {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build protected-resource identifiers (task row M3-11) from `url`, an
+    /// `https://host[:port]` origin, instead of each request's authority.
+    ///
+    /// # Errors
+    /// Anything but a bare HTTPS origin.
+    pub fn with_public_url(mut self, url: &str) -> Result<Self, &'static str> {
+        self.public_url = Some(authorization::validate_public_url(url)?);
+        Ok(self)
+    }
+
+    /// The configured public origin, if any.
+    #[must_use]
+    pub fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
     }
 
     /// Serve `export` for services whose capability names `id`.
@@ -302,6 +323,10 @@ pub(crate) struct ActorReader {
     stream_id: u64,
     operation_id: String,
     status: watch::Receiver<Option<ResultDetail>>,
+    /// The actor's record of the connector RESET.  A read that finds the
+    /// stream already released consults it, so an accepted RESET is never
+    /// reported as a carrier loss (task row M8-C14).
+    peer_reset: watch::Receiver<Option<HttpPeerReset>>,
     signal: ResetSignal,
     pending: Option<tokio::sync::oneshot::Receiver<HttpRead>>,
     pending_reset: Option<u16>,
@@ -322,6 +347,33 @@ impl ActorReader {
     pub(crate) const fn last_reset_reason(&self) -> Option<u16> {
         self.last_reset_reason
     }
+}
+
+/// The RESET reason a read must report instead of a carrier loss.
+///
+/// The actor accepts a connector RESET into the stream's state, publishes it
+/// on `peer_reset`, and may then release the stream (terminal bookkeeping,
+/// FORGET) before this relay's reader or signal task has observed it.  A
+/// read of a released stream answers `Closed`, so without this check the
+/// RESET the device sent is lost and the exchange ends as a carrier failure
+/// (task row M8-C14).
+fn reset_behind_close(peer_reset: &watch::Receiver<Option<HttpPeerReset>>) -> Option<u16> {
+    peer_reset.borrow().map(|peer| peer.reason)
+}
+
+/// Wait for the connector RESET the actor accepted, or for the stream to be
+/// released without one.  A RESET published before the release is always
+/// reported, however the two wakeups are ordered (task row M8-C14).
+async fn accepted_peer_reset(
+    closed: CancellationToken,
+    mut peer_reset: watch::Receiver<Option<HttpPeerReset>>,
+) -> Option<HttpPeerReset> {
+    let observed = tokio::select! {
+        biased;
+        observed = peer_reset.wait_for(Option::is_some) => observed.ok().and_then(|value| *value),
+        () = closed.cancelled() => None,
+    };
+    observed.or_else(|| *peer_reset.borrow())
 }
 
 async fn detail_with_status(
@@ -368,7 +420,13 @@ impl CarrierReader for ActorReader {
                         .await
                     {
                         Some(receiver) => self.pending = Some(receiver),
-                        None => return CarrierEvent::Closed,
+                        None => match reset_behind_close(&self.peer_reset) {
+                            Some(reason) => {
+                                self.pending_reset = Some(reason);
+                                continue;
+                            }
+                            None => return CarrierEvent::Closed,
+                        },
                     }
                 }
                 let Some(receiver) = self.pending.as_mut() else {
@@ -382,7 +440,10 @@ impl CarrierReader for ActorReader {
                     HttpRead::Data(data) => return CarrierEvent::Data(Bytes::from(data)),
                     HttpRead::Fin => return CarrierEvent::Fin,
                     HttpRead::Reset(reason) => self.pending_reset = Some(reason),
-                    HttpRead::Closed => return CarrierEvent::Closed,
+                    HttpRead::Closed => match reset_behind_close(&self.peer_reset) {
+                        Some(reason) => self.pending_reset = Some(reason),
+                        None => return CarrierEvent::Closed,
+                    },
                 }
             }
         }
@@ -401,7 +462,7 @@ pub(crate) fn actor_carriers(
 ) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
     let HttpStreamRegistration {
         base,
-        mut peer_reset,
+        peer_reset,
         // http-forward states its own terminal reasons through RESET and
         // RESULT_STATUS; it has no close code to derive from a teardown cause.
         terminal: _,
@@ -411,16 +472,10 @@ pub(crate) fn actor_carriers(
     let (notifier, signal) = reset_signal_pair();
     let closed = base.closed.clone();
     let mut status = result_status.clone();
+    let reader_peer_reset = peer_reset.clone();
     let task = tokio::spawn(async move {
-        let peer: HttpPeerReset = tokio::select! {
-            () = closed.cancelled() => return,
-            observed = peer_reset.wait_for(Option::is_some) => match observed {
-                Ok(value) => match *value {
-                    Some(peer) => peer,
-                    None => return,
-                },
-                Err(_) => return,
-            },
+        let Some(peer) = accepted_peer_reset(closed, peer_reset).await else {
+            return;
         };
         let detail = detail_with_status(peer.reason, &mut status).await;
         notifier.notify(SignaledReset {
@@ -441,6 +496,7 @@ pub(crate) fn actor_carriers(
             stream_id: base.stream_id,
             operation_id: base.operation_id,
             status: result_status,
+            peer_reset: reader_peer_reset,
             signal,
             pending: None,
             pending_reset: None,
@@ -1272,12 +1328,24 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
 /// every stock client -- curl's `*/*`, httpx's `*/*` -- sends one, so without
 /// this its first request was refused `HTTP_INVALID_HEAD`. MCP and ACP
 /// allowlist `accept` and still receive it unchanged.
-const DROPPED_CLIENT_HEADERS: [http::HeaderName; 5] = [
+///
+/// `cache-control` (task row M3-46) is what the official MCP Python SDK
+/// (mcp 2.2.0) adds, as `no-store`, to the 2025-11-25 standalone GET stream
+/// through httpx2's SSE helper; refusing it failed that stream on every
+/// Python client.  Like every entry here it is dropped for **every**
+/// http-forward profile -- `mcp-2025-11-25`, `mcp-2026-07-28` and
+/// `acp-http-v1` alike -- unless that profile allowlists it (none does).  A
+/// request cache directive has no authority, the relay and the device cache
+/// nothing, and each profile's backend serves its responses uncached whatever
+/// the request said, so dropping it changes nothing the export or the
+/// consumer can observe.
+const DROPPED_CLIENT_HEADERS: [http::HeaderName; 6] = [
     header::USER_AGENT,
     header::ACCEPT_ENCODING,
     header::ACCEPT_LANGUAGE,
     http::HeaderName::from_static("sec-fetch-mode"),
     header::ACCEPT,
+    header::CACHE_CONTROL,
 ];
 
 /// Drop [`DROPPED_CLIENT_HEADERS`] unless the selected profile allowlists
@@ -1369,6 +1437,18 @@ fn ingress_head_rejection(
 /// prove by building their policies from it.
 pub(crate) fn principal_binding_header() -> http::HeaderName {
     http::HeaderName::from_static(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+}
+
+/// Task row M3-16: whether the owner watches a consumer's authorization on
+/// this export so the device can end its protocol sessions on revocation.
+/// Exactly the profiles that carry a principal binding hold sessions keyed
+/// by one.
+fn watches_principal_sessions(export: &HttpForwardExport) -> bool {
+    export
+        .profile
+        .request
+        .headers
+        .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
 }
 
 /// The refusal for a consumer request that presents the relay-only principal
@@ -1490,7 +1570,24 @@ pub(crate) async fn http_forward_route(
         .await
     {
         Ok(value) => value,
-        Err(error) => return consumer_authentication_response(&error, "http-forward"),
+        Err(error) => {
+            // M3-11: a refused credential names the protected-resource
+            // metadata, so a standard MCP client can discover how to
+            // authenticate.  The refusal itself is unchanged.
+            let mut response = consumer_authentication_response(&error, "http-forward");
+            let origin = authorization::resource_origin(&exports, headers, request.uri());
+            if let Some(challenge) = authorization::bearer_challenge(
+                origin.as_deref(),
+                request.uri().path(),
+                &error,
+                &authorization::scopes_supported(oidc),
+            ) {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge);
+            }
+            return response;
+        }
     };
     let bearer_token = forwarded_bearer_token(headers).to_owned();
     let Ok(device_id) = parse_uuid(&device) else {
@@ -1755,6 +1852,8 @@ pub(crate) async fn http_forward_route(
             response.map(axum::body::Body::new)
         }
         _ => {
+            let watch = watches_principal_sessions(&export)
+                .then(|| (validated.consumer.clone(), grant.tenant_id));
             let registration = match timeout(
                 state.limits.operation_timeout,
                 state.handle.open_http_stream(
@@ -1780,6 +1879,14 @@ pub(crate) async fn http_forward_route(
                     );
                 }
             };
+            if let Some((consumer, tenant_id)) = watch {
+                state.handle.watch_principal_sessions(
+                    registration.base.key.clone(),
+                    consumer,
+                    service_id,
+                    tenant_id,
+                );
+            }
             let key = registration.base.key.clone();
             let stream_id = registration.base.stream_id;
             let operation_id = registration.base.operation_id.clone();
@@ -1975,6 +2082,27 @@ async fn both_finished(mut up: watch::Receiver<bool>, mut down: watch::Receiver<
     let _ = down.wait_for(|finished| *finished).await;
 }
 
+/// [`pump_inbound`] for a direction whose sender is shared.
+///
+/// `pump_inbound` reports a carrier that ended without FIN or RESET by
+/// dropping its sender, which the bridge sees as the direction's end only
+/// when that sender was the last one.  On the owner relay it is not: each
+/// owner writer keeps a clone of the *other* direction's sender so a
+/// validation failure can reset both, so a lost carrier left the direction
+/// open, both outbound pumps waiting on each other, and the exchange held
+/// until the peer admission was invalidated (task row M8-C14).  The loss is
+/// therefore stated as an explicit RESET.
+async fn pump_inbound_shared<R: CarrierReader>(reader: R, to_bridge: FrameSender) -> InboundEnd {
+    let end = pump_inbound(reader, to_bridge.clone()).await;
+    if end == InboundEnd::CarrierClosed {
+        to_bridge.reset(ResetDetail {
+            code: HttpErrorCode::StreamInterrupted,
+            execution: Execution::Unknown,
+        });
+    }
+    end
+}
+
 /// Relay one forwarded HTTP exchange between the peer hop and the owner
 /// actor.  The owner admits the stream itself (after re-authenticating the
 /// forwarded token and re-authorizing the grant), remains the only authority
@@ -2019,6 +2147,7 @@ pub(crate) async fn handle_peer_http_stream(
     let request_id = request.envelope().request_id.clone();
     let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
+    let watch = watches_principal_sessions(&export).then(|| (consumer.clone(), grant.tenant_id));
     let registration = match handle
         .open_http_stream(
             consumer,
@@ -2055,9 +2184,24 @@ pub(crate) async fn handle_peer_http_stream(
             );
             return request.reject_stream_limit().await;
         }
+        // M6-C144: the owner lost the device's session after the ingress
+        // resolved it here.  Nothing was dispatched, so the ingress gets the
+        // retryable owner-not-ready refusal rather than a closed exchange it
+        // must report as `unknown`.
+        Err(RelayError::DeviceOffline) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::OwnerNotReady,
+            );
+            return request.reject_owner_not_ready().await;
+        }
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     let key = registration.base.key.clone();
+    if let Some((consumer, tenant_id)) = watch {
+        handle.watch_principal_sessions(key.clone(), consumer, service_id, tenant_id);
+    }
     let stream_id = registration.base.stream_id;
     let operation_id = registration.base.operation_id.clone();
     let mut cleanup = handle.echo_cleanup_guard(
@@ -2117,7 +2261,7 @@ pub(crate) async fn handle_peer_http_stream(
         Arc::clone(&verdict),
         up_tx.clone(),
     );
-    let up_in = tokio::spawn(pump_inbound(hop_reader, up_tx));
+    let up_in = tokio::spawn(pump_inbound_shared(hop_reader, up_tx));
     let up_out = tokio::spawn(pump_outbound(
         up_rx,
         FinObserved {
@@ -2125,7 +2269,7 @@ pub(crate) async fn handle_peer_http_stream(
             finished: up_finished_tx,
         },
     ));
-    let down_in = tokio::spawn(pump_inbound(actor_reader, down_tx));
+    let down_in = tokio::spawn(pump_inbound_shared(actor_reader, down_tx));
     let down_out = tokio::spawn(pump_outbound(
         down_rx,
         FinObserved {
@@ -2370,6 +2514,32 @@ mod tests {
                     });
             }
         }
+        // M3-46: the official MCP Python SDK (mcp 2.2.0) opens the 2025-11-25
+        // standalone GET stream through httpx2's SSE helper, which adds
+        // `Cache-Control: no-store` (`httpx2/_client.py`).  Captured on the
+        // wire through a real relay by scripts/m3-sdk-conformance.sh.
+        let python_sdk_get: &[(&str, &str)] = &[
+            ("host", "127.0.0.1"),
+            ("accept", "text/event-stream"),
+            ("cache-control", "no-store"),
+            ("accept-encoding", "gzip, deflate"),
+            ("connection", "keep-alive"),
+            ("user-agent", "python-httpx2/2.13.1"),
+            ("mcp-session-id", "0123abcd"),
+            ("mcp-protocol-version", "2025-11-25"),
+        ];
+        let policies = tunnel_mcp::McpProfile::V2025_11_25
+            .policies(tunnel_mcp::McpLimits::default())
+            .expect("MCP profile");
+        let mut request = http::Request::get("/mcp").version(http::Version::HTTP_11);
+        for (name, value) in python_sdk_get {
+            request = request.header(*name, *value);
+        }
+        let mut parts = request.body(()).expect("request").into_parts().0;
+        strip_default_client_headers(&mut parts.headers, &policies.request.headers);
+        tunnel_http_bridge::normalize::request_head(&parts, &policies.request).unwrap_or_else(
+            |error| panic!("the Python SDK's standalone GET head was refused: {error:?}"),
+        );
         // Nit: a header over the name bound is skipped, and the next
         // unlisted one is named instead of none.
         let policies = tunnel_mcp::McpProfile::V2025_11_25
@@ -2517,6 +2687,59 @@ mod tests {
         strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
         tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
             .unwrap_or_else(|error| panic!("a stock ACP client's head was refused: {error:?}"));
+    }
+
+    /// M3-46: `cache-control` is dropped for **every** http-forward profile,
+    /// not only the MCP 2025-11-25 one whose Python SDK client sends it: a
+    /// request carrying it is refused by each profile's codec on its own and
+    /// admitted once the ingress has dropped it.
+    #[test]
+    fn cache_control_is_dropped_for_every_http_forward_profile() {
+        let mut cases: Vec<(String, tunnel_http_bridge::Profile, http::request::Parts)> =
+            Vec::new();
+        for profile in tunnel_mcp::McpProfile::ALL {
+            let policies = profile
+                .policies(tunnel_mcp::McpLimits::default())
+                .expect("MCP profile");
+            let mut request = http::Request::post("/mcp")
+                .version(http::Version::HTTP_11)
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .header("content-length", "2")
+                .header("cache-control", "no-store")
+                .header("mcp-protocol-version", profile.protocol_version());
+            if profile == tunnel_mcp::McpProfile::V2026_07_28 {
+                request = request.header("mcp-method", "tools/list");
+            }
+            let parts = request.body(()).expect("request").into_parts().0;
+            cases.push((profile.id().to_owned(), policies, parts));
+        }
+        let acp = tunnel_acp::AcpProfile::HttpV1
+            .policies(tunnel_acp::AcpLimits::default())
+            .expect("ACP profile");
+        let parts = http::Request::post(tunnel_acp::ACP_ENDPOINT_PATH)
+            .version(http::Version::HTTP_2)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("content-length", "2")
+            .header("cache-control", "no-store")
+            .body(())
+            .expect("request")
+            .into_parts()
+            .0;
+        cases.push(("acp-http-v1".to_owned(), acp, parts));
+        assert_eq!(cases.len(), 3, "both MCP profiles and the ACP profile");
+        for (id, policies, parts) in cases {
+            assert!(
+                tunnel_http_bridge::normalize::request_head(&parts, &policies.request).is_err(),
+                "{id}: the codec refuses cache-control on its own"
+            );
+            let mut stripped = parts;
+            strip_default_client_headers(&mut stripped.headers, &policies.request.headers);
+            assert!(!stripped.headers.contains_key("cache-control"), "{id}");
+            tunnel_http_bridge::normalize::request_head(&stripped, &policies.request)
+                .unwrap_or_else(|error| panic!("{id}: refused after the drop: {error:?}"));
+        }
     }
 
     /// Gate 5: a service selects its profile only through the catalog
@@ -2817,5 +3040,77 @@ mod tests {
         // Left for the codec to reject rather than silently laundered.
         assert!(headers.contains_key("proxy-authorization"));
         assert!(headers.contains_key("content-type"));
+    }
+
+    /// A carrier whose only event is an end without FIN or RESET.
+    struct LostCarrier;
+
+    impl CarrierReader for LostCarrier {
+        fn next(&mut self) -> impl Future<Output = CarrierEvent> + Send {
+            std::future::ready(CarrierEvent::Closed)
+        }
+
+        fn reset_signal(&self) -> ResetSignal {
+            reset_signal_pair().1
+        }
+    }
+
+    /// M8-C14.  On the owner relay each writer holds a clone of the other
+    /// direction's sender, so a carrier that ends without FIN or RESET must
+    /// end its direction explicitly.  Dropping the pump's own sender is not
+    /// enough while the clone lives: the direction stayed open, and the
+    /// exchange held until membership expiry invalidated the peer admission
+    /// (~58.7 s in `verify-m8-acp-real-path`).
+    #[tokio::test]
+    async fn a_lost_carrier_ends_a_direction_whose_sender_is_shared() {
+        let (to_bridge, mut from_carrier, _) = channel(HANDOFF_CAPACITY);
+        // The other writer's clone, alive for the whole exchange.
+        let _held_by_other_writer = to_bridge.clone();
+        let end = pump_inbound_shared(LostCarrier, to_bridge).await;
+        assert_eq!(end, InboundEnd::CarrierClosed);
+        let frame = tokio::time::timeout(Duration::from_secs(2), from_carrier.recv())
+            .await
+            .expect("the direction must end, not wait for another sender to drop");
+        assert_eq!(
+            frame,
+            Some(tunnel_http_bridge::Frame::Reset(ResetDetail {
+                code: HttpErrorCode::StreamInterrupted,
+                execution: Execution::Unknown,
+            }))
+        );
+    }
+
+    /// M8-C14.  The actor publishes the connector RESET and may release the
+    /// stream before this relay's signal task runs; both wakeups are then
+    /// ready at once.  The RESET must win every time, and a read of the
+    /// released stream must report it rather than a carrier loss.
+    #[tokio::test]
+    async fn a_reset_published_before_the_release_is_never_lost() {
+        let peer = HttpPeerReset {
+            reason: reset_reason::ADAPTER_FAILURE,
+            after_fin: false,
+        };
+        // `tokio::select!` without `biased` starts at a random branch, so a
+        // single trial could pass by luck; 64 make that negligible.
+        for _ in 0..64 {
+            let (reset_tx, reset_rx) = watch::channel(None);
+            let closed = CancellationToken::new();
+            reset_tx.send_replace(Some(peer));
+            closed.cancel();
+            assert_eq!(
+                accepted_peer_reset(closed, reset_rx.clone()).await,
+                Some(peer)
+            );
+            assert_eq!(
+                reset_behind_close(&reset_rx),
+                Some(reset_reason::ADAPTER_FAILURE)
+            );
+        }
+        // Released with no RESET: the carrier really was lost.
+        let (_reset_tx, reset_rx) = watch::channel(None);
+        let closed = CancellationToken::new();
+        closed.cancel();
+        assert_eq!(accepted_peer_reset(closed, reset_rx.clone()).await, None);
+        assert_eq!(reset_behind_close(&reset_rx), None);
     }
 }

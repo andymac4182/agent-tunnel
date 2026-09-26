@@ -76,6 +76,9 @@ pub struct ExportCounters {
     pub sessions_expired: AtomicU64,
     pub stalled_streams: AtomicU64,
     pub notifications_dropped: AtomicU64,
+    /// Protocol sessions ended because the relay reported that their
+    /// consumer's authorization ended (M3-16).
+    pub sessions_revoked: AtomicU64,
 }
 
 /// A snapshot of [`ExportCounters`].
@@ -103,6 +106,7 @@ pub struct ExportDiagnostics {
     pub stalled_streams: u64,
     pub notifications_dropped: u64,
     pub child_group_kills: u64,
+    pub sessions_revoked: u64,
 }
 
 impl ExportCounters {
@@ -134,6 +138,7 @@ impl ExportCounters {
             stalled_streams: load(&self.stalled_streams),
             notifications_dropped: load(&self.notifications_dropped),
             child_group_kills: load(&self.children.group_kills),
+            sessions_revoked: load(&self.sessions_revoked),
         }
     }
 }
@@ -235,6 +240,29 @@ impl McpExport {
             // dropping it already does.
             Kind::Http(_) => {}
         }
+    }
+
+    /// End every protocol session held for the consumer whose principal
+    /// binding is `binding`, because the relay reported that its
+    /// authorization for this export ended (task row M3-16).  Returns how
+    /// many sessions were ended.
+    ///
+    /// A stdio session is removed and its child's process group killed, as a
+    /// `DELETE` would; later requests naming it get the unknown-session
+    /// `404`.  A Streamable HTTP export forgets the backend sessions it bound
+    /// to `binding`, so they are refused before the backend is dialled; the
+    /// backend's own session state is the backend's to expire.  Sessions of
+    /// every other binding are untouched.  Idempotent.
+    #[must_use]
+    pub fn end_principal_sessions(&self, binding: &str) -> u64 {
+        let ended = match &*self.kind {
+            Kind::Stdio(export) => export.end_binding_sessions(binding),
+            Kind::Http(export) => export.forget_binding_sessions(binding),
+        };
+        self.counters
+            .sessions_revoked
+            .fetch_add(ended, std::sync::atomic::Ordering::Release);
+        ended
     }
 
     /// Serve one exchange in process.

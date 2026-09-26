@@ -98,4 +98,15 @@ gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, su
 gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, an owner-key withdrawal whose teardown the ingress attributes to the key rather than the record version, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with both directions of the owner-to-device segment carrying bytes at one coherent instant" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-cluster
 
+# **A serving relay re-keys its private peer identity on SIGHUP without a
+# restart (M8-C45, M8-C46).**  Two real `tunnel-relay serve` processes: a
+# SIGHUP with a mismatched successor key is refused, the corrected one stages,
+# the signed overlap record lets relay B switch after its convergence hold, and
+# the successor-only record retires the predecessor.  B keeps its PID, owner
+# claim and device generation and never reads unready; a public canary through
+# relay A reaches B's device in every phase.  It runs behind its own long-lived
+# Redis TLS forwarder, because the shared one ends every connection after 5 s.
+gate "M8 relay peer-key rotation: a serving relay re-keys on SIGHUP without restart and stays Ready" \
+  cargo test --locked -p tunnel-test-harness --test m8_relay_rekey_process -- --ignored
+
 echo "m8-harness-verify: implemented M8 harness suite passed" >&2

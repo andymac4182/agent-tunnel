@@ -50,7 +50,8 @@ use tunnel_mcp::message::{McpRejection, codes, validate_delete, validate_get, va
 use tunnel_mcp::{McpLimits, McpProfile};
 
 use crate::body::{
-    BoxError, CollectError, ExportBody, StreamFailure, collect_limited, local_error, rejection,
+    BoxError, CollectError, ExportBody, StreamFailure, capacity_refusal, collect_limited,
+    local_error, rejection,
 };
 use crate::config::{HttpBackend, McpConfigError};
 use crate::{ExportCounters, ExportError};
@@ -146,6 +147,14 @@ impl SessionBindings {
         );
     }
 
+    /// Forget every session issued to `binding`; returns how many.
+    fn forget_binding(&mut self, binding: &str) -> u64 {
+        let before = self.bindings.len();
+        self.bindings
+            .retain(|_, entry| entry.binding.as_deref() != Some(binding));
+        (before - self.bindings.len()) as u64
+    }
+
     fn forget(&mut self, session: &str) {
         self.bindings.remove(session);
     }
@@ -238,6 +247,14 @@ impl Body for BackendBody {
 }
 
 impl HttpBackendExport {
+    /// Forget the backend sessions bound to `binding` (M3-16).
+    pub(crate) fn forget_binding_sessions(&self, binding: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_binding(binding)
+    }
+
     pub(crate) fn new(
         profile: McpProfile,
         limits: McpLimits,
@@ -380,10 +397,11 @@ impl HttpBackendExport {
                     // Counted like any other refusal, so diagnostics and the
                     // gate can see an export that is at its session limit.
                     self.counters.rejected.fetch_add(1, Ordering::Relaxed);
-                    return Ok(local_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
+                    return Ok(capacity_refusal(
                         "the export is at its session limit",
-                        None,
+                        // The request ID is not parsed here; JSON-RPC sends
+                        // an unknown ID as `null` (review of #187).
+                        Some(serde_json::Value::Null),
                     ));
                 }
                 _ => {}

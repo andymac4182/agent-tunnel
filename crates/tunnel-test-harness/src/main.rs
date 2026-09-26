@@ -1570,7 +1570,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M3 http-forward real path passed: relays={} owner={} ingress={} non_owner_ingress={} upload_bytes={} echoed_bytes={} handler_sha256_match={} echo_sha256_match={} saturated_when_probed={} permission_status={} permission_latency_ms={} owner_local_permission_exact={} cancel_owner_release={} cancel_reset_reason={:?} cancel_ingress_error={:?} cancel_device_response_aborted={} handler_cancellation_latency_ms={} ingress_request_handoff_hw={} ingress_response_handoff_hw={} ingress_response_body_hw={} ingress_peer_in_flight_hw={} ingress_peer_receive_hw={} owner_request_handoff_hw={} owner_response_handoff_hw={} owner_peer_in_flight_hw={} owner_peer_receive_hw={} owner_receive_buffer_hw={}/{} owner_parked_hw={} owner_replay_hw={} owner_data_bytes_hw={}/{} device_receive_buffer_hw={}/{} device_parked_hw={} device_request_handoff_hw={} device_response_handoff_hw={} device_request_body_hw={} handler_headers={:?} handler_forbidden_header={} handler_value_leak={} response_header_leak={} internal_header_probe={} unauthenticated={} rejected_probes_dispatched={} sequential_requests={} sequential_ok={} sequential_dispatches={} sequential_not_dispatched_retries={} sequential_highest_stream_id={} sequential_session_stable={} sequential_phase_after={} sequential_ready_after={} open_journal_entries_peak={} open_journal_entries_before={} open_journal_entries_after={} open_journal_ids_before={:?} open_journal_ids_after={:?} open_journal_settle_ms={} earlier_phase_streams={:?} open_streams_retired={}(+{} before) open_retired_ranges_coalesced={}",
+                        "M3 http-forward real path passed: relays={} owner={} ingress={} non_owner_ingress={} upload_bytes={} echoed_bytes={} handler_sha256_match={} echo_sha256_match={} saturated_when_probed={} permission_status={} permission_latency_ms={} owner_local_permission_exact={} cancel_owner_release={} cancel_reset_reason={:?} cancel_ingress_error={:?} cancel_device_response_aborted={} handler_cancellation_latency_ms={} ingress_request_handoff_hw={} ingress_response_handoff_hw={} ingress_response_body_hw={} ingress_peer_in_flight_hw={} ingress_peer_receive_hw={} owner_request_handoff_hw={} owner_response_handoff_hw={} owner_peer_in_flight_hw={} owner_peer_receive_hw={} owner_receive_buffer_hw={}/{} owner_parked_hw={} owner_replay_hw={} owner_data_bytes_hw={}/{} device_receive_buffer_hw={}/{} device_parked_hw={} device_request_handoff_hw={} device_response_handoff_hw={} device_request_body_hw={} handler_headers={:?} handler_forbidden_header={} handler_value_leak={} response_header_leak={} internal_header_probe={} unauthenticated={} rejected_probes_dispatched={} sequential_requests={} sequential_ok={} sequential_dispatches={} sequential_not_dispatched_retries={} sequential_highest_stream_id={} sequential_session_stable={} sequential_phase_after={} sequential_ready_after={} open_journal_entries_peak={} open_journal_entries_before={} open_journal_entries_after={} open_journal_ids_before={:?} open_journal_ids_after={:?} open_journal_settle_ms={} earlier_phase_streams={:?} open_streams_retired={}(+{} before) open_retired_ranges_coalesced={} cancelled_exchanges={} cancelled_handlers_observed={} open_streams_retired_after_cancelled={} open_journal_entries_after_cancelled={} open_journal_ids_after_cancelled={:?} cancelled_session_stable={} cancelled_ready_after={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1634,6 +1634,13 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.open_streams_retired,
                         evidence.open_streams_retired_before_sequential,
                         evidence.open_retired_ranges_coalesced,
+                        evidence.cancelled_exchanges,
+                        evidence.cancelled_handlers_observed,
+                        evidence.open_streams_retired_after_cancelled,
+                        evidence.open_journal_entries_after_cancelled,
+                        evidence.open_journal_stream_ids_after_cancelled,
+                        evidence.cancelled_session_id_stable,
+                        evidence.cancelled_ready_after,
                     );
                     Ok(())
                 }),
@@ -1656,7 +1663,7 @@ pub(crate) async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
+                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} delete_status={} delete_closed={} delete_failed_streams={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1666,6 +1673,9 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.session_id_from_connection_stream,
                         evidence.prompt_accepted_202,
                         evidence.conversation_stop_reason,
+                        evidence.delete_status,
+                        evidence.delete_closed_connection,
+                        evidence.delete_failed_held_streams,
                         evidence.permission_requested_on_wire,
                         evidence.offered_options,
                         evidence.allow_outcome_at_agent,
@@ -2896,7 +2906,7 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.correlation.misrouted,
                     );
                     println!(
-                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {} withdrawn_in={}ms) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={}",
+                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {} withdrawn_in={}ms) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={} revoked_sessions_ended={} session_ended_within={}ms",
                         evidence.revocation.baseline_status,
                         evidence.revocation.in_flight_status,
                         evidence.revocation.in_flight_code,
@@ -2910,6 +2920,8 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.revocation.sibling_principal_served,
                         evidence.revocation.device_session_survived,
                         evidence.revocation.revoked_session_unreachable,
+                        evidence.revocation.revoked_sessions_ended,
+                        evidence.revocation.session_ended_within_ms,
                     );
                     println!(
                         "M3 MCP isolation rotation-span: rotations={} dispatched_between_rotations={} anchor_to_dispatch_ms={} status={} exact={} invocations={} session_stable={}",
@@ -3151,6 +3163,15 @@ pub(crate) async fn main() -> ExitCode {
         [command] if matches!(command.as_str(), "help" | "--help" | "-h") => {
             print_help();
             Ok(())
+        }
+        // The MCP demo's cloud-side client (docs/demo/mcp.md).  Not a
+        // verification gate: it prints what a real client sees and exits
+        // non-zero on the first step that fails.
+        [command, rest @ ..] if command == "mcp-demo-client" => {
+            match tunnel_test_harness::mcp_demo_client::DemoArgs::parse(rest) {
+                Ok(demo) => tunnel_test_harness::mcp_demo_client::run(demo).await,
+                Err(error) => Err(error),
+            }
         }
         _ => Err(HarnessError::InvalidInput(
             "unknown command; use --help".to_owned(),

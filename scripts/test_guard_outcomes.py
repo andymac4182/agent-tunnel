@@ -288,12 +288,25 @@ EXPECTED_MODULE_FILTERS = 9
 #: the truth rather than below it.  That is the whole point of it, and the
 #: correction was taken by re-running `--check-anchors`, not by subtracting
 #: one.
+#:
+#: **487** after task row M4-20 added two gate-4 cases (a `Twrite` refused
+#: under a read-only grant is counted; it is counted by the grant, never by
+#: its opcode), measured by `--check-anchors` on `feat-fs-demo`; **488**
+#: after M4-21 added the gate-4 request-deadline case; **491** after M4-21's
+#: review replaced it with four stall-bound cases, measured by
+#: `--check-anchors`.
 EXPECTED_GUARD_ANCHORS = {
-    "fs-guard-deletion.py": 485,
+    "fs-guard-deletion.py": 491,
     # Was 148. **149** after M5-C16 added the `m8c7` case that defeats
     # `availability()`. Re-measured, not incremented: 150 first, which fails
-    # naming acp ("found 149"), then 149.
-    "acp-guard-deletion.py": 149,
+    # naming acp ("found 149"), then 149.  **151** after feat-acp-demo added
+    # the M8-C27 case and gave the lying-202 prompt case a second edit for
+    # the ordered path; measured the same way: 152 first, which fails naming
+    # acp ("found 151"), then 151.  **164** after relay-rekey (#183) added its
+    # peer-key rotation cases, measured on integration branch
+    # `integrate-2026-09-26f` and on #183's own tip `5eb1805f`: 165 fails
+    # naming acp ("found 164"), then 164.
+    "acp-guard-deletion.py": 164,
     # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
@@ -303,7 +316,9 @@ EXPECTED_GUARD_ANCHORS = {
     # left at 100 would have passed with the whole suite deleted (Opus review
     # of `fc920f8`). Re-measured, not incremented: 111 first, which fails
     # naming m5 ("found 110"), then 110.
-    "m5-guard-deletion.py": 110,
+    # Then **123**, measured on integration branch `integrate-2026-09-26e`
+    # (the floor had lagged 13 behind); 124 fails naming m5, then 123.
+    "m5-guard-deletion.py": 123,
     # Was 5. Measured at the m6c4 tip: 12 anchors across 3 suites -- the seven
     # M6-C08 resolution rules and the `m6c08-doctor` suite for the surface
     # that reports them. (11 before the Fable review, which added the
@@ -342,7 +357,31 @@ EXPECTED_GUARD_ANCHORS = {
     # had been lagging six behind the truth before that case was added (not
     # attributed here to the suites that landed without raising it). Re-measured the same way:
     # 35 first, which fails naming m3 ("found 34"), then 34.
-    "m3-guard-deletion.py": 34,
+    #
+    # Then **60**, measured on branch `m7-connector`: `--check-anchors`
+    # reported 51 across 12 suites after merging `origin/main` (the floor had
+    # lagged 17 behind), and 60 across 14 once the `m7-connector-relay` and
+    # `m7-connector-client` suites added their nine cases (M7-C84, M7-C94,
+    # M7-C95, M7-C98, M7-C109, M7-C110).  Re-measured the same way: 61 first,
+    # which fails naming m3, then 60.  Then **61** for the relay half of
+    # M7-C98 (the frozen fence binds only the old carrier): 62 first, which
+    # fails naming m3 ("found 61"), then 61.  Then **63** for the review of
+    # PR #171 (a transient owner catalog refusal and a busy session's
+    # retention clock): 64 first, which fails naming m3 ("found 63"), then 63.
+    #
+    # Then **55**, on `feat-mcp-demo`: `--check-anchors` reported 51 across
+    # 12 suites at `cb94dc3` (the floor had gone slack by 17 again), and 55
+    # across 15 with the M3-11, M3-16 and M3-22 suites this branch adds.
+    # Re-measured the same way: 56 first, which fails naming m3 ("found
+    # 55"), then 55.
+    #
+    # Then **59**, after the review of #173 added the `m3c16-owner-watch`
+    # suite (3 cases) and the scope-set case. Re-measured the same way: 60
+    # first, which fails naming m3 ("found 59"), then 59.
+    #
+    # Then **71** on integration branch `integrate-2026-09-26e`, which
+    # merges both (#171 and #173); 72 fails naming m3, then 71.
+    "m3-guard-deletion.py": 71,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
@@ -358,7 +397,9 @@ EXPECTED_GUARD_ANCHORS = {
     # m0 raised 13 -> **44** after merging #140, re-measured rather than
     # carried: `--check-anchors` reports 44 across 3 suites, and 45 fails
     # naming m0. The floor had gone slack by 31 without anyone noticing.
-    "m0-guard-exit-codes.py": 44,
+    # **54** after merging #178 (M6-06 ops gate) into the integration branch:
+    # `--check-anchors` reports 54 across 4 suites, and 55 fails naming m0.
+    "m0-guard-exit-codes.py": 54,
     "m6-guard-client-bundle-sentinel.py": 2,
 }
 
