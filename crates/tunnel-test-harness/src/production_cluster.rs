@@ -5847,6 +5847,8 @@ async fn start_relay(
         http_forward: None,
         redis_restart_continuity_seconds: None,
         metrics_bind: None,
+        listener_max_connections: tunnel_transport::DEFAULT_MAX_CONCURRENT_HANDSHAKES,
+        listener_refusal_margin: tunnel_transport::DEFAULT_REFUSAL_MARGIN,
     };
     let mut options = RelayOptions::new(harness.production_oidc_verifier()?);
     options.node_id = node.node_id.clone();
@@ -5917,11 +5919,13 @@ async fn start_relay(
                     send_buffer_bytes: consumer_send_buffer_bytes,
                     diagnostics: consumer_socket_diagnostics.clone(),
                     listener: None,
+                    capacity: Default::default(),
                 },
                 device: AcceptedSocketOptions {
                     send_buffer_bytes: harness.device_send_buffer_bytes,
                     diagnostics: device_socket_diagnostics.clone(),
                     listener: None,
+                    capacity: Default::default(),
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,

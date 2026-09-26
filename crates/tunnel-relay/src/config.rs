@@ -751,6 +751,18 @@ pub struct ServeConfig {
     /// unspecified one and never a public listener's address.
     #[serde(default)]
     pub metrics_bind: Option<SocketAddr>,
+    /// Task row M6-C153: concurrent connections each public listener
+    /// (consumer and device, separately) serves, `1..=4096`, default 64.
+    #[serde(default = "default_listener_max_connections")]
+    pub listener_max_connections: usize,
+    /// Task row M6-C153: extra connections each public listener accepts over
+    /// `listener_max_connections` only to answer `503 CONNECTION_LIMIT` with
+    /// `Retry-After`, `0..=256`, default 16.  While these are also in use the
+    /// listener stops accepting and further connections wait in the kernel
+    /// listen backlog; none is accepted and reset.  `0` does no TLS work over
+    /// the limit.
+    #[serde(default = "default_listener_refusal_margin")]
+    pub listener_refusal_margin: usize,
 }
 
 /// Whether `address` may carry the unauthenticated metrics listener: a
@@ -1032,7 +1044,30 @@ impl ServeConfig {
                 ));
             }
         }
+        if !(1..=tunnel_transport::MAX_LISTENER_CONNECTIONS)
+            .contains(&self.listener_max_connections)
+        {
+            return Err(ConfigError::Invalid(
+                "listener_max_connections must be 1..=4096",
+            ));
+        }
+        if self.listener_refusal_margin > tunnel_transport::MAX_REFUSAL_MARGIN {
+            return Err(ConfigError::Invalid(
+                "listener_refusal_margin must be 0..=256",
+            ));
+        }
         Ok(())
+    }
+
+    /// The public listeners' connection limit and over-capacity refusal
+    /// (task row M6-C153), applied to the consumer and device listeners
+    /// separately.
+    pub fn listener_capacity(&self) -> tunnel_transport::ListenerCapacity {
+        tunnel_transport::ListenerCapacity {
+            max_connections: self.listener_max_connections,
+            refusal_margin: self.listener_refusal_margin,
+            ..tunnel_transport::ListenerCapacity::default()
+        }
     }
 
     /// The listener options `serve` uses: default socket options plus the
@@ -1042,7 +1077,16 @@ impl ServeConfig {
     /// # Errors
     /// An invalid `[http_forward]` table.
     pub fn listener_options(&self) -> Result<crate::ListenerSocketOptions, ConfigError> {
+        let capacity = self.listener_capacity();
         Ok(crate::ListenerSocketOptions {
+            consumer: tunnel_transport::AcceptedSocketOptions {
+                capacity,
+                ..tunnel_transport::AcceptedSocketOptions::default()
+            },
+            device: tunnel_transport::AcceptedSocketOptions {
+                capacity,
+                ..tunnel_transport::AcceptedSocketOptions::default()
+            },
             http_forward: self
                 .http_forward
                 .as_ref()
@@ -1202,6 +1246,14 @@ fn default_max_devices_per_user() -> usize {
 
 fn default_max_pending_operations_per_owner() -> usize {
     DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER
+}
+
+fn default_listener_max_connections() -> usize {
+    tunnel_transport::DEFAULT_MAX_CONCURRENT_HANDSHAKES
+}
+
+fn default_listener_refusal_margin() -> usize {
+    tunnel_transport::DEFAULT_REFUSAL_MARGIN
 }
 
 fn default_max_queue_bytes() -> usize {
@@ -1581,6 +1633,37 @@ consumer_tls_private_key = "consumer-key.pem"
             "{}\nnode_id = \"relay-a\"\n\n[cluster]\ndeployment_id = \"deployment-a\"\npeer_bind = \"127.0.0.1:8443\"\npeer_tls_cert_chain = \"peer-cert.pem\"\npeer_tls_private_key = \"peer-key.pem\"\npeer_tls_client_ca = \"peer-ca.pem\"\nmembership_signer_public_key_path = \"membership-signer.pub\"\nmembership_signer_trust_path = \"membership-trust.pem\"\ncheckpoint_authority_endpoint = \"https://checkpoint.example.test/v1/checkpoint\"\ncheckpoint_authority_trust_path = \"checkpoint-ca.pem\"\nmembership_version_state_path = \"state/membership-version-state.json\"\n\n[cluster.endpoint_policy]\nallowed_ports = [8443]\nrequire_private_ip = true\n",
             valid_toml()
         )
+    }
+
+    /// M6-C153: the listener limit and refusal margin are configurable,
+    /// default to 64 and 16, reach both listeners, and are range checked.
+    #[test]
+    fn listener_capacity_is_configurable_and_bounded() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid");
+        assert_eq!(config.listener_max_connections, 64);
+        assert_eq!(config.listener_refusal_margin, 16);
+        let options = config.listener_options().expect("options");
+        assert_eq!(
+            options.consumer.capacity,
+            tunnel_transport::ListenerCapacity::default()
+        );
+        assert_eq!(options.device.capacity, options.consumer.capacity);
+        let tuned = ServeConfig::parse(&format!(
+            "listener_max_connections = 128\nlistener_refusal_margin = 0\n{}",
+            valid_toml()
+        ))
+        .expect("tuned");
+        let capacity = tuned.listener_options().expect("options").consumer.capacity;
+        assert_eq!(capacity.max_connections, 128);
+        assert_eq!(capacity.refusal_margin, 0);
+        for refused in [
+            "listener_max_connections = 0",
+            "listener_max_connections = 4097",
+            "listener_refusal_margin = 257",
+        ] {
+            ServeConfig::parse(&format!("{refused}\n{}", valid_toml()))
+                .expect_err(&format!("accepted {refused}"));
+        }
     }
 
     #[test]
