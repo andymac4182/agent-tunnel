@@ -16652,6 +16652,7 @@ mod tests {
             block_once: AtomicBool::new(true),
             entered: Notify::new(),
             release: Notify::new(),
+            forget_tick: std::sync::Mutex::new(None),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
         let (control_client, mut control_peer) = test_websocket_pair().await?;
