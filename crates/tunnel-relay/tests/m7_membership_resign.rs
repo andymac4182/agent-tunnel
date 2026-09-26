@@ -111,6 +111,22 @@ struct Fixture {
 
 impl Fixture {
     async fn ready() -> Self {
+        Self::ready_with_policy(PrivateEndpointPolicy::private_ip_only()).await
+    }
+
+    /// A fixture whose verifier allowlists a second port and a second server
+    /// name, so a record can change the endpoint or the server name alone.
+    async fn ready_allowing_route_changes() -> Self {
+        let policy = PrivateEndpointPolicy::allowlisted(
+            ["10.0.0.1", "10.0.0.2"],
+            ["10.0.0.1", "10.0.0.2", "relay-alt.test"],
+            [8443, 9443],
+        )
+        .expect("allowlisted synthetic policy");
+        Self::ready_with_policy(policy).await
+    }
+
+    async fn ready_with_policy(policy: PrivateEndpointPolicy) -> Self {
         let (issuer, _private_key) =
             MembershipIssuer::generate(PUBLISHER_KEY_ID).expect("synthetic publisher");
         let issuer = Arc::new(issuer);
@@ -128,7 +144,7 @@ impl Fixture {
             DEPLOYMENT_INCARNATION,
             NODE_ID,
             BOOT_ID,
-            PrivateEndpointPolicy::private_ip_only(),
+            policy,
             Duration::from_secs(60),
             Duration::from_secs(20),
             Duration::from_secs(1),
@@ -408,7 +424,7 @@ async fn admission_after(
 /// must invalidate, not re-bind (`same_peer_binding`).
 #[tokio::test]
 async fn a_same_key_resign_with_a_changed_endpoint_invalidates() {
-    let fixture = Fixture::ready().await;
+    let fixture = Fixture::ready_allowing_route_changes().await;
     let record = sign_record_with_route(
         &fixture.issuer,
         NODE_ID,
@@ -417,10 +433,19 @@ async fn a_same_key_resign_with_a_changed_endpoint_invalidates() {
         SPKI_SHA256,
         30,
         false,
-        "10.0.0.9:8443",
+        "10.0.0.1:9443",
         "10.0.0.1",
     );
     let stream = admission_after(&fixture, record).await;
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Ready,
+        "precondition: the verifier accepted the changed route, so only the re-bind guard can act"
+    );
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipChanged)
+    );
     assert!(
         stream.is_cancelled(),
         "M7-C80: a changed peer endpoint was re-bound"
@@ -430,7 +455,7 @@ async fn a_same_key_resign_with_a_changed_endpoint_invalidates() {
 /// The re-bind guard's binding identity, server name.
 #[tokio::test]
 async fn a_same_key_resign_with_a_changed_server_name_invalidates() {
-    let fixture = Fixture::ready().await;
+    let fixture = Fixture::ready_allowing_route_changes().await;
     let record = sign_record_with_route(
         &fixture.issuer,
         NODE_ID,
@@ -440,9 +465,18 @@ async fn a_same_key_resign_with_a_changed_server_name_invalidates() {
         30,
         false,
         "10.0.0.1:8443",
-        "10.0.0.9",
+        "relay-alt.test",
     );
     let stream = admission_after(&fixture, record).await;
+    assert_eq!(
+        fixture.runtime.readiness(),
+        MembershipReadiness::Ready,
+        "precondition: the verifier accepted the changed route, so only the re-bind guard can act"
+    );
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipChanged)
+    );
     assert!(
         stream.is_cancelled(),
         "M7-C80: a changed server name was re-bound"
