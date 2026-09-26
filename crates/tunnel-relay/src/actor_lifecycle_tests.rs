@@ -887,6 +887,183 @@ async fn close_all_releases_the_overflow_within_one_shutdown_deadline() {
     spare.shutdown().await;
 }
 
+/// Register `count` live device sessions in `catalog` through `handle`,
+/// spread over users so `max_devices_per_user` (16) is never reached (task
+/// row M6-C185).  Returns the tenant, the device ids and the registrations,
+/// which the caller keeps alive so every session is still live at shutdown.
+async fn register_live_sessions(
+    handle: &RelayHandle,
+    catalog: &HeldCatalog,
+    count: usize,
+) -> (Uuid, Vec<Uuid>, Vec<super::ControlRegistration>) {
+    const PER_USER: usize = 8;
+    let tenant_id = Uuid::from_u128(0xC185_0001);
+    let users: Vec<Uuid> = (0..count.div_ceil(PER_USER))
+        .map(|index| Uuid::from_u128(0xC185_2000 + index as u128))
+        .collect();
+    let device_ids: Vec<Uuid> = (0..count)
+        .map(|index| Uuid::from_u128(0xC185_1000 + index as u128))
+        .collect();
+    let spki = |index: usize| format!("{:064x}", 0xC185_0000_u128 + index as u128);
+    let now = Utc::now();
+    let fixture = CatalogFixture {
+        tenants: vec![TenantRecord {
+            tenant_id,
+            display_name: "c185-tenant".to_owned(),
+            active: true,
+        }],
+        users: users
+            .iter()
+            .map(|&user_id| UserRecord {
+                user_id,
+                display_name: "C185 User".to_owned(),
+            })
+            .collect(),
+        memberships: users
+            .iter()
+            .map(|&user_id| MembershipRecord {
+                tenant_id,
+                user_id,
+                role: MembershipRole::Member,
+                active: true,
+            })
+            .collect(),
+        devices: device_ids
+            .iter()
+            .enumerate()
+            .map(|(index, &device_id)| FixtureDevice {
+                tenant_id,
+                device_id,
+                owner_user_id: users[index / PER_USER],
+                display_name: "C185 Device".to_owned(),
+                active: true,
+                last_seen_at: Some(now),
+            })
+            .collect(),
+        credentials: device_ids
+            .iter()
+            .enumerate()
+            .map(|(index, &device_id)| CredentialRecord {
+                tenant_id,
+                device_id,
+                credential_id: Uuid::from_u128(0xC185_3000 + index as u128),
+                spki_fingerprint: spki(index),
+                serial: Some(format!("c185-{index}")),
+                not_before: now - ChronoDuration::seconds(1),
+                expires_at: now + ChronoDuration::hours(1),
+                revoked_at: None,
+                active: true,
+            })
+            .collect(),
+        ..CatalogFixture::default()
+    };
+    catalog
+        .seed_fixture(&fixture)
+        .await
+        .expect("seed C185 catalog fixture");
+    let mut registrations = Vec::with_capacity(count);
+    for (index, &device_id) in device_ids.iter().enumerate() {
+        let identity = catalog
+            .inner
+            .resolve_device(&spki(index), Utc::now())
+            .await
+            .expect("C185 identity lookup")
+            .expect("C185 fixture identity");
+        registrations.push(
+            handle
+                .register_forwarded_control(identity, spki(index), lifecycle_hello(device_id))
+                .await
+                .expect("register a live C185 session"),
+        );
+    }
+    assert_eq!(
+        still_claimed(catalog, tenant_id, &device_ids).await,
+        count,
+        "every live session holds its owner claim before shutdown"
+    );
+    (tenant_id, device_ids, registrations)
+}
+
+/// **Task row M6-C185.** `close_all` closes every live session, and each
+/// close queued the session's owner token on the cleanup worker's 64-slot
+/// queue with a synchronous `try_send` and no await in between.  Past 64 live
+/// sessions (the default `max_devices` is 1024) the rest were refused as
+/// `saturated` and left fenced until their lease expired.  `tokio::test`
+/// runs on one thread, so the worker cannot drain during the loop: without
+/// the fix exactly the tokens past the capacity stay claimed.  The lease is
+/// 30 s; the bound is 5 s.
+#[tokio::test]
+async fn close_all_releases_more_live_session_owners_than_the_cleanup_queue_holds() {
+    const LIVE: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) =
+        register_live_sessions(&handle, &catalog, LIVE).await;
+
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown with more live sessions than the cleanup queue holds is bounded");
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+
+    let claimed = still_claimed(&catalog, tenant_id, &device_ids).await;
+    assert_eq!(
+        claimed,
+        0,
+        "{claimed} of {LIVE} live session owners were left fenced until lease expiry \
+         (cleanup queue capacity {})",
+        super::CLEANUP_QUEUE_CAPACITY
+    );
+    drop(registrations);
+}
+
+/// **Task row M6-C185, shutdown budget.** The live-session owners past the
+/// cleanup queue are released within `close_all`'s one
+/// `CLEANUP_SHUTDOWN_TIMEOUT`, shared with the worker's drain.  Each release
+/// takes 60 ms of paused time: the worker's 64 take 3.84 s and the 69 left
+/// over would take a further 4.14 s, so the release must stop at the 5 s
+/// deadline having released more than the worker alone could.
+#[tokio::test(start_paused = true)]
+async fn close_all_releases_live_session_overflow_within_one_shutdown_deadline() {
+    const LIVE: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let catalog = HeldCatalog::new();
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+    let (tenant_id, device_ids, registrations) =
+        register_live_sessions(&handle, &catalog, LIVE).await;
+    catalog.release_delay_ms.store(60, Ordering::Release);
+
+    let started = tokio::time::Instant::now();
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    let elapsed = started.elapsed();
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    assert!(
+        elapsed <= super::CLEANUP_SHUTDOWN_TIMEOUT + Duration::from_millis(200),
+        "the live-session owner release took {elapsed:?}, past the {:?} shutdown deadline",
+        super::CLEANUP_SHUTDOWN_TIMEOUT
+    );
+    catalog.release_delay_ms.store(0, Ordering::Release);
+    let released = LIVE - still_claimed(&catalog, tenant_id, &device_ids).await;
+    assert!(
+        released > super::CLEANUP_QUEUE_CAPACITY,
+        "only {released} of {LIVE} live session owners released: the overflow was refused \
+         by the full cleanup queue"
+    );
+    drop(registrations);
+}
+
 #[tokio::test]
 async fn shutdown_joins_inflight_owner_renewal_before_cleanup_worker() {
     let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;
