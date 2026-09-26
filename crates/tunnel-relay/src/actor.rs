@@ -109,6 +109,10 @@ const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
 const CLEANUP_QUEUE_CAPACITY: usize = 64;
 const CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Owner tokens released at once by a direct (post-worker) release: about
+/// 1024 tokens at 20 ms each against a remote Redis fit the 5 s shutdown
+/// budget only when released concurrently (task row M6-C187).
+const OWNER_RELEASE_CONCURRENCY: usize = 8;
 const RUNNING_RELAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_CLEANUP_QUEUE_CAPACITY: usize = 64;
 const MAX_ROTATION_DEADLINE_EVENTS: usize = 8;
@@ -476,39 +480,62 @@ enum OwnerCleanupItem {
     Claim(OwnerClaimRequest),
 }
 
-/// Synchronous sender used by owner-claim guards.  Queue saturation is a
-/// fail-closed signal: the exact token, or the complete claim identity, stays
-/// fenced until lease expiry rather than being replaced by an unsafe guess.
+/// Synchronous sender used by session closes and owner-claim guards.  An
+/// item the bounded queue has no room for is kept in the [`OwnerBacklog`]
+/// and offered back to the worker as room frees up (task row M6-C186).  Past
+/// the backlog's bound the item is refused: the exact token, or the complete
+/// claim identity, stays fenced until lease expiry rather than being
+/// replaced by an unsafe guess.  A refusal is logged once and counted; it
+/// never shuts the relay down (its `refused` flag is the owner worker's own,
+/// never the terminal-cleanup overflow signal).
 #[derive(Clone)]
 struct CleanupDispatcher {
     tx: mpsc::Sender<OwnerCleanupItem>,
     pending: Arc<AtomicUsize>,
-    overflowed: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    refused: Arc<AtomicBool>,
+    refused_count: Arc<AtomicUsize>,
+    backlog: OwnerBacklog,
+    /// Wakes the actor to offer the backlog to the worker again.
+    backlog_notify: Arc<Notify>,
 }
 
 impl CleanupDispatcher {
     fn enqueue(&self, item: OwnerCleanupItem) {
+        // Items already kept go first: a new one queues behind them.
+        if !self.backlog.is_empty() {
+            self.keep_or_refuse(item, "saturated");
+            return;
+        }
         // Reserve the in-flight count before handing the item to the worker;
         // otherwise a fast worker could decrement before the increment and
         // wrap the bounded counter.  try_send never waits, so failed sends
         // release this reservation immediately rather than counting work
         // that was never queued.
         self.pending.fetch_add(1, Ordering::AcqRel);
+        match self.tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                self.keep_or_refuse(item, "saturated");
+            }
+            Err(mpsc::error::TrySendError::Closed(item)) => {
+                // The worker has shut down: `close_all` or the supervisor
+                // releases what is kept.
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                self.keep_or_refuse(item, "closed");
+            }
+        }
+    }
+
+    fn keep_or_refuse(&self, item: OwnerCleanupItem, state: &'static str) {
         let fields = match &item {
             OwnerCleanupItem::Token(owner) => (owner.tenant_id, owner.device_id),
             OwnerCleanupItem::Claim(request) => (request.tenant_id, request.device_id),
         };
-        match self.tx.try_send(item) {
-            Ok(()) => self.notify.notify_one(),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
-                self.fail_closed(fields.0, fields.1, "saturated");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
-                self.fail_closed(fields.0, fields.1, "closed");
-            }
+        if self.backlog.try_keep(item) {
+            self.backlog_notify.notify_one();
+        } else {
+            self.fail_closed(fields.0, fields.1, state);
         }
     }
 
@@ -526,21 +553,40 @@ impl CleanupDispatcher {
         // Reserved before the send, as in `enqueue`.
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(item);
-        self.notify.notify_one();
         true
     }
 
+    #[cfg(test)]
+    fn for_test(
+        tx: mpsc::Sender<OwnerCleanupItem>,
+        pending: Arc<AtomicUsize>,
+        refused: Arc<AtomicBool>,
+        backlog: OwnerBacklog,
+    ) -> Self {
+        Self {
+            tx,
+            pending,
+            refused,
+            refused_count: Arc::new(AtomicUsize::new(0)),
+            backlog,
+            backlog_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Refuse one item: it stays fenced until its lease expires.  Logged
+    /// once and counted; the relay keeps running (task row M6-C186).
     fn fail_closed(&self, tenant_id: Uuid, device_id: Uuid, state: &'static str) {
-        if !self.overflowed.swap(true, Ordering::AcqRel) {
+        self.refused_count.fetch_add(1, Ordering::AcqRel);
+        if !self.refused.swap(true, Ordering::AcqRel) {
             tracing::error!(
                 %tenant_id,
                 %device_id,
                 state,
                 capacity = CLEANUP_QUEUE_CAPACITY,
-                "owner cleanup unavailable; lease expiry is the fencing fallback"
+                backlog_cap = self.backlog.cap(),
+                "owner cleanup refused past the cleanup queue and its backlog; lease expiry is the fencing fallback"
             );
         }
-        self.notify.notify_one();
     }
 }
 
@@ -797,26 +843,142 @@ where
     (released, abandoned)
 }
 
-/// Release owner tokens one at a time against `catalog`, fenced exactly as
-/// the cleanup worker releases them (a token only while it is still the
-/// current owner), within one overall `deadline`.  Returns `(released,
-/// abandoned)`: the token in flight and any not yet started when the
-/// deadline passed are left to lease expiry and counted (task row M6-C185).
-async fn release_owner_tokens_until(
+/// Owner cleanup items (session owner tokens and dropped claim guards) the
+/// cleanup worker's bounded queue had no room for (task rows M6-C185 and
+/// M6-C186).
+///
+/// The dispatcher keeps them here instead of refusing them, and the actor
+/// offers them back to the worker with `CleanupDispatcher::enqueue_if_room`
+/// when the worker signals progress, after every command and on every tick,
+/// so a `tick` that closes more sessions than the queue holds no longer
+/// refuses the rest.  At relay shutdown `close_all` releases whatever is
+/// left, fenced, after the worker has shut down.  The list is shared with the
+/// actor's supervisor ([`StrandedClaimRelease`]), so an actor that panics or
+/// is aborted with items kept here does not drop them (task row M6-C187).
+/// While the relay runs it is bounded by `max_devices`; past that an item is
+/// refused, logged once, counted and left to lease expiry.  `close_all`
+/// lifts the bound, since the live sessions (`max_devices`) bound it then.
+#[derive(Clone)]
+struct OwnerBacklog {
+    state: Arc<Mutex<OwnerBacklogState>>,
+}
+
+struct OwnerBacklogState {
+    items: VecDeque<OwnerCleanupItem>,
+    cap: usize,
+    uncapped: bool,
+}
+
+impl OwnerBacklog {
+    fn new(cap: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(OwnerBacklogState {
+                items: VecDeque::new(),
+                cap,
+                uncapped: false,
+            })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, OwnerBacklogState> {
+        // A panic elsewhere must not stop kept owners being released.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Keep `item` if the bound allows; `false` means it was refused.
+    fn try_keep(&self, item: OwnerCleanupItem) -> bool {
+        let mut state = self.lock();
+        if state.uncapped || state.items.len() < state.cap {
+            state.items.push_back(item);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Lift the running bound for `close_all`, where the live sessions bound
+    /// the backlog instead.
+    fn lift_cap(&self) {
+        self.lock().uncapped = true;
+    }
+
+    fn cap(&self) -> usize {
+        self.lock().cap
+    }
+
+    #[cfg(test)]
+    fn set_cap(&self, cap: usize) {
+        self.lock().cap = cap;
+    }
+
+    #[cfg(test)]
+    fn push(&self, item: OwnerCleanupItem) {
+        self.lock().items.push_back(item);
+    }
+
+    fn pop_front(&self) -> Option<OwnerCleanupItem> {
+        self.lock().items.pop_front()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lock().items.is_empty()
+    }
+}
+
+/// Release the items kept in `backlog` against `catalog`, at most
+/// `OWNER_RELEASE_CONCURRENCY` at a time, fenced exactly as the cleanup
+/// worker releases them (a token only while it is still the current owner, a
+/// claim only after a lookup finds that exact identity), within one overall
+/// `deadline`.  Returns `(attempted, abandoned)`: `attempted` counts the
+/// releases that ran to completion, which includes a release that failed or
+/// timed out and left its token to lease expiry; the items in flight and any
+/// still kept when the deadline passed are taken out of the backlog, left to
+/// lease expiry and counted as abandoned (task rows M6-C185 and M6-C187).  A
+/// deadline already passed abandons the whole backlog without starting one.
+async fn release_backlog_until(
     catalog: &SharedCatalog,
-    owners: Vec<OwnerToken>,
+    backlog: &OwnerBacklog,
     deadline: tokio::time::Instant,
 ) -> (usize, usize) {
-    let total = owners.len();
-    let mut released = 0_usize;
-    let _ = tokio::time::timeout_at(deadline, async {
-        for owner in owners {
-            release_cleanup_item(catalog, &OwnerCleanupItem::Token(owner)).await;
-            released = released.saturating_add(1);
+    use futures_util::StreamExt as _;
+    if tokio::time::Instant::now() >= deadline {
+        let mut abandoned = 0_usize;
+        while backlog.pop_front().is_some() {
+            abandoned = abandoned.saturating_add(1);
+        }
+        return (0, abandoned);
+    }
+    let started = AtomicUsize::new(0);
+    let mut attempted = 0_usize;
+    let finished = tokio::time::timeout_at(deadline, async {
+        let items = std::iter::from_fn(|| {
+            let item = backlog.pop_front()?;
+            started.fetch_add(1, Ordering::Relaxed);
+            Some(item)
+        });
+        let mut releases = futures_util::stream::iter(items)
+            .map(|item| async move { release_cleanup_item(catalog, &item).await })
+            .buffer_unordered(OWNER_RELEASE_CONCURRENCY);
+        while releases.next().await.is_some() {
+            attempted = attempted.saturating_add(1);
         }
     })
-    .await;
-    (released, total.saturating_sub(released))
+    .await
+    .is_ok();
+    let mut abandoned = started.load(Ordering::Relaxed).saturating_sub(attempted);
+    if !finished {
+        while backlog.pop_front().is_some() {
+            abandoned = abandoned.saturating_add(1);
+        }
+    }
+    (attempted, abandoned)
 }
 
 /// Held by the actor task's supervisor: once the actor has ended, release
@@ -827,20 +989,49 @@ async fn release_owner_tokens_until(
 /// counted in the log.
 struct StrandedClaimRelease {
     handoffs: ClaimHandoffs,
+    /// Session owner tokens the actor kept for its cleanup queue (task row
+    /// M6-C187); `close_all` empties it, so only an actor that panicked or
+    /// was aborted leaves anything here.
+    backlog: OwnerBacklog,
     catalog: SharedCatalog,
 }
 
 impl StrandedClaimRelease {
+    /// Returns `(released, abandoned)` over the kept session owners and the
+    /// parked claims together.  The owners go first, within the same one
+    /// deadline.
     async fn release(&self) -> (usize, usize) {
         let catalog = &self.catalog;
-        let (released, abandoned) = release_parked_until(
-            &self.handoffs,
-            tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT,
-            |item| async move { release_cleanup_item(catalog, &item).await },
-        )
-        .await;
+        let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
+        let (owners_released, owners_abandoned) =
+            release_backlog_until(catalog, &self.backlog, deadline).await;
+        log_stranded_owner_release(owners_released, owners_abandoned);
+        let (released, abandoned) =
+            release_parked_until(&self.handoffs, deadline, |item| async move {
+                release_cleanup_item(catalog, &item).await
+            })
+            .await;
         log_stranded_release(released, abandoned);
-        (released, abandoned)
+        (
+            released.saturating_add(owners_released),
+            abandoned.saturating_add(owners_abandoned),
+        )
+    }
+}
+
+fn log_stranded_owner_release(attempted: usize, abandoned: usize) {
+    if abandoned > 0 {
+        tracing::error!(
+            attempted,
+            abandoned,
+            timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
+            "owner cleanup kept for the cleanup queue when the relay actor ended exceeded the release deadline; lease expiry is the fencing fallback"
+        );
+    } else if attempted > 0 {
+        tracing::warn!(
+            attempted,
+            "owner cleanup kept for the cleanup queue when the relay actor ended was attempted"
+        );
     }
 }
 
@@ -865,6 +1056,10 @@ impl Drop for StrandedClaimRelease {
         // Reached with parked guards only when the supervisor was aborted
         // before `release` ran (or during it).
         let mut items = Vec::new();
+        while let Some(item) = self.backlog.pop_front() {
+            items.push(item);
+        }
+        let owners = items.len();
         while let Some(item) = self.handoffs.take_next_after_end() {
             items.push(item);
         }
@@ -875,6 +1070,7 @@ impl Drop for StrandedClaimRelease {
         // is shutting down, and a spawn then is silently dropped.
         tracing::error!(
             count = items.len(),
+            owners,
             "owner claims stranded behind an aborted relay actor; releasing on the runtime, lease expiry is the fencing fallback"
         );
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -914,34 +1110,44 @@ struct CleanupWorker {
 impl CleanupWorker {
     #[cfg(test)]
     fn spawn(catalog: SharedCatalog) -> Self {
-        Self::spawn_with_signal(
+        Self::spawn_with_backlog(
             catalog,
-            Arc::new(AtomicBool::new(false)),
+            OwnerBacklog::new(CLEANUP_QUEUE_CAPACITY),
             Arc::new(Notify::new()),
         )
     }
 
-    fn spawn_with_signal(
+    /// `backlog_notify` is signalled after each release while anything is
+    /// kept, so the actor refills the queue as soon as it has room rather
+    /// than once per tick (task row M6-C186).
+    fn spawn_with_backlog(
         catalog: SharedCatalog,
-        overflowed: Arc<AtomicBool>,
-        notify: Arc<Notify>,
+        backlog: OwnerBacklog,
+        backlog_notify: Arc<Notify>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
         let worker_catalog = catalog.clone();
+        let worker_backlog = backlog.clone();
+        let worker_notify = backlog_notify.clone();
         let task = tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
                 release_cleanup_item(&worker_catalog, &item).await;
                 worker_pending.fetch_sub(1, Ordering::AcqRel);
+                if !worker_backlog.is_empty() {
+                    worker_notify.notify_one();
+                }
             }
         });
         Self {
             dispatcher: Some(CleanupDispatcher {
                 tx,
                 pending,
-                overflowed,
-                notify,
+                refused: Arc::new(AtomicBool::new(false)),
+                refused_count: Arc::new(AtomicUsize::new(0)),
+                backlog,
+                backlog_notify,
             }),
             task: Some(AbortOnDropJoinHandle::new(task)),
         }
@@ -2655,6 +2861,9 @@ enum Command {
     Snapshot {
         response: oneshot::Sender<RelaySnapshot>,
     },
+    /// Test hook: run a closure against the live actor between commands.
+    #[cfg(test)]
+    TestMutate(Box<dyn FnOnce(&mut RelayActor) + Send>),
 }
 
 /// Which sessions' HTTP writer-freeze state one command can have changed.
@@ -2695,6 +2904,8 @@ impl Command {
             Self::Snapshot { .. } | Self::RecordConsumerResponseTimeout { .. } => {
                 HttpMaintenanceScope::None
             }
+            #[cfg(test)]
+            Self::TestMutate(_) => HttpMaintenanceScope::None,
             Self::RegisterControl { .. }
             | Self::AttachData { .. }
             | Self::DispatchEcho { .. }
@@ -2760,10 +2971,17 @@ impl RelayHandle {
         let (terminal_cleanup_tx, terminal_cleanup_rx) =
             mpsc::channel(TERMINAL_CLEANUP_QUEUE_CAPACITY);
         let terminal_cleanup = TerminalCleanupDispatcher::new(terminal_cleanup_tx);
-        let cleanup = CleanupWorker::spawn_with_signal(
+        // The owner cleanup worker has its own refusal flag: a refused owner
+        // release is left to lease expiry and never raises the terminal
+        // cleanup overflow signal that shuts the relay down (task row
+        // M6-C186).
+        let owner_backlog =
+            OwnerBacklog::new(options.limits.max_devices.max(CLEANUP_QUEUE_CAPACITY));
+        let owner_backlog_notify = Arc::new(Notify::new());
+        let cleanup = CleanupWorker::spawn_with_backlog(
             catalog.clone(),
-            terminal_cleanup.overflowed.clone(),
-            terminal_cleanup.notify.clone(),
+            owner_backlog.clone(),
+            owner_backlog_notify.clone(),
         );
         let actor_cancel = options.shutdown.clone();
         let maintenance_cancel = options.shutdown.clone();
@@ -2776,6 +2994,7 @@ impl RelayHandle {
         let claim_handoffs = ClaimHandoffs::default();
         let stranded_claims = StrandedClaimRelease {
             handoffs: claim_handoffs.clone(),
+            backlog: owner_backlog.clone(),
             catalog: catalog.clone(),
         };
         let handle = Self {
@@ -2829,7 +3048,8 @@ impl RelayHandle {
             http_maintenance: HttpMaintenance::default(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
-            shutdown_owner_overflow: None,
+            owner_backlog,
+            owner_backlog_notify,
             claim_handoffs: claim_handoffs.clone(),
             background_tasks: JoinSet::new(),
             background_failure,
@@ -3690,12 +3910,14 @@ struct RelayActor {
     http_maintenance: HttpMaintenance,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
-    /// Set only while `close_all` closes the live sessions: owner tokens the
-    /// cleanup worker's bounded queue has no room for are kept here and
-    /// released, fenced, after the worker has shut down, within the same
-    /// shutdown deadline (task row M6-C185).  Bounded by the live sessions
-    /// (`max_devices`).
-    shutdown_owner_overflow: Option<Vec<OwnerToken>>,
+    /// Owner cleanup the worker's bounded queue had no room for, offered back
+    /// to it as room frees up and released by `close_all` at shutdown (task
+    /// rows M6-C185 and M6-C186).  Shared with the dispatcher and the actor's
+    /// supervisor (task row M6-C187).
+    owner_backlog: OwnerBacklog,
+    /// Signalled when something is kept and after each worker release while
+    /// something is kept.
+    owner_backlog_notify: Arc<Notify>,
     /// Owner-claim guards in transit to this actor (task row M6-C170).
     claim_handoffs: ClaimHandoffs,
     background_tasks: JoinSet<()>,
@@ -3719,6 +3941,9 @@ impl RelayActor {
                 }
                 _ = self.options.shutdown.cancelled() => {
                     self.shutting_down = true;
+                }
+                () = self.owner_backlog_notify.notified() => {
+                    self.offer_owner_backlog();
                 }
                 background = self.background_tasks.join_next(), if !self.background_tasks.is_empty() => {
                     match background {
@@ -3767,8 +3992,23 @@ impl RelayActor {
             if self.shutting_down {
                 break;
             }
+            // Owner tokens a burst of closes left kept go back to the cleanup
+            // worker as its queue frees up (task row M6-C186).  The actor
+            // wakes at least every maintenance tick.
+            self.offer_owner_backlog();
         }
         self.close_all().await;
+    }
+
+    /// Hand kept owner tokens to the cleanup worker, oldest first, while its
+    /// bounded queue has room.  Never waits.
+    fn offer_owner_backlog(&self) {
+        if self.owner_backlog.is_empty() {
+            return;
+        }
+        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
+            while dispatcher.enqueue_if_room(|| self.owner_backlog.pop_front()) {}
+        }
     }
 
     fn spawn_background<F>(&mut self, task: F)
@@ -3956,6 +4196,8 @@ impl RelayActor {
                 self.check_principal_watches();
                 self.tick().await;
             }
+            #[cfg(test)]
+            Command::TestMutate(mutate) => mutate(self),
             Command::WatchPrincipalSessions {
                 key,
                 consumer,
@@ -4452,19 +4694,18 @@ impl RelayActor {
     }
 
     async fn enqueue_cleanup(&mut self, owner: OwnerToken) {
-        if let Some(overflow) = self.shutdown_owner_overflow.as_mut() {
-            // `close_all` closes every live session with no await in between,
-            // so a synchronous `try_send` per session refused every token
-            // past the queue's capacity as `saturated` and left it fenced
-            // until lease expiry (task row M6-C185).  Queue only while there
-            // is room; keep the rest for `close_all`'s fenced release.
-            let mut slot = Some(owner);
-            let queued = self.cleanup_dispatcher.as_ref().is_some_and(|dispatcher| {
-                dispatcher.enqueue_if_room(|| slot.take().map(OwnerCleanupItem::Token))
-            });
-            if !queued && let Some(owner) = slot.take() {
-                overflow.push(owner);
-            }
+        if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
+            // `close_all` and the actor's `tick` close many sessions with no
+            // await in between, so a synchronous `try_send` per session
+            // refused every token past the queue's capacity as `saturated`
+            // and left it fenced until lease expiry (task rows M6-C185 and
+            // M6-C186); the refusal also shut the relay down.  The
+            // dispatcher now keeps what the queue has no room for, behind
+            // anything already kept, for the next offer or `close_all`'s
+            // fenced release; past the backlog's bound it refuses without
+            // touching the relay's lifecycle.
+            self.offer_owner_backlog();
+            dispatcher.enqueue(OwnerCleanupItem::Token(owner));
             return;
         }
         if let Some(cleanup) = self.cleanup.as_ref() {
@@ -15457,6 +15698,10 @@ impl RelayActor {
 
     async fn close_all(&mut self) {
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
+        let refused_count = self
+            .cleanup_dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.refused_count.clone());
         // Stop every background result sender before the actor stops draining
         // commands.  A queued registration command dropped by the drain
         // leaves its owner-claim guard parked in `ClaimHandoffs`; the
@@ -15476,12 +15721,12 @@ impl RelayActor {
             .map(|session| session.key.clone())
             .collect();
         // Every live session's owner token is queued on the cleanup worker
-        // only while its bounded queue has room; the rest are kept and
-        // released below, after the worker has shut down, within this same
-        // deadline (task row M6-C185).
-        self.shutdown_owner_overflow = Some(Vec::with_capacity(
-            keys.len().saturating_sub(CLEANUP_QUEUE_CAPACITY),
-        ));
+        // only while its bounded queue has room; the rest are kept, behind
+        // any a running `tick` already kept, and released below, after the
+        // worker has shut down, within this same deadline (task rows M6-C185
+        // and M6-C186).  The kept list is shared with the supervisor, so a
+        // panic or abort from here on does not drop it (task row M6-C187).
+        self.owner_backlog.lift_cap();
         for key in keys {
             self.close_session(&key, "SHUTDOWN").await;
         }
@@ -15512,6 +15757,9 @@ impl RelayActor {
         // The registry is closed first either way, so a later deposit keeps
         // its guard with its own handoff.
         self.claim_handoffs.close();
+        // The worker may have drained while background tasks were joined:
+        // offer it the kept session owners again first (task row M6-C187).
+        self.offer_owner_backlog();
         if let Some(dispatcher) = self.cleanup_dispatcher.as_ref() {
             while dispatcher.enqueue_if_room(|| self.claim_handoffs.take_next_after_end()) {}
         }
@@ -15533,26 +15781,33 @@ impl RelayActor {
         //
         // Live-session owner tokens the queue had no room for are released
         // first, the same way and within the same deadline (task row
-        // M6-C185).  Taking the overflow ends the shutdown mode of
-        // `enqueue_cleanup`: a late close now finds no worker and releases
-        // its token directly, as before.
-        let overflow = self.shutdown_owner_overflow.take().unwrap_or_default();
+        // M6-C185), `OWNER_RELEASE_CONCURRENCY` at a time (task row
+        // M6-C187), so they take the budget before the parked guards.  The
+        // dispatcher is gone, so a late close now finds no worker and
+        // releases its token directly, as before.
         let catalog = &self.catalog;
-        let (owners_released, owners_abandoned) =
-            release_owner_tokens_until(catalog, overflow, deadline).await;
+        let (owners_attempted, owners_abandoned) =
+            release_backlog_until(catalog, &self.owner_backlog, deadline).await;
         if owners_abandoned > 0 {
             tracing::error!(
-                released = owners_released,
+                attempted = owners_attempted,
                 abandoned = owners_abandoned,
                 capacity = CLEANUP_QUEUE_CAPACITY,
                 timeout_ms = CLEANUP_SHUTDOWN_TIMEOUT.as_millis(),
-                "session owners beyond the cleanup queue exceeded the relay shutdown deadline; lease expiry is the fencing fallback"
+                "owner cleanup beyond the cleanup queue exceeded the relay shutdown deadline; lease expiry is the fencing fallback"
             );
-        } else if owners_released > 0 {
+        } else if owners_attempted > 0 {
             tracing::info!(
-                released = owners_released,
+                attempted = owners_attempted,
                 capacity = CLEANUP_QUEUE_CAPACITY,
-                "session owners beyond the cleanup queue were released at relay shutdown"
+                "owner cleanup beyond the cleanup queue was attempted at relay shutdown"
+            );
+        }
+        let refused = refused_count.map_or(0, |count| count.load(Ordering::Acquire));
+        if refused > 0 {
+            tracing::error!(
+                refused,
+                "owner cleanup was refused past the cleanup queue and its backlog while the relay ran; those owners were left to lease expiry"
             );
         }
         let (released, abandoned) =
@@ -17986,7 +18241,8 @@ mod stream_identity_tests {
             http_maintenance: super::HttpMaintenance::default(),
             cleanup_dispatcher: None,
             cleanup: None,
-            shutdown_owner_overflow: None,
+            owner_backlog: super::OwnerBacklog::new(super::CLEANUP_QUEUE_CAPACITY),
+            owner_backlog_notify: Arc::new(tokio::sync::Notify::new()),
             claim_handoffs: super::ClaimHandoffs::default(),
             background_tasks: tokio::task::JoinSet::new(),
             background_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -25913,12 +26169,12 @@ mod cleanup_tests {
     fn owner_claim_guard_enqueues_exact_token_and_fails_closed_on_overflow() {
         let (tx, mut rx) = mpsc::channel(1);
         let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dispatcher = CleanupDispatcher {
+        let dispatcher = CleanupDispatcher::for_test(
             tx,
-            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            overflowed: overflowed.clone(),
-            notify: Arc::new(super::Notify::new()),
-        };
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            overflowed.clone(),
+            super::OwnerBacklog::new(0),
+        );
         let owner = owner_token(7);
         {
             let mut guard = super::OwnerClaimCleanup::new(dispatcher.clone());
@@ -25931,12 +26187,13 @@ mod cleanup_tests {
         assert!(!overflowed.load(std::sync::atomic::Ordering::Acquire));
 
         let (tx, _rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
-        let dispatcher = CleanupDispatcher {
-            tx: tx.clone(),
-            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            overflowed: overflowed.clone(),
-            notify: Arc::new(super::Notify::new()),
-        };
+        // A backlog with no room: the refusal is flagged and counted.
+        let dispatcher = CleanupDispatcher::for_test(
+            tx.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            overflowed.clone(),
+            super::OwnerBacklog::new(0),
+        );
         for index in 0..CLEANUP_QUEUE_CAPACITY {
             tx.try_send(OwnerCleanupItem::Token(owner_token(index as u64)))
                 .expect("cleanup queue capacity");
@@ -26483,12 +26740,12 @@ mod cleanup_tests {
     async fn saturated_cleanup_queue_does_not_stall_the_actor() {
         let (tx, _rx) = mpsc::channel(CLEANUP_QUEUE_CAPACITY);
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let dispatcher = CleanupDispatcher {
-            tx: tx.clone(),
-            pending: pending.clone(),
-            overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            notify: Arc::new(super::Notify::new()),
-        };
+        let dispatcher = CleanupDispatcher::for_test(
+            tx.clone(),
+            pending.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            super::OwnerBacklog::new(0),
+        );
         let worker = CleanupWorker {
             dispatcher: Some(dispatcher),
             task: None,
@@ -26517,8 +26774,8 @@ mod cleanup_tests {
         worker.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn repeated_stale_cleanup_cannot_release_a_successor() {
+    /// One tenant, user and device in a fresh catalog, with no owner yet.
+    async fn seeded_cleanup_catalog() -> MemoryCatalog {
         let catalog = MemoryCatalog::new();
         catalog
             .seed_fixture(&CatalogFixture {
@@ -26552,6 +26809,12 @@ mod cleanup_tests {
             })
             .await
             .expect("catalog fixture");
+        catalog
+    }
+
+    #[tokio::test]
+    async fn repeated_stale_cleanup_cannot_release_a_successor() {
+        let catalog = seeded_cleanup_catalog().await;
         let first = catalog
             .claim_owner(&owner_request("first"))
             .await
@@ -26579,5 +26842,130 @@ mod cleanup_tests {
             .expect("current owner")
             .expect("successor remains");
         assert_eq!(current.token, successor.token);
+    }
+
+    /// A first owner released and a successor claimed on the same device:
+    /// the first owner's token is now superseded.
+    async fn superseded_catalog() -> (MemoryCatalog, OwnerToken, OwnerToken) {
+        let catalog = seeded_cleanup_catalog().await;
+        let first = catalog
+            .claim_owner(&owner_request("first"))
+            .await
+            .expect("first owner");
+        assert!(
+            catalog
+                .release_owner(&first.token)
+                .await
+                .expect("release first")
+        );
+        let successor = catalog
+            .claim_owner(&owner_request("successor"))
+            .await
+            .expect("successor owner");
+        (catalog, first.token, successor.token)
+    }
+
+    async fn current_owner(catalog: &MemoryCatalog) -> Option<OwnerToken> {
+        catalog
+            .current_owner(Uuid::from_u128(1), Uuid::from_u128(2), Utc::now())
+            .await
+            .expect("current owner")
+            .map(|claim| claim.token)
+    }
+
+    /// **Task row M6-C187 (e).** A token kept in the owner backlog whose
+    /// session has since been superseded is released fenced: the successor
+    /// that now owns the device is left untouched, and the stale token is
+    /// still counted as handled rather than retried.
+    #[tokio::test]
+    async fn backlog_release_leaves_a_superseded_owner_untouched() {
+        let (catalog, first, successor) = superseded_catalog().await;
+        let backlog = super::OwnerBacklog::new(usize::MAX);
+        backlog.push(OwnerCleanupItem::Token(first.clone()));
+        backlog.push(OwnerCleanupItem::Token(first));
+        let shared: SharedCatalog = Arc::new(catalog.clone());
+        let (released, abandoned) = super::release_backlog_until(
+            &shared,
+            &backlog,
+            tokio::time::Instant::now() + super::CLEANUP_SHUTDOWN_TIMEOUT,
+        )
+        .await;
+        assert_eq!((released, abandoned), (2, 0));
+        assert!(backlog.is_empty());
+        assert_eq!(
+            current_owner(&catalog).await,
+            Some(successor),
+            "releasing a superseded backlog token released the successor"
+        );
+    }
+
+    /// **Task row M6-C187 (a).** Session owners kept in the backlog when the
+    /// actor ends are released by its supervisor, not dropped.
+    #[tokio::test]
+    async fn stranded_release_covers_owners_kept_in_the_backlog() {
+        let catalog = seeded_cleanup_catalog().await;
+        let owner = catalog
+            .claim_owner(&owner_request("kept"))
+            .await
+            .expect("kept owner")
+            .token;
+        let backlog = super::OwnerBacklog::new(usize::MAX);
+        backlog.push(OwnerCleanupItem::Token(owner));
+        let stranded = super::StrandedClaimRelease {
+            handoffs: super::ClaimHandoffs::default(),
+            backlog: backlog.clone(),
+            catalog: Arc::new(catalog.clone()),
+        };
+        assert_eq!(stranded.release().await, (1, 0));
+        assert!(backlog.is_empty());
+        assert_eq!(
+            current_owner(&catalog).await,
+            None,
+            "an owner kept in the backlog when the actor ended was left fenced"
+        );
+    }
+
+    /// **Task row M6-C187 (a, e).** A supervisor aborted before its release
+    /// ran logs how many kept owners it found and releases them on the
+    /// runtime.
+    #[tokio::test]
+    async fn aborted_stranded_release_logs_and_releases_kept_owners() {
+        let catalog = seeded_cleanup_catalog().await;
+        let owner = catalog
+            .claim_owner(&owner_request("kept"))
+            .await
+            .expect("kept owner")
+            .token;
+        let backlog = super::OwnerBacklog::new(usize::MAX);
+        backlog.push(OwnerCleanupItem::Token(owner));
+        let captured = super::connector_rejected::Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_env_filter("info")
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is cached process-wide; another test thread can
+        // cache "never" for a shared callsite just before this subscriber exists.
+        tracing::callsite::rebuild_interest_cache();
+        drop(super::StrandedClaimRelease {
+            handoffs: super::ClaimHandoffs::default(),
+            backlog: backlog.clone(),
+            catalog: Arc::new(catalog.clone()),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while current_owner(&catalog).await.is_some() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(guard);
+        let text = captured.text();
+        assert!(
+            text.contains("owner claims stranded behind an aborted relay actor")
+                && text.contains("count=1")
+                && text.contains("owners=1"),
+            "the dropped kept-owner count was not logged: {text}"
+        );
+        assert!(backlog.is_empty());
+        assert_eq!(current_owner(&catalog).await, None);
     }
 }
