@@ -1356,7 +1356,7 @@ async fn admit_local_consumer_stream(
     let registration = handle
         .open_echo_stream(consumer, device_id, service_id, grant, consumer_expires_at)
         .await
-        .map_err(local_consumer_admission_response)?;
+        .map_err(|error| local_consumer_admission_response("stream", error))?;
     let cleanup = handle.echo_cleanup_guard(
         registration.key.clone(),
         registration.stream_id,
@@ -4563,7 +4563,14 @@ fn catalog_error(error: tunnel_catalog::CatalogError) -> Response {
 /// across a rotation freeze past its bound, or refused because the hold was
 /// full (task row M3-15), answers the same distinct body as a held stream
 /// OPEN; every other failure keeps [`failure_outcome`].
+/// The unary echo route's answer for a failure from this relay's own actor.
+/// A `ROTATION_FREEZE` refusal is counted under route `echo`.
 fn echo_failure_response(code: &'static str, execution: &'static str) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
+    if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
+        crate::metrics::count_local_rotation_freeze("echo");
+    }
     if code == crate::actor::ROTATION_FREEZE_ECHO_CODE {
         return rotation_freeze_response(crate::actor::ROTATION_FREEZE_RETRY_AFTER_MS);
     }
@@ -4659,7 +4666,16 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
     error_response(status, code, "owner forwarding did not complete", execution)
 }
 
-fn local_consumer_admission_response(error: RelayError) -> Response {
+/// The consumer answer for a refusal from this relay's own actor, as the
+/// device's owner.  `route` is the fixed metrics label of the public route;
+/// a `ROTATION_FREEZE` refusal is counted under it (M6-C24's
+/// `consumer_refusals_total`, stage `rotation_freeze`).
+fn local_consumer_admission_response(route: &'static str, error: RelayError) -> Response {
+    // Counted apart from the answer, which `scripts/m3-guard-deletion.py`
+    // deletes by its exact text.
+    if matches!(error, RelayError::RotationFreeze) {
+        crate::metrics::count_local_rotation_freeze(route);
+    }
     match error {
         RelayError::OwnerNotReady => {
             retryable_peer_failure_response(OWNER_NOT_READY_RETRY_AFTER_MS)
@@ -5305,7 +5321,7 @@ mod tests {
         for (label, fault) in [
             (
                 "local",
-                local_consumer_admission_response(RelayError::OwnerNotReady),
+                local_consumer_admission_response("stream", RelayError::OwnerNotReady),
             ),
             (
                 "forwarded",
@@ -5335,7 +5351,7 @@ mod tests {
         for (label, freeze) in [
             (
                 "local",
-                local_consumer_admission_response(RelayError::RotationFreeze),
+                local_consumer_admission_response("stream", RelayError::RotationFreeze),
             ),
             (
                 "unary echo",
@@ -5372,6 +5388,52 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A local `ROTATION_FREEZE` refusal is counted in the metrics scrape's
+    /// `consumer_refusals_total{route,stage="rotation_freeze"}` under the
+    /// public route that refused it, and an owner-not-ready refusal is not
+    /// (it is not a freeze).  The counter is process-wide, so the test reads
+    /// deltas; other tests can only raise them.
+    #[test]
+    fn a_local_rotation_freeze_refusal_is_counted_by_route() {
+        let count = |route: &'static str| {
+            crate::metrics::consumer_refusals()
+                .get(&(route, "rotation_freeze"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = [count("echo"), count("stream"), count("http-forward")];
+        drop(echo_failure_response(
+            crate::actor::ROTATION_FREEZE_ECHO_CODE,
+            "not_dispatched",
+        ));
+        drop(local_consumer_admission_response(
+            "stream",
+            RelayError::RotationFreeze,
+        ));
+        drop(local_consumer_admission_response(
+            "http-forward",
+            RelayError::RotationFreeze,
+        ));
+        drop(local_consumer_admission_response(
+            "http-forward",
+            RelayError::RotationFreeze,
+        ));
+        let after = [count("echo"), count("stream"), count("http-forward")];
+        assert!(after[0] > before[0], "echo: {before:?} -> {after:?}");
+        assert!(after[1] > before[1], "stream: {before:?} -> {after:?}");
+        assert!(
+            after[2] >= before[2] + 2,
+            "http-forward: {before:?} -> {after:?}"
+        );
+        // A different refusal adds no rotation_freeze sample for its route.
+        let other = count("devices");
+        drop(local_consumer_admission_response(
+            "devices",
+            RelayError::OwnerNotReady,
+        ));
+        assert_eq!(count("devices"), other);
     }
 
     #[tokio::test]

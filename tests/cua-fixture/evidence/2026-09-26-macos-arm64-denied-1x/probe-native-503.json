@@ -1,0 +1,9 @@
+{
+  "commands_body": "{\"detail\": \"Service unavailable: CONTAINER_NAME is required but not configured\"}",
+  "commands_http_status": 503,
+  "label": "native-503",
+  "status": {
+    "body": "{\"detail\": \"Service unavailable: CONTAINER_NAME is required but not configured\"}",
+    "http_status": 503
+  }
+}

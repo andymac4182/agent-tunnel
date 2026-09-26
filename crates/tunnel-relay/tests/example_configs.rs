@@ -59,6 +59,8 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("m6-catalog.toml", ExampleParser::CatalogRecords),
     // One records document per further service type (task row M6-C57).
     ("m6-catalog-acp.toml", ExampleParser::CatalogRecords),
+    // M5 Lane B: the computer-v1 records the CUA demo provisions.
+    ("m6-catalog-cua.toml", ExampleParser::CatalogRecords),
     ("m6-catalog-fs.toml", ExampleParser::CatalogRecords),
     ("m6-catalog-mcp.toml", ExampleParser::CatalogRecords),
     ("m7-cluster-relay.toml", ExampleParser::RelayServe),

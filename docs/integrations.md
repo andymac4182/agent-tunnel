@@ -313,6 +313,44 @@ against the pinned 0.3.46 source rather than a probe:
   itself unmeasured). Where a real device
   gets the declaration from is an owner decision that needs a probe (M5-C02).
 
+### The device export (Lane B)
+
+`tunnel-client` serves a `computer-v1` export only in a build with the
+non-default `cua` feature, and only when `AGENT_TUNNEL_CUA_LANE_B=1` is set
+(task row M5-C21); the relay routes the profile like MCP and ACP. The export
+supervises the backend (above), probes it read-only, negotiates the
+intersection of its `[exports.<id>.cua]` operations, the backend's
+`/commands` and the caller's grant, and answers through the device-side
+facade. Three wire-level facts from the first run against the real server:
+`/commands` is an object keyed by command name (M5-C27), `/cmd` over HTTP/1.1
+is `Transfer-Encoding: chunked` (M5-C22), and a stock client's `accept` is
+dropped at the ingress for this profile (M5-C26).
+
+- **Sessions** are keyed by the relay's opaque principal binding, so each
+  authenticated principal has its own input lease and capture identities.
+- **A request with no principal binding is refused**
+  (`principal_binding_missing`, not retryable). It is never given a shared
+  session.
+- **Two provisional `computer.v1` operations carry the lease** (M5-C20; the
+  owner decision on whether they move into the pure schema is still open):
+
+  | Operation | Request `params` | Answer |
+  | --- | --- | --- |
+  | `acquire_input_lease` | `{}` (may be omitted; nothing else allowed) | `answered_locally`, `result: {"held": true, "lease": <id>, "target": <name>}`; or `not_dispatched` with `lease_held_by_another_session`, retryable |
+  | `release_input_lease` | `{}` | `answered_locally`, `result: {"held": false, "lease": null, "target": <name>}`; or `not_dispatched` with `lease_not_held`, retryable |
+
+  Both are answered from device state before the schema sees the body, and
+  never reach the backend. An input operation never takes the lease itself:
+  without it, input is refused with `lease_not_held`. The lease belongs to the
+  principal binding's session, and there is no idle expiry (M5-C29).
+- **The display scale** comes from a declared point space (`point_width`,
+  `point_height`; M5-C19 option (b), applied by default pending owner
+  confirmation). Each capture's ratio is derived from its own PNG, and a
+  declaration that the capture or the backend's `get_screen_size`
+  contradicts refuses every coordinate.
+
+The recipe, run against a Linux guest, is [docs/demo/cua.md](demo/cua.md).
+
 ### Authentication and platform limits
 
 Computer Server defaults to `127.0.0.1`. In the inspected `/cmd` and `/ws` paths,

@@ -16,6 +16,15 @@ tunnel-acp-export = { path = "../tunnel-acp-export" }
 # (M3-09); without it, supervised process groups leak on every crash.
 tunnel-deadman = { path = "../tunnel-deadman" }
 tunnel-mcp-export = { path = "../tunnel-mcp-export" }
+# M5 Lane B: a `computer.v1` export driving a real CUA backend. Optional, and
+# only behind the non-default `cua` feature; a build with it still serves a
+# CUA export only when `AGENT_TUNNEL_CUA_LANE_B=1` is set. None of the three
+# links anything capable of input or capture (`tunnel-cua/tests/host_untouched.rs`);
+# the capability lives in the supervised backend process, which must run on a
+# dedicated, disposable machine.
+tunnel-cua = { path = "../tunnel-cua", optional = true }
+tunnel-cua-export = { path = "../tunnel-cua-export", optional = true }
+tunnel-cua-fixture = { path = "../tunnel-cua-fixture", optional = true }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
@@ -55,6 +64,11 @@ ring = "0.17.14"
 # `reconnect_cli.rs` resets a connection mid-handshake (`SO_LINGER` 0).
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { version = "1.1", default-features = false, features = ["net", "std"] }
+
+[features]
+default = []
+# M5 Lane B (see the optional dependencies above). Non-default on purpose.
+cua = ["dep:tunnel-cua", "dep:tunnel-cua-export", "dep:tunnel-cua-fixture"]
 
 [lints]
 workspace = true

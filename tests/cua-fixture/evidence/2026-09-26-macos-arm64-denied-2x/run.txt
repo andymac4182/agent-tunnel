@@ -1,0 +1,14 @@
+nonce=8409B11E-449F-49CA-9B7A-C596FCDD4A4A head=62e0daa1 vm=cua-mac-d1 expect=denied
+from=cua-macos-golden-denied
+display=1280x800pt
+{
+  "Disk" : 50,
+  "CPU" : 4,
+  "Running" : true,
+  "Memory" : 8192,
+  "Display" : "1280x800pt",
+  "OS" : "darwin",
+  "State" : "running",
+  "Size" : "29.783",
+  "DiskFormat" : "raw"
+}

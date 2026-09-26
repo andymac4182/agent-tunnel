@@ -2471,7 +2471,7 @@ The GUI fixture should display a known test window, unique screen markers, a tex
 
 ### Disposable Linux CUA VM (Apple Silicon host)
 
-The owner approved on 2026-09-25 running CUA in a VM on the owner's Apple Silicon laptop, **never** against the laptop's own desktop. [`scripts/m5-cua-vm.sh`](../scripts/m5-cua-vm.sh) builds and drives that VM with [Tart](https://tart.run) (Apple Virtualization framework). It is the Linux half of the M5-03 proposal; macOS and Windows guests are not built yet.
+The owner approved on 2026-09-25 running CUA in a VM on the owner's Apple Silicon laptop, **never** against the laptop's own desktop. [`scripts/m5-cua-vm.sh`](../scripts/m5-cua-vm.sh) builds and drives that VM with [Tart](https://tart.run) (Apple Virtualization framework). It is the Linux half of the M5-03 proposal; the macOS half is the next section, and no Windows guest is built yet.
 
 **Safety boundary.** Every screen capture and input event happens inside the guest. The script never starts `cua-computer-server`, a VNC server, a screenshot tool or a tunnel CUA export on the macOS host, and nothing requires granting the host Terminal or any host process Screen Recording or Accessibility. The server binds `127.0.0.1` inside the guest; the host reaches it only through an SSH forward over Tart's private NAT network (`192.168.64.0/24`), and [`probe.py`](../tests/cua-fixture/probe.py) refuses any base URL other than the host end of that forward. The forward uses a free host port chosen per run, and the script refuses to send any request unless the `ssh` process is alive and is the **only** listener on that port (`lsof -sTCP:LISTEN`), so nothing else on the host can receive the probe. SSH authenticates the guest against a per-run `known_hosts` holding the guest's ed25519 host key, read over the hypervisor channel with `tart exec`; there is no `StrictHostKeyChecking=no`. The probe sends no input. Screen content is the synthetic fixture only, and `probe.py` enforces it: unless all four screenshot corners are exactly the fixture's marker colours (read from `fixture_app.py`), it writes neither the PNG nor any pixel value and exits 3, which fails the run.
 
@@ -2497,7 +2497,87 @@ Runs always use a clone (`tart clone` is an APFS copy-on-write clone, so a clone
 
 **A black root framebuffer is an environment failure.** On this image an X `GetImage` of the root window (PIL `ImageGrab`, which the native Linux backend uses, and ImageMagick `import`) returned an all-black frame until something forced an Expose of every window; `x11vnc` starting or `xrefresh` cleared it. The session therefore runs `xrefresh` once the fixture maps, and `run` does not report a guest up until a root capture inside the guest shows the red marker. Why the first paint is missing from the root image was not established.
 
-**Not covered yet.** No input is sent and the tunnel device does not run in the guest: there is no `aarch64-unknown-linux-gnu` release artifact and the CLI does not yet wire a CUA export (M5-03). No macOS or Windows guest exists, and the guest's display runs at identity scale, so it cannot answer M5-C19's non-identity question on its own.
+**Through the tunnel (M5 Lane B, 2026-09-26).** [`scripts/m5-cua-demo.sh`](../scripts/m5-cua-demo.sh) runs the device **inside** a fresh clone and drives it from the host only through a local relay. The device is a `tunnel-client` built `--features cua` for `aarch64-unknown-linux-gnu` by `scripts/m5-cua-vm.sh build-client` inside another disposable clone, and it runs with `AGENT_TUNNEL_CUA_LANE_B=1`. The relay binds host loopback only, and the guest reaches its device port through an `ssh -R` forward authenticated by the guest's host key, so no host firewall setting changes. The script keeps the probe's two gates: the relay (and, in the guest, `sshd`) must be the only listener on each port, and no input is sent until a capture taken *through the tunnel* shows all five markers. The verdict is read from the fixture's `state.json`: exactly one more click, and the text field equal to the typed text. After the demo, and still inside the guest, it measures whether input held through the server survives client disconnect and server `SIGKILL` (M5-C09a). The recipe is [docs/demo/cua.md](demo/cua.md); the recorded run is [`tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/`](../tests/cua-fixture/evidence/2026-09-26-linux-aarch64-tunnel-demo/).
+
+**Not covered yet.** Cancellation, lost-answer, unsupported-capability and permission-denied fixtures over the tunnel; the `vnc` and `cua-driver` backends through the tunnel; the macOS guest through the tunnel, and any Windows guest. The Linux guest's display runs at identity scale, so it cannot answer M5-C19's non-identity question on its own; the macOS guest below does. The Lane B unit and fixture tests need `cargo test -p tunnel-client --features cua`, which the workspace run does not build (M5-C24).
+
+### Disposable macOS CUA VM (Apple Silicon host)
+
+[`scripts/m5-cua-vm-macos.sh`](../scripts/m5-cua-vm-macos.sh) is the macOS half of the M5-03 proposal, on the same owner approval as the Linux VM: a Tart VM on the owner's laptop, **never** the laptop's own desktop. It keeps every safety gate of the Linux script: a pinned Tart version, the 20 GiB disk floor, exit-time cleanup traps, a per-VM `known_hosts` holding the guest's ed25519 host key read over `tart exec`, a free host port whose **only** listener must be the SSH forward, and `probe.py`'s fixture-marker gate. It adds one more: before anything runs in a guest the script requires `kern.hv_vmm_present = 1` there, and `provision-guest-macos.sh` refuses to run without it, so neither can act on the host by mistake.
+
+**Safety boundary.** Screen capture and input happen only inside the guest. Nothing on the host is started, captured, or granted Screen Recording or Accessibility. The server is started by launchd inside the guest's `cua` session, binds `127.0.0.1` there, and is reached only through the SSH forward. The probe sends no input. **One exception inside the guest:** when `computer_server/handlers/macos.py` 0.3.46 is imported it posts a zero-distance `kCGEventMouseMoved` at the current cursor position and calls `ImageGrab.grab()`, so that macOS raises its permission prompts. That event is posted in the guest.
+
+**The golden image is root-equivalent to anything on Tart's network, and holds the TCC grants.** The guest's `sshd` offers `publickey,password,keyboard-interactive` (measured 2026-09-26 on a clone of the denied image). The Cirrus base image's documented `admin` / `admin` account is kept and has passwordless `sudo`. So any host process, and any other Tart VM on the shared `192.168.64.0/24` NAT network, can get root in a running golden image or clone. That root can read the probe traffic and use the Screen Recording and Accessibility grants given to `Python.app`. This is acceptable only because the images run on this owner's laptop, on Tart's private NAT network, and hold synthetic content. **Never push `cua-macos-golden` or `cua-macos-golden-denied` to a registry, never run either with `--net-bridged` or any other non-NAT networking, and never copy them off this machine.** Disabling password SSH or changing the `admin` password is not done, because the owner's grant steps use that account; it is a candidate hardening for a later rebuild. The script refuses the NAT gateway address `192.168.64.1` (the host's side) as a guest address.
+
+**Images.** Both are cloned from the official `ghcr.io/cirruslabs/macos-sequoia-base`, pinned by digest (`sha256:4947ac5a…514dd`, macOS 15.7.7 build 24G720; 25.3 GB compressed download, 50 GB sparse disk, about 30 GB allocated). Each has 4 vCPU, 8 GB RAM and a `1280x800pt` display. The script never runs either image itself; runs use APFS clones.
+
+- `cua-macos-golden` is provisioned by [`provision-guest-macos.sh`](../tests/cua-fixture/provision-guest-macos.sh). It installs python.org CPython 3.13.15 from the installer pinned by SHA-256 (`3b7eaf7f…bfdcd3`, the digest the python.org release API publishes) and requires the `Developer ID Installer: Python Software Foundation (BMM5U3QVKW)` signature. It installs `cua-computer-server==0.3.46` with the `driver` and `vnc` extras into `/opt/cua-server` by `pip install --require-hashes --no-deps --only-binary :all:` from [`requirements-macos-arm64.lock`](../tests/cua-fixture/requirements-macos-arm64.lock), which has 263 packages, all of them wheels. The script refuses to build unless the lock's two `cua-computer-server` hashes are `cua_pin`'s. It creates a standard, non-admin `cua` user that logs in automatically; the random password exists only in `/etc/kcpassword`. It copies the Setup Assistant record so no first-login panes appear, and turns off sleep, the screen saver and automatic updates. Telemetry is off (`CUA_TELEMETRY_ENABLED=false`, `CUA_TELEMETRY_DISABLED=1`). Three launchd agents run in `cua`'s session, none of them at load: `org.agentuplink.cua-fixture`, `org.agentuplink.cua-server` and `org.agentuplink.cua-permcheck`. The permcheck agent is a read-only `CGPreflightScreenCaptureAccess()` / `AXIsProcessTrusted()` readout that does not prompt. Because launchd starts all three, each is its own TCC responsible process, running `/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python`, and that `Python.app` is what the owner grants.
+- `cua-macos-golden-denied` is cloned from the golden image **after provisioning and before any grant**, and is never granted. It is the M5-03 permission-denied variant.
+
+**Lock note.** `uv pip compile --python-platform aarch64-apple-darwin` evaluates `platform_release` as unknown. That drops all 122 pyobjc framework packages which the `pyobjc` 12.2.2 metapackage gates on it, and the guest's `pip check` then failed. [`requirements-macos-pyobjc-darwin24.in`](../tests/cua-fixture/requirements-macos-pyobjc-darwin24.in) lists the frameworks those markers select on Darwin 24, taken from the metapackage's METADATA, and is compiled into the lock.
+
+**`tart exec` runs as the GUI user (measured).** The Tart Guest Agent serves `exec` from its per-session launchd agent, not its root daemon. Before the golden image's first reboot it runs as `admin`; afterwards it runs as `cua`, which has no `sudo`. So the script uses `tart exec` only for unprivileged reads, including the host-key read. Everything that needs root goes over SSH as `admin`, authenticated against that host key. A single long `tart exec` that is silent for minutes also failed with `unavailable (14): Transport became inactive`, so provisioning runs detached in the guest and the script polls for its exit code.
+
+**Commands.**
+
+```sh
+scripts/m5-cua-vm-macos.sh golden                  # both images (~25 min with the base cached; the base pull is ~25 GB)
+# --- the owner grants the permissions in cua-macos-golden (next paragraph) ---
+scripts/m5-cua-vm-macos.sh cycle cua-mac-g1 --from golden --expect granted                        # 2x display
+scripts/m5-cua-vm-macos.sh cycle cua-mac-g2 --from golden --expect granted --display 1280x800px   # 1x display
+scripts/m5-cua-vm-macos.sh cycle cua-mac-d1 --from denied --expect denied                         # permission-denied
+scripts/m5-cua-vm-macos.sh create NAME --from golden|denied [--display WxH(pt|px)]; scripts/m5-cua-vm-macos.sh run NAME
+scripts/m5-cua-vm-macos.sh probe NAME --expect granted|denied|record [OUTDIR]
+scripts/m5-cua-vm-macos.sh destroy NAME; scripts/m5-cua-vm-macos.sh destroy-golden
+```
+
+`run` waits for `cua`'s Aqua session (Dock and Finder running, no Setup Assistant) and then kickstarts the fixture. It reports the guest up only when the fixture has written its state **and** the front on-screen window is the fixture's, covering the whole point screen. The window list comes from [`window-state-macos.py`](../tests/cua-fixture/window-state-macos.py) and needs no permission. Without a Screen Recording grant nothing in the guest can check the markers by capture. `probe --expect` is checked twice, and each check can fail:
+
+- **preflight:** `granted` requires both preflight values `true`, and `denied` requires both `false`;
+- **frame:** under `denied`, a screenshot whose four corners *are* the fixture's markers counts as a failure (`probe.py` exit 0); under `granted`, a frame that is not the fixture counts as a failure (exit 3). Nothing of an unverified frame is kept, but its dimensions and the numeric fields of `get_desktop_state` are.
+
+The variants are `native`, `native --width 640 --height 400`, `native` with `UNAVAILABLE_WITHOUT_CONTAINER_NAME=1`, and `cua-driver`. There is no `vnc` variant, because macOS Screen Sharing is not provisioned. `--permission-reads` also records the outcome, but not the content, of `get_accessibility_tree`. That is a behaviour record for comparison with a granted run, not a permission check: without Accessibility the `native` tree still answers `success: true` (M5-C32). The preflight is the permission readout.
+
+#### Owner: granting the permissions (once, by hand, in `cua-macos-golden` only)
+
+TCC cannot be written without turning SIP off, so a person has to grant these permissions at the VM's own window. Every click below goes **inside the VM window**. Nothing is granted on the host. Do not run `cua-macos-golden-denied`.
+
+1. On the host, with nothing else using the image: `~/.local/bin/tart run cua-macos-golden`. A window opens and the guest logs in to the **CUA Fixture** desktop by itself. The fixture is not started in the golden image, so the desktop is empty.
+2. In the VM window, open the Apple menu (top left), then **System Settings…**
+3. In the sidebar, scroll down and click **Privacy & Security**.
+4. In the right pane, click **Screen & System Audio Recording**.
+5. Under **Screen & System Audio Recording**, click **+** below the list. When macOS asks for an administrator, enter User Name `admin`, Password `admin` (the Cirrus Labs base image's documented account), then click **Modify Settings**.
+6. In the file dialog, press **⌘⇧G**, paste `/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app`, press **Return**, and click **Open**. If the dialog shows the folder instead, select **Python.app** in it and click **Open**.
+7. **Python** now appears in the list. Make sure its switch is **on**, and authenticate again with `admin` / `admin` if asked. If a "Quit & Reopen" dialog appears, click **Later**.
+8. Click the back arrow **‹** to return to Privacy & Security, then click **Accessibility**.
+9. Click **+** and repeat steps 5–7 with the same `Python.app` path. **Python** must be listed with its switch **on**.
+10. Close System Settings. Open the Apple menu, choose **Shut Down…**, then **Shut Down**. Wait until the VM window closes and `~/.local/bin/tart list` shows `cua-macos-golden` as `stopped`.
+11. Verify on the host: `scripts/m5-cua-vm-macos.sh cycle cua-mac-g1 --from golden --expect granted`. It must log `preflight: screen_recording=True accessibility=True` and end with `cycle complete`. Every `native*` and `cua-driver` probe must show `"fixture_markers_verified": true`. If the preflight reports `False`, the grant went to a different binary: open the pane again and check that the entry is **Python** from the path above, not `python3.13` or Terminal.
+
+Unmeasured risk: macOS 15 is widely reported to ask again, periodically, before an app that holds a Screen Recording grant through the legacy capture APIs (which `screencapture` and Pillow's `ImageGrab` use) can keep capturing. The interval has not been measured here or checked against an Apple source. Clones inherit the golden image's grant date, so a clone started more than a month after the grant may show that dialog over the fixture, and the granted probe then fails its marker gate. If that happens, repeat steps 1–4 and 10 and confirm the dialog in the golden image (M5-C34).
+
+#### Measured without the grants (2026-09-26, evidence in `tests/cua-fixture/evidence/2026-09-26-macos-arm64-denied-*`)
+
+Both runs used clones of `cua-macos-golden-denied`, with `probe --expect denied`. In both, the preflight reported `screen_recording_preflight=false` and `accessibility_trusted=false` for the Python.app process image.
+
+| | `2x` clone (`1280x800pt` configured) | `1x` clone (`--display 1280x800px`) |
+|---|---|---|
+| `NSScreen` points / backing scale | **1024x768 / 2.0** | 1280x800 / 1.0 |
+| `native` `get_screen_size` | 2048x1536 (pixels) | 1280x800 |
+| `native` `screenshot` PNG | 1920x1440 (resized to the handler's 1,920 px cap) | 1280x800 |
+| `cua-driver` `get_screen_size` | 1024x768 (points) | 1280x800 |
+| `cua-driver` `screenshot` PNG | 2048x1536 | 1280x800 |
+| `cua-driver` `get_desktop_state` | `scale_factor 2.0`, `screen` 1024x768, `screenshot` 2048x1536 | `scale_factor 1.0`, both 1280x800 |
+| `get_cursor_position` (both backends) | `(10, 10)` | `(10, 10)` |
+
+Findings:
+
+- **Permission denial is silent.** Without Screen Recording, `screenshot` still returns `success: true` with a full-size PNG, but the frame is not the fixture: `probe.py` exits 3 and keeps nothing of it. Without Accessibility, the `native` backend's `get_accessibility_tree` also returns `success: true`, with keys `applications`, `dock_items`, `menubar_items` and `windows`, and no error. `cua-driver` refuses that command whatever the permissions (`Accessibility queries are unavailable with the Cua Driver backend`). So neither response tells a consumer that permission is missing (M5-C32).
+- **Scale (M5-C19).** On macOS the two backends answer in different spaces. `native` `get_screen_size` is the unresized capture in pixels, and its `screenshot` is resized again whenever it is wider than 1,920 px. `cua-driver` reports points for `get_screen_size`, and `get_desktop_state` carries `scale_factor` together with the point size and the pixel size. At 2x that is the first non-identity measurement of candidate (c): `screen_*` is point space and `screenshot_*` is pixel space (M5-C33).
+- **A `1280x800pt` display comes up as 1024x768 points** at a 2.0 backing scale in both the golden image and its clones. `WxHpx` gives exactly the requested size at 1.0. Why macOS picks 1024x768 for the Retina configuration was not established.
+- `native` with `UNAVAILABLE_WITHOUT_CONTAINER_NAME=1` answers `/status` and `/commands` with 503 `CONTAINER_NAME is required but not configured`, as on Linux.
+
+**Not covered yet.** The granted cycle, which depends on the owner's grant (M5-C31); input fixtures; the tunnel device inside the guest; and Windows.
 
 
 ## Soak, chaos, and load experiments

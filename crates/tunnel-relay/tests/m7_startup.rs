@@ -106,6 +106,19 @@ struct StartupFixture {
     consumer_bind: SocketAddr,
     device_bind: SocketAddr,
     peer_bind: SocketAddr,
+    /// The sockets bound to the three addresses above, held by the fixture
+    /// (task row M6-C93).  Picking a port by binding and releasing it let
+    /// another process take it before `serve` or
+    /// [`Self::assert_bindings_available`] bound it, which failed tests with
+    /// `AddrInUse`.  A held address cannot be taken by anything else, and
+    /// `serve` cannot bind it either: a case whose refusal comes before the
+    /// listeners keeps all three held, which proves `serve` bound none of
+    /// them.  A case whose refusal comes after a bind releases that address
+    /// first ([`Self::let_serve_bind_listeners`],
+    /// [`Self::let_serve_bind_peer`]).
+    held_consumer: Option<TcpListener>,
+    held_device: Option<TcpListener>,
+    held_peer: Option<UdpSocket>,
 }
 
 impl StartupFixture {
@@ -185,7 +198,16 @@ impl StartupFixture {
         let state = files.path("startup-membership-state.json");
         let config = files.path("relay.toml");
 
+        let consumer = TcpListener::bind("127.0.0.1:0").expect("hold startup consumer port");
+        let device = TcpListener::bind("127.0.0.1:0").expect("hold startup device port");
+        let peer = hold_udp_outside_ephemeral_range();
         Self {
+            consumer_bind: consumer.local_addr().expect("read startup consumer port"),
+            device_bind: device.local_addr().expect("read startup device port"),
+            peer_bind: peer.local_addr().expect("read startup peer port"),
+            held_consumer: Some(consumer),
+            held_device: Some(device),
+            held_peer: Some(peer),
             redis_root_ca: ca.clone(),
             files,
             certificate_chain,
@@ -195,9 +217,6 @@ impl StartupFixture {
             membership_trust,
             state,
             config,
-            consumer_bind: free_tcp_addr(),
-            device_bind: free_tcp_addr(),
-            peer_bind: free_udp_addr(),
         }
     }
 
@@ -282,13 +301,66 @@ require_private_ip = true
         )
     }
 
+    /// For a case whose refusal comes after `serve` binds its consumer and
+    /// device listeners: configure both on port 0, so `serve` binds ports
+    /// the kernel picks and no other process can have taken, and release
+    /// the fixture's two held sockets.  Call before writing the config.
+    fn let_serve_bind_listeners(&mut self) {
+        self.held_consumer = None;
+        self.held_device = None;
+        self.consumer_bind = "127.0.0.1:0".parse().expect("ephemeral consumer bind");
+        self.device_bind = "127.0.0.1:0".parse().expect("ephemeral device bind");
+    }
+
+    /// For a case whose refusal comes after `serve` binds the peer endpoint:
+    /// release the held peer port just before `serve` runs.  The peer port
+    /// must be nonzero, so it cannot be left to the kernel; it lies outside
+    /// the ephemeral ranges, so no process's automatic port assignment can
+    /// take it between this release and `serve`'s bind.
+    fn let_serve_bind_peer(&mut self) {
+        self.held_peer = None;
+    }
+
+    /// `serve` left nothing bound (M6-C93).  Every address the fixture still
+    /// holds was never bound by `serve` -- its bind would have failed --
+    /// and this proves the hold still excludes the relay's own bind calls
+    /// (tokio's `TcpListener::bind`, which sets `SO_REUSEADDR`, and a plain
+    /// UDP bind, which is how quinn binds the peer endpoint).  An address
+    /// released to `serve` is not re-bound here: the caller has already
+    /// reaped the process (its exit status was asserted), the relay starts no
+    /// child process, and the kernel has closed every socket a reaped process
+    /// held, so re-binding a released port could only race other processes.
     fn assert_bindings_available(&self) {
-        TcpListener::bind(self.consumer_bind)
-            .expect("consumer listener was not left serving after startup failure");
-        TcpListener::bind(self.device_bind)
-            .expect("device listener was not left serving after startup failure");
-        UdpSocket::bind(self.peer_bind)
-            .expect("peer listener was not left serving after startup failure");
+        assert!(
+            self.held_consumer.is_some() || self.held_device.is_some() || self.held_peer.is_some(),
+            "no address is held, so this check would prove nothing; do not call it after \
+             releasing every address to `serve`"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("startup bind-probe runtime");
+        for (label, held, address) in [
+            ("consumer", self.held_consumer.is_some(), self.consumer_bind),
+            ("device", self.held_device.is_some(), self.device_bind),
+        ] {
+            if !held {
+                continue;
+            }
+            let refused = runtime
+                .block_on(TokioTcpListener::bind(address))
+                .expect_err("the fixture must hold its address against the relay's TCP bind");
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::AddrInUse,
+                "{label}: {refused}"
+            );
+        }
+        if self.held_peer.is_some() {
+            let refused = UdpSocket::bind(self.peer_bind)
+                .expect_err("the fixture must hold its address against the relay's UDP bind");
+            assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "peer: {refused}");
+        }
     }
 }
 
@@ -316,9 +388,29 @@ fn free_tcp_addr() -> SocketAddr {
     listener.local_addr().expect("read startup TCP port")
 }
 
-fn free_udp_addr() -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("allocate startup UDP port");
-    socket.local_addr().expect("read startup UDP port")
+/// Hold a UDP port outside every common ephemeral range (Linux 32768-60999,
+/// macOS and IANA 49152-65535), so a released port cannot be taken by any
+/// process's automatic port assignment (M6-C93).  Candidates are spread by
+/// the process ID, a counter and the clock; one already in use is skipped.
+fn hold_udp_outside_ephemeral_range() -> UdpSocket {
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seed = std::process::id()
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+    for _ in 0..512 {
+        let step = u32::try_from(NEXT.fetch_add(1, Ordering::Relaxed) % u64::from(SPAN))
+            .expect("bounded step");
+        let port = FIRST + (seed.wrapping_add(step.wrapping_mul(7_919)) % SPAN);
+        let port = u16::try_from(port).expect("port below 32768");
+        if let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) {
+            return socket;
+        }
+    }
+    panic!("no free UDP port below the ephemeral ranges");
 }
 
 fn relay_binary() -> std::ffi::OsString {
@@ -371,6 +463,10 @@ fn assert_failure(output: &Output, expected: &str) {
     assert!(
         !diagnostics.contains("tunnel-relay listening:"),
         "startup emitted a serving marker before failing: {diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("already in use"),
+        "startup reached a listener bind before its refusal: {diagnostics}"
     );
     assert!(
         !diagnostics.contains(DIAGNOSTIC_SECRET),
@@ -491,7 +587,9 @@ fn serve_rejects_unavailable_verified_redis_before_binding() {
 
 #[test]
 fn serve_rejects_corrupt_membership_state_through_the_binary() {
-    let fixture = StartupFixture::new();
+    let mut fixture = StartupFixture::new();
+    // `serve` binds its listeners before this refusal (M6-C93).
+    fixture.let_serve_bind_listeners();
     let placeholder_url = "rediss://127.0.0.1:1/0";
     initialize_state(&fixture, placeholder_url);
     fixture.files.write(
@@ -513,7 +611,9 @@ fn serve_rejects_corrupt_membership_state_through_the_binary() {
 #[cfg(unix)]
 #[test]
 fn serve_rejects_insecure_membership_state_through_the_binary() {
-    let fixture = StartupFixture::new();
+    let mut fixture = StartupFixture::new();
+    // `serve` binds its listeners before this refusal (M6-C93).
+    fixture.let_serve_bind_listeners();
     initialize_state(&fixture, "rediss://127.0.0.1:1/0");
     set_mode(&fixture.state, 0o644);
 
@@ -530,7 +630,10 @@ fn serve_rejects_insecure_membership_state_through_the_binary() {
 
 #[test]
 fn serve_rejects_unavailable_checkpoint_before_public_serving() {
-    let fixture = StartupFixture::new();
+    let mut fixture = StartupFixture::new();
+    // `serve` binds its listeners and the peer endpoint before this
+    // refusal (M6-C93).
+    fixture.let_serve_bind_listeners();
     initialize_state(&fixture, "rediss://127.0.0.1:1/0");
     let redis = FakeRedisTls::start(&fixture);
     let checkpoint_port = free_tcp_addr().port();
@@ -541,6 +644,7 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
         None,
         true,
     );
+    fixture.let_serve_bind_peer();
     let output = run_relay_bounded([
         OsStr::new("serve"),
         OsStr::new("--config"),
@@ -550,7 +654,8 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
     // redacted readiness state; the executable refuses to serve with the
     // bounded, stable startup-level reason.
     assert_failure(&output, "cluster membership bootstrap did not reach ready");
-    fixture.assert_bindings_available();
+    // Every address was released to `serve`, so nothing is left to prove
+    // unbound (see `assert_bindings_available`).
 }
 
 /// The four fake-Redis tests above failed on the GitHub Linux runner with
@@ -560,7 +665,9 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
 /// startup still to reach the membership check the fixture exists to reach.
 #[test]
 fn serve_reaches_the_membership_check_when_redis_lanes_open_slowly() {
-    let fixture = StartupFixture::new();
+    let mut fixture = StartupFixture::new();
+    // `serve` binds its listeners before this refusal (M6-C93).
+    fixture.let_serve_bind_listeners();
     initialize_state(&fixture, "rediss://127.0.0.1:1/0");
     fixture.files.write(
         "startup-membership-state.json",
@@ -814,7 +921,10 @@ fn serve_sigterm_inherited_as_ignored_still_stops_startup() {
 #[cfg(unix)]
 #[test]
 fn serve_sigterm_during_the_membership_bootstrap_exits_interrupted() {
-    let fixture = StartupFixture::new();
+    let mut fixture = StartupFixture::new();
+    // `serve` binds its listeners and the peer endpoint before this
+    // refusal (M6-C93).
+    fixture.let_serve_bind_listeners();
     initialize_state(&fixture, "rediss://127.0.0.1:1/0");
     let redis = FakeRedisTls::start(&fixture);
     let checkpoint = SilentPeer::start();
@@ -828,9 +938,11 @@ fn serve_sigterm_during_the_membership_bootstrap_exits_interrupted() {
         None,
         true,
     );
+    fixture.let_serve_bind_peer();
     let (output, after_signal) = signal_serve_during_startup(&config, &checkpoint, "TERM", false);
     assert_interrupted_during_startup(&output, after_signal, "TERM");
-    fixture.assert_bindings_available();
+    // Every address was released to `serve`, so nothing is left to prove
+    // unbound (see `assert_bindings_available`).
 }
 
 // ------------------------------------------------------------------------
