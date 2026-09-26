@@ -33,6 +33,46 @@ use crate::tls::{TlsIdentity, TlsIdentityError, parse_leaf_identity};
 /// handshake tasks before the relay's admission layer runs.
 pub const DEFAULT_MAX_CONCURRENT_HANDSHAKES: usize = 64;
 
+/// Default number of extra connections the listener accepts beyond
+/// [`DEFAULT_MAX_CONCURRENT_HANDSHAKES`] only to refuse them (task row
+/// M6-C153).
+///
+/// Each such connection completes TLS, reads one request head and a body of
+/// at most [`MAX_REFUSAL_BODY_BYTES`], is answered `503 CONNECTION_LIMIT` with
+/// `Retry-After`, and is closed with `close_notify`, all within
+/// [`DEFAULT_REFUSAL_TIMEOUT`].  The margin bounds that TLS work.  When the
+/// margin is also full the listener stops calling `accept`, so further
+/// connections wait in the kernel listen backlog instead of being reset.
+pub const DEFAULT_REFUSAL_MARGIN: usize = 16;
+
+/// Largest accepted [`ListenerCapacity::max_connections`].
+pub const MAX_LISTENER_CONNECTIONS: usize = 4096;
+
+/// Largest accepted [`ListenerCapacity::refusal_margin`].
+pub const MAX_REFUSAL_MARGIN: usize = 256;
+
+/// Default bound on the whole life of one over-capacity connection: TLS
+/// handshake, request, refusal and close.
+pub const DEFAULT_REFUSAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest request body an over-capacity connection reads before answering.
+///
+/// The body is read, not ignored, because closing a socket with unread bytes
+/// in its receive buffer sends a TCP reset, which can destroy the refusal
+/// before the client reads it.
+pub const MAX_REFUSAL_BODY_BYTES: usize = 64 * 1024;
+
+/// Retry hint carried by a `CONNECTION_LIMIT` refusal, in milliseconds.
+pub const CONNECTION_LIMIT_RETRY_AFTER_MS: u64 = 1_000;
+
+/// The fixed, payload-free body of a `CONNECTION_LIMIT` refusal.  Its shape
+/// matches the relay's other flat error bodies.
+pub const CONNECTION_LIMIT_BODY: &str = concat!(
+    r#"{"code":"CONNECTION_LIMIT","execution":"not_dispatched","#,
+    r#""message":"relay listener connection limit reached","#,
+    r#""retryable":true,"retry_after_ms":1000}"#
+);
+
 /// Maximum HTTP/2 streams advertised for one accepted connection.
 ///
 /// A connection permit is held until the HTTP connection future completes;
@@ -158,12 +198,73 @@ impl ListenerTimeouts {
     }
 }
 
+/// The listener's connection limit and its bounded over-capacity refusal
+/// (task row M6-C153).
+///
+/// `max_connections` permits are held for the whole HTTP connection, as
+/// before.  A connection accepted while they are all held takes one of
+/// `refusal_margin` refusal slots and is answered `503 CONNECTION_LIMIT`
+/// (see [`DEFAULT_REFUSAL_MARGIN`]).  While both are full the listener does
+/// not accept, so the kernel listen backlog holds further connections; it
+/// never accepts and drops one.  A margin of zero therefore means "no TLS
+/// work beyond the limit": excess connections wait in the backlog until a
+/// permit frees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenerCapacity {
+    /// Concurrent served connections.  Default
+    /// [`DEFAULT_MAX_CONCURRENT_HANDSHAKES`]; accepts
+    /// 1..=[`MAX_LISTENER_CONNECTIONS`].
+    pub max_connections: usize,
+    /// Concurrent over-capacity refusals.  Default
+    /// [`DEFAULT_REFUSAL_MARGIN`]; accepts 0..=[`MAX_REFUSAL_MARGIN`].
+    pub refusal_margin: usize,
+    /// Bound on one over-capacity connection's whole life.  Default
+    /// [`DEFAULT_REFUSAL_TIMEOUT`]; accepts 100ms..=300s.
+    pub refusal_timeout: Duration,
+}
+
+impl Default for ListenerCapacity {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONCURRENT_HANDSHAKES,
+            refusal_margin: DEFAULT_REFUSAL_MARGIN,
+            refusal_timeout: DEFAULT_REFUSAL_TIMEOUT,
+        }
+    }
+}
+
+impl ListenerCapacity {
+    /// Validate the limit, the margin and the refusal deadline.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if !(1..=MAX_LISTENER_CONNECTIONS).contains(&self.max_connections) {
+            return Err(TransportError::InvalidListenerCapacity {
+                field: "max_connections",
+                reason: "must be 1..=4096",
+            });
+        }
+        if self.refusal_margin > MAX_REFUSAL_MARGIN {
+            return Err(TransportError::InvalidListenerCapacity {
+                field: "refusal_margin",
+                reason: "must be 0..=256",
+            });
+        }
+        if !(MIN_LISTENER_TIMEOUT..=MAX_LISTENER_TIMEOUT).contains(&self.refusal_timeout) {
+            return Err(TransportError::InvalidListenerCapacity {
+                field: "refusal_timeout",
+                reason: LISTENER_TIMEOUT_RANGE,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Bounded diagnostics for the most recently accepted TCP socket configured by
 /// [`AcceptedSocketOptions`].  The value is deliberately a single atomic
 /// sample: it cannot retain connection identifiers, addresses, or payloads.
 #[derive(Clone, Debug, Default)]
 pub struct AcceptedSocketDiagnostics {
     last_send_buffer_bytes: Arc<AtomicUsize>,
+    capacity_refusals: Arc<AtomicUsize>,
 }
 
 impl AcceptedSocketDiagnostics {
@@ -180,6 +281,16 @@ impl AcceptedSocketDiagnostics {
             0 => None,
             value => Some(value),
         }
+    }
+
+    /// Connections accepted over the connection limit and answered
+    /// `503 CONNECTION_LIMIT` (task row M6-C153).
+    pub fn capacity_refusals(&self) -> usize {
+        self.capacity_refusals.load(Ordering::Acquire)
+    }
+
+    fn record_capacity_refusal(&self) {
+        self.capacity_refusals.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_send_buffer_bytes(&self, bytes: usize) {
@@ -201,6 +312,8 @@ pub struct AcceptedSocketOptions {
     /// A fixed name for this listener (`consumer`, `device`) carried by its
     /// TLS refusal log lines (M6-C52); `None` logs `unnamed`.
     pub listener: Option<&'static str>,
+    /// The connection limit and its over-capacity refusal (M6-C153).
+    pub capacity: ListenerCapacity,
 }
 
 /// Errors returned by the listener supervisor itself.  A malformed or
@@ -240,6 +353,14 @@ pub enum TransportError {
     #[error("listener timeout {field} is invalid: {reason}")]
     InvalidListenerTimeouts {
         /// Name of the offending [`ListenerTimeouts`] field.
+        field: &'static str,
+        /// Bounded explanation; it never contains connection data.
+        reason: &'static str,
+    },
+    /// A configured [`ListenerCapacity`] value was outside its range.
+    #[error("listener capacity {field} is invalid: {reason}")]
+    InvalidListenerCapacity {
+        /// Name of the offending [`ListenerCapacity`] field.
         field: &'static str,
         /// Bounded explanation; it never contains connection data.
         reason: &'static str,
@@ -325,60 +446,115 @@ pub async fn serve_with_listener_options(
 ) -> Result<(), TransportError> {
     validate_socket_options(&socket_options)?;
     timeouts.validate()?;
+    let capacity = socket_options.capacity;
+    capacity.validate()?;
     let acceptor = TlsAcceptor::from(config);
-    let permits = Arc::new(tokio::sync::Semaphore::new(
-        DEFAULT_MAX_CONCURRENT_HANDSHAKES,
-    ));
+    let permits = Arc::new(tokio::sync::Semaphore::new(capacity.max_connections));
+    let refusals = Arc::new(tokio::sync::Semaphore::new(capacity.refusal_margin));
     let mut tasks = JoinSet::new();
     let child_cancel = cancel.child_token();
     let mut first_error = None;
+    let listener_name = socket_options.listener.unwrap_or("unnamed");
 
     loop {
-        tokio::select! {
+        // M6-C153: take a slot before accepting.  While neither a connection
+        // permit nor a refusal slot is free the listener does not accept, so
+        // the kernel listen backlog holds the connection; an accepted socket
+        // is never dropped unanswered.
+        let slot = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            result = listener.accept() => {
-                let (stream, remote_addr) = match result {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        first_error = Some(TransportError::Accept(error));
-                        break;
-                    }
-                };
-                let permit = match permits.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        // The socket has not completed TLS authentication.  Drop it
-                        // immediately when the bounded handshake budget is full.
-                        tracing::debug!(%remote_addr, "dropping TLS connection at handshake capacity");
-                        continue;
-                    }
-                };
-                if let Err(error) = configure_accepted_socket(&stream, &socket_options, remote_addr) {
+            Some(result) = tasks.join_next() => {
+                if let Err(error) = joined_result(result) {
                     first_error = Some(error);
                     break;
                 }
-                let acceptor = acceptor.clone();
+                continue;
+            }
+            slot = next_slot(&permits, &refusals) => slot,
+        };
+        let Some(slot) = slot else { break };
+        let (stream, remote_addr) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            Some(result) = tasks.join_next() => {
+                // The slot is released and taken again on the next pass.
+                if let Err(error) = joined_result(result) {
+                    first_error = Some(error);
+                    break;
+                }
+                continue;
+            }
+            result = listener.accept() => match result {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    first_error = Some(TransportError::Accept(error));
+                    break;
+                }
+            },
+        };
+        // A permit may have been released while this slot waited in accept.
+        let slot = match slot {
+            Slot::Refuse(refusal) => match permits.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    drop(refusal);
+                    Slot::Serve(permit)
+                }
+                Err(_) => Slot::Refuse(refusal),
+            },
+            serve => serve,
+        };
+        if let Err(error) = configure_accepted_socket(&stream, &socket_options, remote_addr) {
+            first_error = Some(error);
+            break;
+        }
+        let acceptor = acceptor.clone();
+        let connection_cancel = child_cancel.child_token();
+        match slot {
+            Slot::Serve(permit) => {
                 let router = router.clone();
-                let connection_cancel = child_cancel.child_token();
-                let listener_name = socket_options.listener.unwrap_or("unnamed");
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = serve_connection(stream, acceptor, router, connection_cancel, timeouts, listener_name).await {
+                    if let Err(error) = serve_connection(
+                        stream,
+                        acceptor,
+                        router,
+                        connection_cancel,
+                        timeouts,
+                        listener_name,
+                    )
+                    .await
+                    {
                         tracing::debug!(%remote_addr, ?error, "TLS/HTTP connection closed");
                     }
                     Ok::<(), TransportError>(())
                 });
             }
-            Some(result) = tasks.join_next() => {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => Err(TransportError::Task(error)),
-                };
-                if let Err(error) = result {
-                    first_error = Some(error);
-                    break;
+            Slot::Refuse(refusal) => {
+                if let Some(diagnostics) = &socket_options.diagnostics {
+                    diagnostics.record_capacity_refusal();
                 }
+                if let Some(suppressed) = CAPACITY_REFUSAL_LOG.admit(listener_name) {
+                    tracing::info!(
+                        phase = "listener_capacity",
+                        listener = listener_name,
+                        max_connections = capacity.max_connections,
+                        suppressed,
+                        "refusing connection over the listener connection limit"
+                    );
+                }
+                tasks.spawn(async move {
+                    let _refusal = refusal;
+                    refuse_connection(
+                        stream,
+                        acceptor,
+                        connection_cancel,
+                        capacity.refusal_timeout,
+                        timeouts,
+                    )
+                    .await;
+                    Ok::<(), TransportError>(())
+                });
             }
         }
     }
@@ -397,6 +573,140 @@ pub async fn serve_with_listener_options(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// A connection permit, or a slot to answer one connection over the limit.
+enum Slot {
+    Serve(tokio::sync::OwnedSemaphorePermit),
+    Refuse(tokio::sync::OwnedSemaphorePermit),
+}
+
+/// Wait for a connection permit, or failing that a refusal slot, preferring a
+/// permit.  `None` only if a semaphore was closed, which this module never
+/// does.
+async fn next_slot(
+    permits: &Arc<tokio::sync::Semaphore>,
+    refusals: &Arc<tokio::sync::Semaphore>,
+) -> Option<Slot> {
+    if let Ok(permit) = permits.clone().try_acquire_owned() {
+        return Some(Slot::Serve(permit));
+    }
+    if let Ok(refusal) = refusals.clone().try_acquire_owned() {
+        return Some(Slot::Refuse(refusal));
+    }
+    tokio::select! {
+        biased;
+        permit = permits.clone().acquire_owned() => permit.ok().map(Slot::Serve),
+        refusal = refusals.clone().acquire_owned() => refusal.ok().map(Slot::Refuse),
+    }
+}
+
+fn joined_result(
+    result: Result<Result<(), TransportError>, tokio::task::JoinError>,
+) -> Result<(), TransportError> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(TransportError::Task(error)),
+    }
+}
+
+/// The process-wide limit on over-capacity refusal lines, keyed by listener.
+static CAPACITY_REFUSAL_LOG: std::sync::LazyLock<crate::log_limit::RefusalLogLimiter> =
+    std::sync::LazyLock::new(crate::log_limit::RefusalLogLimiter::with_defaults);
+
+/// The `503 CONNECTION_LIMIT` answer.  It is built from constants only: no
+/// request data reaches it.
+fn connection_limit_response(version: http::Version) -> axum::response::Response {
+    let retry_after_seconds = CONNECTION_LIMIT_RETRY_AFTER_MS.div_ceil(1_000);
+    let mut response = axum::response::Response::new(axum::body::Body::from(CONNECTION_LIMIT_BODY));
+    *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from(retry_after_seconds),
+    );
+    // HTTP/2 forbids connection-specific headers; it closes with GOAWAY.
+    if version < http::Version::HTTP_2 {
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+/// Answer every request on an over-capacity connection with
+/// [`connection_limit_response`], after reading at most
+/// [`MAX_REFUSAL_BODY_BYTES`] of its body.
+fn connection_limit_router() -> Router {
+    Router::new().fallback(|request: axum::extract::Request| async move {
+        let version = request.version();
+        // The outcome is ignored: an oversized or broken body still gets the
+        // refusal.  Only a body read to its end avoids a reset on close.
+        let _ = axum::body::to_bytes(request.into_body(), MAX_REFUSAL_BODY_BYTES).await;
+        connection_limit_response(version)
+    })
+}
+
+/// Serve one over-capacity connection: TLS, one `503 CONNECTION_LIMIT`
+/// answer, then a graceful close (`Connection: close` on HTTP/1, GOAWAY on
+/// HTTP/2).  The whole life is bounded by `refusal_timeout`; a peer that has
+/// not finished by then is dropped, which releases the refusal slot.
+async fn refuse_connection(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    cancel: CancellationToken,
+    refusal_timeout: Duration,
+    timeouts: ListenerTimeouts,
+) {
+    let refusal = async {
+        let Ok(tls_stream) = acceptor.accept(stream).await else {
+            return;
+        };
+        let first_request = CancellationToken::new();
+        let service = ObserveFirstRequest {
+            inner: TowerToHyperService::new(connection_limit_router().into_service()),
+            first_request: first_request.clone(),
+        };
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .keep_alive(false)
+            .max_headers(DEFAULT_MAX_HTTP1_HEADERS)
+            .header_read_timeout(Some(timeouts.http1_header_read_timeout));
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(1)
+            .max_header_list_size(DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES);
+        let connection = builder.serve_connection(TokioIo::new(tls_stream), service);
+        tokio::pin!(connection);
+        let mut closing = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled(), if !closing => {
+                    connection.as_mut().graceful_shutdown();
+                    closing = true;
+                }
+                _ = &mut connection => return,
+                _ = first_request.cancelled(), if !closing => {
+                    // One answer per connection: stop accepting further
+                    // requests and close once the refusal is written.
+                    connection.as_mut().graceful_shutdown();
+                    closing = true;
+                }
+            }
+        }
+    };
+    if timeout(refusal_timeout, refusal).await.is_err() {
+        tracing::debug!("over-capacity connection did not finish within the refusal bound");
+    }
 }
 
 fn validate_socket_options(options: &AcceptedSocketOptions) -> Result<(), TransportError> {
@@ -915,6 +1225,7 @@ mod tests {
                 send_buffer_bytes: Some(TEST_SEND_BUFFER_BYTES),
                 diagnostics: Some(diagnostics.clone()),
                 listener: None,
+                capacity: ListenerCapacity::default(),
             },
         ));
 
@@ -960,6 +1271,7 @@ mod tests {
                 send_buffer_bytes: Some(0),
                 diagnostics: None,
                 listener: None,
+                capacity: ListenerCapacity::default(),
             },
         ));
 
