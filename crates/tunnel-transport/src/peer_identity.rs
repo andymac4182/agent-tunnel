@@ -57,6 +57,10 @@ pub enum PeerIdentityError {
     /// so peers dialing the approved server name would refuse it.
     #[error("peer identity certificate does not cover the current server names")]
     ServerNamesNarrowed,
+    /// The identity currently served has no parseable relay peer role, so no
+    /// successor can be proven to be the same node; rotation is refused.
+    #[error("the served peer identity has no relay peer role, so it cannot be rotated")]
+    CurrentIdentityUnverifiable,
     /// The leaf certificate does not chain to the operator-provisioned relay
     /// peer CA, or is outside its validity window, or lacks client usage.
     #[error("peer identity certificate does not verify against the peer CA: {0}")]
@@ -153,7 +157,11 @@ fn verify_against_peer_ca(
 
 struct IdentitySlot {
     certified: Arc<CertifiedKey>,
-    identity: TlsIdentity,
+    spki: SpkiSha256,
+    /// `None` only for a startup certificate whose role SAN did not parse,
+    /// which `with_single_cert` used to accept; such a slot serves but can
+    /// never be rotated.
+    identity: Option<TlsIdentity>,
     generation: u64,
 }
 
@@ -173,7 +181,7 @@ impl fmt::Debug for RotatingPeerIdentity {
         formatter
             .debug_struct("RotatingPeerIdentity")
             .field("generation", &slot.generation)
-            .field("spki_sha256", &slot.identity.spki_sha256().to_hex())
+            .field("spki_sha256", &slot.spki.to_hex())
             .finish_non_exhaustive()
     }
 }
@@ -185,7 +193,8 @@ impl RotatingPeerIdentity {
         Arc::new(Self {
             slot: RwLock::new(Arc::new(IdentitySlot {
                 certified: initial.certified,
-                identity: initial.identity,
+                spki: initial.identity.spki_sha256(),
+                identity: Some(initial.identity),
                 generation: 1,
             })),
         })
@@ -194,10 +203,11 @@ impl RotatingPeerIdentity {
     /// Start from the relay's configured peer certificate at process start.
     ///
     /// This keeps the startup contract `with_single_cert` had: the chain is
-    /// not re-verified here (peers verify it at every handshake) and a key
-    /// whose consistency rustls cannot establish is accepted.  A key that
-    /// provably does not match its certificate, or a leaf without a parseable
-    /// role, is refused.  Successors staged later go through the strict
+    /// not re-verified here (peers verify it at every handshake), a key whose
+    /// consistency rustls cannot establish is accepted, and a leaf whose role
+    /// SAN does not parse still serves (peers refuse it at the handshake if
+    /// they require the role).  Such a slot cannot be rotated.  A key that
+    /// provably does not match its certificate is refused.  Successors staged later go through the strict
     /// [`StagedPeerIdentity::from_pem`].
     pub fn from_pem_at_startup(
         certificate_pem: &[u8],
@@ -209,11 +219,18 @@ impl RotatingPeerIdentity {
             .map_err(|error| PeerIdentityError::Unusable(error.to_string()))?;
         let certified = CertifiedKey::from_der(chain.clone(), key, &ring_provider())
             .map_err(|_| PeerIdentityError::KeyMismatch)?;
-        let identity = parse_leaf_identity(&chain)
+        let leaf = chain
+            .first()
+            .ok_or_else(|| PeerIdentityError::Unusable("empty certificate chain".into()))?;
+        let spki = crate::tls::spki_sha256_from_der(leaf.as_ref())
             .map_err(|error| PeerIdentityError::Unusable(error.to_string()))?;
-        Ok(Self::new(StagedPeerIdentity {
-            certified: Arc::new(certified),
-            identity,
+        Ok(Arc::new(Self {
+            slot: RwLock::new(Arc::new(IdentitySlot {
+                certified: Arc::new(certified),
+                spki,
+                identity: parse_leaf_identity(&chain).ok(),
+                generation: 1,
+            })),
         }))
     }
 
@@ -238,7 +255,7 @@ impl RotatingPeerIdentity {
     /// The SPKI digest new handshakes present.
     #[must_use]
     pub fn current_spki(&self) -> SpkiSha256 {
-        self.current_slot().identity.spki_sha256()
+        self.current_slot().spki
     }
 
     /// The generation new handshakes present.  It starts at 1 and increases
@@ -248,24 +265,28 @@ impl RotatingPeerIdentity {
         self.current_slot().generation
     }
 
-    /// The public identity new handshakes present.
+    /// The public identity new handshakes present, when its role parsed.
     #[must_use]
-    pub fn current_identity(&self) -> TlsIdentity {
+    pub fn current_identity(&self) -> Option<TlsIdentity> {
         self.current_slot().identity.clone()
     }
 
     /// Check that `staged` may replace the current identity: same relay node,
     /// and every DNS/IP name the current certificate serves is still served.
     pub fn check_replacement(&self, staged: &StagedPeerIdentity) -> Result<(), PeerIdentityError> {
-        let current = self.current_slot();
-        if staged.identity.role_id() != current.identity.role_id() {
+        let slot = self.current_slot();
+        let current = slot
+            .identity
+            .as_ref()
+            .ok_or(PeerIdentityError::CurrentIdentityUnverifiable)?;
+        if staged.identity.role_id() != current.role_id() {
             return Err(PeerIdentityError::DifferentNode);
         }
         let covers = |name: &SanName| {
             !matches!(name, SanName::Dns(_) | SanName::Ip(_))
                 || staged.identity.subject_alt_names().contains(name)
         };
-        if !current.identity.subject_alt_names().iter().all(covers) {
+        if !current.subject_alt_names().iter().all(covers) {
             return Err(PeerIdentityError::ServerNamesNarrowed);
         }
         Ok(())
@@ -282,7 +303,8 @@ impl RotatingPeerIdentity {
         let generation = slot.generation.saturating_add(1);
         *slot = Arc::new(IdentitySlot {
             certified: staged.certified,
-            identity: staged.identity,
+            spki: staged.identity.spki_sha256(),
+            identity: Some(staged.identity),
             generation,
         });
         Ok(generation)

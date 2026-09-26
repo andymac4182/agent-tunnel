@@ -498,3 +498,27 @@ fn a_candidate_identity_is_refused_unless_it_is_the_same_relay_under_the_same_ca
     assert!(rendered.contains(&current.spki.to_hex()));
     assert!(!rendered.contains("PRIVATE KEY"));
 }
+
+#[test]
+fn a_startup_certificate_without_a_role_still_serves_but_cannot_be_rotated() {
+    // `with_single_cert` accepted a peer leaf whose role SAN does not parse;
+    // peers refuse it at the handshake if they require the role.  The
+    // replaceable slot keeps that startup contract (the M7 startup tests
+    // rely on it), and refuses any rotation away from an identity it cannot
+    // prove is a relay node.
+    let pki = Pki::new("rotation role-less CA");
+    let roleless = pki.issue("urn:example:not-a-role", &[SERVER_NAME]);
+    let slot = RotatingPeerIdentity::from_pem_at_startup(
+        roleless.chain_pem.as_bytes(),
+        roleless.private_key_pem.as_bytes(),
+    )
+    .expect("a role-less startup certificate still serves");
+    assert_eq!(slot.current_spki(), roleless.spki);
+    assert!(slot.current_identity().is_none());
+    let successor = pki.peer("relay-a");
+    assert_eq!(
+        slot.install(pki.staged(&successor)).unwrap_err(),
+        PeerIdentityError::CurrentIdentityUnverifiable
+    );
+    assert_eq!(slot.generation(), 1);
+}
