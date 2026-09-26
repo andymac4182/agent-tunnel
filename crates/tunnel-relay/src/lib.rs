@@ -59,9 +59,9 @@ pub use http::{
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,
     CheckpointResponse, HttpsCheckpointAuthority, LocalKeyApproval, LocalServingSwitchError,
-    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipChangeObserver, MembershipReadiness,
-    MembershipRecordSource, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError,
-    MembershipRuntimeHandle, MembershipSnapshot, MembershipUnreadyReason, PeerAdmission,
+    MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT, MembershipReadiness, MembershipRecordSource,
+    MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeError, MembershipRuntimeHandle,
+    MembershipSnapshot, MembershipUnreadyReason, PeerAdmission,
     PeerIdentity as MembershipPeerIdentity, PeerInvalidationReason,
 };
 pub use membership_version_state::{

@@ -203,6 +203,11 @@ impl Fixture {
         *self.source.records.write().await = vec![record, peer];
     }
 
+    /// Replace the peer's record; it is published with the next local one.
+    async fn set_peer_record(&self, record: SignedMembershipRecord) {
+        *self.peer_record.write().await = record;
+    }
+
     /// Publish a re-signed record at `version` for the same node and key.
     async fn resign(&self, version: u64) {
         self.publish(self.record(version, "key-1", SPKI_SHA256, 30))
@@ -227,12 +232,37 @@ fn sign_record(
     lifetime_s: i64,
     revoked: bool,
 ) -> SignedMembershipRecord {
-    let now = Utc::now();
     let host = if node_id == NODE_ID {
         "10.0.0.1"
     } else {
         "10.0.0.2"
     };
+    sign_record_with_route(
+        issuer,
+        node_id,
+        version,
+        key_id,
+        spki,
+        lifetime_s,
+        revoked,
+        &format!("{host}:8443"),
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_record_with_route(
+    issuer: &MembershipIssuer,
+    node_id: &str,
+    version: u64,
+    key_id: &str,
+    spki: &str,
+    lifetime_s: i64,
+    revoked: bool,
+    peer_endpoint: &str,
+    server_name: &str,
+) -> SignedMembershipRecord {
+    let now = Utc::now();
     let record = MembershipRecord {
         schema_version: MEMBERSHIP_SCHEMA_VERSION,
         deployment_id: DEPLOYMENT_ID.to_owned(),
@@ -240,8 +270,8 @@ fn sign_record(
         node_id: node_id.to_owned(),
         record_version: version,
         roles: vec![RELAY_PEER_ROLE.to_owned()],
-        peer_endpoint: format!("{host}:8443"),
-        server_name: host.to_owned(),
+        peer_endpoint: peer_endpoint.to_owned(),
+        server_name: server_name.to_owned(),
         keys: {
             let mut keys = vec![RelayKey {
                 key_id: key_id.to_owned(),
@@ -357,9 +387,139 @@ async fn a_resign_that_changes_the_key_still_invalidates_the_admission() {
     );
 }
 
-/// The rebind guard, part 1: a same-key record at an *equal* version whose
-/// validity ends earlier is not a renewal. The verifier refuses the
-/// conflicting bytes and the admission is invalidated.
+/// Admit this node as a peer, publish `record`, reconcile, and return the
+/// admission's cancellation edge.
+async fn admission_after(
+    fixture: &Fixture,
+    record: SignedMembershipRecord,
+) -> tunnel_relay::membership_runtime::PeerAdmissionCancellation {
+    let admission = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .expect("an active admission");
+    let stream = admission.cancellation();
+    fixture.publish(record).await;
+    let _ = fixture.runtime.reconcile_once().await;
+    stream
+}
+
+/// The re-bind guard's binding identity, endpoint: a same-key re-sign at a
+/// higher version that moves the peer endpoint is a different route and
+/// must invalidate, not re-bind (`same_peer_binding`).
+#[tokio::test]
+async fn a_same_key_resign_with_a_changed_endpoint_invalidates() {
+    let fixture = Fixture::ready().await;
+    let record = sign_record_with_route(
+        &fixture.issuer,
+        NODE_ID,
+        2,
+        "key-1",
+        SPKI_SHA256,
+        30,
+        false,
+        "10.0.0.9:8443",
+        "10.0.0.1",
+    );
+    let stream = admission_after(&fixture, record).await;
+    assert!(
+        stream.is_cancelled(),
+        "M7-C80: a changed peer endpoint was re-bound"
+    );
+}
+
+/// The re-bind guard's binding identity, server name.
+#[tokio::test]
+async fn a_same_key_resign_with_a_changed_server_name_invalidates() {
+    let fixture = Fixture::ready().await;
+    let record = sign_record_with_route(
+        &fixture.issuer,
+        NODE_ID,
+        2,
+        "key-1",
+        SPKI_SHA256,
+        30,
+        false,
+        "10.0.0.1:8443",
+        "10.0.0.9",
+    );
+    let stream = admission_after(&fixture, record).await;
+    assert!(
+        stream.is_cancelled(),
+        "M7-C80: a changed server name was re-bound"
+    );
+}
+
+/// A higher version that revokes the admitted key invalidates with
+/// `MembershipRevoked`: the binding no longer verifies. The peer's record is
+/// used so this relay's own readiness is not what cancels the admission.
+#[tokio::test]
+async fn a_higher_version_that_revokes_the_key_invalidates() {
+    let fixture = Fixture::ready().await;
+    let admission = fixture
+        .runtime
+        .admit_peer(MembershipPeerIdentity::new(
+            PEER_NODE_ID,
+            "boot-peer",
+            PEER_SPKI_SHA256,
+        ))
+        .expect("an admission of the peer");
+    let stream = admission.cancellation();
+    fixture
+        .set_peer_record(sign_record(
+            &fixture.issuer,
+            PEER_NODE_ID,
+            2,
+            "peer-key-1",
+            PEER_SPKI_SHA256,
+            30,
+            true,
+        ))
+        .await;
+    fixture.resign(2).await;
+    assert!(stream.is_cancelled(), "M7-C80: a revoked key was re-bound");
+    assert_eq!(
+        stream.reason(),
+        Some(PeerInvalidationReason::MembershipRevoked)
+    );
+}
+
+/// The re-bind guard's deadline clause: an admission whose own deadline has
+/// already passed is never resurrected by a later, renewing re-sign, even if
+/// no expiry sweep ran in between.
+#[tokio::test]
+async fn an_admission_past_its_deadline_is_not_re_bound_by_a_renewal() {
+    let fixture = Fixture::ready().await;
+    // Install a short record, admit under it, and let the deadline pass.
+    fixture
+        .publish(fixture.record(2, "key-1", SPKI_SHA256, 2))
+        .await;
+    fixture
+        .runtime
+        .reconcile_once()
+        .await
+        .expect("the short record is shorter but still Ready");
+    let admission = fixture
+        .runtime
+        .admit_peer(Fixture::identity())
+        .expect("an admission under the short record");
+    let stream = admission.cancellation();
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    // No readiness or snapshot read here: the reconcile is the first thing
+    // to see the passed deadline, so only the re-bind guard can stop it.
+    fixture
+        .publish(fixture.record(3, "key-1", SPKI_SHA256, 30))
+        .await;
+    let _ = fixture.runtime.reconcile_once().await;
+    assert!(
+        stream.is_cancelled(),
+        "M7-C80: an admission past its deadline was re-bound and resurrected"
+    );
+}
+
+/// An equal-version record with different bytes is refused **by the
+/// verifier** (`EqualVersionConflict`), which makes membership unready and
+/// invalidates every admission. This test does not reach the re-bind guard;
+/// `every_rebind_clause_fails_closed_on_its_own` witnesses the version clause.
 #[tokio::test]
 async fn an_equal_version_same_key_record_invalidates_the_admission() {
     let fixture = Fixture::ready().await;
@@ -379,7 +539,9 @@ async fn an_equal_version_same_key_record_invalidates_the_admission() {
     );
 }
 
-/// The rebind guard, part 2: a *lower* version is a rollback, never a renewal.
+/// A lower-version record is refused **by the verifier** (rollback), which
+/// invalidates every admission. Like the test above, it never reaches the
+/// re-bind guard; it pins that a rollback cannot keep an admission alive.
 #[tokio::test]
 async fn a_lower_version_same_key_record_invalidates_the_admission() {
     let fixture = Fixture::ready().await;
@@ -399,8 +561,8 @@ async fn a_lower_version_same_key_record_invalidates_the_admission() {
     );
 }
 
-/// The rebind guard, part 3: a higher version whose own validity ends
-/// earlier shrinks the signed boundary and invalidates.
+/// The re-bind guard's boundary clause: a higher version whose own validity
+/// ends earlier shrinks the signed boundary and invalidates.
 #[tokio::test]
 async fn a_higher_version_with_an_earlier_boundary_invalidates_the_admission() {
     let fixture = Fixture::ready().await;
@@ -427,7 +589,7 @@ async fn a_higher_version_with_an_earlier_boundary_invalidates_the_admission() {
     );
 }
 
-/// The rebind guard, part 4: a shrunk *checkpoint* window shrinks the trust
+/// The re-bind guard's boundary clause, checkpoint side: a shrunk *checkpoint* window shrinks the trust
 /// boundary of every admission and invalidates, even with the record
 /// unchanged.
 #[tokio::test]

@@ -965,10 +965,6 @@ struct RuntimeState {
     active_peers: BTreeMap<PeerIdentity, ActivePeer>,
     callback: Option<PeerInvalidationCallback>,
     last_persisted_version_state: Option<MembershipVersionState>,
-    /// Advanced only when a successful reconcile installs a verified
-    /// directory whose `(node, record_version)` set differs from the last.
-    directory_revision: u64,
-    directory_versions: Vec<(String, u64)>,
 }
 
 /// A cancellable, joined membership reconciliation task.
@@ -1032,22 +1028,6 @@ pub struct MembershipRuntime {
     /// reconcile gate and only to a key the verified record approves now
     /// (task rows M8-C28, M8-C45).
     local_serving_spki: Mutex<Option<String>>,
-    /// Process-local observer of readiness transitions and verified
-    /// directory changes (M7-C91), with the last state it was told about.
-    change_observer: Mutex<ChangeObserverState>,
-}
-
-/// Callback invoked, outside every runtime lock, when this runtime's
-/// readiness changes or a reconcile installs a verified directory whose
-/// record versions differ from the previous one. It receives the readiness
-/// that triggered it; like [`PeerInvalidationCallback`] it carries no signed
-/// bytes, endpoint or credential.
-pub type MembershipChangeObserver = Arc<dyn Fn(&MembershipReadiness) + Send + Sync>;
-
-#[derive(Default)]
-struct ChangeObserverState {
-    observer: Option<MembershipChangeObserver>,
-    last: Option<(MembershipReadiness, u64)>,
 }
 
 /// How the current verified record for this relay treats one of its own
@@ -1215,14 +1195,11 @@ impl MembershipRuntime {
                 active_peers: BTreeMap::new(),
                 callback: None,
                 last_persisted_version_state: persisted_version_state,
-                directory_revision: 0,
-                directory_versions: Vec::new(),
             }),
             local_serving_spki: Mutex::new(config.local_spki_sha256.clone()),
             config,
             version_store,
             started: AtomicBool::new(false),
-            change_observer: Mutex::new(ChangeObserverState::default()),
         }))
     }
 
@@ -1336,46 +1313,6 @@ impl MembershipRuntime {
         }
     }
 
-    /// Install or replace the process-local change observer (M7-C91).
-    ///
-    /// The observer runs after every readiness transition -- including the
-    /// reconcile that returns membership to `Ready`, which has no admission
-    /// left to invalidate and so never reaches the invalidation callback --
-    /// and after a reconcile that installs different record versions while
-    /// staying `Ready`. It runs outside every runtime lock and may call back
-    /// into this runtime. Installing it does not replay the current state.
-    pub fn set_change_observer(&self, observer: Option<MembershipChangeObserver>) {
-        let current = {
-            let state = self.state.lock().expect("membership state mutex poisoned");
-            (state.readiness.clone(), state.directory_revision)
-        };
-        if let Ok(mut observed) = self.change_observer.lock() {
-            observed.observer = observer;
-            observed.last = Some(current);
-        }
-    }
-
-    /// Tell the change observer about a readiness or directory change, once.
-    fn notify_change_observer(&self) {
-        let current = {
-            let state = self.state.lock().expect("membership state mutex poisoned");
-            (state.readiness.clone(), state.directory_revision)
-        };
-        let observer = {
-            let Ok(mut observed) = self.change_observer.lock() else {
-                return;
-            };
-            if observed.last.as_ref() == Some(&current) {
-                return;
-            }
-            observed.last = Some(current.clone());
-            observed.observer.clone()
-        };
-        if let Some(observer) = observer {
-            observer(&current.0);
-        }
-    }
-
     /// Trigger a best-effort immediate reconcile.  Periodic reconciliation
     /// remains enabled, so lost pub/sub notifications cannot preserve stale
     /// trust indefinitely.
@@ -1478,22 +1415,6 @@ impl MembershipRuntime {
         if !matches!(state.readiness, MembershipReadiness::Ready) {
             return Vec::new();
         }
-        Self::route_targets_at(&state, now)
-    }
-
-    /// Route targets the *installed* verifier approves at `now`, whatever this
-    /// runtime's own readiness (M7-C86).
-    ///
-    /// A local or transient unready state retains the published pin set, but
-    /// only as far as the newest verified evidence still approves it: an
-    /// unready candidate is installed *with* its verified records, so a peer
-    /// key that candidate revoked, removed or let expire is not approved here
-    /// and must leave the retained set at once. Empty without a fresh
-    /// checkpoint.
-    #[must_use]
-    pub fn currently_approved_peer_route_targets(&self) -> Vec<PeerRouteTarget> {
-        let now = Utc::now();
-        let state = self.state.lock().expect("membership state mutex poisoned");
         Self::route_targets_at(&state, now)
     }
 
@@ -1957,22 +1878,6 @@ impl MembershipRuntime {
         state.verifier = candidate_verifier;
         state.readiness = MembershipReadiness::Ready;
         state.generation = state.generation.saturating_add(1);
-        let mut directory_versions = state
-            .verifier
-            .retained_memberships()
-            .into_iter()
-            .map(|membership| {
-                (
-                    membership.node_id().to_owned(),
-                    membership.record().record_version,
-                )
-            })
-            .collect::<Vec<_>>();
-        directory_versions.sort();
-        if directory_versions != state.directory_versions {
-            state.directory_versions = directory_versions;
-            state.directory_revision = state.directory_revision.saturating_add(1);
-        }
         state.checkpoint_version = Some(checkpoint.checkpoint().checkpoint_version);
         state.checkpoint_expires_at = Some(checkpoint_expiry);
         state.trust_expires_at = Some(trust_wall_expiry);
@@ -2183,10 +2088,6 @@ impl MembershipRuntime {
                 callback(invalidation.identity, invalidation.reason);
             }
         }
-        // Every state transition in this runtime is followed by a dispatch,
-        // even an empty one, so this is the one place a readiness or
-        // directory change is guaranteed to be observed.
-        self.notify_change_observer();
     }
 }
 
@@ -2363,15 +2264,15 @@ impl RuntimeState {
                     expires_at.min(binding.valid_until())
                         < peer.admission.deadline.trust_expires_at()
                 });
-            let version_regressed =
-                current_version.is_none_or(|version| version < peer.record_version);
+            let permitted = rebind_permitted(RebindCheck {
+                previous_version: peer.record_version,
+                current_version,
+                binding_changed,
+                trust_deadline_shrank,
+                deadline_expired: peer.admission.deadline.is_expired(),
+            });
             match current {
-                Ok(binding)
-                    if !version_regressed
-                        && !binding_changed
-                        && !trust_deadline_shrank
-                        && !peer.admission.deadline.is_expired() =>
-                {
+                Ok(binding) if permitted => {
                     let signed_boundary = self
                         .trust_expires_at
                         .map_or(binding.valid_until(), |expires_at| {
@@ -2384,15 +2285,12 @@ impl RuntimeState {
                     // and keeping the latest would ratchet it later by
                     // clock-conversion drift, past the peer's own conversion
                     // of the same boundary (the M7-C86 trust-expiry race).
-                    let renewed = if signed_boundary > peer.admission.deadline.trust_expires_at() {
-                        let peer_deadline =
-                            monotonic_deadline(now, now_mono, binding.valid_until());
-                        self.trust_deadline
-                            .map_or(peer_deadline, |deadline| deadline.min(peer_deadline))
-                            .max(peer.admission.deadline.expires_at)
-                    } else {
-                        peer.admission.deadline.expires_at
-                    };
+                    let renewed = renewed_deadline(
+                        peer.admission.deadline.expires_at,
+                        signed_boundary > peer.admission.deadline.trust_expires_at(),
+                        self.trust_deadline,
+                        monotonic_deadline(now, now_mono, binding.valid_until()),
+                    );
                     peer.admission.deadline = AdmissionDeadline {
                         started_at: peer.admission.deadline.started_at,
                         expires_at: renewed,
@@ -2422,6 +2320,49 @@ impl RuntimeState {
         }
         invalidations
     }
+}
+
+/// The facts one re-bind decision rests on (M7-C80).
+#[derive(Clone, Copy, Debug)]
+struct RebindCheck {
+    previous_version: u64,
+    current_version: Option<u64>,
+    binding_changed: bool,
+    trust_deadline_shrank: bool,
+    deadline_expired: bool,
+}
+
+/// Whether an active admission may be re-bound to freshly verified evidence
+/// instead of invalidated. Every clause fails closed: a missing or lower
+/// record version, a changed binding identity, a shrunk signed boundary or
+/// an already-passed deadline each forbid the re-bind. The verifier already
+/// refuses a lower or equal-version record, so the version clause is defence
+/// in depth and is witnessed by a unit test rather than through a record.
+const fn rebind_permitted(check: RebindCheck) -> bool {
+    let version_ok = match check.current_version {
+        Some(version) => version >= check.previous_version,
+        None => false,
+    };
+    let deadline_ok = !check.deadline_expired;
+    version_ok && !check.binding_changed && !check.trust_deadline_shrank && deadline_ok
+}
+
+/// The monotonic deadline of a re-bound admission. It is re-converted only
+/// when the signed boundary moved later -- re-converting an unchanged
+/// boundary on every reconcile would ratchet it later by clock-conversion
+/// drift -- and it is never moved earlier than the deadline it already had.
+fn renewed_deadline(
+    previous: Instant,
+    boundary_moved_later: bool,
+    local_trust_deadline: Option<Instant>,
+    peer_deadline: Instant,
+) -> Instant {
+    if !boundary_moved_later {
+        return previous;
+    }
+    let bounded =
+        local_trust_deadline.map_or(peer_deadline, |deadline| deadline.min(peer_deadline));
+    bounded.max(previous)
 }
 
 /// Whether two verified bindings name the same peer authority: node, boot,
@@ -2747,6 +2688,68 @@ fn parse_root_certificates(pem: &[u8]) -> Result<RootCertStore, CheckpointAuthor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rebind_check() -> RebindCheck {
+        RebindCheck {
+            previous_version: 3,
+            current_version: Some(4),
+            binding_changed: false,
+            trust_deadline_shrank: false,
+            deadline_expired: false,
+        }
+    }
+
+    /// M7-C80: every clause of the re-bind guard fails closed on its own.
+    #[test]
+    fn every_rebind_clause_fails_closed_on_its_own() {
+        assert!(
+            rebind_permitted(rebind_check()),
+            "control: a clean re-sign re-binds"
+        );
+        let mut equal = rebind_check();
+        equal.current_version = Some(3);
+        assert!(rebind_permitted(equal), "the same version still re-binds");
+        type Mutation = fn(&mut RebindCheck);
+        let cases: [(&str, Mutation); 5] = [
+            ("a lower version", |c| c.current_version = Some(2)),
+            ("a missing record", |c| c.current_version = None),
+            ("a changed binding", |c| c.binding_changed = true),
+            ("a shrunk boundary", |c| c.trust_deadline_shrank = true),
+            ("a passed deadline", |c| c.deadline_expired = true),
+        ];
+        for (name, mutate) in cases {
+            let mut check = rebind_check();
+            mutate(&mut check);
+            assert!(!rebind_permitted(check), "M7-C80: {name} was re-bound");
+        }
+    }
+
+    /// M7-C80: a renewal never moves a deadline earlier, and an unchanged
+    /// signed boundary keeps the deadline it was first converted to.
+    #[test]
+    fn a_renewed_deadline_is_never_earlier_and_unchanged_boundaries_keep_theirs() {
+        let base = Instant::now();
+        let previous = base + Duration::from_secs(10);
+        let earlier = base + Duration::from_secs(9);
+        let later = base + Duration::from_secs(20);
+        assert_eq!(
+            renewed_deadline(previous, true, Some(earlier), later),
+            previous,
+            "M7-C80: a renewal moved the deadline earlier than it already was"
+        );
+        assert_eq!(renewed_deadline(previous, true, None, earlier), previous);
+        assert_eq!(renewed_deadline(previous, true, Some(later), later), later);
+        assert_eq!(
+            renewed_deadline(previous, true, Some(later + Duration::from_secs(1)), later),
+            later,
+            "the peer boundary still bounds the renewal"
+        );
+        assert_eq!(
+            renewed_deadline(previous, false, Some(later), later),
+            previous,
+            "an unchanged boundary keeps its first conversion"
+        );
+    }
 
     #[test]
     fn request_rejects_invalid_nonce() {
