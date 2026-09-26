@@ -153,6 +153,8 @@ struct RekeyEvidence {
     device_generation_final: u64,
     old_presented_initially: PeerProbeOutcome,
     new_presented_initially: PeerProbeOutcome,
+    mismatched_refused: bool,
+    new_presented_after_refusal: PeerProbeOutcome,
     staged_logged: bool,
     new_presented_while_staged: PeerProbeOutcome,
     old_presented_while_staged: PeerProbeOutcome,
@@ -192,6 +194,9 @@ impl RekeyEvidence {
         }
         if !self.old_presented_initially.accepted() || self.new_presented_initially.accepted() {
             bail!("relay B did not start by presenting only the configured certificate");
+        }
+        if !self.mismatched_refused || self.new_presented_after_refusal.accepted() {
+            bail!("a SIGHUP with a mismatched successor key was not refused cleanly");
         }
         if !self.staged_logged {
             bail!("SIGHUP did not stage the configured successor");
@@ -233,7 +238,7 @@ impl RekeyEvidence {
 
     fn evidence_line(&self) -> String {
         format!(
-            "m8-relay-rekey-process b_pid={}->{} old_spki={} new_spki={} owner_boot={} owner_epoch={} device_generation={}->{} initial(old={} new={}) staged_logged={} staged(new={} old={}) switched(new={} old={}) switch_logged={} retired_logged={} retired(new={} old={}) canary(initial={} overlap={} after_retirement_attempts={}) b_ready_samples={} b_unready={} a_ready_samples={} a_unready={} payload_free={}",
+            "m8-relay-rekey-process b_pid={}->{} old_spki={} new_spki={} owner_boot={} owner_epoch={} device_generation={}->{} initial(old={} new={}) mismatched_refused={} after_refusal(new={}) staged_logged={} staged(new={} old={}) switched(new={} old={}) switch_logged={} retired_logged={} retired(new={} old={}) canary(initial={} overlap={} after_retirement_attempts={}) b_ready_samples={} b_unready={} a_ready_samples={} a_unready={} payload_free={}",
             self.b_pid_initial,
             self.b_pid_final,
             self.old_spki,
@@ -244,6 +249,8 @@ impl RekeyEvidence {
             self.device_generation_final,
             probe_code(&self.old_presented_initially),
             probe_code(&self.new_presented_initially),
+            self.mismatched_refused,
+            probe_code(&self.new_presented_after_refusal),
             self.staged_logged,
             probe_code(&self.new_presented_while_staged),
             probe_code(&self.old_presented_while_staged),
@@ -350,6 +357,8 @@ struct RekeyFixture {
     new_key: FixturePeerKey,
     a_config: PathBuf,
     b_config: PathBuf,
+    b_next_key_path: PathBuf,
+    b_next_key_pem: String,
     client_config: ConnectConfig,
     processes: Vec<RelayProcessSlot>,
     client: Option<tunnel_client::ConnectionHandle>,
@@ -561,10 +570,11 @@ async fn create_fixture_inner(
         "relay-b-next-peer-chain.pem",
         new_credential.chain_pem.as_bytes(),
     )?;
-    let peer_b_next_key_path = files.write(
-        "relay-b-next-peer-key.pem",
-        new_credential.key_pem.as_bytes(),
-    )?;
+    // The first SIGHUP meets a key that does not match the successor
+    // certificate (relay-a's own key); the gate then writes the right one.
+    let peer_b_next_key_path =
+        files.write("relay-b-next-peer-key.pem", a_credential.key_pem.as_bytes())?;
+    let b_next_key_pem = new_credential.key_pem.clone();
     let state_a = files.state_path()?;
     let state_b = state_a.with_file_name("relay-b-membership-state.json");
     let a_consumer_bind = free_tcp_addr();
@@ -692,6 +702,8 @@ async fn create_fixture_inner(
         new_key,
         a_config,
         b_config,
+        b_next_key_path: peer_b_next_key_path,
+        b_next_key_pem,
         client_config,
         processes: Vec::new(),
         client: None,
@@ -725,6 +737,28 @@ impl RekeyFixture {
             vec![fresh_key(&self.a_key)],
         )?;
         publish_membership(&self.upstream_url, &self.namespace, "relay-a", &record).await
+    }
+
+    /// Wait until the checkpoint authority has served `passes` more
+    /// reconciliation requests than it had when called.
+    async fn wait_reconciles(&self, passes: usize, deadline: Instant) -> Result<()> {
+        let count = || {
+            self.checkpoint
+                .as_ref()
+                .map(CheckpointServer::request_count)
+                .unwrap_or(0)
+        };
+        let start = count();
+        let end = (Instant::now() + TRANSITION_DEADLINE).min(deadline);
+        while count() < start + passes {
+            if Instant::now() >= end {
+                bail!(
+                    "the relays did not reconcile {passes} more times before the bounded deadline"
+                );
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+        Ok(())
     }
 
     fn catalog(&self) -> Result<&RedisCatalog> {
@@ -1000,14 +1034,28 @@ impl RekeyFixture {
         let b_sampler = ReadinessSampler::start(self.b_consumer_bind, self.server_ca_der.clone());
         let a_sampler = ReadinessSampler::start(self.a_consumer_bind, self.server_ca_der.clone());
 
-        // ---- phase 1: the operator trigger stages the successor -----------
+        // ---- phase 1a: a trigger with a mismatched key is refused --------
+        send_sighup(b_pid_initial)?;
+        self.wait_b_logged(
+            &["peer rekey refused", "does not match its certificate"],
+            "mismatched trigger",
+            deadline,
+        )
+        .await?;
+        let mismatched_refused = !self.b_stderr().contains("peer identity staged");
+        let new_presented_after_refusal = self.b_presents(self.new_spki).await?;
+
+        // ---- phase 1b: the operator fixes the key; the trigger stages -----
+        std::fs::write(&self.b_next_key_path, self.b_next_key_pem.as_bytes())?;
         send_sighup(b_pid_initial)?;
         let staged_line = format!("staged_spki_sha256={}", self.new_spki.to_hex());
         self.wait_b_logged(&["peer identity staged", &staged_line], "staged", deadline)
             .await?;
         let staged_logged = true;
-        // Two reconcile intervals: an unapproved successor must still not serve.
-        sleep(Duration::from_secs(4)).await;
+        // Until both relays have reconciled at least twice more, an
+        // unapproved successor must still not serve.  A condition, not a
+        // fixed sleep: the checkpoint authority counts every reconcile.
+        self.wait_reconciles(4, deadline).await?;
         let new_presented_while_staged = self.b_presents(self.new_spki).await?;
         let old_presented_while_staged = self.b_presents(self.old_spki).await?;
 
@@ -1057,6 +1105,8 @@ impl RekeyFixture {
             device_generation_final,
             old_presented_initially,
             new_presented_initially,
+            mismatched_refused,
+            new_presented_after_refusal,
             staged_logged,
             new_presented_while_staged,
             old_presented_while_staged,

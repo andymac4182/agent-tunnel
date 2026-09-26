@@ -24,8 +24,10 @@
 //!    stream's teardown to the key (`membership_revoked`) while the owner
 //!    stays Ready, latches no `membership_revoked` of its own, and retires the
 //!    predecessor because it was withdrawn;
-//! 5. complete a fresh ACP turn across the rotated route, then **rotate back**
-//!    the same way so every later case meets the cluster it expects.
+//! 5. complete a fresh ACP turn across the rotated route, then make the
+//!    successor the fixture's own identity for the owner and re-sign every
+//!    record, so every later case meets a cluster serving on it.  (A retired
+//!    key cannot be restaged, so the owner is not rotated back.)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,8 +253,8 @@ impl Gate<'_> {
             evidence.genuine_owner_unready = owner_unready.load(Ordering::Acquire);
 
             // ---- restore: a second genuine rotation, back -------------------
-            evidence.genuine_rotated_back = self
-                .rotate_owner_back(&rekey, &old_spki, &new_spki)
+            evidence.genuine_resigned_on_successor = self
+                .adopt_successor(&new_spki)
                 .await?;
             Ok::<(), HarnessError>(())
         }
@@ -270,7 +272,7 @@ impl Gate<'_> {
             "ACP cluster genuine peer-key rotation: staged_not_served={} switched={} switch_after_overlap_ms={} \
              acp_survived_switch={} forward_survived_switch={} successor_presented={} predecessor_not_presented={} \
              interrupted={} no_stop_reason={} ingress_reasons={:?} owner_reasons={:?} owner_unready={} \
-             retired_by_withdrawal={} post_rotation_turn={} rotated_back={}",
+             retired_by_withdrawal={} post_rotation_turn={} resigned_on_successor={}",
             evidence.genuine_staged_not_served,
             evidence.genuine_switched,
             evidence.genuine_switch_after_overlap_ms,
@@ -285,7 +287,7 @@ impl Gate<'_> {
             evidence.genuine_owner_unready,
             evidence.genuine_retired_by_withdrawal,
             evidence.genuine_post_rotation_turn,
-            evidence.genuine_rotated_back,
+            evidence.genuine_resigned_on_successor,
         );
 
         // Hand every later case the cluster it expects.
@@ -377,67 +379,48 @@ impl Gate<'_> {
         Ok(presented)
     }
 
-    /// Rotate the owner back to its original identity through the same
-    /// procedure, so the cluster every later case meets is the one it
-    /// started with.
-    async fn rotate_owner_back(
-        &mut self,
-        rekey: &Arc<tunnel_relay::peer_rekey::PeerRekey>,
-        original_spki: &str,
-        current_spki: &str,
-    ) -> Result<bool> {
-        let original = self
+    /// Make the rotated identity the cluster's own for every later case.
+    ///
+    /// A retired key cannot be restaged (M8-C45 review), so the owner is not
+    /// rotated back.  Instead the fixture adopts the successor: the owner
+    /// node's certificate and the membership re-signer's pinned SPKI for it
+    /// become the successor's, exactly what an operator does after a
+    /// rotation (operator.md section 3.4, step 5).  A full re-sign of every
+    /// record through the ordinary re-signer then proves the cluster serves
+    /// on the successor alone: every relay Ready and the ingress route
+    /// answering.
+    async fn adopt_successor(&mut self, successor_spki: &str) -> Result<bool> {
+        let successor = self.rekey_successor.clone();
+        let node = self
             .cluster
             .fixture
             .nodes
-            .iter()
+            .iter_mut()
             .find(|node| node.node_id == TARGET_NODE)
             .ok_or_else(|| {
                 HarnessError::InvalidInput("the owner node fixture is missing".into())
             })?;
-        let chain = original.peer_certificate_chain_pem();
-        let key = original.peer_certificate.private_key_pem.clone();
-        rekey
-            .stage_pem(chain.as_bytes(), key.as_bytes())
-            .map_err(|error| {
-                HarnessError::Process(format!("staging the original back: {error}"))
-            })?;
-        let now = Utc::now();
-        let overlap = self.next_record_version();
-        self.publish_owner_keys(overlap, &[original_spki, current_spki], now)
-            .await?;
-        if !self
-            .converge_owner_keys(overlap, &[original_spki, current_spki])
-            .await?
-        {
+        node.peer_certificate = successor;
+        let mut adopted = false;
+        for (identity, _) in &mut self.cluster.membership_resign_inputs.nodes {
+            if identity.node_id == TARGET_NODE {
+                identity.peer_spki_sha256 = successor_spki.to_owned();
+                adopted = true;
+            }
+        }
+        if !adopted || target_peer_spki(self.cluster)? != successor_spki {
             return Ok(false);
         }
+        self.cluster.resign_membership_now().await?;
+        self.membership_signed_at = Instant::now();
+        self.membership_resigns += 1;
         self.settle_after_publish().await?;
-        let deadline = Instant::now() + SWITCH_BOUND;
-        while rekey.snapshot().serving_spki != original_spki {
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        let withdraw = self.next_record_version();
-        self.publish_owner_keys(withdraw, &[original_spki], now)
-            .await?;
-        if !self.converge_owner_keys(withdraw, &[original_spki]).await? {
-            return Ok(false);
-        }
-        self.settle_after_publish().await?;
-        let deadline = Instant::now() + SWITCH_BOUND;
-        while rekey.phase() != PeerRekeyPhase::Stable {
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        let snapshot = rekey.snapshot();
-        Ok(snapshot.switches >= 2
-            && snapshot.retirements >= 2
-            && snapshot.serving_spki == original_spki)
+        let rekey = &self.cluster.relay(TARGET_NODE)?.rekey;
+        Ok(rekey.snapshot().serving_spki == successor_spki
+            && matches!(
+                self.cluster.relay(TARGET_NODE)?.membership.readiness(),
+                MembershipReadiness::Ready
+            ))
     }
 }
 

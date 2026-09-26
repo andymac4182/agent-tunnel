@@ -541,8 +541,9 @@ pub struct AcpClusterEvidence {
     pub genuine_retired_by_withdrawal: bool,
     /// A whole ACP turn completed across the rotated route afterwards.
     pub genuine_post_rotation_turn: bool,
-    /// The owner rotated back to its original identity the same way.
-    pub genuine_rotated_back: bool,
+    /// The fixture adopted the successor for the owner and a full re-sign
+    /// left the owner Ready, serving the successor.
+    pub genuine_resigned_on_successor: bool,
 
     // --- saturation ---
     /// The **request** direction of the ingress→owner peer hop: high-water
@@ -4556,8 +4557,8 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.genuine_post_rotation_turn,
         ),
         (
-            "genuine rotation: the owner rotated back to its original identity the same way",
-            evidence.genuine_rotated_back,
+            "genuine rotation: a full re-sign on the successor alone left the owner Ready and serving it",
+            evidence.genuine_resigned_on_successor,
         ),
     ];
     for (rule, passed) in genuine {
@@ -4843,7 +4844,7 @@ mod tests {
             genuine_owner_unready: false,
             genuine_retired_by_withdrawal: true,
             genuine_post_rotation_turn: true,
-            genuine_rotated_back: true,
+            genuine_resigned_on_successor: true,
             ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
             ingress_request_direction_saturated: true,
@@ -5477,9 +5478,9 @@ mod tests {
                 "whole ACP turn completed across the rotated route",
             ),
             (
-                "genuine_rotated_back",
-                |e| e.genuine_rotated_back = false,
-                "rotated back to its original identity",
+                "genuine_resigned_on_successor",
+                |e| e.genuine_resigned_on_successor = false,
+                "full re-sign on the successor alone",
             ),
             (
                 "leftover_processes",

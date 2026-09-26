@@ -2479,11 +2479,11 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        'the owner must rotate back the same way',
+        'the cluster must re-sign the owner on its successor',
         [
             (
                 ACP_CLUSTER,
-                '            evidence.genuine_rotated_back,',
+                '            evidence.genuine_resigned_on_successor,',
                 "            true,",
             )
         ],
@@ -2969,7 +2969,7 @@ WITNESSES: dict[tuple[str, str], frozenset[str]] = {
     ('m8c5', 'the genuine withdrawal must interrupt explicitly with no stopReason'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', 'the owner must retire the predecessor because it was withdrawn'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
     ('m8c5', 'a whole turn must complete across the rotated route'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
-    ('m8c5', 'the owner must rotate back the same way'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
+    ('m8c5', 'the cluster must re-sign the owner on its successor'): frozenset({'production_cluster::acp_cluster::tests::every_claim_can_fail_on_its_own'}),
 }
 
 #: The pinned ledger, loaded once.
