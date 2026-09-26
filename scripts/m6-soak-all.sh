@@ -8,7 +8,8 @@
 # every sample and event.  The short experiments (chaos, load, fairness) run
 # through the shared throttle gate when M6_SOAK_GATE names it; the 2-hour soak
 # does not hold a gate slot.  M6_SOAK_CHAOS_ARGS adds chaos arguments (the
-# hosted workflow passes --dedicated-redis); M6_SOAK_DURATION sets the soak;
+# hosted workflow passes --dedicated-redis); M6_SOAK_LOAD_ARGS adds load
+# arguments (for example a bulk --payload 65536); M6_SOAK_DURATION sets the soak;
 # M6_SOAK_EXPERIMENTS selects a subset (default "chaos load fairness soak");
 # M6_SOAK_REDIS names the plaintext Redis (default 127.0.0.1:63790).
 set -u
@@ -29,6 +30,7 @@ for experiment in ${M6_SOAK_EXPERIMENTS:-chaos load fairness soak}; do
   quiet
   extra=""
   [ "$experiment" = chaos ] && extra=${M6_SOAK_CHAOS_ARGS:-}
+  [ "$experiment" = load ] && extra=${M6_SOAK_LOAD_ARGS:-}
   echo "m6-soak-all: $experiment start $(date +%Y-%m-%dT%H:%M:%S%z) $(host)"
   # shellcheck disable=SC2086
   if [ -n "$gate" ]; then
