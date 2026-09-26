@@ -2678,6 +2678,8 @@ mod tests {
 
     /// Task row M6-C124: the device's control and data WebSockets are opened
     /// by `open_socket`, which must leave `TCP_NODELAY` set on the socket.
+    // The handshake callback's error type is tungstenite's, not ours.
+    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn open_socket_sets_tcp_nodelay() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
