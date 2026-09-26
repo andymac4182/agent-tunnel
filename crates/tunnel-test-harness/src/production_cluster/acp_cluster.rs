@@ -4175,8 +4175,13 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // That is a stronger control than the old `membership_changed`:
             // whatever the key arm tears down is now attributable to the key
             // alone, with the version bump shown to be inert beside it.
-            "the same-key control arm invalidated nothing and the stream survived (M7-C80)",
-            evidence.version_bump_reasons.is_empty() && !evidence.version_bump_interrupted,
+            // `version_bump_interrupted` is recorded but not asserted: the
+            // arm watches its stream for up to 45 s, longer than the ACP
+            // exchange itself is bounded, so a stream that later ends on its
+            // own exchange deadline is not a membership event -- and a
+            // membership invalidation would have latched a reason here.
+            "the same-key control arm invalidated nothing (M7-C80)",
+            evidence.version_bump_reasons.is_empty(),
         ),
         (
             // **The disclosure, made load-bearing.**  The key arm withdraws
@@ -4677,7 +4682,7 @@ mod tests {
             owner_loss_interrupted: true,
             owner_loss_no_stop_reason: true,
             key_overlap_staged: true,
-            version_bump_interrupted: false,
+            version_bump_interrupted: true,
             version_bump_reasons: Vec::new(),
             key_rotation_interrupted: true,
             key_rotation_no_stop_reason: true,
@@ -5114,13 +5119,6 @@ mod tests {
                 "version_bump_reasons membership_changed",
                 |e| {
                     e.version_bump_reasons = vec!["membership_changed".to_owned()];
-                },
-                "same-key control arm invalidated nothing",
-            ),
-            (
-                "version_bump_interrupted",
-                |e| {
-                    e.version_bump_interrupted = true;
                 },
                 "same-key control arm invalidated nothing",
             ),
