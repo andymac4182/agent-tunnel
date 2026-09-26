@@ -1030,6 +1030,10 @@ async fn exercise(
         observation.emitted_before = stream.last_emitted_relay_to_connector;
         observation.recv_contiguous_before = stream.recv_contiguous_connector_to_relay;
     }
+    // The device's own emit cursor, also fixed while paused: step 5 waits for
+    // it to move, which is the device sequencing the `Rread` into the paused
+    // direction (M6-C163).
+    let device_emitted_before = client.status_snapshot().emitted_sequences;
 
     // 4. Send one Tread and deliberately do not read its reply.  The request
     //    crosses on the still-flowing relay→connector direction; the device
@@ -1044,8 +1048,18 @@ async fn exercise(
         .await?;
     evidence.held_tag = held_tag;
 
-    // 5. Wait for the owner to show the request dispatched and unanswered, and
-    //    destroy the data socket at that instant.
+    // 5. Wait for the owner to show the request dispatched and unanswered,
+    //    **and** for the device to have sequenced its reply into the paused
+    //    direction, then destroy the data socket.  The owner's cursors move
+    //    when the relay *emits* the `Tread`, not when the device has it: on
+    //    the owner's evidence alone the socket could die with the `Tread`
+    //    still in flight, or delivered but not yet answered, and which of
+    //    those happened was socket timing (M6-C163: with Nagle on the relay's
+    //    accepted socket the `Tread` died in flight and the relay replayed it;
+    //    with `TCP_NODELAY` it arrived and the socket died before the device
+    //    answered, so nothing was replayed at all).  Waiting for the device's
+    //    emit cursor makes step 6's premise -- a produced `Rread` dies inside
+    //    the failed carrier -- a measured condition rather than a race.
     {
         let deadline = Instant::now() + WAIT;
         let mut polls = 0_usize;
@@ -1064,8 +1078,11 @@ async fn exercise(
                     ..observation.clone()
                 };
                 // Only a sample that actually shows the record dispatched and
-                // unanswered ends the wait.
-                if sample.request_outstanding_at_failure() {
+                // unanswered, with the device's reply already produced into
+                // the paused direction, ends the wait.
+                if sample.request_outstanding_at_failure()
+                    && client.status_snapshot().emitted_sequences > device_emitted_before
+                {
                     evidence.failure_polls = polls;
                     observation = sample;
                     break;
@@ -1076,10 +1093,12 @@ async fn exercise(
                 let _ = proxy
                     .resume(ProxyDirection::ClientToTarget, connection)
                     .await;
-                return Err(HarnessError::Process(
-                    "the held Tread was never observed dispatched and unanswered at the owner"
-                        .into(),
-                ));
+                return Err(HarnessError::Process(format!(
+                    "the held Tread was never observed dispatched and unanswered at the owner \
+                     with the device's reply produced into the paused direction: \
+                     device_emitted_before={device_emitted_before} device_emitted_now={}",
+                    client.status_snapshot().emitted_sequences
+                )));
             }
             sleep(POLL).await;
         }
