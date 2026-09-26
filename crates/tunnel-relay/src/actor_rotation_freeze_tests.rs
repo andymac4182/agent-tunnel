@@ -2612,6 +2612,129 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
     assert!(fixture.session().terminal_fin_failure_deadline.is_none());
 }
 
+/// M6-C157: a FIN that a momentarily full writer queue refuses is kept for
+/// the ordered retry, like a refused RESET, so the burst that filled the
+/// queue is survived instead of ending the device session.
+///
+/// Measured on hosted `ubuntu-latest` (m6-soak load, 32 MCP workers): the
+/// relay's 128-slot data channel was full for a moment, `finish_http_stream`
+/// marked the FIN failed with nothing pending, the tick had nothing to retry,
+/// and 5 s later the session closed `TERMINAL_FIN_TIMEOUT` with the queue
+/// empty -- every consumer of the device then saw `DEVICE_OFFLINE`.
+#[tokio::test]
+async fn m6c157_refused_http_fin_is_retried_and_the_session_survives() {
+    let mut fixture = FreezeFixture::new("http-fin-refused", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let generation = fixture.attempt.old_generation;
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    assert!(
+        !fixture
+            .actor
+            .finish_http_stream(&key, STREAM_ID, OPERATION_ID),
+        "the full writer queue refuses the FIN"
+    );
+    assert_eq!(
+        fixture.stream().pending_terminal,
+        Some(Terminal::Fin),
+        "the refused FIN stays pending for the ordered retry"
+    );
+    assert!(fixture.stream().terminal_fin_failure);
+    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+
+    // The writer drains; the tick's retry publishes the FIN in order.
+    // (The retry is the tick's `retry_failed_terminals` step, called on its
+    // own because this fixture's tick would also start its prepared QUIESCE.)
+    let _ = drain_data(&mut fixture.old_rx);
+    fixture.actor.retry_failed_terminals(&key);
+    assert!(fixture.session_alive());
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Fin, 1, generation)],
+        "the retry publishes the retained FIN"
+    );
+    assert!(fixture.stream().pending_terminal.is_none());
+    assert!(!fixture.stream().terminal_fin_failure);
+    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+
+    // The next deadline check therefore has nothing to fail closed on.
+    fixture.actor.tick().await;
+    assert!(fixture.session_alive());
+}
+
+/// M6-C157, the other half: a FIN the writer keeps refusing for the whole
+/// failure window still fails the session closed.  The retry narrows the
+/// fence to a writer that is really stuck; it does not remove it.
+#[tokio::test]
+async fn m6c157_a_fin_refused_for_the_whole_window_still_fails_closed() {
+    let mut fixture = FreezeFixture::new("http-fin-stuck", false);
+    let _watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    assert!(
+        !fixture
+            .actor
+            .finish_http_stream(&key, STREAM_ID, OPERATION_ID)
+    );
+    fixture.actor.tick().await;
+    assert!(fixture.session_alive(), "inside the window the FIN waits");
+    assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
+    if let Some(session) = fixture.actor.sessions.get_mut(&key.scope()) {
+        session.terminal_fin_failure_deadline = Some(Instant::now());
+    }
+    fixture.actor.tick().await;
+    assert!(!fixture.session_alive());
+    assert_eq!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some("TERMINAL_FIN_TIMEOUT")
+    );
+}
+
+/// M6-C157: the relay's reply to a connector terminal, refused by a full
+/// writer queue, is retained and retried by the tick the same way.
+#[tokio::test]
+async fn m6c157_refused_peer_terminal_reply_is_retried_by_the_tick() {
+    let mut fixture = FreezeFixture::new("peer-reply-refused", false);
+    let key = fixture.key.clone();
+    let generation = fixture.attempt.old_generation;
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    assert!(
+        !fixture
+            .actor
+            .queue_peer_terminal_reply(&key, STREAM_ID, Terminal::Fin)
+    );
+    assert_eq!(fixture.stream().pending_terminal, Some(Terminal::Fin));
+    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+    let _ = drain_data(&mut fixture.old_rx);
+    fixture.actor.retry_failed_terminals(&key);
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Fin, 1, generation)]
+    );
+    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+    fixture.actor.tick().await;
+    assert!(fixture.session_alive());
+}
+
 /// Review item 9: an HTTP stream whose RESET is still deferred behind a
 /// freeze defers its owner-stream record to reclamation; a session that ends
 /// first must still record it, exactly once.
