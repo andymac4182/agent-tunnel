@@ -67,20 +67,32 @@ const M2_CONTROL_QUEUE_BYTES: usize = 64 * 1024;
 // duplicating the full writer queue.
 const M2_PENDING_CRITICAL_CONTROL_FRAMES: usize = 4;
 const M2_PENDING_CRITICAL_CONTROL_BYTES: usize = MAX_CONTROL_MESSAGE_BYTES;
-// OPEN refusals share the spill, and there can be one per OPEN the owner has
-// outstanding (task row M6-C120).  While an OPEN pair waits for writer room,
-// every later OPEN the connector refuses -- live limit, retained table, OPEN
-// retention -- is a REJECTED that must wait behind it.  The owner bounds its
-// outstanding OPENs per device (pending finite echoes and live streams each at
-// most `max_streams_per_device`), not by this spill, so a four-frame spill
-// turned the fifth such refusal into a session-fatal `QueueLimit`, and one
-// consumer flood ended the device's session for every user of it.  The spill
-// therefore holds one refusal per retained stream slot on top of the fixed
-// critical allowance (a REJECTED is a few hundred bytes; the per-refusal
-// byte allowance leaves room for maximum-length identifiers), and the actor
-// stops reading the control socket while the spill is short of headroom, so
-// an owner beyond even that bound is back-pressured instead of failing the
-// session.
+// OPEN refusals share the spill (task row M6-C120).  While an OPEN pair waits
+// for writer room, every later OPEN the connector refuses -- live limit,
+// retained table, OPEN retention -- is a REJECTED that waits behind it, and a
+// four-frame spill turned the fifth such refusal into a session-fatal
+// `QueueLimit`: one consumer flood ended the device's session for every user
+// of it.  The spill therefore also holds one refusal per retained stream slot,
+// `retained_stream_limit(max_streams)` (at most 128), at 2 KiB each (a
+// REJECTED is a few hundred bytes; the allowance covers maximum-length
+// identifiers).
+//
+// That size is not a proof that the spill can never fill.  The owner bounds
+// its outstanding OPENs per device by *its own* `max_streams_per_device`
+// (pending finite echoes and live streams, each up to that bound), so the
+// retained-slot allowance matches the owner's bound only when the relay's and
+// the connector's `max_streams` match; a connector configured lower, or an
+// owner with more outstanding, can exceed it.  What keeps the session alive
+// then is the read gate (`control_read_ready`): the actor stops reading the
+// control socket while fewer than `M2_PENDING_CRITICAL_CONTROL_FRAMES` frames
+// or `M2_CRITICAL_READ_HEADROOM_BYTES` bytes of spill remain.  One inbound
+// control message spills at most two critical replies (a recovery RESUME
+// can answer with two RESUMED frames, each up to a maximum control frame), so
+// the byte headroom is two maximum frames and the frame headroom four.  While
+// reads are stopped, the bounded stall path applies: the owner's socket task
+// blocks on a full socket, and if the writer makes no progress for the 5 s
+// critical deadline the session ends as a retryable transport failure.
+const M2_CRITICAL_READ_HEADROOM_BYTES: usize = 2 * MAX_CONTROL_MESSAGE_BYTES;
 const M2_PENDING_OPEN_REFUSAL_SPILL_BYTES: usize = 2 * 1024;
 const M2_CRITICAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 // A control STREAM_FORGET can legitimately overtake the final data-channel
@@ -2658,17 +2670,20 @@ impl M2Actor {
 
     /// The critical spill's byte bound, sized like its frame bound.
     fn pending_critical_control_byte_limit(&self) -> usize {
-        M2_PENDING_CRITICAL_CONTROL_BYTES.saturating_add(
-            retained_stream_limit(self.config.limits.max_streams)
-                .saturating_mul(M2_PENDING_OPEN_REFUSAL_SPILL_BYTES),
-        )
+        M2_PENDING_CRITICAL_CONTROL_BYTES
+            .max(M2_CRITICAL_READ_HEADROOM_BYTES)
+            .saturating_add(
+                retained_stream_limit(self.config.limits.max_streams)
+                    .saturating_mul(M2_PENDING_OPEN_REFUSAL_SPILL_BYTES),
+            )
     }
 
     /// Whether the actor may read the next inbound control message.  One
-    /// inbound message spills at most a few critical replies, so reading
-    /// stops while fewer than the fixed critical allowance of frames (or one
-    /// maximum control frame of bytes) remain; the writer drains the spill
-    /// on the deadline tick and reading resumes (task row M6-C120).
+    /// inbound message spills at most two critical replies of up to one
+    /// maximum control frame each, so reading stops while fewer than the
+    /// fixed critical allowance of frames, or two maximum frames of bytes,
+    /// remain; the writer drains the spill on the deadline tick and reading
+    /// resumes (task row M6-C120).
     fn control_read_ready(&self) -> bool {
         self.pending_critical_controls
             .len()
@@ -2676,7 +2691,7 @@ impl M2Actor {
             <= self.pending_critical_control_frame_limit()
             && self
                 .pending_critical_control_bytes
-                .saturating_add(M2_PENDING_CRITICAL_CONTROL_BYTES)
+                .saturating_add(M2_CRITICAL_READ_HEADROOM_BYTES)
                 <= self.pending_critical_control_byte_limit()
     }
 
@@ -5198,7 +5213,7 @@ impl M2Actor {
         // cross-channel ordering into PROTOCOL_ERROR.
         let (proof_pending, proof_deadline) = match self.validate_stream_forget(&forget) {
             Ok(()) => (false, None),
-            Err(_error) if self.stream_forget_proof_may_still_complete(&forget) => (
+            Err(_error) if self.stream_forget_proof_may_converge(&forget) => (
                 true,
                 Some(Instant::now() + M2_STREAM_FORGET_REVALIDATION_TIMEOUT),
             ),
@@ -5243,42 +5258,6 @@ impl M2Actor {
         &self,
         forget: &tunnel_protocol::rotation_control::StreamForget,
     ) -> bool {
-        self.stream_forget_proof_may_converge_with(forget, false)
-    }
-
-    /// Whether a failed `STREAM_FORGET` proof may be retained for the
-    /// bounded revalidation window: it may converge from the owner's final
-    /// ACK, or everything the owner asserts already holds and only this
-    /// connector's own sender is behind (task row M6-C121).
-    fn stream_forget_proof_may_still_complete(
-        &self,
-        forget: &tunnel_protocol::rotation_control::StreamForget,
-    ) -> bool {
-        self.stream_forget_proof_may_converge_with(forget, true)
-    }
-
-    /// Whether the proof fails only because this connector's own sender has
-    /// not finished: its terminal not yet emitted, sequenced frames not yet
-    /// written, or deferred output for the stream still queued, while every
-    /// owner assertion, the receive side and the credit relation hold (task
-    /// row M6-C121).  That evidence is incomplete, not contradictory: under
-    /// a consumer flood the connector's data writer is the one that lags.
-    /// Once the revalidation window expires it ends the session as the
-    /// retryable expiry, never as a terminal `PROTOCOL_ERROR` that stops
-    /// `connect`.
-    fn stream_forget_connector_sender_lagging(
-        &self,
-        forget: &tunnel_protocol::rotation_control::StreamForget,
-    ) -> bool {
-        self.stream_forget_proof_may_converge_with(forget, true)
-            && !self.stream_forget_proof_may_converge_with(forget, false)
-    }
-
-    fn stream_forget_proof_may_converge_with(
-        &self,
-        forget: &tunnel_protocol::rotation_control::StreamForget,
-        allow_sender_lag: bool,
-    ) -> bool {
         let Some(stream) = self.streams.get(&forget.stream_id) else {
             return false;
         };
@@ -5305,17 +5284,9 @@ impl M2Actor {
             || stream.pending_bytes != 0
             || !stream.record_buffer.is_empty()
             || stream.record_expected.is_some()
+            || has_pending_output_for_stream(&self.pending_outputs, forget.stream_id)
         {
             return false;
-        }
-        // Deferred output is the connector's own sender debt: it drains as
-        // the data writer makes room (M6-C121), so it counts as lag.
-        let mut sender_lag = false;
-        if has_pending_output_for_stream(&self.pending_outputs, forget.stream_id) {
-            if !allow_sender_lag {
-                return false;
-            }
-            sender_lag = true;
         }
 
         let local = stream.sequence.snapshot();
@@ -5347,20 +5318,16 @@ impl M2Actor {
         // The connector must already have emitted its own terminal.  Only the
         // relay's final ACK/replay release and bounded carrier debt may still
         // converge on this side of the independent data/control channels.
-        if local_sender.reorder_frames != 0 || local_sender.reorder_bytes != 0 {
-            return false;
-        }
         if local_sender.send_terminal.is_none()
             || local_sender.send_terminal_sequence != Some(local_sender.last_emitted)
+            || local_sender.reorder_frames != 0
+            || local_sender.reorder_bytes != 0
             || !stream
                 .sequence
                 .ready_frames(Direction::ConnectorToRelay)
                 .is_empty()
         {
-            if !allow_sender_lag {
-                return false;
-            }
-            sender_lag = true;
+            return false;
         }
         let sender_ack_pending = local_sender.peer_acked < local_sender.last_emitted
             || local_sender.replay_floor.is_some()
@@ -5374,7 +5341,7 @@ impl M2Actor {
                     carrier.pending_controls.contains_key(&forget.stream_id)
                 });
 
-        sender_ack_pending || carrier_work_pending || sender_lag
+        sender_ack_pending || carrier_work_pending
     }
 
     fn validate_stream_forget(
@@ -5617,7 +5584,7 @@ impl M2Actor {
                 Err(error) if deadline.is_none_or(|deadline| now >= deadline) => {
                     return Err(self.expired_stream_forget_proof_error(&forget, error));
                 }
-                Err(_) if self.stream_forget_proof_may_still_complete(&forget) => {}
+                Err(_) if self.stream_forget_proof_may_converge(&forget) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -5656,9 +5623,8 @@ impl M2Actor {
         forget: &tunnel_protocol::rotation_control::StreamForget,
         error: ClientError,
     ) -> ClientError {
-        if (self.stream_forget_proof_may_converge(forget)
-            && self.validate_stream_forget_with(forget, true).is_ok())
-            || self.stream_forget_connector_sender_lagging(forget)
+        if self.stream_forget_proof_may_converge(forget)
+            && self.validate_stream_forget_with(forget, true).is_ok()
         {
             stream_forget_proof_expired()
         } else {
@@ -5759,7 +5725,7 @@ impl M2Actor {
                 continue;
             };
             if let Err(error) = self.validate_stream_forget(&forget) {
-                if !proof_pending || !self.stream_forget_proof_may_still_complete(&forget) {
+                if !proof_pending || !self.stream_forget_proof_may_converge(&forget) {
                     return Err(error);
                 }
                 // Past the window, the failure is classified as a retryable
@@ -11338,43 +11304,48 @@ mod tests {
         // never read in this session; the successor starts without it.
     }
 
-    /// M6-C121: under a consumer flood, `connect` once exited with the
-    /// terminal `PROTOCOL_ERROR` "STREAM_FORGET connector sender evidence is
-    /// incomplete".  That message is the final validator's: the owner's R2C
-    /// evidence and the receive side matched, and only this connector's own
-    /// sender had not finished.  Here the owner's proof is complete and
-    /// consistent while the connector's C2R terminal has not been emitted
-    /// yet (its writer is the side that lags under a flood).  The FORGET
-    /// must be retained for the bounded revalidation window, never reclaim
-    /// the stream early, and on expiry end the session with the retryable
-    /// expiry, so `connect` reconnects instead of exiting.
+    /// M6-C121 review probe: the M6-C105 invalid-owner-snapshot proof (more
+    /// bytes sent than send credit) with the connector's own C2R FIN never
+    /// emitted.  The owner publishes STREAM_FORGET only after it has received
+    /// the connector's C2R terminal, so a FORGET that arrives before this
+    /// connector emitted one contradicts the connector's state; together
+    /// with an invalid snapshot it must stay a non-retryable
+    /// `PROTOCOL_ERROR`, whether refused at once or at expiry, and never be
+    /// laundered into the retryable expiry.
     #[tokio::test]
-    async fn m6c121_a_forget_ahead_of_the_connectors_own_sender_is_never_terminal() {
-        let stream_id = 47;
+    async fn m6c121_a_forget_before_the_connector_terminal_with_an_invalid_snapshot_stays_a_protocol_error()
+     {
+        let stream_id = 48;
         let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
         let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
-        let relay_fin = Frame::fin(1, 1, stream_id, 1, 0);
-        relay
-            .send_frame(Direction::RelayToConnector, &relay_fin)
-            .expect("relay FIN is admitted");
+        for frame in [
+            Frame::data(1, 1, stream_id, 1, 0, b"synth".to_vec()),
+            Frame::fin(1, 1, stream_id, 2, 0),
+        ] {
+            relay
+                .send_frame(Direction::RelayToConnector, &frame)
+                .expect("relay frame is admitted");
+            connector
+                .receive_frame(Direction::RelayToConnector, &frame)
+                .expect("connector receives relay frame");
+        }
         connector
-            .receive_frame(Direction::RelayToConnector, &relay_fin)
-            .expect("connector receives relay FIN");
-        connector
-            .mark_delivered(Direction::RelayToConnector, 1)
-            .expect("connector delivers relay FIN");
-        let connector_ack = Frame::ack(1, 1, stream_id, 1);
+            .mark_delivered(Direction::RelayToConnector, 2)
+            .expect("connector delivers relay DATA and FIN");
+        let connector_ack = Frame::ack(1, 1, stream_id, 2);
         connector
             .send_frame(Direction::ConnectorToRelay, &connector_ack)
             .expect("connector ACK is admitted");
         relay
             .receive_frame(Direction::ConnectorToRelay, &connector_ack)
-            .expect("relay receives connector ACK");
-        let final_state = ResumeDirectionState::from_sequence_snapshot(
+            .expect("relay observes the ACK");
+        let mut final_state = ResumeDirectionState::from_sequence_snapshot(
             stream_id,
             relay.snapshot().direction(Direction::RelayToConnector),
         )
         .expect("owner terminal snapshot encodes");
+        assert_eq!(final_state.sent_bytes, 5);
+        final_state.send_credit = 1;
 
         let (mut actor, _key, _carrier_receiver, _control_receiver) =
             test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
@@ -11383,7 +11354,7 @@ mod tests {
         stream.input_fin = true;
         actor.streams.insert(stream_id, stream);
         let forget = tunnel_protocol::rotation_control::StreamForget {
-            message_id: "forget-m6c121".to_owned(),
+            message_id: "forget-m6c121-probe".to_owned(),
             reply_to: String::new(),
             session_id: "session".to_owned(),
             epoch: 1,
@@ -11392,44 +11363,24 @@ mod tests {
             direction: Direction::RelayToConnector,
             final_state,
         };
-        assert!(
-            matches!(
-                actor.validate_stream_forget(&forget),
-                Err(ClientError::Protocol(message))
-                    if message == "STREAM_FORGET connector sender evidence is incomplete"
-            ),
-            "the final validator still refuses to reclaim"
-        );
-        actor
+        let error = match actor
             .handle_control(ControlMessage::StreamForget(forget))
             .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "incomplete, uncontradicted evidence must not end connect: {}",
-                    error.safe_message()
-                )
-            });
-        assert!(
-            actor
-                .pending_forgets
-                .get(&stream_id)
-                .is_some_and(|pending| pending.proof_pending && pending.proof_deadline.is_some())
-        );
-        actor
-            .retry_pending_forget_barriers()
-            .expect("within the window the proof stays retained");
-        assert!(actor.streams.contains_key(&stream_id));
-
-        actor
-            .pending_forgets
-            .get_mut(&stream_id)
-            .expect("proof remains retained")
-            .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
-        let error = actor
-            .retry_pending_forget_barriers()
-            .expect_err("an expired proof still ends the session");
-        assert!(error.retryable(), "{error:?}");
-        assert!(is_expired_forget_proof(&error), "{error:?}");
+        {
+            Err(error) => error,
+            Ok(()) => {
+                actor
+                    .pending_forgets
+                    .get_mut(&stream_id)
+                    .expect("a retained proof")
+                    .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+                actor
+                    .retry_pending_forget_barriers()
+                    .expect_err("an expired proof ends the session")
+            }
+        };
+        assert_eq!(error.code(), "PROTOCOL_ERROR", "{error:?}");
+        assert!(!error.retryable(), "{error:?}");
         assert!(actor.streams.contains_key(&stream_id));
         assert_eq!(actor.forgotten_stream_through, 0);
     }
@@ -16145,6 +16096,207 @@ mod tests {
         fn drop(&mut self) {
             self.0.release.notify_waiters();
         }
+    }
+
+    /// M6-C120, review: the read gate on the real session loop.  With the
+    /// control writer held, an OPEN flood fills the writer queue and then the
+    /// critical spill with refusals.  Once the spill lacks headroom the actor
+    /// must stop reading control: a CANCEL (and, with `with_prepare`, a
+    /// ROTATE_PREPARE ahead of it) sent after the flood stays unread -- no
+    /// RESET, no rotation -- and the session stays up instead of failing with
+    /// `QueueLimit`.  Once the writer is released, reading resumes and the
+    /// CANCEL is handled.  Without the gate the spill overflows and the
+    /// session ends "bounded connector queue limit reached".
+    async fn m6c120_read_gate_on_real_session_loop(with_prepare: bool) -> Result<(), String> {
+        let gate = Arc::new(test_hooks::ControlWriterGate {
+            block_once: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let _gate_guard = ControlWriterGateGuard(gate.clone());
+        let (control_client, mut control_peer) = test_websocket_pair().await?;
+        let (data_client, mut data_peer) = test_websocket_pair().await?;
+        let (control_sink, control_stream) = control_client.split();
+        let (data_sink, data_stream) = data_client.split();
+        let cancellation = CancellationToken::new();
+        let (readiness, _readiness_receiver) = watch::channel(Readiness::Connecting);
+        let (status, status_receiver) = watch::channel(ConnectionStatus::default());
+        let mut config = RuntimeConfig::default();
+        // A small live limit keeps the spill small: 4 critical frames plus
+        // `retained_stream_limit(2)` = 4 refusal slots.
+        config.limits.max_streams = 2;
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut actor = tokio::spawn(run_m2_session(
+            config,
+            session,
+            runtime_welcome(),
+            "owner".to_owned(),
+            None,
+            RotationConfig::default(),
+            control_sink,
+            control_stream,
+            data_sink,
+            data_stream,
+            cancellation.clone(),
+            readiness,
+            status,
+            None,
+            None,
+            Some(gate.clone()),
+            HttpHandlers::default(),
+        ));
+
+        let proof = async {
+            let entered = gate.entered.notified();
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(test_open(1))))
+                .await
+                .map_err(|error| format!("first OPEN should reach the actor: {error}"))?;
+            timeout(TEST_SETUP_TIMEOUT, entered)
+                .await
+                .map_err(|_| "control writer did not enter the deterministic hold".to_owned())?;
+            // Far more refusals than the writer queue (16) plus the spill (8).
+            for stream_id in 2..=48 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(test_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN flood should reach the socket: {error}"))?;
+            }
+            if with_prepare {
+                control_peer
+                    .send(websocket_control(&ControlMessage::RotatePrepare(
+                        tunnel_protocol::rotation_control::RotatePrepare {
+                            message_id: "prepare-under-back-pressure".to_owned(),
+                            reply_to: String::new(),
+                            attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity {
+                                session_id: "session".to_owned(),
+                                epoch: 1,
+                                owner_id: "owner".to_owned(),
+                                rotation_id: "rotation-under-back-pressure".to_owned(),
+                                old_generation: 1,
+                                new_generation: 2,
+                                old_connection_id: "connection".to_owned(),
+                                new_connection_id: "candidate".to_owned(),
+                            },
+                            attachment_purpose: Default::default(),
+                            attachment_ticket: "ticket".to_owned(),
+                            reconnect_credential: None,
+                            remaining_ms: 60_000,
+                        },
+                    )))
+                    .await
+                    .map_err(|error| format!("PREPARE should reach the socket: {error}"))?;
+            }
+            control_peer
+                .send(websocket_control(&ControlMessage::Cancel(Cancel::new(
+                    "cancel-1",
+                    "session",
+                    1,
+                    1,
+                    "operation-1",
+                ))))
+                .await
+                .map_err(|error| format!("CANCEL should reach the socket: {error}"))?;
+
+            // While the writer is held, nothing after the flood is read.
+            let early_reset = timeout(TEST_ASSERT_TIMEOUT, async {
+                while let Some(message) = data_peer.next().await {
+                    let Ok(Message::Binary(bytes)) = message else {
+                        continue;
+                    };
+                    let Ok(frame) = Frame::decode(bytes.as_ref()) else {
+                        continue;
+                    };
+                    if frame.kind == FrameKind::Reset && frame.stream_id == 1 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            if early_reset {
+                return Err("CANCEL was read while the spill lacked headroom".to_owned());
+            }
+            if actor.is_finished() {
+                return Err("the session ended under back-pressure".to_owned());
+            }
+            let held = status_receiver.borrow().clone();
+            if held.rotation_id.is_some() {
+                return Err("ROTATE_PREPARE was read while the spill lacked headroom".to_owned());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        // Release the writer: the spill drains, reading resumes.
+        gate.release.notify_waiters();
+        let resumed = if proof.is_ok() && !with_prepare {
+            timeout(TEST_SETUP_TIMEOUT, async {
+                while let Some(message) = data_peer.next().await {
+                    let Ok(Message::Binary(bytes)) = message else {
+                        continue;
+                    };
+                    let Ok(frame) = Frame::decode(bytes.as_ref()) else {
+                        continue;
+                    };
+                    if frame.kind == FrameKind::Reset && frame.stream_id == 1 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            true
+        };
+        let ended_early = actor.is_finished();
+        cancellation.cancel();
+        let actor_result = match timeout(TEST_ACTOR_CLEANUP_TIMEOUT, &mut actor).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                actor.abort();
+                (&mut actor).await
+            }
+        };
+        proof?;
+        assert!(
+            !matches!(&actor_result, Ok(Err(ClientError::QueueLimit))),
+            "the flood must never end the session with QueueLimit: {actor_result:?}"
+        );
+        if !with_prepare {
+            assert!(
+                !ended_early,
+                "the session survives the release: {actor_result:?}"
+            );
+            assert!(
+                matches!(&actor_result, Ok(Ok(()))),
+                "session actor must be joined cleanly after cancellation: {actor_result:?}"
+            );
+        }
+        assert!(
+            resumed,
+            "after the writer drains, the CANCEL is read and handled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn m6c120_read_gate_stops_control_reads_under_back_pressure() -> Result<(), String> {
+        m6c120_read_gate_on_real_session_loop(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn m6c120_rotation_prepare_under_back_pressure_is_held_not_failed() -> Result<(), String>
+    {
+        m6c120_read_gate_on_real_session_loop(true).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
