@@ -16,7 +16,7 @@ on:
         description: Experiments to run on one runner, space separated (empty runs two runners, short experiments and the soak)
         default: ""
       load_args:
-        description: Extra arguments for the load experiment only, e.g. "--payload 65536 --steps 1,8" (letters, digits, space , . = - only)
+        description: Extra arguments for the load experiment only, e.g. "--payload 65536 --steps 1,8" (letters, digits, space , . = - only). Harness wiring flags (--redis, --logs, --bin-dir, --bin-head, --max-load) are refused, since they would override the workflow's own
         default: ""
 
 permissions:
@@ -91,6 +91,9 @@ jobs:
           # arguments, never evaluated; the character set excludes quoting,
           # expansion and redirection.
           case "$INPUT_LOAD_ARGS" in *[!A-Za-z0-9\ ,.=-]*) echo "invalid load_args" >&2; exit 2;; esac
+          for word in $INPUT_LOAD_ARGS; do
+            case "$word" in --redis*|--logs*|--bin-dir*|--bin-head*|--max-load*) echo "load_args may not override $word" >&2; exit 2;; esac
+          done
           export M6_SOAK_LOAD_ARGS="$INPUT_LOAD_ARGS"
           echo "M6_SOAK_EXPERIMENTS=$M6_SOAK_EXPERIMENTS" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/logs"
