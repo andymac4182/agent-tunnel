@@ -1566,6 +1566,25 @@ M7_CONNECTOR_CLIENT_CASES: list[Case] = [
         ),
     ),
     Case(
+        # M6-C148: a resume credits the paused time; it does not restart the
+        # grace (review of PR #190).
+        "resumed control reads credit the paused time rather than restart the grace",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            self.open_retention_exhausted_since = "
+                "Some(since.checked_add(paused).unwrap_or(now));\n",
+                "            let _ = (since, paused);\n"
+                "            self.open_retention_exhausted_since = Some(now);\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::paused_control_reads_pause_the_open_retention_give_up_clock",
+            }
+        ),
+    ),
+    Case(
         # M6-C148: the paused time is credited back when reads resume.
         "paused control reads are credited back to the retention give-up clock",
         [

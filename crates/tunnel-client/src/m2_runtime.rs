@@ -1729,6 +1729,9 @@ struct M2Actor {
     /// are stopped: the `STREAM_FORGET`s that would reclaim retention arrive
     /// on control (task row M6-C148).
     open_retention_paused_at: Option<Instant>,
+    /// Test-only record of the read gate's changes (task row M6-C148).
+    #[cfg(test)]
+    read_gate_probe: Option<super::WriterTestGate>,
     /// Highest terminal stream ID whose carrier barriers have completed.
     /// Relay stream IDs are allocated monotonically for a session, so this
     /// scalar keeps late frames from forgotten streams from creating an
@@ -1789,6 +1792,8 @@ async fn run_m2_session(
         M2_CONTROL_QUEUE_BYTES.min(config.limits.max_queue_bytes),
         cancellation.clone(),
     );
+    #[cfg(test)]
+    let read_gate_probe = test_writer_gate.clone();
     #[cfg(test)]
     let mut forget_tick_hook = test_writer_gate.as_ref().and_then(|gate| {
         gate.forget_tick
@@ -1906,6 +1911,8 @@ async fn run_m2_session(
         pending_forgets: BTreeMap::new(),
         open_retention_exhausted_since: None,
         open_retention_paused_at: None,
+        #[cfg(test)]
+        read_gate_probe: read_gate_probe.clone(),
         forgotten_stream_through: 0,
         retired_streams: RetiredStreamIds::default(),
         peer_fence_message_id: None,
@@ -4251,19 +4258,39 @@ impl M2Actor {
     /// (task row M6-C148).  Only the part of a pause that fell inside the
     /// current exhaustion is credited, so the clock counts exactly the
     /// exhausted time during which the session was reading control and could
-    /// have received a reclaiming `STREAM_FORGET`.  A pause is bounded on its
-    /// own: a spilled critical control whose writer makes no progress for
-    /// [`M2_CRITICAL_CONTROL_TIMEOUT`] ends the session.
+    /// have received a reclaiming `STREAM_FORGET`.  This bounds the *reading*
+    /// time a session may spend exhausted before it gives up, not its total
+    /// wall time.  Paused time is bounded elsewhere, per spilled item: each
+    /// critical control spilled while reads are stopped carries a
+    /// [`M2_CRITICAL_CONTROL_TIMEOUT`] deadline, and one that expires before
+    /// the writer takes it ends the session.
     fn observe_control_read_gate_at(&mut self, now: Instant) {
         if !self.control_read_ready() {
-            self.open_retention_paused_at.get_or_insert(now);
+            if self.open_retention_paused_at.is_none() {
+                self.open_retention_paused_at = Some(now);
+                #[cfg(test)]
+                self.record_read_gate_event(true, now);
+            }
             return;
+        }
+        #[cfg(test)]
+        if self.open_retention_paused_at.is_some() {
+            self.record_read_gate_event(false, now);
         }
         if let Some(paused_at) = self.open_retention_paused_at.take()
             && let Some(since) = self.open_retention_exhausted_since
         {
             let paused = now.saturating_duration_since(paused_at.max(since));
             self.open_retention_exhausted_since = Some(since.checked_add(paused).unwrap_or(now));
+        }
+    }
+
+    #[cfg(test)]
+    fn record_read_gate_event(&self, stopped: bool, now: Instant) {
+        if let Some(gate) = self.read_gate_probe.as_ref()
+            && let Ok(mut events) = gate.read_gate_events.lock()
+        {
+            events.push((stopped, now));
         }
     }
 
@@ -4290,7 +4317,7 @@ impl M2Actor {
         }
         // While control reads are stopped the clock is paused: the session
         // cannot read the STREAM_FORGETs that would reclaim its retention.
-        // The critical-control deadline bounds such a stall on its own.
+        // Each spilled critical control's own deadline bounds that stall.
         self.observe_control_read_gate_at(now);
         if self.open_retention_paused_at.is_some() {
             return Ok(());
@@ -9569,6 +9596,8 @@ mod tests {
             pending_forgets: BTreeMap::new(),
             open_retention_exhausted_since: None,
             open_retention_paused_at: None,
+            #[cfg(test)]
+            read_gate_probe: None,
             forgotten_stream_through: 0,
             retired_streams: RetiredStreamIds::default(),
             peer_fence_message_id: None,
@@ -16702,6 +16731,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
         let (control_client, mut control_peer) = test_websocket_pair().await?;
@@ -16897,6 +16927,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
 
@@ -17169,6 +17200,7 @@ mod tests {
             entered: Notify::new(),
             release: Notify::new(),
             forget_tick: std::sync::Mutex::new(None),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
         let _gate_guard = ControlWriterGateGuard(gate.clone());
         let (control_client, mut control_peer) = test_websocket_pair().await?;
@@ -17252,7 +17284,6 @@ mod tests {
                 return Err("the session gave up before the grace elapsed".to_owned());
             }
             // 3. Hold the writer and flood, so the read gate stops reads.
-            let held_at = Instant::now();
             gate.block_once.store(true, Ordering::Release);
             let entered = gate.entered.notified();
             control_peer
@@ -17274,8 +17305,21 @@ mod tests {
                     .map_err(|error| format!("OPEN flood should reach the socket: {error}"))?;
                 stream_id += 1;
             }
-            // 4. Hold past the rest of the grace, inside the critical deadline.
-            tokio::time::sleep_until((held_at + Duration::from_millis(3_500)).into()).await;
+            // Time the rest from the instant the session itself stopped
+            // reading, as its give-up clock does, not from the test's sends.
+            let paused_at = timeout(TEST_SETUP_TIMEOUT, read_gate_event(&gate, true))
+                .await
+                .map_err(|_| "the read gate never stopped control reads".to_owned())?;
+            let read_before_pause = paused_at.saturating_duration_since(exhausted_at);
+            if read_before_pause < Duration::from_secs(2) {
+                return Err(format!(
+                    "reads stopped only {read_before_pause:?} into the exhaustion; the test \
+                     cannot tell a credited clock from a restarted one"
+                ));
+            }
+            // 4. Hold past the rest of the grace, inside the critical deadline
+            // of the first spilled refusal (spilled just before the pause).
+            tokio::time::sleep_until((paused_at + Duration::from_millis(3_300)).into()).await;
             if exhausted_at.elapsed() < grace {
                 return Err("the hold did not outlast the grace".to_owned());
             }
@@ -17286,23 +17330,29 @@ mod tests {
                     exhausted_at.elapsed()
                 ));
             }
-            Ok::<_, String>(control_peer)
+            Ok::<_, String>((control_peer, read_before_pause))
         }
         .await;
 
         // 5. Release: reads resume; nothing reclaims, so the rest of the grace
         // runs out and the session gives up.
         gate.release.notify_waiters();
-        let released_at = Instant::now();
-        let proof = proof.map(|mut control_peer| {
-            tokio::spawn(async move { while control_peer.next().await.is_some() {} });
-        });
+        let proof = match proof {
+            Ok((mut control_peer, read_before_pause)) => {
+                tokio::spawn(async move { while control_peer.next().await.is_some() {} });
+                match timeout(TEST_SETUP_TIMEOUT, read_gate_event(&gate, false)).await {
+                    Ok(resumed_at) => Ok((read_before_pause, resumed_at)),
+                    Err(_) => Err("control reads never resumed after the release".to_owned()),
+                }
+            }
+            Err(error) => Err(error),
+        };
         let joined = if proof.is_ok() {
             timeout(Duration::from_secs(15), &mut actor).await.ok()
         } else {
             None
         };
-        let ended_after = released_at.elapsed();
+        let ended_at = Instant::now();
         cancellation.cancel();
         let actor_result = match joined {
             Some(joined) => joined,
@@ -17314,17 +17364,44 @@ mod tests {
                 }
             },
         };
-        proof?;
+        let (read_before_pause, resumed_at) = proof?;
         assert!(
             matches!(&actor_result, Ok(Err(ClientError::OpenRetentionFull))),
             "unreclaimed retention still gives the session up once reads resume: {actor_result:?}"
         );
+        // Credited, the clock has `grace - read_before_pause` left when reads
+        // resume.  Restarted, it would have the whole grace; not paused, none.
+        // `read_before_pause` is at least 2 s, so the window below excludes
+        // both: its upper edge is at most `grace - 1 s`.
+        let remainder = grace.saturating_sub(read_before_pause);
+        let ended_after = ended_at.saturating_duration_since(resumed_at);
         assert!(
-            ended_after >= Duration::from_secs(1),
-            "the paused time is credited back, so the give-up waits for the unpaused \
-             remainder of the grace: ended {ended_after:?} after reads resumed"
+            ended_after + Duration::from_millis(500) >= remainder,
+            "the paused time is credited back, so the give-up waits for the reading \
+             remainder of the grace ({remainder:?}): ended {ended_after:?} after reads resumed"
+        );
+        assert!(
+            ended_after < remainder + Duration::from_secs(1),
+            "only the paused time is credited back, not a fresh grace: the remainder was \
+             {remainder:?} but the session ended {ended_after:?} after reads resumed"
         );
         Ok(())
+    }
+
+    /// The first change of the read gate to `stopped` that the session loop
+    /// recorded (task row M6-C148), polled until it appears.
+    async fn read_gate_event(gate: &test_hooks::ControlWriterGate, stopped: bool) -> Instant {
+        loop {
+            if let Some(at) = gate.read_gate_events.lock().ok().and_then(|events| {
+                events
+                    .iter()
+                    .find(|(event, _)| *event == stopped)
+                    .map(|(_, at)| *at)
+            }) {
+                return at;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Task row M7-C84, forced end to end on the real session loop.  A
@@ -17385,6 +17462,7 @@ mod tests {
                 entered: entered.clone(),
                 release: release.clone(),
             })),
+            read_gate_events: std::sync::Mutex::new(Vec::new()),
         });
 
         let (control_client, _control_peer) = test_websocket_pair().await?;
