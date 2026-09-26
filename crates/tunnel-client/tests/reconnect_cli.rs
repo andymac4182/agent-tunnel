@@ -34,7 +34,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::{BufRead, BufReader, Read},
-    net::{TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -441,13 +441,27 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// A port nothing listens on: bound once to pick it, then released, so a
-/// connection to it is refused at once.
+/// The refused target: loopback port 1 (task row M6-C177).
+///
+/// The port used to be picked by binding `127.0.0.1:0` and then **releasing**
+/// it, and the freed number was dialled as the refused target.  Tests in this
+/// binary run in parallel and every `FakeRelay` binds `127.0.0.1:0`, so the
+/// kernel could hand the freed port to another test's TLS stand-in, whose CA
+/// the device does not trust: the refused dial then failed as
+/// `CREDENTIAL_ERROR` "unknown issuer" instead of `TRANSPORT_ERROR`, as
+/// hosted Linux run 36237768855 did once.
+///
+/// Port 1 cannot be handed out that way: it is below every platform's
+/// ephemeral range, so no bind of port 0 returns it, and it is privileged, so
+/// an unprivileged process cannot bind it explicitly either.  A dial to it is
+/// refused at once (`exit_codes_cli.rs` relies on the same).  Holding a
+/// freshly picked port bound but never listening was tried first and
+/// rejected: Linux resets a SYN to such a port, but macOS drops it, so the
+/// dial timed out instead of being refused (measured locally).
+const REFUSED_PORT: u16 = 1;
+
 fn refused_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("pick a port");
-    let port = listener.local_addr().expect("picked port").port();
-    drop(listener);
-    format!("wss://127.0.0.1:{port}/v1/tunnel/control")
+    format!("wss://127.0.0.1:{REFUSED_PORT}/v1/tunnel/control")
 }
 
 struct Profile {
@@ -639,6 +653,36 @@ fn delay_ms(event: &Value) -> u64 {
     event["result"]["delay_ms"]
         .as_u64()
         .unwrap_or_else(|| panic!("backoff event without delay_ms: {event}"))
+}
+
+/// Task row M6-C177: the refused target is refused, and no socket in this
+/// binary can be given it.  A `FakeRelay` binds `127.0.0.1:0`, which only
+/// ever returns a port from the ephemeral range, and an unprivileged process
+/// cannot bind a port below 1024 explicitly.  A helper that picks a port by
+/// binding port 0 and releasing it again (as the old `refused_url` did) is
+/// red here: its port is ephemeral.
+#[test]
+fn the_refused_target_is_refused_and_outside_every_ephemeral_range() {
+    let url = refused_url();
+    let port: u16 = url
+        .strip_prefix("wss://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("a loopback refused target: {url}"));
+    assert!(
+        port != 0 && port < 1024,
+        "the refused target {port} is a port `127.0.0.1:0` can hand to a FakeRelay"
+    );
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+    for _ in 0..20 {
+        let error = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .expect_err("nothing may accept on the refused port");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "a dial to the refused target is refused, not timed out: {error}"
+        );
+    }
 }
 
 /// A refused relay is retried: each consecutive attempt's delay lies in

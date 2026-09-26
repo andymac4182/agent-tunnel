@@ -705,6 +705,117 @@ async fn an_actor_aborted_while_a_claim_is_in_flight_releases_that_claim() {
     );
 }
 
+/// **Task row M6-C179.** `close_all` can find up to `max_devices` guards
+/// parked, and the cleanup worker's queue holds `CLEANUP_QUEUE_CAPACITY`.
+/// Every guard it took out of the registry and could not queue used to be
+/// logged and left fenced until its lease expired.  The overflow now stays
+/// parked, and the supervisor releases it after the worker has shut down.
+/// `tokio::test` runs on one thread, so the worker cannot drain while
+/// `close_all` fills its queue: without the fix exactly the guards past the
+/// capacity stay claimed.  The lease is 30 s; the bound is 5 s.
+#[tokio::test]
+async fn close_all_releases_more_parked_claims_than_the_cleanup_queue_holds() {
+    const PARKED: usize = super::CLEANUP_QUEUE_CAPACITY * 2 + 5;
+    let tenant_id = Uuid::from_u128(0xC179_0001);
+    let user_id = Uuid::from_u128(0xC179_0002);
+    let device_ids: Vec<Uuid> = (0..PARKED)
+        .map(|index| Uuid::from_u128(0xC179_1000 + index as u128))
+        .collect();
+    let now = Utc::now();
+    let fixture = CatalogFixture {
+        tenants: vec![TenantRecord {
+            tenant_id,
+            display_name: "c179-tenant".to_owned(),
+            active: true,
+        }],
+        users: vec![UserRecord {
+            user_id,
+            display_name: "C179 User".to_owned(),
+        }],
+        memberships: vec![MembershipRecord {
+            tenant_id,
+            user_id,
+            role: MembershipRole::Member,
+            active: true,
+        }],
+        devices: device_ids
+            .iter()
+            .map(|&device_id| FixtureDevice {
+                tenant_id,
+                device_id,
+                owner_user_id: user_id,
+                display_name: "C179 Device".to_owned(),
+                active: true,
+                last_seen_at: Some(now),
+            })
+            .collect(),
+        ..CatalogFixture::default()
+    };
+    let catalog = MemoryCatalog::new();
+    catalog
+        .seed_fixture(&fixture)
+        .await
+        .expect("seed C179 catalog fixture");
+    let shared: Arc<dyn Catalog> = Arc::new(catalog.clone());
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(cancel.clone(), shared.clone(), Duration::from_secs(30));
+
+    // Guards are built on a dispatcher of their own: every guard is taken
+    // out of the registry disarmed, so this one must never receive an item.
+    let spare = super::CleanupWorker::spawn(shared.clone());
+    for &device_id in &device_ids {
+        let claim = catalog
+            .claim_owner(&OwnerClaimRequest {
+                deployment_incarnation: "c179".to_owned(),
+                tenant_id,
+                device_id,
+                node_id: "c179-node".to_owned(),
+                boot_id: "c179-boot".to_owned(),
+                session_id: format!("c179-session-{device_id}"),
+                lease_expires_at: Utc::now() + ChronoDuration::seconds(30),
+            })
+            .await
+            .expect("commit a synthetic owner claim");
+        let mut guard = super::OwnerClaimCleanup::new(spare.dispatcher());
+        guard.arm_token(claim.token);
+        // Dropping a handoff whose guard is parked leaves the guard parked.
+        drop(handle.claim_handoffs.deposit(Some(guard)));
+    }
+    assert_eq!(handle.claim_handoffs.parked(), PARKED);
+
+    cancel.cancel();
+    let shutdown = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown with a full cleanup queue is bounded");
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    assert_eq!(handle.claim_handoffs.parked(), 0, "nothing is left parked");
+
+    let mut still_claimed = 0_usize;
+    for &device_id in &device_ids {
+        if catalog
+            .current_owner(tenant_id, device_id, Utc::now())
+            .await
+            .expect("read C179 owner")
+            .is_some()
+        {
+            still_claimed += 1;
+        }
+    }
+    assert_eq!(
+        still_claimed,
+        0,
+        "{still_claimed} of {PARKED} parked claims were left fenced until lease expiry \
+         (cleanup queue capacity {})",
+        super::CLEANUP_QUEUE_CAPACITY
+    );
+    assert_eq!(
+        spare.dispatcher().pending.load(Ordering::Acquire),
+        0,
+        "a taken guard is disarmed and queues nothing itself"
+    );
+    spare.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_joins_inflight_owner_renewal_before_cleanup_worker() {
     let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;
