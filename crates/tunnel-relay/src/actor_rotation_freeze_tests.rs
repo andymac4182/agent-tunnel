@@ -2783,8 +2783,14 @@ async fn m6c190_http_data_refused_by_a_full_writer_parks_and_is_sequenced_in_ord
     // order.
     let _ = drain_data(&mut fixture.old_rx);
     fixture.actor.retry_writer_held_http();
-    assert!(matches!(head.try_recv(), Ok(Ok(_))), "the head chunk was sequenced");
-    assert!(matches!(body.try_recv(), Ok(Ok(_))), "the body chunk was sequenced");
+    assert!(
+        matches!(head.try_recv(), Ok(Ok(_))),
+        "the head chunk was sequenced"
+    );
+    assert!(
+        matches!(body.try_recv(), Ok(Ok(_))),
+        "the body chunk was sequenced"
+    );
     assert_eq!(
         sequenced(&drain_data(&mut fixture.old_rx)),
         vec![
@@ -2816,9 +2822,13 @@ async fn m6c191_a_credit_parked_chunk_is_sequenced_before_the_owners_fin() {
     while !fixture.stream().credit_held {
         assert!(waiters.len() < 64, "the window must run out");
         let (tx, rx) = oneshot::channel();
-        fixture
-            .actor
-            .write_echo_stream(key.clone(), STREAM_ID, OPERATION_ID.to_owned(), chunk.clone(), tx);
+        fixture.actor.write_echo_stream(
+            key.clone(),
+            STREAM_ID,
+            OPERATION_ID.to_owned(),
+            chunk.clone(),
+            tx,
+        );
         waiters.push(rx);
     }
     let mut parked = waiters.pop().expect("the parked chunk's waiter");
