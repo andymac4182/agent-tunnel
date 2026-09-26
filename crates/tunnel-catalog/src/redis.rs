@@ -461,36 +461,7 @@ impl RedisCatalog {
                 CatalogError::InvalidInput("redis URL"),
             ));
         }
-        let client = match tls {
-            Some(tls) => {
-                let connection_info = redis_url.into_connection_info().map_err(|error| {
-                    catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
-                })?;
-                if !matches!(
-                    connection_info.addr(),
-                    redis::ConnectionAddr::TcpTls {
-                        insecure: false,
-                        ..
-                    }
-                ) {
-                    return Err(catalog_connection_error(
-                        CatalogConnectionStage::TlsSetup,
-                        CatalogError::InvalidInput(
-                            "Redis TLS connection requires a verified rediss:// URL",
-                        ),
-                    ));
-                }
-                let certificates = tls.into_redis_certificates().map_err(|error| {
-                    catalog_connection_error(CatalogConnectionStage::TlsSetup, error)
-                })?;
-                redis::Client::build_with_tls(connection_info, certificates).map_err(|error| {
-                    catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
-                })?
-            }
-            None => redis::Client::open(redis_url).map_err(|error| {
-                catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
-            })?,
-        };
+        let client = build_catalog_client(redis_url, tls)?;
         let (connection, redis_run_id) = open_verified_connection(&client).await?;
         let lane_group = Arc::new(LaneGroup::default());
         // Lanes are numbered 1..=LANE_CONNECTIONS in opening order so a
@@ -2735,6 +2706,58 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// The one place a catalog Redis client is built, for every lane, the
+/// recovery scanner and the primary connection alike.
+fn build_catalog_client(
+    redis_url: &str,
+    tls: Option<RedisTlsOptions>,
+) -> Result<redis::Client, CatalogConnectionError> {
+    let client = match tls {
+        Some(tls) => {
+            let connection_info = catalog_connection_info(redis_url)?;
+            if !matches!(
+                connection_info.addr(),
+                redis::ConnectionAddr::TcpTls {
+                    insecure: false,
+                    ..
+                }
+            ) {
+                return Err(catalog_connection_error(
+                    CatalogConnectionStage::TlsSetup,
+                    CatalogError::InvalidInput(
+                        "Redis TLS connection requires a verified rediss:// URL",
+                    ),
+                ));
+            }
+            let certificates = tls.into_redis_certificates().map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::TlsSetup, error)
+            })?;
+            redis::Client::build_with_tls(connection_info, certificates).map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+            })?
+        }
+        None => redis::Client::open(catalog_connection_info(redis_url)?).map_err(|error| {
+            catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+        })?,
+    };
+    Ok(client)
+}
+
+/// Parse `redis_url` and disable Nagle's algorithm on its sockets (task row
+/// M6-C124).  Every catalog lane is a request/reply lane of small commands on
+/// the authorization path of each consumer request, and redis-rs leaves
+/// `TCP_NODELAY` off by default, so a command written behind an
+/// unacknowledged one could wait out the peer's delayed ACK.
+fn catalog_connection_info(
+    redis_url: &str,
+) -> Result<redis::ConnectionInfo, CatalogConnectionError> {
+    let connection_info = redis_url.into_connection_info().map_err(|error| {
+        catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+    })?;
+    let tcp_settings = connection_info.tcp_settings().clone().set_nodelay(true);
+    Ok(connection_info.set_tcp_settings(tcp_settings))
+}
+
 /// The redis-rs connection configuration every authority connection uses.
 ///
 /// redis-rs applies its own per-command response deadline inside the
@@ -4086,6 +4109,27 @@ mod tests {
     };
 
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// Task row M6-C124: every catalog Redis client, plaintext or TLS, opens
+    /// its sockets with `TCP_NODELAY` set.  redis-rs's default is off.
+    #[test]
+    fn catalog_clients_disable_nagle_on_every_connection() {
+        let plain = super::build_catalog_client("redis://127.0.0.1:6379/", None)
+            .expect("plaintext catalog client");
+        assert!(
+            plain.get_connection_info().tcp_settings().nodelay(),
+            "plaintext catalog lanes must set TCP_NODELAY"
+        );
+        let tls = super::build_catalog_client(
+            "rediss://localhost:6379/",
+            Some(super::RedisTlsOptions::default()),
+        )
+        .expect("TLS catalog client");
+        assert!(
+            tls.get_connection_info().tcp_settings().nodelay(),
+            "TLS catalog lanes must set TCP_NODELAY"
+        );
+    }
 
     /// PR #158 review: a failed seed whose rollback stops at the scan bound
     /// leaves keys behind, so it must not be reported as "nothing was
