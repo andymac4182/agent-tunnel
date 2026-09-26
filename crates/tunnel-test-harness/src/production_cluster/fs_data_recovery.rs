@@ -1138,10 +1138,6 @@ async fn exercise(
         )));
     }
     let device_emitted_before = device_before.emitted_sequences;
-    // The device's status immediately before the held Tread is sent; the
-    // failure point is judged against it, not against `device_before`, which
-    // predates the credit fillers.
-    let mut before_held = device_before.clone();
     let mut next_offset = transferred.len() as u64;
     let mut filler_tags = Vec::new();
 
@@ -1155,9 +1151,13 @@ async fn exercise(
     //    and the next Tread is sent once emission has settled); an emit
     //    cursor that holds still for [`DEVICE_SETTLE`] means the reply is
     //    parked, and that Tread is the held one.
-    let held_tag = match point {
+    //
+    //    `before_held` is the device's status immediately before the held
+    //    Tread is sent.  The failure point is judged against it, not against
+    //    `device_before`, which predates the credit fillers.
+    let (held_tag, before_held) = match point {
         FailurePoint::ReplyProduced => {
-            before_held = client.status_snapshot();
+            let before_held = client.status_snapshot();
             let tag = session
                 .send(Message::Tread {
                     fid: FILE_FID,
@@ -1166,7 +1166,7 @@ async fn exercise(
                 })
                 .await?;
             next_offset += u64::from(READ_COUNT);
-            tag
+            (tag, before_held)
         }
         FailurePoint::ReplyParkedForCredit => loop {
             if filler_tags.len() >= MAX_CREDIT_PROBE_READS {
@@ -1179,7 +1179,6 @@ async fn exercise(
                 )));
             }
             let before = client.status_snapshot();
-            before_held = before.clone();
             let tag = session
                 .send(Message::Tread {
                     fid: FILE_FID,
@@ -1227,7 +1226,7 @@ async fn exercise(
                 sleep(POLL).await;
             };
             if parked {
-                break tag;
+                break (tag, before);
             }
             // Answered: let whatever the device can send reach the paused
             // direction before the next Tread, so no frame it emits after the
