@@ -218,7 +218,7 @@ pub const NOT_COVERED: [&str; 14] = [
     "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
     "peer-key rotation as a survivable event: the key-rotation case drives the teardown and attributes the INGRESS's own decision, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
-    "which end's teardown closed the socket first IN THE PHANTOM-SUCCESSOR ARM: the peer-key-rotation case still withdraws the OWNER's own serving key for a phantom no certificate presents, deliberately, so it also drives the owner's runtime through MembershipRejected to Unready and invalidates the owner's own admission of the ingress at the same moment. That arm is three concurrent teardowns -- ingress-side revalidation, owner-side fail-closed, and the version bump -- and the control arm controls for the third only. Both ends' latched reasons are recorded rather than inferred. A relay no longer binds one serving identity for the life of its process (M8-C28, closed by the product change of M8-C45): the genuine-peer-key-rotation case re-keys the owner through its own PeerRekey state machine and shows the owner staying Ready, and that case -- not this arm -- is the peer-key rotation",
+    "which end's teardown closed the socket first IN THE PHANTOM-SUCCESSOR ARM: the peer-key-rotation case still withdraws the OWNER's own serving key for a phantom no certificate presents, deliberately, so it also drives the owner's runtime through MissingLocalKey to Unready (MembershipRejected before M7-C80's reason split) and invalidates the owner's own admission of the ingress at the same moment. That arm is three concurrent teardowns -- ingress-side revalidation, owner-side fail-closed, and the version bump -- and the control arm controls for the third only. Both ends' latched reasons are recorded rather than inferred. A relay no longer binds one serving identity for the life of its process (M8-C28, closed by the product change of M8-C45): the genuine-peer-key-rotation case re-keys the owner through its own PeerRekey state machine and shows the owner staying Ready, and that case -- not this arm -- is the peer-key rotation",
     "an in-flight stream SURVIVING the predecessor's withdrawal in the genuine rotation: the owner keeps serving existing connections under the predecessor through the overlap and the switch, and both live streams are shown serving across the switch, but when the publisher withdraws the predecessor the ingress's connection presenting it is closed and its admission revoked, so the held turn is torn down and the ingress attributes that to the key. The owner does not GOAWAY-drain inbound connections under the predecessor before the withdrawal (M8-C47), and the flooded forwarded stream's survival is shown by one frame read after the switch, not by a saturation threshold -- both forwarding segments saturated at one instant is M8-05's third discriminator and is not claimed here",
     "any of this at the shipped rotation default, or a key rotation reaching the consumer as a typed terminal: the interruption is an explicit stream failure with no stopReason, which is what the consumer sees, and no code on the wire names the key",
 ];
@@ -483,7 +483,7 @@ pub struct AcpClusterEvidence {
     ///
     /// The withdrawn key is the owner's *own* serving key and the incoming one
     /// is a phantom no certificate presents, so the key arm also takes the
-    /// owner's membership runtime through `MembershipRejected`, which
+    /// owner's membership runtime through `MissingLocalKey` (M7-C86), which
     /// invalidates every admission the owner holds — including its admission
     /// of the ingress. These two fields are the owner's own decision about the
     /// ingress, so a reader can see that the key arm tears down from both ends
@@ -1103,12 +1103,52 @@ impl Gate<'_> {
                 // as a status for a caller to describe as a broken route.
                 return Err(HarnessError::Process(format!(
                     "ACP POST refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
-                     (coincided with an observed freeze: {coincides}); {}",
-                    self.freeze.unexplained()
+                     (coincided with an observed freeze: {coincides}); {}; M7-C130 forensics: \
+                     refusal code={} retry_after_ms={}; {}",
+                    self.freeze.unexplained(),
+                    serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|value| value
+                            .pointer("/error/code")
+                            .or_else(|| value.get("code"))
+                            .cloned())
+                        .map_or("-".to_owned(), |code| code.to_string()),
+                    headers
+                        .get("x-agent-tunnel-retry-after-ms")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("-"),
+                    self.membership_forensics().await,
                 )));
             }
             return Ok((status, headers, body));
         }
+    }
+
+    /// Per-relay membership, peer and ownership state for a refusal, payload
+    /// free: readiness labels, counters and the pin/fault forensics line.
+    async fn membership_forensics(&self) -> String {
+        let mut parts = vec![self.cluster.peer_path_forensics().await];
+        for relay in self
+            .cluster
+            .relays
+            .iter()
+            .filter(|relay| relay.running.is_some())
+        {
+            let membership = relay.membership.snapshot();
+            let owned = match tokio::time::timeout(Duration::from_secs(2), relay.snapshot()).await {
+                Ok(Ok(snapshot)) => format!("sessions={}", snapshot.sessions.len()),
+                Ok(Err(error)) => format!("snapshot_error={error}"),
+                Err(_) => "snapshot_timed_out".to_owned(),
+            };
+            parts.push(format!(
+                "{}: membership={:?} generation={} active_peers={} {owned}",
+                relay.node_id,
+                membership.readiness,
+                membership.generation,
+                membership.active_peer_count
+            ));
+        }
+        parts.join(" || ")
     }
 
     /// Open an SSE stream and hold it.
@@ -1345,7 +1385,7 @@ impl Gate<'_> {
         workspace: &std::path::Path,
     ) -> Result<Conversation> {
         let consumer = AcpConsumer::connect(self.ingress_addr, &self.ca).await?;
-        let (status, headers, _body) = self
+        let (status, headers, init_body) = self
             .post_as(
                 &consumer,
                 base_uri,
@@ -1364,8 +1404,86 @@ impl Gate<'_> {
             )
             .await?;
         if status != http::StatusCode::OK {
+            // M7-C130 forensics: the gateway's typed error code and execution,
+            // plus each relay's pin state and bounded peer fault tuples.
+            // Identifiers and closed labels only; the body of a gateway error
+            // carries no application payload.
+            let code = headers
+                .get("x-agent-tunnel-error-code")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned();
+            let execution = headers
+                .get("x-agent-tunnel-execution")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned();
+            let body_code = serde_json::from_str::<Value>(&init_body)
+                .ok()
+                .map(|value| {
+                    format!(
+                        "code={} execution={}",
+                        value
+                            .pointer("/error/code")
+                            .or_else(|| value.get("code"))
+                            .map_or("-".into(), ToString::to_string),
+                        value
+                            .pointer("/error/execution")
+                            .or_else(|| value.get("execution"))
+                            .map_or("-".into(), ToString::to_string),
+                    )
+                })
+                .unwrap_or_default();
             return Err(HarnessError::Http(format!(
-                "initialize over the real route answered {status}"
+                "initialize over the real route answered {status} (header code={code} \
+                 execution={execution}; body {body_code}); {}",
+                {
+                    let mut text = self.cluster.peer_path_forensics().await;
+                    for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
+                        if let Ok(snapshot) = relay.snapshot().await {
+                            let forward = snapshot.http_forward;
+                            let exchanges = forward
+                                .exchanges
+                                .iter()
+                                .rev()
+                                .take(3)
+                                .map(|e| {
+                                    format!(
+                                        "{}:{}/{}/{:?}/{}",
+                                        e.role,
+                                        e.request_outcome,
+                                        e.response_outcome,
+                                        e.error_code,
+                                        e.execution
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let owners = forward
+                                .owner_streams
+                                .iter()
+                                .rev()
+                                .take(3)
+                                .map(|o| {
+                                    format!(
+                                        "{}:{:?}:rid={}",
+                                        o.release,
+                                        o.reset_reason,
+                                        o.request_id.is_some()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            text.push_str(&format!(
+                                " || {} exchanges={} [{exchanges}] owner_streams={} [{owners}]",
+                                relay.node_id,
+                                forward.exchanges_recorded,
+                                forward.owner_streams_recorded
+                            ));
+                        }
+                    }
+                    text
+                }
             )));
         }
         let connection = headers
@@ -1545,6 +1663,8 @@ const FORGED_BINDING: &str = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
 /// How long an explicit interruption may take to reach the consumer before the
 /// gate reports that it did not arrive.
 const INTERRUPTION_BOUND: Duration = Duration::from_secs(45);
+/// How long the same-key control arm watches its stream (M7-C80, M7-C130).
+const CONTROL_ARM_OBSERVATION: Duration = Duration::from_millis(300);
 
 /// How long a live stream is watched after its ingress relay's peer pins are
 /// withdrawn, before the gate records that the withdrawal left it serving.
@@ -2331,7 +2451,7 @@ impl Gate<'_> {
     /// fixture certificate presents, so the key the key arm withdraws is the
     /// owner's **own serving key** and its replacement is a phantom.  The
     /// owner's own membership runtime therefore cannot find its local key in
-    /// the record it just reconciled, takes the `MembershipRejected` branch of
+    /// the record it just reconciled, takes the `MissingLocalKey` branch (M7-C86) of
     /// `membership_runtime.rs`, goes **Unready**, and invalidates *every*
     /// admission it holds — including its admission of the ingress — with the
     /// same `MembershipRevoked`.  The run's own logs say so: a
@@ -2548,7 +2668,23 @@ impl Gate<'_> {
         // the key arm drives it Unready and a readiness excursion that is over
         // by the time the arm returns would otherwise be invisible.
         let mut owner_unready = false;
-        let deadline = Instant::now() + INTERRUPTION_BOUND;
+        // The control arm withdraws nothing, and since M7-C80 a same-key
+        // re-sign re-binds the admission rather than tearing the stream down,
+        // so the stream has nothing to show: the evidence is the reason the
+        // ingress's invalidation dispatcher latched (or did not), which it
+        // does synchronously at the reconcile `converge_owner_keys` already
+        // waited for. Watching the stream for seconds only shifts every later
+        // case in phase against the devices' scheduled data rotations, and
+        // M7-C130 measured what that costs: the next case's first request can
+        // land while the owner device's rotation candidate is stalled behind
+        // the key arm's peer-trust teardown. Keep the control arm as short as
+        // it was before the re-bind made the stream survive.
+        let bound = if spkis.contains(&old_spki) {
+            CONTROL_ARM_OBSERVATION
+        } else {
+            INTERRUPTION_BOUND
+        };
+        let deadline = Instant::now() + bound;
         while Instant::now() < deadline {
             if !matches!(
                 self.cluster.relay(TARGET_NODE)?.membership.readiness(),
@@ -4239,8 +4375,17 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // a label nobody checked.  Exact equality here too: an earlier
             // version was `!is_empty && !any(revoked)`, whose first conjunct
             // no falsification ever exercised.
-            "the same-key control arm was attributed to the record version, naming no key",
-            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],
+            // **Since M7-C80 the control arm invalidates nothing.**  A same-key
+            // re-sign at a newer version re-binds the admission rather than
+            // replacing it, so no reason is latched: whatever the key arm
+            // tears down is attributable to the key alone.
+            // `version_bump_interrupted` is recorded but not asserted: the
+            // arm watches its stream only briefly (`CONTROL_ARM_OBSERVATION`,
+            // 300 ms, M7-C130), so whether the stream later ends on its own
+            // exchange deadline is not a membership event; a membership
+            // invalidation would have latched a reason here.
+            "the same-key control arm invalidated nothing (M7-C80)",
+            evidence.version_bump_reasons.is_empty(),
         ),
         (
             // **The disclosure, made load-bearing.**  The key arm withdraws
@@ -4819,7 +4964,7 @@ mod tests {
             owner_loss_no_stop_reason: true,
             key_overlap_staged: true,
             version_bump_interrupted: true,
-            version_bump_reasons: vec!["membership_changed".to_owned()],
+            version_bump_reasons: Vec::new(),
             key_rotation_interrupted: true,
             key_rotation_no_stop_reason: true,
             key_rotation_reasons: vec!["membership_revoked".to_owned()],
@@ -5260,18 +5405,20 @@ mod tests {
                     // evidence of nothing.
                     e.version_bump_reasons = vec!["membership_revoked".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
             ),
             (
                 // The other half of that rule.  It used to read
                 // `!is_empty && !any(revoked)` with only the second conjunct
                 // falsified, so a control arm that invalidated *nothing* --
                 // and therefore controlled for nothing -- would have passed.
-                "version_bump_reasons empty",
+                // M7-C80 regressed: a same-key version bump invalidating the
+                // admission again, as it did before the re-bind.
+                "version_bump_reasons membership_changed",
                 |e| {
-                    e.version_bump_reasons = Vec::new();
+                    e.version_bump_reasons = vec!["membership_changed".to_owned()];
                 },
-                "same-key control arm was attributed to the record version",
+                "same-key control arm invalidated nothing",
             ),
             (
                 "key_rotation_owner_unready",

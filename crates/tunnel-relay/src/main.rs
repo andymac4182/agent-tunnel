@@ -1431,6 +1431,9 @@ fn membership_readiness_code(
             MembershipUnreadyReason::MissingLocalMembership => {
                 ("unready", "missing_local_membership", "membership")
             }
+            MembershipUnreadyReason::MissingLocalKey => {
+                ("unready", "missing_local_key", "membership")
+            }
             MembershipUnreadyReason::PersistenceUnavailable => {
                 ("unready", "persistence_unavailable", "persistence")
             }
@@ -1905,6 +1908,11 @@ mod tests {
             (
                 MembershipUnreadyReason::MissingLocalMembership,
                 "missing_local_membership",
+                "membership",
+            ),
+            (
+                MembershipUnreadyReason::MissingLocalKey,
+                "missing_local_key",
                 "membership",
             ),
             (

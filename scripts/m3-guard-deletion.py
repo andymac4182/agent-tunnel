@@ -755,7 +755,8 @@ ROUTE_PROOF_CASES: list[Case] = [
                 "a_pin_addition_keeps_a_route_proven_with_a_still_approved_key"
             }
         ),
-    ),    Case(
+    ),
+    Case(
         # An unreachable mark must withdraw the proof with the reachability,
         # or a later overlap record could preserve evidence for a route the
         # request path had just seen fail.
@@ -772,6 +773,116 @@ ROUTE_PROOF_CASES: list[Case] = [
             {
                 "peer_runtime::peer_readiness::tests::"
                 "an_unreachable_route_is_not_revived_by_an_overlap_record"
+            }
+        ),
+    ),
+]
+
+#: **M7-C80: membership re-signs re-bind an admission instead of replacing it.**
+#: (M7-C86 and its wiring rows M7-C90/M7-C91 are held on the draft branch.)  Each case defeats one fix in `membership_runtime.rs`
+#: and names the regression in `tests/m7_membership_resign.rs` that sees it.
+#: The witnesses drive the real `MembershipRuntime` and the library
+#: `PeerPinPublisher` / `peer_trust_tick` that the serving relay and the
+#: production-cluster fixture both install, so no Redis is needed.
+MEMBERSHIP_RUNTIME = RELAY / "src" / "membership_runtime.rs"
+MEMBERSHIP_RESIGN_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--test",
+    "m7_membership_resign",
+]
+
+MEMBERSHIP_RESIGN_CASES: list[Case] = [
+    Case(
+        # M7-C80.  Defeated, no admission is ever re-bound, so every same-key
+        # re-sign invalidates it and kills every stream riding it.
+        "a same-key re-sign re-binds the active admission",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "                Ok(binding) if permitted => {",
+                "                Ok(binding) if false && permitted => {",
+            )
+        ],
+        frozenset({"a_same_key_resign_keeps_the_active_admission"}),
+    ),
+    Case(
+        # The binding identity's endpoint clause.
+        "a re-sign that moves the peer endpoint is not re-bound",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "        && left.peer_endpoint() == right.peer_endpoint()\n",
+                "",
+            )
+        ],
+        frozenset({"a_same_key_resign_with_a_changed_endpoint_invalidates"}),
+    ),
+    Case(
+        # The binding identity's server-name clause.
+        "a re-sign that changes the server name is not re-bound",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "        && left.server_name() == right.server_name()\n",
+                "",
+            )
+        ],
+        frozenset({"a_same_key_resign_with_a_changed_server_name_invalidates"}),
+    ),
+    Case(
+        # The passed-deadline clause, seen through a real reconcile.
+        "an admission past its deadline is never re-bound",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "    let deadline_ok = !check.deadline_expired;",
+                "    let deadline_ok = true;",
+            )
+        ],
+        frozenset({"an_admission_past_its_deadline_is_not_re_bound_by_a_renewal"}),
+    ),
+]
+
+MEMBERSHIP_REBIND_UNIT_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "membership_runtime::tests",
+]
+
+MEMBERSHIP_REBIND_UNIT_CASES: list[Case] = [
+    Case(
+        # The version clause.  The verifier refuses a lower or equal-version
+        # record first, so this clause is witnessed as a unit.
+        "a lower or missing record version is never re-bound",
+        [
+            (
+                MEMBERSHIP_RUNTIME,
+                "        Some(version) => version >= check.previous_version,",
+                "        Some(_) => true,",
+            )
+        ],
+        frozenset(
+            {"membership_runtime::tests::every_rebind_clause_fails_closed_on_its_own"}
+        ),
+    ),
+    Case(
+        # A renewal never moves a deadline earlier than it already was.
+        "a renewed admission deadline is never earlier",
+        [(MEMBERSHIP_RUNTIME, "    bounded.max(previous)", "    bounded")],
+        frozenset(
+            {
+                "membership_runtime::tests::"
+                "a_renewed_deadline_is_never_earlier_and_unchanged_boundaries_keep_theirs"
             }
         ),
     ),
@@ -1980,6 +2091,18 @@ SUITES: list[Suite] = [
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
     Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
     Suite("m8c30-route-proof", [RELAY], ROUTE_PROOF_TEST, ROUTE_PROOF_CASES),
+    Suite(
+        "m7-membership-resign",
+        [RELAY],
+        MEMBERSHIP_RESIGN_TEST,
+        MEMBERSHIP_RESIGN_CASES,
+    ),
+    Suite(
+        "m7-membership-rebind-unit",
+        [RELAY],
+        MEMBERSHIP_REBIND_UNIT_TEST,
+        MEMBERSHIP_REBIND_UNIT_CASES,
+    ),
     Suite("m7c92-unary-echo", [RELAY], UNARY_ECHO_TEST, UNARY_ECHO_CASES),
     Suite(
         "m7c97-retiring-admission",
