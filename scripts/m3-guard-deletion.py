@@ -1793,6 +1793,23 @@ M7_CONNECTOR_RELAY_CASES.append(
         frozenset({STRANDED + "an_aborted_maintenance_task_is_done_without_ever_failing"}),
     )
 )
+M7_CONNECTOR_RELAY_CASES.append(
+    Case(
+        # M6-C175 (review of #203): aborting the maintenance task keeps a
+        # failure it already recorded.
+        "aborting the relay maintenance task keeps its recorded failure",
+        [
+            (
+                ACTOR,
+                "            let _ = task.join().await;\n"
+                "            self.maintenance_completion.mark_stopped();\n",
+                "            let _ = task.join().await;\n"
+                "            self.maintenance_completion.mark_done(false);\n",
+            )
+        ],
+        frozenset({STRANDED + "aborting_the_maintenance_task_keeps_a_recorded_failure"}),
+    )
+)
 #: M6-C162: the device http-forward writer/reader reply waits.  Their tests
 #: live in `http_forward`, outside the `m2_runtime::tests::` filter.
 HTTP_FORWARD_REPLY_TEST = [

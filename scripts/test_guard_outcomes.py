@@ -403,7 +403,10 @@ EXPECTED_GUARD_ANCHORS = {
     # Then **89** on branch `fix-soak-mcp` (M6-C175), which adds the
     # maintenance clean-abort case to `m7-connector-relay`: `--check-anchors`
     # reports 89 across 22 suites; 90 fails naming m3.
-    "m3-guard-deletion.py": 89,
+    # Then **90** after the review of #203 added the case that keeps a
+    # recorded maintenance failure: `--check-anchors` reports 90 across 22
+    # suites; 91 fails naming m3.
+    "m3-guard-deletion.py": 90,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

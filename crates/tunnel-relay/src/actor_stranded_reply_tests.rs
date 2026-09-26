@@ -383,6 +383,21 @@ async fn an_aborted_maintenance_task_is_done_without_ever_failing() {
     let _ = timeout(BOUND, handle.shutdown()).await;
 }
 
+/// `abort_maintenance_task` records only a stop: a failure the maintenance
+/// task already recorded (a panic caught by its `catch_unwind`) is kept, not
+/// overwritten with "not failed" (task row M6-C175).
+#[tokio::test]
+async fn aborting_the_maintenance_task_keeps_a_recorded_failure() {
+    let handle = spawned_handle();
+    handle.maintenance_completion.mark_done(true);
+    handle.abort_maintenance_task().await;
+    assert!(
+        handle.maintenance_completion.failed(),
+        "abort_maintenance_task erased the maintenance task's recorded failure"
+    );
+    let _ = timeout(BOUND, handle.shutdown()).await;
+}
+
 #[tokio::test]
 async fn a_stranded_forwarded_attach_returns_shutdown() {
     let (handle, owner) = stranded_handle().await;
